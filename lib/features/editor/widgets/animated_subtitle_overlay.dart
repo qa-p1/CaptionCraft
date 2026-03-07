@@ -21,6 +21,8 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
 
   SubtitleStyleModel get _style {
     final base = entry.styleOverride ?? globalStyle;
+    final resolvedAnimationPreset =
+        entry.styleOverride?.animationPreset ?? globalStyle.animationPreset;
     // Spatial + size controls are treated as global editor transforms.
     return base.copyWith(
       fontSize: globalStyle.fontSize,
@@ -28,6 +30,7 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
       offsetX: globalStyle.offsetX,
       offsetY: globalStyle.offsetY,
       maxWidthFactor: globalStyle.maxWidthFactor,
+      animationPreset: resolvedAnimationPreset,
     );
   }
 
@@ -35,19 +38,24 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (_preset == null || entry.words == null || entry.words!.isEmpty) {
+    if (_preset == null) {
       return _buildStaticOverlay();
     }
 
+    final hasWordTiming = entry.words != null && entry.words!.isNotEmpty;
     switch (_preset!) {
       case SubtitleAnimationPreset.wordPop:
-        return _buildWordPop();
+        return hasWordTiming ? _buildWordPop() : _buildWordPopFallback();
       case SubtitleAnimationPreset.lineFade:
         return _buildLineFade();
       case SubtitleAnimationPreset.karaokeHighlight:
-        return _buildKaraokeHighlight();
+        return hasWordTiming
+            ? _buildKaraokeHighlight()
+            : _buildKaraokeHighlightFallback();
       case SubtitleAnimationPreset.wordSlideUp:
-        return _buildWordSlideUp();
+        return hasWordTiming
+            ? _buildWordSlideUp()
+            : _buildWordSlideUpFallback();
       case SubtitleAnimationPreset.typewriter:
         return _buildTypewriter();
     }
@@ -125,6 +133,28 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
     );
   }
 
+  Widget _buildWordPopFallback() {
+    final style = _style;
+    final elapsed = (currentPosition - entry.startTime).inMilliseconds;
+    final t = (elapsed / 160.0).clamp(0.0, 1.0);
+    final pulse = sin(t * pi) * 0.06;
+
+    return _wrapBackground(
+      style,
+      Opacity(
+        opacity: t,
+        child: Transform.scale(
+          scale: 0.88 + (t * 0.12) + pulse,
+          child: Text(
+            style.isAllCaps ? entry.text.toUpperCase() : entry.text,
+            textAlign: style.textAlignment,
+            style: _textStyle(style),
+          ),
+        ),
+      ),
+    );
+  }
+
   // ─── Preset 2: Line Fade ───
   // Entire line fades in as a single unit over 200ms.
   Widget _buildLineFade() {
@@ -181,6 +211,37 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
     );
   }
 
+  Widget _buildKaraokeHighlightFallback() {
+    final style = _style;
+    final durationMs = max(entry.duration.inMilliseconds, 1);
+    final elapsedMs = (currentPosition - entry.startTime).inMilliseconds.clamp(
+      0,
+      durationMs,
+    );
+    final progress = elapsedMs / durationMs;
+
+    return _wrapBackground(
+      style,
+      ShaderMask(
+        blendMode: BlendMode.srcIn,
+        shaderCallback: (bounds) {
+          final highlightStop = progress.clamp(0.0, 1.0);
+          return LinearGradient(
+            begin: Alignment.centerLeft,
+            end: Alignment.centerRight,
+            colors: [kAccent, kAccent, style.textColor, style.textColor],
+            stops: [0, highlightStop, highlightStop, 1],
+          ).createShader(bounds);
+        },
+        child: Text(
+          style.isAllCaps ? entry.text.toUpperCase() : entry.text,
+          textAlign: style.textAlignment,
+          style: _textStyle(style),
+        ),
+      ),
+    );
+  }
+
   // ─── Preset 4: Word Slide Up ───
   // Each word slides up from 12px below + fades in.
   // 80ms stagger per word, 150ms duration per word.
@@ -217,6 +278,27 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
             ),
           );
         }),
+      ),
+    );
+  }
+
+  Widget _buildWordSlideUpFallback() {
+    final style = _style;
+    final elapsed = (currentPosition - entry.startTime).inMilliseconds;
+    final t = (elapsed / 180.0).clamp(0.0, 1.0);
+
+    return _wrapBackground(
+      style,
+      Transform.translate(
+        offset: Offset(0, 14 * (1 - t)),
+        child: Opacity(
+          opacity: t,
+          child: Text(
+            style.isAllCaps ? entry.text.toUpperCase() : entry.text,
+            textAlign: style.textAlignment,
+            style: _textStyle(style),
+          ),
+        ),
       ),
     );
   }

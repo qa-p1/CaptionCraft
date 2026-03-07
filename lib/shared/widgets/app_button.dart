@@ -34,7 +34,7 @@ class AppButton extends StatelessWidget {
           fit: StackFit.expand, // preserves tight constraints
           children: [
             ...previousChildren,
-            if (currentChild != null) currentChild,
+            ?currentChild,
           ],
         ),
         child: _buildButton(),

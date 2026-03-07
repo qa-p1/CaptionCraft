@@ -1,3 +1,5 @@
+// ignore_for_file: use_build_context_synchronously
+
 import 'dart:async';
 import 'dart:io';
 import 'package:file_picker/file_picker.dart';
@@ -44,27 +46,28 @@ class EditorScreen extends ConsumerStatefulWidget {
 
 enum _CanvasAspectRatio { original, ratio16x9, ratio9x16, ratio1x1, ratio4x5 }
 
-class _EditorScreenState extends ConsumerState<EditorScreen> {
+class _EditorScreenState extends ConsumerState<EditorScreen>
+    with WidgetsBindingObserver {
   Timer? _saveDebounce;
-  Timer? _giphySearchDebounce;
+  bool _isSavingProject = false;
+  bool _queuedProjectSave = false;
+  bool _queuedRemoteSync = false;
   _CanvasAspectRatio _canvasAspectRatio = _CanvasAspectRatio.original;
-  final TextEditingController _giphySearchController = TextEditingController();
-  List<GiphyAssetResult> _giphyResults = const [];
-  bool _isLoadingGiphy = false;
-  bool _hasLoadedInitialGiphyResults = false;
-  String? _giphyError;
-  GiphySearchKind _giphySearchKind = GiphySearchKind.both;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
+      final initialStyle = _normalizedInitialSubtitleStyle(
+        widget.project.globalStyle,
+      );
       ref
           .read(subtitleProvider.notifier)
           .initializeFromProject(
             entries: widget.project.subtitles,
-            globalStyle: widget.project.globalStyle,
+            globalStyle: initialStyle,
           );
       ref
           .read(editorProvider.notifier)
@@ -72,7 +75,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
             videoPath: widget.project.videoPath,
             projectId: widget.project.id,
             projectName: widget.project.name,
-            timeline: widget.project.timeline,
+            timeline: widget.project.timeline.mergeSubtitleEntries(
+              subtitles: widget.project.subtitles,
+              globalStyle: initialStyle,
+            ),
           );
     });
   }
@@ -80,14 +86,29 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
   @override
   void dispose() {
     _saveDebounce?.cancel();
-    _giphySearchDebounce?.cancel();
-    _giphySearchController.dispose();
+    WidgetsBinding.instance.removeObserver(this);
+    unawaited(_saveProjectState(syncRemote: false));
     super.dispose();
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      unawaited(_flushProjectSave(syncRemote: false));
+    }
+  }
+
+  SubtitleStyleModel _normalizedInitialSubtitleStyle(SubtitleStyleModel style) {
+    if (style.fontSize == 24 && style.maxWidthFactor == 0.85) {
+      return style.copyWith(fontSize: 10, maxWidthFactor: 1);
+    }
+    return style;
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final subtitleState = ref.watch(subtitleProvider);
     final editorState = ref.watch(editorProvider);
     final isLandscape =
         MediaQuery.of(context).orientation == Orientation.landscape;
@@ -106,42 +127,40 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
       }
     });
 
-    return Scaffold(
-      backgroundColor: kBackground,
-      appBar: AppBar(
+    return PopScope(
+      canPop: true,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) {
+          unawaited(_flushProjectSave(syncRemote: false));
+        }
+      },
+      child: Scaffold(
         backgroundColor: kBackground,
-        title: Text(
-          widget.project.name,
-          style: GoogleFonts.inter(fontSize: 16, fontWeight: FontWeight.w600),
-        ),
-        actions: [
-          _buildAspectRatioPicker(),
-          IconButton(
-            tooltip: 'Generate subtitles',
-            icon: const Icon(Icons.subtitles_rounded, color: kTextPrimary),
-            onPressed: _handleGenerateSubtitles,
+        appBar: AppBar(
+          backgroundColor: kBackground,
+          title: Text(
+            widget.project.name,
+            style: GoogleFonts.inter(fontSize: 16, fontWeight: FontWeight.w600),
           ),
-          IconButton(
-            tooltip: 'Export / Import',
-            icon: const Icon(Icons.ios_share_rounded, color: kTextPrimary),
-            onPressed: _showExportActions,
-          ),
-          const SizedBox(width: 6),
-        ],
-      ),
-      body: isLandscape
-          ? _buildLandscape(
-              context,
-              subtitleState.selectedEntry,
-              selectedClip,
-              editorState,
-            )
-          : _buildPortrait(
-              context,
-              subtitleState.selectedEntry,
-              selectedClip,
-              editorState,
+          actions: [
+            _buildAspectRatioPicker(),
+            IconButton(
+              tooltip: 'Generate subtitles',
+              icon: const Icon(Icons.subtitles_rounded, color: kTextPrimary),
+              onPressed: _handleGenerateSubtitles,
             ),
+            IconButton(
+              tooltip: 'Export / Import',
+              icon: const Icon(Icons.ios_share_rounded, color: kTextPrimary),
+              onPressed: _showExportActions,
+            ),
+            const SizedBox(width: 6),
+          ],
+        ),
+        body: isLandscape
+            ? _buildLandscape(context, selectedClip)
+            : _buildPortrait(context, selectedClip),
+      ),
     );
   }
 
@@ -646,33 +665,64 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
     });
   }
 
-  Future<void> _saveProjectState() async {
-    final subtitleState = ref.read(subtitleProvider);
-    final editorState = ref.read(editorProvider);
-    final mergedTimeline = editorState.timeline.mergeSubtitleEntries(
-      subtitles: subtitleState.entries,
-      globalStyle: subtitleState.globalStyle,
-    );
-    final updatedProject = widget.project.copyWith(
-      subtitles: subtitleState.entries,
-      globalStyle: subtitleState.globalStyle,
-      timeline: mergedTimeline,
-      lastModifiedAt: DateTime.now(),
-    );
+  Future<void> _flushProjectSave({bool syncRemote = true}) async {
+    _saveDebounce?.cancel();
+    await _saveProjectState(syncRemote: syncRemote);
+  }
 
-    await ProjectLocalStorage.saveProject(updatedProject);
+  Future<void> _saveProjectState({bool syncRemote = true}) async {
+    if (_isSavingProject) {
+      _queuedProjectSave = true;
+      _queuedRemoteSync = _queuedRemoteSync || syncRemote;
+      return;
+    }
 
-    final user = ref.read(currentUserProvider);
-    if (user == null) return;
+    _isSavingProject = true;
+    var shouldSyncRemote = syncRemote;
 
     try {
-      await FirebaseService.saveProject(
-        user.uid,
-        updatedProject.id,
-        updatedProject.toFirestore(),
-      );
-    } catch (_) {
-      // Local persistence remains the fallback when Firestore sync fails.
+      while (true) {
+        _queuedProjectSave = false;
+        _queuedRemoteSync = false;
+
+        final subtitleState = ref.read(subtitleProvider);
+        final editorState = ref.read(editorProvider);
+        final mergedTimeline = editorState.timeline.mergeSubtitleEntries(
+          subtitles: subtitleState.entries,
+          globalStyle: subtitleState.globalStyle,
+        );
+        final updatedProject = widget.project.copyWith(
+          subtitles: subtitleState.entries,
+          globalStyle: subtitleState.globalStyle,
+          timeline: mergedTimeline,
+          lastModifiedAt: DateTime.now(),
+        );
+
+        await ProjectLocalStorage.saveProject(updatedProject);
+
+        if (shouldSyncRemote) {
+          final user = ref.read(currentUserProvider);
+          if (user != null) {
+            try {
+              await FirebaseService.saveProject(
+                user.uid,
+                updatedProject.id,
+                updatedProject.toFirestore(),
+              );
+            } catch (_) {
+              // Local persistence remains the fallback when Firestore sync fails.
+            }
+          }
+        }
+
+        if (!_queuedProjectSave) {
+          break;
+        }
+
+        shouldSyncRemote = _queuedRemoteSync;
+      }
+    } finally {
+      _isSavingProject = false;
     }
   }
 
@@ -696,12 +746,28 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
     return null;
   }
 
-  Widget _buildPortrait(
-    BuildContext context,
-    SubtitleEntry? selectedEntry,
-    TimelineClip? selectedClip,
-    EditorState editorState,
-  ) {
+  TimelineTrack? _trackForClip(TimelineClip? clip, EditorState editorState) {
+    if (clip == null) return null;
+    for (final track in editorState.timeline.tracks) {
+      if (track.clips.any((candidate) => candidate.id == clip.id)) {
+        return track;
+      }
+    }
+    return null;
+  }
+
+  TimelineClip? _clipById(String clipId, EditorState editorState) {
+    for (final track in editorState.timeline.tracks) {
+      for (final clip in track.clips) {
+        if (clip.id == clipId) {
+          return clip;
+        }
+      }
+    }
+    return null;
+  }
+
+  Widget _buildPortrait(BuildContext context, TimelineClip? selectedClip) {
     return Column(
       children: [
         SizedBox(
@@ -713,51 +779,38 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
         ),
         Expanded(
           flex: 2,
-          child: TimelinePanel(onEditRequested: _openSubtitleTextEditor),
+          child: TimelinePanel(
+            onEditRequested: _openSubtitleTextEditor,
+            onTextClipEditRequested: _editTextClip,
+            onTransitionRequested: _openTransitionSheet,
+            onOverlayAddRequested: _pickOverlayMediaForTrack,
+          ),
         ),
-        _buildBottomEditorBar(selectedEntry, selectedClip),
-        _buildBottomToolTabs(editorState),
-        _buildBottomPanelSummary(context, editorState, selectedClip),
+        _buildBottomQuickActions(context, selectedClip),
       ],
     );
   }
 
-  Widget _buildLandscape(
-    BuildContext context,
-    SubtitleEntry? selectedEntry,
-    TimelineClip? selectedClip,
-    EditorState editorState,
-  ) {
-    return Row(
+  Widget _buildLandscape(BuildContext context, TimelineClip? selectedClip) {
+    return Column(
       children: [
         Expanded(
           flex: 3,
-          child: Column(
-            children: [
-              Expanded(
-                flex: 3,
-                child: VideoPreviewPanel(
-                  videoPath: widget.project.videoPath,
-                  targetAspectRatio: _selectedAspectRatioValue,
-                ),
-              ),
-              Expanded(
-                flex: 2,
-                child: TimelinePanel(onEditRequested: _openSubtitleTextEditor),
-              ),
-              _buildBottomEditorBar(selectedEntry, selectedClip),
-              _buildBottomToolTabs(editorState),
-              _buildBottomPanelSummary(context, editorState, selectedClip),
-            ],
+          child: VideoPreviewPanel(
+            videoPath: widget.project.videoPath,
+            targetAspectRatio: _selectedAspectRatioValue,
           ),
         ),
-        Container(
-          width: 260,
-          decoration: const BoxDecoration(
-            border: Border(left: BorderSide(color: kBorder)),
+        Expanded(
+          flex: 2,
+          child: TimelinePanel(
+            onEditRequested: _openSubtitleTextEditor,
+            onTextClipEditRequested: _editTextClip,
+            onTransitionRequested: _openTransitionSheet,
+            onOverlayAddRequested: _pickOverlayMediaForTrack,
           ),
-          child: const SubtitleStylePanel(),
         ),
+        _buildBottomQuickActions(context, selectedClip),
       ],
     );
   }
@@ -916,6 +969,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
     );
   }
 
+  Future<void> _pickOverlayMediaForTrack(TimelineTrack track) async {
+    ref.read(editorProvider.notifier).selectTrack(track.id);
+    await _pickOverlayMedia();
+  }
+
   Future<void> _pickAudioMedia() async {
     final result = await FilePicker.platform.pickFiles(
       allowMultiple: false,
@@ -1025,38 +1083,14 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
     SnackBarHelper.showSuccess(context, '$label added at playhead');
   }
 
-  void _onGiphyQueryChanged(String value) {
-    setState(() {});
-    _giphySearchDebounce?.cancel();
-    _giphySearchDebounce = Timer(const Duration(milliseconds: 350), () {
-      unawaited(_refreshGiphyResults());
-    });
-  }
-
-  Future<void> _refreshGiphyResults() async {
-    setState(() {
-      _isLoadingGiphy = true;
-      _giphyError = null;
-    });
-
-    try {
-      final results = await GiphyService.search(
-        query: _giphySearchController.text,
-        kind: _giphySearchKind,
-      );
-      if (!mounted) return;
-      setState(() {
-        _giphyResults = results;
-        _isLoadingGiphy = false;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _giphyResults = const [];
-        _giphyError = e.toString().replaceFirst('Exception: ', '');
-        _isLoadingGiphy = false;
-      });
-    }
+  Future<void> _openGiphyPickerSheet() async {
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: Colors.black.withValues(alpha: 0.4),
+      builder: (_) => _GiphyPickerSheet(onSelected: _insertGiphyAsset),
+    );
   }
 
   Future<void> _insertGiphyAsset(GiphyAssetResult result) async {
@@ -1165,73 +1199,119 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
     SnackBarHelper.showSuccess(context, 'Text updated');
   }
 
+  Future<void> _openClipAnimationSheetForSelection(TimelineClip clip) async {
+    final editorState = ref.read(editorProvider);
+    final track = _trackForClip(clip, editorState);
+    if (track == null) return;
+    await _openClipAnimationSheet(clip, track);
+  }
+
   Future<String?> _showTextClipDialog({String initialValue = ''}) async {
     final controller = TextEditingController(text: initialValue);
-    final result = await showDialog<String>(
+    final focusNode = FocusNode();
+    final result = await showModalBottomSheet<String>(
       context: context,
-      builder: (_) => AlertDialog(
-        backgroundColor: kSurface,
-        title: Text(
-          initialValue.isEmpty ? 'Add Text Clip' : 'Edit Text Clip',
-          style: GoogleFonts.inter(
-            color: kTextPrimary,
-            fontSize: 18,
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          maxLines: 4,
-          minLines: 2,
-          style: GoogleFonts.inter(color: kTextPrimary),
-          decoration: InputDecoration(
-            hintText: 'Type your text',
-            hintStyle: GoogleFonts.inter(color: kTextSecondary),
-            filled: true,
-            fillColor: kSurfaceElevated,
-            border: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(10),
-              borderSide: const BorderSide(color: kBorder),
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (sheetContext) {
+        final viewInsets = MediaQuery.of(sheetContext).viewInsets;
+        return Padding(
+          padding: EdgeInsets.only(bottom: viewInsets.bottom),
+          child: Container(
+            decoration: const BoxDecoration(
+              color: kSurface,
+              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+            ),
+            padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 44,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: kBorder,
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                Text(
+                  initialValue.isEmpty ? 'Add Text Clip' : 'Edit Text Clip',
+                  style: GoogleFonts.inter(
+                    color: kTextPrimary,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: controller,
+                  focusNode: focusNode,
+                  autofocus: true,
+                  maxLines: 5,
+                  minLines: 3,
+                  style: GoogleFonts.inter(color: kTextPrimary),
+                  decoration: InputDecoration(
+                    hintText: 'Type your text',
+                    hintStyle: GoogleFonts.inter(color: kTextSecondary),
+                    filled: true,
+                    fillColor: kSurfaceElevated,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: const BorderSide(color: kBorder),
+                    ),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: const BorderSide(color: kBorder),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: const BorderSide(color: kAccent),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: () {
+                          focusNode.unfocus();
+                          Navigator.of(sheetContext).pop();
+                        },
+                        child: const Text('Cancel'),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: ElevatedButton(
+                        onPressed: () {
+                          focusNode.unfocus();
+                          Navigator.of(sheetContext).pop(controller.text);
+                        },
+                        child: const Text('Save'),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
             ),
           ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(context, controller.text),
-            child: const Text('Save'),
-          ),
-        ],
-      ),
+        );
+      },
     );
+    focusNode.dispose();
     controller.dispose();
     return result;
   }
 
-  void _deleteSelectedClip(TimelineClip clip) {
-    final editorState = ref.read(editorProvider);
-    final nextTracks = editorState.timeline.tracks
-        .map(
-          (track) => track.copyWith(
-            clips: track.clips
-                .where((candidate) => candidate.id != clip.id)
-                .toList(),
-          ),
-        )
-        .toList();
-
-    ref
-        .read(editorProvider.notifier)
-        .setTimeline(editorState.timeline.copyWith(tracks: nextTracks));
-    ref.read(editorProvider.notifier).selectClip(null);
-  }
-
   void _updateSelectedClipTransition({
     required TimelineClip clip,
+    bool updateIntro = false,
+    bool updateOutro = true,
     TransitionType? type,
     int? durationMs,
   }) {
@@ -1241,11 +1321,22 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
           .map(
             (candidate) => candidate.id == clip.id
                 ? candidate.copyWith(
-                    outroTransition: candidate.outroTransition.copyWith(
-                      type: type ?? candidate.outroTransition.type,
-                      durationMs:
-                          durationMs ?? candidate.outroTransition.durationMs,
-                    ),
+                    introTransition: updateIntro
+                        ? candidate.introTransition.copyWith(
+                            type: type ?? candidate.introTransition.type,
+                            durationMs:
+                                durationMs ??
+                                candidate.introTransition.durationMs,
+                          )
+                        : candidate.introTransition,
+                    outroTransition: updateOutro
+                        ? candidate.outroTransition.copyWith(
+                            type: type ?? candidate.outroTransition.type,
+                            durationMs:
+                                durationMs ??
+                                candidate.outroTransition.durationMs,
+                          )
+                        : candidate.outroTransition,
                   )
                 : candidate,
           )
@@ -1262,6 +1353,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
     TimelineClip clip, {
     bool? muted,
     double? volume,
+    int? fadeInMs,
+    int? fadeOutMs,
   }) {
     final editorState = ref.read(editorProvider);
     final nextTracks = editorState.timeline.tracks.map((track) {
@@ -1272,6 +1365,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
                     audioMix: candidate.audioMix.copyWith(
                       muted: muted ?? candidate.audioMix.muted,
                       volume: volume ?? candidate.audioMix.volume,
+                      fadeInMs: fadeInMs ?? candidate.audioMix.fadeInMs,
+                      fadeOutMs: fadeOutMs ?? candidate.audioMix.fadeOutMs,
                     ),
                   )
                 : candidate,
@@ -1329,200 +1424,72 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
     return sectionTracks.isEmpty ? null : sectionTracks.first;
   }
 
-  Widget _buildBottomEditorBar(
-    SubtitleEntry? selectedEntry,
+  Widget _buildBottomQuickActions(
+    BuildContext context,
     TimelineClip? selectedClip,
   ) {
-    final subtitleNotifier = ref.read(subtitleProvider.notifier);
-    final playbackState = ref.watch(playbackProvider);
-    final editorNotifier = ref.read(editorProvider.notifier);
-    final hasSelection = selectedEntry != null;
-    final hasVideoSelection = selectedClip?.type == TimelineTrackType.video;
-    final hasTextClipSelection = selectedClip?.type == TimelineTrackType.text;
-    final canDeleteClip = selectedClip != null && !hasSelection;
+    final editorState = ref.read(editorProvider);
+    final selectedTrack = _trackForClip(selectedClip, editorState);
+    final canAdjustAudio =
+        selectedClip != null &&
+        (selectedClip.type == TimelineTrackType.audio ||
+            selectedClip.type == TimelineTrackType.video);
+    final canAnimateClip =
+        selectedClip != null &&
+        selectedTrack != null &&
+        (selectedTrack.section == TimelineTrackSection.overlay ||
+            selectedTrack.section == TimelineTrackSection.baseVideo);
 
     return Container(
-      height: 52,
-      padding: const EdgeInsets.symmetric(horizontal: 8),
+      height: 60,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: const BoxDecoration(
         color: kSurface,
         border: Border(top: BorderSide(color: kBorder)),
       ),
-      child: Row(
-        children: [
-          IconButton(
-            tooltip: 'Undo',
-            icon: Icon(
-              Icons.undo_rounded,
-              color: subtitleNotifier.canUndo
-                  ? kTextPrimary
-                  : kTextPrimary.withValues(alpha: 0.3),
-            ),
-            onPressed: subtitleNotifier.canUndo
-                ? () => subtitleNotifier.undo()
-                : null,
-          ),
-          IconButton(
-            tooltip: 'Redo',
-            icon: Icon(
-              Icons.redo_rounded,
-              color: subtitleNotifier.canRedo
-                  ? kTextPrimary
-                  : kTextPrimary.withValues(alpha: 0.3),
-            ),
-            onPressed: subtitleNotifier.canRedo
-                ? () => subtitleNotifier.redo()
-                : null,
-          ),
-          const VerticalDivider(color: kBorder),
-          IconButton(
-            tooltip: 'Edit text',
-            icon: Icon(
-              Icons.edit_note_rounded,
-              color: (hasSelection || hasTextClipSelection)
-                  ? kTextPrimary
-                  : kTextPrimary.withValues(alpha: 0.3),
-            ),
-            onPressed: hasSelection
-                ? () => _openSubtitleTextEditor(selectedEntry)
-                : hasTextClipSelection
-                ? () => _editTextClip(selectedClip!)
-                : null,
-          ),
-          IconButton(
-            tooltip: 'Split at playhead',
-            icon: Icon(
-              Icons.call_split_rounded,
-              color: hasSelection
-                  ? kTextPrimary
-                  : kTextPrimary.withValues(alpha: 0.3),
-            ),
-            onPressed: hasSelection
-                ? () {
-                    final entry = selectedEntry;
-                    final splitPoint = playbackState.position;
-                    if (splitPoint <= entry.startTime ||
-                        splitPoint >= entry.endTime) {
-                      SnackBarHelper.showInfo(
-                        context,
-                        'Move playhead inside the selected subtitle to split it.',
-                      );
-                      return;
-                    }
-                    subtitleNotifier.splitEntry(entry.id, splitPoint);
-                  }
-                : null,
-          ),
-          IconButton(
-            tooltip: 'Duplicate',
-            icon: Icon(
-              Icons.copy_rounded,
-              color: hasSelection
-                  ? kTextPrimary
-                  : kTextPrimary.withValues(alpha: 0.3),
-            ),
-            onPressed: hasSelection
-                ? () => subtitleNotifier.duplicateEntry(selectedEntry.id)
-                : null,
-          ),
-          IconButton(
-            tooltip: 'Delete',
-            icon: Icon(
-              Icons.delete_rounded,
-              color: (hasSelection || canDeleteClip)
-                  ? kError
-                  : kError.withValues(alpha: 0.3),
-            ),
-            onPressed: hasSelection
-                ? () => subtitleNotifier.deleteEntry(selectedEntry.id)
-                : canDeleteClip
-                ? () => _deleteSelectedClip(selectedClip)
-                : null,
-          ),
-          IconButton(
-            tooltip: 'Transitions',
-            icon: Icon(
-              Icons.auto_awesome_motion_rounded,
-              color: hasVideoSelection
-                  ? kTextPrimary
-                  : kTextPrimary.withValues(alpha: 0.3),
-            ),
-            onPressed: hasVideoSelection
-                ? () => editorNotifier.setActivePanel(
-                    EditorBottomPanel.transitions,
-                  )
-                : null,
-          ),
-          const Spacer(),
-          Text(
-            hasSelection
-                ? 'Subtitle selected'
-                : hasVideoSelection
-                ? selectedClip!.label
-                : 'No selection',
-            style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
-          ),
-          const SizedBox(width: 4),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildBottomToolTabs(EditorState editorState) {
-    const tabs = [
-      (EditorBottomPanel.timeline, 'Edit', Icons.tune_rounded),
-      (EditorBottomPanel.media, 'Media', Icons.perm_media_rounded),
-      (EditorBottomPanel.text, 'Text', Icons.text_fields_rounded),
-      (EditorBottomPanel.audio, 'Audio', Icons.graphic_eq_rounded),
-      (EditorBottomPanel.stickers, 'Sticker', Icons.emoji_emotions_outlined),
-      (
-        EditorBottomPanel.transitions,
-        'Transitions',
-        Icons.auto_awesome_motion_rounded,
-      ),
-      (EditorBottomPanel.style, 'Style', Icons.palette_rounded),
-    ];
-
-    return Container(
-      height: 54,
-      decoration: const BoxDecoration(
-        color: kSurface,
-        border: Border(top: BorderSide(color: kBorder)),
-      ),
-      child: ListView.separated(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        itemCount: tabs.length,
-        separatorBuilder: (_, _) => const SizedBox(width: 8),
-        itemBuilder: (_, index) {
-          final tab = tabs[index];
-          final isActive = editorState.activePanel == tab.$1;
-          return InkWell(
-            borderRadius: BorderRadius.circular(10),
-            onTap: () =>
-                ref.read(editorProvider.notifier).setActivePanel(tab.$1),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-              decoration: BoxDecoration(
-                color: isActive ? kAccent.withValues(alpha: 0.16) : kSurface,
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: isActive ? kAccent : kBorder),
-              ),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          return SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: ConstrainedBox(
+              constraints: BoxConstraints(minWidth: constraints.maxWidth),
               child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
                 children: [
-                  Icon(
-                    tab.$3,
-                    size: 16,
-                    color: isActive ? kAccent : kTextSecondary,
+                  _buildQuickActionButton(
+                    tooltip: 'Add overlay',
+                    icon: Icons.perm_media_rounded,
+                    onTap: _pickOverlayMedia,
                   ),
-                  const SizedBox(width: 6),
-                  Text(
-                    tab.$2,
-                    style: GoogleFonts.inter(
-                      color: isActive ? kAccent : kTextSecondary,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600,
-                    ),
+                  _buildQuickActionButton(
+                    tooltip: 'Add text',
+                    icon: Icons.title_rounded,
+                    onTap: _addTextClipAtPlayhead,
+                  ),
+                  _buildQuickActionButton(
+                    tooltip: 'Add audio',
+                    icon: Icons.music_note_rounded,
+                    onTap: canAdjustAudio
+                        ? () => _openAudioControlsSheet(selectedClip)
+                        : _pickAudioMedia,
+                  ),
+                  _buildQuickActionButton(
+                    tooltip: 'Open GIF picker',
+                    icon: Icons.emoji_emotions_outlined,
+                    onTap: _openGiphyPickerSheet,
+                  ),
+                  _buildQuickActionButton(
+                    tooltip: 'Clip animation',
+                    icon: Icons.auto_awesome_motion_rounded,
+                    onTap: canAnimateClip
+                        ? () =>
+                              _openClipAnimationSheetForSelection(selectedClip)
+                        : null,
+                  ),
+                  _buildQuickActionButton(
+                    tooltip: 'Subtitle style',
+                    icon: Icons.palette_outlined,
+                    onTap: () => _openStylePanelSheet(context),
                   ),
                 ],
               ),
@@ -1533,329 +1500,47 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
     );
   }
 
-  Widget _buildBottomPanelSummary(
-    BuildContext context,
-    EditorState editorState,
-    TimelineClip? selectedClip,
-  ) {
-    if (editorState.activePanel == EditorBottomPanel.stickers) {
-      return _buildStickerPanel();
-    }
-    if (editorState.activePanel == EditorBottomPanel.transitions &&
-        selectedClip?.type == TimelineTrackType.video) {
-      return _buildTransitionEditor(selectedClip!);
-    }
-    if (editorState.activePanel == EditorBottomPanel.audio &&
-        selectedClip != null &&
-        (selectedClip.type == TimelineTrackType.audio ||
-            selectedClip.type == TimelineTrackType.video)) {
-      return _buildAudioControls(selectedClip);
-    }
-
-    final summary = switch (editorState.activePanel) {
-      EditorBottomPanel.timeline =>
-        'Use the timeline to select clips, trim flow later, and place transitions between base videos.',
-      EditorBottomPanel.media =>
-        'Media panel will add overlay video, image, gif, and sticker assets onto overlay tracks.',
-      EditorBottomPanel.text =>
-        'Text panel manages title clips on text tracks and selected subtitle clips.',
-      EditorBottomPanel.audio =>
-        'Audio panel will add music, voiceover, and effects onto bottom audio tracks.',
-      EditorBottomPanel.stickers =>
-        'Search Giphy GIFs and stickers, then add them directly to overlay tracks at the playhead.',
-      EditorBottomPanel.transitions =>
-        selectedClip == null
-            ? 'Tap the marker between base video clips to set a transition for that cut.'
-            : 'Transition editing is focused on ${selectedClip.label}.',
-      EditorBottomPanel.style =>
-        'Style panel controls subtitle/text appearance and canvas look.',
-    };
-
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
-      decoration: const BoxDecoration(
-        color: kSurface,
-        border: Border(top: BorderSide(color: kBorder)),
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            child: Text(
-              summary,
-              style: GoogleFonts.inter(
-                color: kTextSecondary,
-                fontSize: 12,
-                height: 1.4,
-              ),
-            ),
-          ),
-          if (editorState.activePanel == EditorBottomPanel.media)
-            TextButton.icon(
-              onPressed: _pickOverlayMedia,
-              icon: const Icon(Icons.add_photo_alternate_outlined, size: 16),
-              label: const Text('Add'),
-            ),
-          if (editorState.activePanel == EditorBottomPanel.text)
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextButton.icon(
-                  onPressed: _addTextClipAtPlayhead,
-                  icon: const Icon(Icons.title_rounded, size: 16),
-                  label: const Text('Add'),
-                ),
-                if (selectedClip?.type == TimelineTrackType.text)
-                  TextButton.icon(
-                    onPressed: () => _editTextClip(selectedClip!),
-                    icon: const Icon(Icons.edit_rounded, size: 16),
-                    label: const Text('Edit'),
-                  ),
-              ],
-            ),
-          if (editorState.activePanel == EditorBottomPanel.audio)
-            TextButton.icon(
-              onPressed: _pickAudioMedia,
-              icon: const Icon(Icons.library_music_rounded, size: 16),
-              label: const Text('Add'),
-            ),
-          if (editorState.activePanel == EditorBottomPanel.style)
-            TextButton.icon(
-              onPressed: () => _openStylePanelSheet(context),
-              icon: const Icon(Icons.open_in_new_rounded, size: 16),
-              label: const Text('Open'),
-            ),
-        ],
+  Future<void> _openAudioControlsSheet(TimelineClip clip) async {
+    await showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (_) => Consumer(
+        builder: (context, ref, _) {
+          final editorState = ref.watch(editorProvider);
+          final liveClip = _clipById(clip.id, editorState) ?? clip;
+          return _buildAudioControls(liveClip);
+        },
       ),
     );
   }
 
-  Widget _buildStickerPanel() {
-    if (!_hasLoadedInitialGiphyResults && !_isLoadingGiphy) {
-      _hasLoadedInitialGiphyResults = true;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        unawaited(_refreshGiphyResults());
-      });
-    }
-
-    return Container(
-      width: double.infinity,
-      height: 250,
-      padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
-      decoration: const BoxDecoration(
-        color: kSurface,
-        border: Border(top: BorderSide(color: kBorder)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _giphySearchController,
-                  onChanged: _onGiphyQueryChanged,
-                  style: GoogleFonts.inter(color: kTextPrimary),
-                  decoration: InputDecoration(
-                    isDense: true,
-                    hintText: 'Search Giphy GIFs and stickers',
-                    prefixIcon: const Icon(Icons.search_rounded, size: 18),
-                    suffixIcon: _giphySearchController.text.isEmpty
-                        ? null
-                        : IconButton(
-                            tooltip: 'Clear',
-                            icon: const Icon(Icons.close_rounded, size: 18),
-                            onPressed: () {
-                              _giphySearchController.clear();
-                              _refreshGiphyResults();
-                            },
-                          ),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 8),
-              IconButton(
-                tooltip: 'Refresh',
-                onPressed: _isLoadingGiphy ? null : _refreshGiphyResults,
-                icon: const Icon(Icons.refresh_rounded, color: kTextSecondary),
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
-          Wrap(
-            spacing: 8,
-            children: [
-              _buildGiphyKindChip(
-                label: 'GIFs + Stickers',
-                kind: GiphySearchKind.both,
-              ),
-              _buildGiphyKindChip(label: 'GIFs', kind: GiphySearchKind.gifs),
-              _buildGiphyKindChip(
-                label: 'Stickers',
-                kind: GiphySearchKind.stickers,
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
-          Expanded(
-            child: Builder(
-              builder: (context) {
-                if (_isLoadingGiphy) {
-                  return const Center(
-                    child: CircularProgressIndicator(
-                      color: kAccent,
-                      strokeWidth: 2,
-                    ),
-                  );
-                }
-                if (_giphyError != null) {
-                  return _buildGiphyMessage(
-                    icon: Icons.key_off_rounded,
-                    message: _giphyError!,
-                  );
-                }
-                if (_giphyResults.isEmpty) {
-                  return _buildGiphyMessage(
-                    icon: Icons.gif_box_outlined,
-                    message: _giphySearchController.text.trim().isEmpty
-                        ? 'No trending items available right now.'
-                        : 'No Giphy results for this search.',
-                  );
-                }
-
-                return GridView.builder(
-                  padding: EdgeInsets.zero,
-                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount: 4,
-                    mainAxisSpacing: 8,
-                    crossAxisSpacing: 8,
-                    childAspectRatio: 0.8,
-                  ),
-                  itemCount: _giphyResults.length,
-                  itemBuilder: (context, index) {
-                    final result = _giphyResults[index];
-                    return InkWell(
-                      borderRadius: BorderRadius.circular(12),
-                      onTap: () => _insertGiphyAsset(result),
-                      child: Ink(
-                        decoration: BoxDecoration(
-                          color: kSurfaceElevated,
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: kBorder),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            Expanded(
-                              child: ClipRRect(
-                                borderRadius: const BorderRadius.vertical(
-                                  top: Radius.circular(12),
-                                ),
-                                child: Image.network(
-                                  result.previewUrl,
-                                  fit: BoxFit.cover,
-                                  filterQuality: FilterQuality.low,
-                                  errorBuilder: (_, _, _) => Container(
-                                    color: kSurface,
-                                    child: const Center(
-                                      child: Icon(
-                                        Icons.broken_image_outlined,
-                                        color: kTextSecondary,
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ),
-                            Padding(
-                              padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    result.isSticker ? 'Sticker' : 'GIF',
-                                    style: GoogleFonts.inter(
-                                      color: kAccent,
-                                      fontSize: 10,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 2),
-                                  Text(
-                                    result.title,
-                                    maxLines: 2,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: GoogleFonts.inter(
-                                      color: kTextPrimary,
-                                      fontSize: 11,
-                                      height: 1.25,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    );
-                  },
-                );
-              },
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildGiphyKindChip({
-    required String label,
-    required GiphySearchKind kind,
+  Widget _buildQuickActionButton({
+    required String tooltip,
+    required IconData icon,
+    required VoidCallback? onTap,
   }) {
-    final isSelected = _giphySearchKind == kind;
-    return ChoiceChip(
-      label: Text(label),
-      selected: isSelected,
-      selectedColor: kAccent.withValues(alpha: 0.18),
-      backgroundColor: kSurfaceElevated,
-      side: BorderSide(color: isSelected ? kAccent : kBorder),
-      labelStyle: GoogleFonts.inter(
-        color: isSelected ? kAccent : kTextSecondary,
-        fontSize: 12,
-      ),
-      onSelected: (_) {
-        setState(() => _giphySearchKind = kind);
-        unawaited(_refreshGiphyResults());
-      },
-    );
-  }
-
-  Widget _buildGiphyMessage({required IconData icon, required String message}) {
-    return Container(
-      decoration: BoxDecoration(
-        color: kSurfaceElevated,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: kBorder),
-      ),
-      child: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(icon, color: kTextSecondary),
-              const SizedBox(height: 8),
-              Text(
-                message,
-                textAlign: TextAlign.center,
-                style: GoogleFonts.inter(
-                  color: kTextSecondary,
-                  fontSize: 12,
-                  height: 1.4,
-                ),
-              ),
-            ],
+    final isEnabled = onTap != null;
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: onTap,
+        child: Ink(
+          width: 44,
+          height: 44,
+          decoration: BoxDecoration(
+            color: kSurfaceElevated,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: isEnabled ? kBorder : kBorder.withValues(alpha: 0.45),
+            ),
+          ),
+          child: Icon(
+            icon,
+            color: isEnabled
+                ? kTextPrimary
+                : kTextPrimary.withValues(alpha: 0.32),
+            size: 20,
           ),
         ),
       ),
@@ -1866,14 +1551,26 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
     final isVideoClip = clip.type == TimelineTrackType.video;
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
       decoration: const BoxDecoration(
         color: kSurface,
-        border: Border(top: BorderSide(color: kBorder)),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
       ),
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          Center(
+            child: Container(
+              width: 44,
+              height: 4,
+              decoration: BoxDecoration(
+                color: kBorder,
+                borderRadius: BorderRadius.circular(999),
+              ),
+            ),
+          ),
+          const SizedBox(height: 14),
           Text(
             isVideoClip ? 'Video Clip Audio' : 'Audio Clip Controls',
             style: GoogleFonts.inter(
@@ -1926,10 +1623,53 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
               ),
             ),
           ),
+          const SizedBox(height: 6),
+          Text(
+            'Fade In',
+            style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
+          ),
+          SliderTheme(
+            data: SliderThemeData(
+              activeTrackColor: kAccent,
+              inactiveTrackColor: kBorder,
+              thumbColor: kAccent,
+              overlayColor: kAccent.withValues(alpha: 0.14),
+            ),
+            child: Slider(
+              value: clip.audioMix.fadeInMs.toDouble().clamp(0, 1500),
+              min: 0,
+              max: 1500,
+              divisions: 15,
+              label: '${clip.audioMix.fadeInMs}ms',
+              onChanged: (value) =>
+                  _updateSelectedClipAudioMix(clip, fadeInMs: value.round()),
+            ),
+          ),
+          Text(
+            'Fade Out',
+            style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
+          ),
+          SliderTheme(
+            data: SliderThemeData(
+              activeTrackColor: kAccent,
+              inactiveTrackColor: kBorder,
+              thumbColor: kAccent,
+              overlayColor: kAccent.withValues(alpha: 0.14),
+            ),
+            child: Slider(
+              value: clip.audioMix.fadeOutMs.toDouble().clamp(0, 1500),
+              min: 0,
+              max: 1500,
+              divisions: 15,
+              label: '${clip.audioMix.fadeOutMs}ms',
+              onChanged: (value) =>
+                  _updateSelectedClipAudioMix(clip, fadeOutMs: value.round()),
+            ),
+          ),
           Text(
             isVideoClip
-                ? 'Overlay videos start muted by default. Use mute/unmute and volume here.'
-                : 'Basic clip audio controls are active now. Deeper mixing will come in the advanced audio pass.',
+                ? 'Overlay video audio can be faded in and out here.'
+                : 'Audio clips now support volume plus simple fade in and fade out.',
             style: GoogleFonts.inter(
               color: kTextSecondary,
               fontSize: 12,
@@ -1941,26 +1681,76 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
     );
   }
 
+  Future<void> _openTransitionSheet(TimelineClip clip) async {
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: Colors.black.withValues(alpha: 0.35),
+      builder: (_) => Consumer(
+        builder: (context, ref, _) {
+          final editorState = ref.watch(editorProvider);
+          final liveClip = _clipById(clip.id, editorState) ?? clip;
+          return _buildTransitionEditor(liveClip);
+        },
+      ),
+    );
+  }
+
+  Future<void> _openClipAnimationSheet(
+    TimelineClip clip,
+    TimelineTrack track,
+  ) async {
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: Colors.black.withValues(alpha: 0.35),
+      builder: (_) => Consumer(
+        builder: (context, ref, _) {
+          final editorState = ref.watch(editorProvider);
+          final liveClip = _clipById(clip.id, editorState) ?? clip;
+          final liveTrack = _trackForClip(liveClip, editorState) ?? track;
+          return _buildClipAnimationSheet(liveClip, liveTrack);
+        },
+      ),
+    );
+  }
+
   Widget _buildTransitionEditor(TimelineClip clip) {
     const transitionOptions = [
       (TransitionType.cut, 'Cut'),
       (TransitionType.fade, 'Fade'),
       (TransitionType.dissolve, 'Dissolve'),
-      (TransitionType.slideLeft, 'Slide'),
+      (TransitionType.slideLeft, 'Left'),
+      (TransitionType.slideRight, 'Right'),
+      (TransitionType.slideUp, 'Up'),
+      (TransitionType.slideDown, 'Down'),
       (TransitionType.zoom, 'Zoom'),
     ];
-    const durationOptions = [0, 200, 400, 600, 800];
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
       decoration: const BoxDecoration(
         color: kSurface,
-        border: Border(top: BorderSide(color: kBorder)),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
       ),
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          Center(
+            child: Container(
+              width: 44,
+              height: 4,
+              decoration: BoxDecoration(
+                color: kBorder,
+                borderRadius: BorderRadius.circular(999),
+              ),
+            ),
+          ),
+          const SizedBox(height: 14),
           Text(
             'Transition from ${clip.label}',
             style: GoogleFonts.inter(
@@ -2005,33 +1795,232 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
             'Duration',
             style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
           ),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: durationOptions.map((duration) {
-              final isSelected = clip.outroTransition.durationMs == duration;
-              return ChoiceChip(
-                label: Text('${duration}ms'),
-                selected: isSelected,
-                selectedColor: kAccent.withValues(alpha: 0.18),
-                backgroundColor: kSurfaceElevated,
-                side: BorderSide(color: isSelected ? kAccent : kBorder),
-                labelStyle: GoogleFonts.inter(
-                  color: isSelected ? kAccent : kTextSecondary,
-                  fontSize: 12,
-                ),
-                onSelected:
-                    clip.outroTransition.type == TransitionType.cut &&
-                        duration > 0
-                    ? null
-                    : (_) => _updateSelectedClipTransition(
-                        clip: clip,
-                        durationMs: duration,
-                      ),
-              );
-            }).toList(),
+          SliderTheme(
+            data: SliderThemeData(
+              activeTrackColor: kAccent,
+              inactiveTrackColor: kBorder,
+              thumbColor: kAccent,
+              overlayColor: kAccent.withValues(alpha: 0.14),
+            ),
+            child: Slider(
+              value: clip.outroTransition.type == TransitionType.cut
+                  ? 0
+                  : clip.outroTransition.durationMs.toDouble().clamp(100, 1200),
+              min: 0,
+              max: 1200,
+              divisions: 12,
+              label:
+                  '${clip.outroTransition.type == TransitionType.cut ? 0 : clip.outroTransition.durationMs}ms',
+              onChanged: (value) => _updateSelectedClipTransition(
+                clip: clip,
+                durationMs: clip.outroTransition.type == TransitionType.cut
+                    ? 0
+                    : value.round(),
+              ),
+            ),
           ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildClipAnimationSheet(TimelineClip clip, TimelineTrack track) {
+    const animationOptions = [
+      (TransitionType.none, 'None'),
+      (TransitionType.fade, 'Fade'),
+      (TransitionType.slideLeft, 'Slide Left'),
+      (TransitionType.slideRight, 'Slide Right'),
+      (TransitionType.slideUp, 'Slide Up'),
+      (TransitionType.slideDown, 'Slide Down'),
+      (TransitionType.zoom, 'Zoom'),
+    ];
+    final isAudioTrack = track.section == TimelineTrackSection.audio;
+    final sheetTitle = isAudioTrack
+        ? 'Audio Animation'
+        : track.section == TimelineTrackSection.baseVideo
+        ? 'Clip Animation'
+        : 'Overlay Animation';
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
+      decoration: const BoxDecoration(
+        color: kSurface,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Center(
+            child: Container(
+              width: 44,
+              height: 4,
+              decoration: BoxDecoration(
+                color: kBorder,
+                borderRadius: BorderRadius.circular(999),
+              ),
+            ),
+          ),
+          const SizedBox(height: 14),
+          Text(
+            sheetTitle,
+            style: GoogleFonts.inter(
+              color: kTextPrimary,
+              fontSize: 16,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: 12),
+          if (!isAudioTrack) ...[
+            Text(
+              'Animate In',
+              style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: animationOptions.map((option) {
+                final isSelected = clip.introTransition.type == option.$1;
+                return ChoiceChip(
+                  label: Text(option.$2),
+                  selected: isSelected,
+                  selectedColor: kAccent.withValues(alpha: 0.18),
+                  backgroundColor: kSurfaceElevated,
+                  side: BorderSide(color: isSelected ? kAccent : kBorder),
+                  labelStyle: GoogleFonts.inter(
+                    color: isSelected ? kAccent : kTextSecondary,
+                    fontSize: 12,
+                  ),
+                  onSelected: (_) => _updateSelectedClipTransition(
+                    clip: clip,
+                    updateIntro: true,
+                    updateOutro: false,
+                    type: option.$1,
+                    durationMs: option.$1 == TransitionType.none ? 0 : 350,
+                  ),
+                );
+              }).toList(),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'Animate Out',
+              style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: animationOptions.map((option) {
+                final isSelected = clip.outroTransition.type == option.$1;
+                return ChoiceChip(
+                  label: Text(option.$2),
+                  selected: isSelected,
+                  selectedColor: kAccent.withValues(alpha: 0.18),
+                  backgroundColor: kSurfaceElevated,
+                  side: BorderSide(color: isSelected ? kAccent : kBorder),
+                  labelStyle: GoogleFonts.inter(
+                    color: isSelected ? kAccent : kTextSecondary,
+                    fontSize: 12,
+                  ),
+                  onSelected: (_) => _updateSelectedClipTransition(
+                    clip: clip,
+                    updateIntro: false,
+                    updateOutro: true,
+                    type: option.$1,
+                    durationMs: option.$1 == TransitionType.none ? 0 : 350,
+                  ),
+                );
+              }).toList(),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'Animation Length',
+              style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
+            ),
+            SliderTheme(
+              data: SliderThemeData(
+                activeTrackColor: kAccent,
+                inactiveTrackColor: kBorder,
+                thumbColor: kAccent,
+                overlayColor: kAccent.withValues(alpha: 0.14),
+              ),
+              child: Slider(
+                value:
+                    (clip.introTransition.durationMs == 0
+                            ? clip.outroTransition.durationMs
+                            : clip.introTransition.durationMs)
+                        .toDouble()
+                        .clamp(150, 1200),
+                min: 150,
+                max: 1200,
+                divisions: 7,
+                label:
+                    '${(clip.introTransition.durationMs == 0 ? clip.outroTransition.durationMs : clip.introTransition.durationMs)}ms',
+                onChanged: (value) {
+                  final rounded = value.round();
+                  _updateSelectedClipTransition(
+                    clip: clip,
+                    updateIntro:
+                        clip.introTransition.type != TransitionType.none,
+                    updateOutro: false,
+                    durationMs: rounded,
+                  );
+                  _updateSelectedClipTransition(
+                    clip: clip,
+                    updateIntro: false,
+                    updateOutro:
+                        clip.outroTransition.type != TransitionType.none,
+                    durationMs: rounded,
+                  );
+                },
+              ),
+            ),
+          ] else ...[
+            Text(
+              'Fade In',
+              style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
+            ),
+            SliderTheme(
+              data: SliderThemeData(
+                activeTrackColor: kAccent,
+                inactiveTrackColor: kBorder,
+                thumbColor: kAccent,
+                overlayColor: kAccent.withValues(alpha: 0.14),
+              ),
+              child: Slider(
+                value: clip.audioMix.fadeInMs.toDouble().clamp(0, 1500),
+                min: 0,
+                max: 1500,
+                divisions: 15,
+                label: '${clip.audioMix.fadeInMs}ms',
+                onChanged: (value) =>
+                    _updateSelectedClipAudioMix(clip, fadeInMs: value.round()),
+              ),
+            ),
+            Text(
+              'Fade Out',
+              style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
+            ),
+            SliderTheme(
+              data: SliderThemeData(
+                activeTrackColor: kAccent,
+                inactiveTrackColor: kBorder,
+                thumbColor: kAccent,
+                overlayColor: kAccent.withValues(alpha: 0.14),
+              ),
+              child: Slider(
+                value: clip.audioMix.fadeOutMs.toDouble().clamp(0, 1500),
+                min: 0,
+                max: 1500,
+                divisions: 15,
+                label: '${clip.audioMix.fadeOutMs}ms',
+                onChanged: (value) =>
+                    _updateSelectedClipAudioMix(clip, fadeOutMs: value.round()),
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -2084,6 +2073,347 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
             ),
           );
         },
+      ),
+    );
+  }
+}
+
+class _GiphyPickerSheet extends StatefulWidget {
+  final Future<void> Function(GiphyAssetResult result) onSelected;
+
+  const _GiphyPickerSheet({required this.onSelected});
+
+  @override
+  State<_GiphyPickerSheet> createState() => _GiphyPickerSheetState();
+}
+
+class _GiphyPickerSheetState extends State<_GiphyPickerSheet> {
+  final TextEditingController _searchController = TextEditingController();
+  Timer? _searchDebounce;
+  List<GiphyAssetResult> _results = const [];
+  bool _isLoading = false;
+  String? _error;
+  GiphySearchKind _searchKind = GiphySearchKind.both;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(_refreshResults());
+    });
+  }
+
+  @override
+  void dispose() {
+    _searchDebounce?.cancel();
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  void _onQueryChanged(String _) {
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(const Duration(milliseconds: 300), () {
+      unawaited(_refreshResults());
+    });
+  }
+
+  Future<void> _refreshResults() async {
+    setState(() {
+      _isLoading = true;
+      _error = null;
+    });
+
+    try {
+      final results = await GiphyService.search(
+        query: _searchController.text,
+        kind: _searchKind,
+      );
+      if (!mounted) return;
+      setState(() {
+        _results = results;
+        _isLoading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _results = const [];
+        _error = e.toString().replaceFirst('Exception: ', '');
+        _isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _selectResult(GiphyAssetResult result) async {
+    await widget.onSelected(result);
+    if (!mounted) return;
+    Navigator.of(context).pop();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return DraggableScrollableSheet(
+      initialChildSize: 0.82,
+      minChildSize: 0.5,
+      maxChildSize: 0.94,
+      expand: false,
+      builder: (_, scrollController) {
+        return Container(
+          decoration: const BoxDecoration(
+            color: kSurface,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+          ),
+          child: Column(
+            children: [
+              const SizedBox(height: 12),
+              Container(
+                width: 44,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: kBorder,
+                  borderRadius: BorderRadius.circular(999),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _searchController,
+                        onChanged: _onQueryChanged,
+                        style: GoogleFonts.inter(color: kTextPrimary),
+                        decoration: InputDecoration(
+                          hintText: 'Search GIFs and stickers',
+                          prefixIcon: const Icon(
+                            Icons.search_rounded,
+                            size: 20,
+                          ),
+                          suffixIcon: _searchController.text.isEmpty
+                              ? null
+                              : IconButton(
+                                  onPressed: () {
+                                    _searchController.clear();
+                                    _refreshResults();
+                                  },
+                                  icon: const Icon(
+                                    Icons.close_rounded,
+                                    size: 18,
+                                  ),
+                                ),
+                          filled: true,
+                          fillColor: kSurfaceElevated,
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: 14,
+                          ),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(18),
+                            borderSide: const BorderSide(color: kBorder),
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(18),
+                            borderSide: const BorderSide(color: kBorder),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(18),
+                            borderSide: const BorderSide(color: kAccent),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    InkWell(
+                      borderRadius: BorderRadius.circular(16),
+                      onTap: _isLoading ? null : _refreshResults,
+                      child: Ink(
+                        width: 48,
+                        height: 48,
+                        decoration: BoxDecoration(
+                          color: kSurfaceElevated,
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(color: kBorder),
+                        ),
+                        child: const Icon(
+                          Icons.refresh_rounded,
+                          color: kTextPrimary,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                child: Row(
+                  children: [
+                    _buildKindChip(label: 'All', kind: GiphySearchKind.both),
+                    const SizedBox(width: 8),
+                    _buildKindChip(label: 'GIFs', kind: GiphySearchKind.gifs),
+                    const SizedBox(width: 8),
+                    _buildKindChip(
+                      label: 'Stickers',
+                      kind: GiphySearchKind.stickers,
+                    ),
+                  ],
+                ),
+              ),
+              Expanded(
+                child: Builder(
+                  builder: (context) {
+                    if (_isLoading) {
+                      return const Center(
+                        child: CircularProgressIndicator(
+                          color: kAccent,
+                          strokeWidth: 2,
+                        ),
+                      );
+                    }
+
+                    if (_error != null) {
+                      return _buildSheetMessage(
+                        icon: Icons.key_off_rounded,
+                        message: _error!,
+                      );
+                    }
+
+                    if (_results.isEmpty) {
+                      return _buildSheetMessage(
+                        icon: Icons.gif_box_outlined,
+                        message: _searchController.text.trim().isEmpty
+                            ? 'No trending results right now.'
+                            : 'No results for this search.',
+                      );
+                    }
+
+                    return GridView.builder(
+                      controller: scrollController,
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
+                      gridDelegate:
+                          const SliverGridDelegateWithFixedCrossAxisCount(
+                            crossAxisCount: 3,
+                            mainAxisSpacing: 10,
+                            crossAxisSpacing: 10,
+                            childAspectRatio: 0.82,
+                          ),
+                      itemCount: _results.length,
+                      itemBuilder: (_, index) {
+                        final result = _results[index];
+                        return Material(
+                          color: Colors.transparent,
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(22),
+                            onTap: () => _selectResult(result),
+                            child: Ink(
+                              decoration: BoxDecoration(
+                                color: kSurfaceElevated,
+                                borderRadius: BorderRadius.circular(22),
+                                border: Border.all(color: kBorder),
+                              ),
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(22),
+                                child: Stack(
+                                  fit: StackFit.expand,
+                                  children: [
+                                    Image.network(
+                                      result.previewUrl,
+                                      fit: BoxFit.cover,
+                                      filterQuality: FilterQuality.low,
+                                      errorBuilder: (_, _, _) => Container(
+                                        color: kSurfaceElevated,
+                                        alignment: Alignment.center,
+                                        child: const Icon(
+                                          Icons.broken_image_outlined,
+                                          color: kTextSecondary,
+                                        ),
+                                      ),
+                                    ),
+                                    Positioned(
+                                      right: 10,
+                                      bottom: 10,
+                                      child: Container(
+                                        width: 30,
+                                        height: 30,
+                                        decoration: BoxDecoration(
+                                          color: Colors.black.withValues(
+                                            alpha: 0.45,
+                                          ),
+                                          shape: BoxShape.circle,
+                                        ),
+                                        child: const Icon(
+                                          Icons.add_rounded,
+                                          color: Colors.white,
+                                          size: 18,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildKindChip({
+    required String label,
+    required GiphySearchKind kind,
+  }) {
+    final isSelected = _searchKind == kind;
+    return ChoiceChip(
+      label: Text(label),
+      selected: isSelected,
+      selectedColor: kAccent.withValues(alpha: 0.18),
+      backgroundColor: kSurfaceElevated,
+      side: BorderSide(color: isSelected ? kAccent : kBorder),
+      labelStyle: GoogleFonts.inter(
+        color: isSelected ? kAccent : kTextSecondary,
+        fontSize: 12,
+        fontWeight: FontWeight.w600,
+      ),
+      onSelected: (_) {
+        setState(() => _searchKind = kind);
+        unawaited(_refreshResults());
+      },
+    );
+  }
+
+  Widget _buildSheetMessage({required IconData icon, required String message}) {
+    return Center(
+      child: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 16),
+        padding: const EdgeInsets.all(20),
+        decoration: BoxDecoration(
+          color: kSurfaceElevated,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: kBorder),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, color: kTextSecondary),
+            const SizedBox(height: 10),
+            Text(
+              message,
+              textAlign: TextAlign.center,
+              style: GoogleFonts.inter(
+                color: kTextSecondary,
+                fontSize: 12,
+                height: 1.5,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

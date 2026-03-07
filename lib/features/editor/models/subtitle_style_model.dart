@@ -21,7 +21,7 @@ class SubtitleStyleModel {
 
   const SubtitleStyleModel({
     this.fontFamily = 'Inter',
-    this.fontSize = 24,
+    this.fontSize = 10,
     this.textColor = Colors.white,
     this.backgroundType = SubtitleBackground.none,
     this.backgroundColor = Colors.black,
@@ -30,7 +30,7 @@ class SubtitleStyleModel {
     this.verticalOffset = 0,
     this.offsetX = 0,
     this.offsetY = 0,
-    this.maxWidthFactor = 0.85,
+    this.maxWidthFactor = 1,
     this.textAlignment = TextAlign.center,
     this.isBold = false,
     this.isItalic = false,
@@ -100,7 +100,7 @@ class SubtitleStyleModel {
   factory SubtitleStyleModel.fromJson(Map<String, dynamic> json) {
     return SubtitleStyleModel(
       fontFamily: json['fontFamily'] as String? ?? 'Inter',
-      fontSize: (json['fontSize'] as num?)?.toDouble() ?? 24,
+      fontSize: (json['fontSize'] as num?)?.toDouble() ?? 10,
       textColor: Color(json['textColor'] as int? ?? 0xFFFFFFFF),
       backgroundType: SubtitleBackground.values.firstWhere(
         (e) => e.name == json['backgroundType'],
@@ -115,7 +115,7 @@ class SubtitleStyleModel {
       verticalOffset: (json['verticalOffset'] as num?)?.toDouble() ?? 0,
       offsetX: (json['offsetX'] as num?)?.toDouble() ?? 0,
       offsetY: (json['offsetY'] as num?)?.toDouble() ?? 0,
-      maxWidthFactor: (json['maxWidthFactor'] as num?)?.toDouble() ?? 0.85,
+      maxWidthFactor: (json['maxWidthFactor'] as num?)?.toDouble() ?? 1,
       textAlignment: TextAlign.values.firstWhere(
         (e) => e.name == json['textAlignment'],
         orElse: () => TextAlign.center,
@@ -132,10 +132,10 @@ class SubtitleStyleModel {
     );
   }
   static int _colorToInt(Color c) {
-    final a = ((c.a * 255.0).round().clamp(0, 255)) as int;
-    final r = ((c.r * 255.0).round().clamp(0, 255)) as int;
-    final g = ((c.g * 255.0).round().clamp(0, 255)) as int;
-    final b = ((c.b * 255.0).round().clamp(0, 255)) as int;
+    final a = (c.a * 255.0).round().clamp(0, 255);
+    final r = (c.r * 255.0).round().clamp(0, 255);
+    final g = (c.g * 255.0).round().clamp(0, 255);
+    final b = (c.b * 255.0).round().clamp(0, 255);
     return (a << 24) | (r << 16) | (g << 8) | b;
   }
 }

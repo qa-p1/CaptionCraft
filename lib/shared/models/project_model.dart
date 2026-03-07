@@ -254,7 +254,7 @@ class ProjectLocalStorage {
   static Future<void> saveProject(Project project) async {
     final dir = await _projectsDir;
     final file = File(p.join(dir, '${project.id}.json'));
-    await file.writeAsString(jsonEncode(project.toJson()));
+    await file.writeAsString(jsonEncode(project.toJson()), flush: true);
   }
 
   /// Load all projects from local JSON.

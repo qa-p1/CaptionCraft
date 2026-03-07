@@ -20,7 +20,17 @@ enum CanvasAspectRatioPreset {
   ratio4x5,
 }
 
-enum TransitionType { none, cut, fade, dissolve, slideLeft, slideRight, zoom }
+enum TransitionType {
+  none,
+  cut,
+  fade,
+  dissolve,
+  slideLeft,
+  slideRight,
+  slideUp,
+  slideDown,
+  zoom,
+}
 
 class TimelineTransform {
   final double offsetX;

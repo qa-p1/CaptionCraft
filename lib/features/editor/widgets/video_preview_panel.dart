@@ -207,6 +207,24 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     return items;
   }
 
+  TimelineClip? _activeBaseClip(EditorTimeline timeline, Duration position) {
+    TimelineClip? activeClip;
+    for (final track in timeline.tracks) {
+      if (track.section != TimelineTrackSection.baseVideo || track.isHidden) {
+        continue;
+      }
+      for (final clip in track.clips) {
+        if (position < clip.startTime || position > clip.endTime) continue;
+        activeClip = clip;
+        break;
+      }
+      if (activeClip != null) {
+        break;
+      }
+    }
+    return activeClip;
+  }
+
   void _selectOverlayClip(_OverlayCanvasItem item) {
     final editorNotifier = ref.read(editorProvider.notifier);
     editorNotifier.selectTrack(item.trackId);
@@ -243,6 +261,11 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     final localPath = item.asset.sourcePath;
     final localFile = localPath == null ? null : File(localPath);
     final hasLocalFile = localFile?.existsSync() ?? false;
+    final animation = _resolveOverlayAnimation(
+      item.clip,
+      constraints,
+      playbackState.position,
+    );
     final child = switch (item.asset.type) {
       EditorAssetType.image || EditorAssetType.gif => ClipRRect(
         borderRadius: BorderRadius.circular(10),
@@ -297,12 +320,88 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
       _ => _buildMissingOverlay(item.clip.label),
     };
 
-    return Opacity(
-      opacity: item.clip.transform.opacity.clamp(0.1, 1.0),
-      child: Transform.rotate(
-        angle: item.clip.transform.rotation,
-        child: Transform.scale(scale: item.clip.transform.scale, child: child),
+    return Transform.translate(
+      offset: animation.offset,
+      child: Opacity(
+        opacity: animation.opacity,
+        child: Transform.rotate(
+          angle: item.clip.transform.rotation,
+          child: Transform.scale(scale: animation.scale, child: child),
+        ),
       ),
+    );
+  }
+
+  _OverlayAnimationState _resolveOverlayAnimation(
+    TimelineClip clip,
+    BoxConstraints constraints,
+    Duration position,
+  ) {
+    var opacity = clip.transform.opacity.clamp(0.1, 1.0).toDouble();
+    var scale = clip.transform.scale;
+    var offset = Offset.zero;
+
+    final elapsedMs = (position - clip.startTime).inMilliseconds
+        .clamp(0, clip.duration.inMilliseconds)
+        .toDouble();
+    final remainingMs = (clip.endTime - position).inMilliseconds
+        .clamp(0, clip.duration.inMilliseconds)
+        .toDouble();
+
+    void applyTransition(ClipTransition transition, double hiddenAmount) {
+      if (transition.type == TransitionType.none ||
+          transition.type == TransitionType.cut ||
+          hiddenAmount <= 0) {
+        return;
+      }
+
+      switch (transition.type) {
+        case TransitionType.fade:
+        case TransitionType.dissolve:
+          opacity *= (1 - hiddenAmount).clamp(0.0, 1.0);
+          break;
+        case TransitionType.slideLeft:
+          offset += Offset(-constraints.maxWidth * 0.18 * hiddenAmount, 0);
+          opacity *= (1 - hiddenAmount * 0.15).clamp(0.0, 1.0);
+          break;
+        case TransitionType.slideRight:
+          offset += Offset(constraints.maxWidth * 0.18 * hiddenAmount, 0);
+          opacity *= (1 - hiddenAmount * 0.15).clamp(0.0, 1.0);
+          break;
+        case TransitionType.slideUp:
+          offset += Offset(0, -constraints.maxHeight * 0.18 * hiddenAmount);
+          opacity *= (1 - hiddenAmount * 0.15).clamp(0.0, 1.0);
+          break;
+        case TransitionType.slideDown:
+          offset += Offset(0, constraints.maxHeight * 0.18 * hiddenAmount);
+          opacity *= (1 - hiddenAmount * 0.15).clamp(0.0, 1.0);
+          break;
+        case TransitionType.zoom:
+          scale *= (1 - hiddenAmount * 0.22).clamp(0.6, 1.0);
+          opacity *= (1 - hiddenAmount * 0.1).clamp(0.0, 1.0);
+          break;
+        case TransitionType.none:
+        case TransitionType.cut:
+          break;
+      }
+    }
+
+    final introDuration = clip.introTransition.durationMs;
+    if (introDuration > 0 && elapsedMs < introDuration) {
+      final hiddenAmount = 1 - (elapsedMs / introDuration).clamp(0.0, 1.0);
+      applyTransition(clip.introTransition, hiddenAmount);
+    }
+
+    final outroDuration = clip.outroTransition.durationMs;
+    if (outroDuration > 0 && remainingMs < outroDuration) {
+      final hiddenAmount = 1 - (remainingMs / outroDuration).clamp(0.0, 1.0);
+      applyTransition(clip.outroTransition, hiddenAmount);
+    }
+
+    return _OverlayAnimationState(
+      opacity: opacity.clamp(0.0, 1.0),
+      scale: scale.clamp(0.2, 4.0),
+      offset: offset,
     );
   }
 
@@ -353,6 +452,10 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
       editorState.timeline,
       playbackState.position,
     );
+    final activeBaseClip = _activeBaseClip(
+      editorState.timeline,
+      playbackState.position,
+    );
 
     SubtitleEntry? activeSubtitle;
     for (final entry in subtitleState.entries) {
@@ -380,11 +483,36 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                               _controller.value.aspectRatio,
                           child: Container(
                             color: Colors.black,
-                            child: Center(
-                              child: AspectRatio(
-                                aspectRatio: _controller.value.aspectRatio,
-                                child: VideoPlayer(_controller),
-                              ),
+                            child: LayoutBuilder(
+                              builder: (context, constraints) {
+                                final animation = activeBaseClip == null
+                                    ? const _OverlayAnimationState(
+                                        opacity: 1,
+                                        scale: 1,
+                                        offset: Offset.zero,
+                                      )
+                                    : _resolveOverlayAnimation(
+                                        activeBaseClip,
+                                        constraints,
+                                        playbackState.position,
+                                      );
+                                return Center(
+                                  child: Transform.translate(
+                                    offset: animation.offset,
+                                    child: Opacity(
+                                      opacity: animation.opacity,
+                                      child: Transform.scale(
+                                        scale: animation.scale,
+                                        child: AspectRatio(
+                                          aspectRatio:
+                                              _controller.value.aspectRatio,
+                                          child: VideoPlayer(_controller),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                );
+                              },
                             ),
                           ),
                         ),
@@ -803,84 +931,104 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                     },
                   ),
                 ),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    IconButton(
-                      icon: const Icon(
-                        Icons.replay_10_rounded,
-                        color: kTextPrimary,
-                        size: 22,
-                      ),
-                      onPressed: () => _seekTo(
-                        playbackState.position - const Duration(seconds: 10),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    IconButton(
-                      icon: Icon(
-                        playbackState.isPlaying
-                            ? Icons.pause_rounded
-                            : Icons.play_arrow_rounded,
-                        color: kTextPrimary,
-                        size: 32,
-                      ),
-                      onPressed: _togglePlayPause,
-                    ),
-                    const SizedBox(width: 8),
-                    IconButton(
-                      icon: const Icon(
-                        Icons.forward_10_rounded,
-                        color: kTextPrimary,
-                        size: 22,
-                      ),
-                      onPressed: () => _seekTo(
-                        playbackState.position + const Duration(seconds: 10),
-                      ),
-                    ),
-                    const SizedBox(width: 4),
-                    PopupMenuButton<double>(
-                      tooltip: 'Playback speed',
-                      color: kSurfaceElevated,
-                      onSelected: _setPlaybackSpeed,
-                      itemBuilder: (_) => const [
-                        PopupMenuItem(value: 0.5, child: Text('0.5x')),
-                        PopupMenuItem(value: 0.75, child: Text('0.75x')),
-                        PopupMenuItem(value: 1.0, child: Text('1.0x')),
-                        PopupMenuItem(value: 1.25, child: Text('1.25x')),
-                        PopupMenuItem(value: 1.5, child: Text('1.5x')),
-                        PopupMenuItem(value: 2.0, child: Text('2.0x')),
-                      ],
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 8,
-                          vertical: 4,
+                LayoutBuilder(
+                  builder: (context, constraints) {
+                    return SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: ConstrainedBox(
+                        constraints: BoxConstraints(
+                          minWidth: constraints.maxWidth,
                         ),
-                        decoration: BoxDecoration(
-                          color: kSurfaceElevated,
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: kBorder),
-                        ),
-                        child: Text(
-                          '${_playbackSpeed.toStringAsFixed(_playbackSpeed == 1 ? 0 : 2)}x',
-                          style: const TextStyle(
-                            color: kTextSecondary,
-                            fontSize: 11,
-                          ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            IconButton(
+                              icon: const Icon(
+                                Icons.replay_10_rounded,
+                                color: kTextPrimary,
+                                size: 22,
+                              ),
+                              onPressed: () => _seekTo(
+                                playbackState.position -
+                                    const Duration(seconds: 10),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            IconButton(
+                              icon: Icon(
+                                playbackState.isPlaying
+                                    ? Icons.pause_rounded
+                                    : Icons.play_arrow_rounded,
+                                color: kTextPrimary,
+                                size: 32,
+                              ),
+                              onPressed: _togglePlayPause,
+                            ),
+                            const SizedBox(width: 8),
+                            IconButton(
+                              icon: const Icon(
+                                Icons.forward_10_rounded,
+                                color: kTextPrimary,
+                                size: 22,
+                              ),
+                              onPressed: () => _seekTo(
+                                playbackState.position +
+                                    const Duration(seconds: 10),
+                              ),
+                            ),
+                            const SizedBox(width: 4),
+                            PopupMenuButton<double>(
+                              tooltip: 'Playback speed',
+                              color: kSurfaceElevated,
+                              onSelected: _setPlaybackSpeed,
+                              itemBuilder: (_) => const [
+                                PopupMenuItem(value: 0.5, child: Text('0.5x')),
+                                PopupMenuItem(
+                                  value: 0.75,
+                                  child: Text('0.75x'),
+                                ),
+                                PopupMenuItem(value: 1.0, child: Text('1.0x')),
+                                PopupMenuItem(
+                                  value: 1.25,
+                                  child: Text('1.25x'),
+                                ),
+                                PopupMenuItem(value: 1.5, child: Text('1.5x')),
+                                PopupMenuItem(value: 2.0, child: Text('2.0x')),
+                              ],
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 4,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: kSurfaceElevated,
+                                  borderRadius: BorderRadius.circular(8),
+                                  border: Border.all(color: kBorder),
+                                ),
+                                child: Text(
+                                  '${_playbackSpeed.toStringAsFixed(_playbackSpeed == 1 ? 0 : 2)}x',
+                                  style: const TextStyle(
+                                    color: kTextSecondary,
+                                    fontSize: 11,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 16),
+                            Text(
+                              '${SubtitleEntry.formatDisplayTime(playbackState.position)} / '
+                              '${SubtitleEntry.formatDisplayTime(playbackState.duration)}',
+                              style: const TextStyle(
+                                fontFamily: 'SpaceMono',
+                                color: kTextSecondary,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
                         ),
                       ),
-                    ),
-                    const Spacer(),
-                    Text(
-                      '${SubtitleEntry.formatDisplayTime(playbackState.position)} / '
-                      '${SubtitleEntry.formatDisplayTime(playbackState.duration)}',
-                      style: const TextStyle(
-                        fontFamily: 'SpaceMono',
-                        color: kTextSecondary,
-                        fontSize: 12,
-                      ),
-                    ),
-                  ],
+                    );
+                  },
                 ),
               ],
             ),
@@ -900,6 +1048,18 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
         return Alignment.bottomCenter;
     }
   }
+}
+
+class _OverlayAnimationState {
+  final double opacity;
+  final double scale;
+  final Offset offset;
+
+  const _OverlayAnimationState({
+    required this.opacity,
+    required this.scale,
+    required this.offset,
+  });
 }
 
 class _OverlayCanvasItem {
@@ -1000,9 +1160,28 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
     if (forceSeek || (currentMs - targetMs).abs() > 200) {
       await controller.seekTo(Duration(milliseconds: targetMs));
     }
-    await controller.setVolume(
-      widget.clip.audioMix.muted ? 0 : widget.clip.audioMix.volume.clamp(0, 1),
-    );
+    final clipElapsedMs = (widget.playbackPosition - widget.clip.startTime)
+        .inMilliseconds
+        .clamp(0, widget.clip.duration.inMilliseconds)
+        .toDouble();
+    final clipRemainingMs = (widget.clip.endTime - widget.playbackPosition)
+        .inMilliseconds
+        .clamp(0, widget.clip.duration.inMilliseconds)
+        .toDouble();
+    var volume = widget.clip.audioMix.muted
+        ? 0.0
+        : widget.clip.audioMix.volume.clamp(0, 1).toDouble();
+    if (widget.clip.audioMix.fadeInMs > 0) {
+      volume *= (clipElapsedMs / widget.clip.audioMix.fadeInMs)
+          .clamp(0.0, 1.0)
+          .toDouble();
+    }
+    if (widget.clip.audioMix.fadeOutMs > 0) {
+      volume *= (clipRemainingMs / widget.clip.audioMix.fadeOutMs)
+          .clamp(0.0, 1.0)
+          .toDouble();
+    }
+    await controller.setVolume(volume);
     if (!mounted) return;
     if (widget.isPlaying) {
       if (!controller.value.isPlaying) {
