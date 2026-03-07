@@ -237,37 +237,62 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     BoxConstraints constraints,
     PlaybackState playbackState,
   ) {
-    final file = File(item.asset.sourcePath ?? '');
-    if (!file.existsSync()) {
-      return _buildMissingOverlay(item.clip.label);
-    }
-
     final baseWidth = (constraints.maxWidth * 0.32).clamp(90.0, 220.0);
+    final previewUrl =
+        item.asset.metadata['previewUrl'] as String? ?? item.asset.remoteUrl;
+    final localPath = item.asset.sourcePath;
+    final localFile = localPath == null ? null : File(localPath);
+    final hasLocalFile = localFile?.existsSync() ?? false;
     final child = switch (item.asset.type) {
       EditorAssetType.image || EditorAssetType.gif => ClipRRect(
         borderRadius: BorderRadius.circular(10),
-        child: Image.file(
-          file,
-          width: baseWidth,
-          fit: BoxFit.contain,
-          filterQuality: FilterQuality.medium,
-        ),
+        child: hasLocalFile
+            ? Image.file(
+                localFile!,
+                width: baseWidth,
+                fit: BoxFit.contain,
+                filterQuality: FilterQuality.medium,
+              )
+            : previewUrl != null
+            ? Image.network(
+                previewUrl,
+                width: baseWidth,
+                fit: BoxFit.contain,
+                filterQuality: FilterQuality.medium,
+                errorBuilder: (_, _, _) =>
+                    _buildMissingOverlay(item.clip.label),
+              )
+            : _buildMissingOverlay(item.clip.label),
       ),
-      EditorAssetType.video => _OverlayVideoPreview(
-        videoPath: file.path,
-        clip: item.clip,
-        playbackPosition: playbackState.position,
-        isPlaying: playbackState.isPlaying,
-        width: baseWidth,
-      ),
+      EditorAssetType.video =>
+        hasLocalFile
+            ? _OverlayVideoPreview(
+                videoPath: localFile!.path,
+                clip: item.clip,
+                playbackPosition: playbackState.position,
+                isPlaying: playbackState.isPlaying,
+                width: baseWidth,
+              )
+            : _buildMissingOverlay(item.clip.label),
       EditorAssetType.sticker => ClipRRect(
         borderRadius: BorderRadius.circular(10),
-        child: Image.file(
-          file,
-          width: baseWidth,
-          fit: BoxFit.contain,
-          filterQuality: FilterQuality.medium,
-        ),
+        child: hasLocalFile
+            ? Image.file(
+                localFile!,
+                width: baseWidth,
+                fit: BoxFit.contain,
+                filterQuality: FilterQuality.medium,
+              )
+            : previewUrl != null
+            ? Image.network(
+                previewUrl,
+                width: baseWidth,
+                fit: BoxFit.contain,
+                filterQuality: FilterQuality.medium,
+                errorBuilder: (_, _, _) =>
+                    _buildMissingOverlay(item.clip.label),
+              )
+            : _buildMissingOverlay(item.clip.label),
       ),
       _ => _buildMissingOverlay(item.clip.label),
     };
@@ -295,36 +320,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
         maxLines: 2,
         overflow: TextOverflow.ellipsis,
         style: const TextStyle(color: kTextPrimary, fontSize: 12),
-      ),
-    );
-  }
-
-  Widget _buildVideoOverlayPlaceholder(String label, double width) {
-    return Container(
-      width: width,
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.65),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: kBorder),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Icon(
-            Icons.video_library_rounded,
-            color: Colors.white,
-            size: 28,
-          ),
-          const SizedBox(height: 6),
-          Text(
-            label,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            textAlign: TextAlign.center,
-            style: const TextStyle(color: Colors.white, fontSize: 11),
-          ),
-        ],
       ),
     );
   }
