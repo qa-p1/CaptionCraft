@@ -108,6 +108,18 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
     state = state.copyWith(entries: entries);
   }
 
+  /// Sync subtitle entries from timeline edits without creating a new undo step.
+  void syncFromTimeline(List<SubtitleEntry> entries) {
+    final selectedId = state.selectedEntryId;
+    final hasSelected =
+        selectedId != null && entries.any((e) => e.id == selectedId);
+    state = state.copyWith(
+      entries: entries,
+      selectedEntryId: hasSelected ? selectedId : null,
+      clearSelection: !hasSelected,
+    );
+  }
+
   /// Initialize editor state from a persisted project.
   /// This intentionally clears undo/redo stacks to create a clean session baseline.
   void initializeFromProject({

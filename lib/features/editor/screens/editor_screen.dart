@@ -12,7 +12,14 @@ import '../../../core/utils/subtitle_export_service.dart';
 import '../../../shared/models/project_model.dart';
 import '../../../shared/widgets/snack_bar_helper.dart';
 import '../../auth/providers/auth_provider.dart';
+import '../../home/providers/transcription_pipeline.dart';
+import '../../home/screens/processing_screen.dart';
+import '../../quota/providers/quota_provider.dart';
+import '../../quota/screens/quota_exhausted_screen.dart';
 import '../models/subtitle_entry.dart';
+import '../models/subtitle_style_model.dart';
+import '../models/timeline_models.dart';
+import '../providers/editor_provider.dart';
 import '../providers/playback_provider.dart';
 import '../providers/subtitle_provider.dart';
 import 'export_video_screen.dart';
@@ -50,6 +57,14 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
             entries: widget.project.subtitles,
             globalStyle: widget.project.globalStyle,
           );
+      ref
+          .read(editorProvider.notifier)
+          .loadProject(
+            videoPath: widget.project.videoPath,
+            projectId: widget.project.id,
+            projectName: widget.project.name,
+            timeline: widget.project.timeline,
+          );
     });
   }
 
@@ -62,13 +77,20 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
   @override
   Widget build(BuildContext context) {
     final subtitleState = ref.watch(subtitleProvider);
+    final editorState = ref.watch(editorProvider);
     final isLandscape =
         MediaQuery.of(context).orientation == Orientation.landscape;
+    final selectedClip = _selectedClipFromState(editorState);
 
     ref.listen(subtitleProvider, (prev, next) {
       final entriesChanged = prev?.entries != next.entries;
       final styleChanged = prev?.globalStyle != next.globalStyle;
       if (entriesChanged || styleChanged) {
+        _scheduleProjectSave();
+      }
+    });
+    ref.listen(editorProvider.select((state) => state.timeline), (prev, next) {
+      if (prev != null && prev != next) {
         _scheduleProjectSave();
       }
     });
@@ -84,6 +106,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
         actions: [
           _buildAspectRatioPicker(),
           IconButton(
+            tooltip: 'Generate subtitles',
+            icon: const Icon(Icons.subtitles_rounded, color: kTextPrimary),
+            onPressed: _handleGenerateSubtitles,
+          ),
+          IconButton(
             tooltip: 'Export / Import',
             icon: const Icon(Icons.ios_share_rounded, color: kTextPrimary),
             onPressed: _showExportActions,
@@ -92,8 +119,18 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
         ],
       ),
       body: isLandscape
-          ? _buildLandscape(context, subtitleState.selectedEntry)
-          : _buildPortrait(context, subtitleState.selectedEntry),
+          ? _buildLandscape(
+              context,
+              subtitleState.selectedEntry,
+              selectedClip,
+              editorState,
+            )
+          : _buildPortrait(
+              context,
+              subtitleState.selectedEntry,
+              selectedClip,
+              editorState,
+            ),
     );
   }
 
@@ -327,6 +364,266 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
     );
   }
 
+  Future<void> _handleGenerateSubtitles() async {
+    final quota = ref.read(quotaProvider);
+    if (!quota.canRun) {
+      if (!mounted) return;
+      await Navigator.push(
+        context,
+        MaterialPageRoute(builder: (_) => const QuotaExhaustedScreen()),
+      );
+      return;
+    }
+
+    final timeline = ref.read(editorProvider).timeline;
+    final targetClip = await _resolveTargetVideoClip(timeline);
+    if (targetClip == null || !mounted) return;
+
+    await _generateSubtitlesForClip(targetClip, timeline);
+  }
+
+  Future<TimelineClip?> _resolveTargetVideoClip(EditorTimeline timeline) async {
+    final videoClips = timeline.videoClips;
+    if (videoClips.isEmpty) {
+      SnackBarHelper.showInfo(context, 'Import a video clip first.');
+      return null;
+    }
+
+    final selectedClipId = ref.read(editorProvider).selectedClipId;
+    if (selectedClipId != null) {
+      for (final clip in videoClips) {
+        if (clip.id == selectedClipId) {
+          return clip;
+        }
+      }
+    }
+
+    if (videoClips.length == 1) {
+      return videoClips.first;
+    }
+
+    return showModalBottomSheet<TimelineClip>(
+      context: context,
+      backgroundColor: kSurface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (_) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(height: 10),
+            Text(
+              'Choose Video Clip',
+              style: GoogleFonts.inter(
+                color: kTextPrimary,
+                fontSize: 16,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 8),
+            ...videoClips.map((clip) {
+              return ListTile(
+                leading: const Icon(Icons.movie_creation_outlined),
+                title: Text(
+                  clip.label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                subtitle: Text(
+                  '${SubtitleEntry.formatDisplayTime(clip.startTime)} - ${SubtitleEntry.formatDisplayTime(clip.endTime)}',
+                ),
+                onTap: () => Navigator.pop(context, clip),
+              );
+            }),
+            const SizedBox(height: 6),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _generateSubtitlesForClip(
+    TimelineClip targetClip,
+    EditorTimeline timeline,
+  ) async {
+    final user = ref.read(currentUserProvider);
+    if (user == null) {
+      SnackBarHelper.showError(context, 'Sign in to generate subtitles.');
+      return;
+    }
+
+    EditorAssetReference? sourceAsset;
+    for (final asset in timeline.assets) {
+      if (asset.id == targetClip.assetId) {
+        sourceAsset = asset;
+        break;
+      }
+    }
+    final videoPath = sourceAsset?.sourcePath ?? widget.project.videoPath;
+    if (videoPath.isEmpty) {
+      SnackBarHelper.showError(
+        context,
+        'Video source is missing for this clip.',
+      );
+      return;
+    }
+
+    final consumed = await ref
+        .read(quotaProvider.notifier)
+        .consumeRun(user.uid);
+    if (!consumed) {
+      if (!mounted) return;
+      await Navigator.push(
+        context,
+        MaterialPageRoute(builder: (_) => const QuotaExhaustedScreen()),
+      );
+      return;
+    }
+
+    if (!mounted) return;
+    final pipeline = TranscriptionPipeline();
+    var processingClosed = false;
+
+    unawaited(
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (processingContext) => ProcessingScreen(
+            progressStream: pipeline.progressStream,
+            onCancel: () {
+              pipeline.cancel();
+              if (Navigator.of(processingContext).canPop()) {
+                Navigator.of(processingContext).pop();
+              }
+            },
+          ),
+        ),
+      ).then((_) {
+        processingClosed = true;
+      }),
+    );
+
+    try {
+      final generatedEntries = await pipeline.transcribeVideoSegment(
+        videoPath: videoPath,
+        startTime: targetClip.sourceStartTime,
+        clipDuration: targetClip.sourceDuration,
+      );
+
+      if (generatedEntries == null || generatedEntries.isEmpty) {
+        if (!processingClosed && mounted && Navigator.of(context).canPop()) {
+          Navigator.of(context).pop();
+        }
+        if (mounted) {
+          SnackBarHelper.showInfo(
+            context,
+            'No subtitles detected for this clip.',
+          );
+        }
+        return;
+      }
+
+      final shiftedEntries =
+          generatedEntries
+              .map(
+                (entry) => entry.copyWith(
+                  startTime: entry.startTime + targetClip.startTime,
+                  endTime: entry.endTime + targetClip.startTime,
+                ),
+              )
+              .toList()
+            ..sort((a, b) => a.startTime.compareTo(b.startTime));
+
+      final existingLinkedSubtitleIds = timeline
+          .subtitleClipsForLinkedClip(targetClip.id)
+          .map((clip) => clip.id)
+          .toSet();
+
+      final currentSubtitleState = ref.read(subtitleProvider);
+      final mergedEntries = [
+        ...currentSubtitleState.entries.where(
+          (entry) => !existingLinkedSubtitleIds.contains(entry.id),
+        ),
+        ...shiftedEntries,
+      ]..sort((a, b) => a.startTime.compareTo(b.startTime));
+
+      final nextTimeline = _timelineWithGeneratedSubtitles(
+        timeline: timeline,
+        targetClip: targetClip,
+        generatedEntries: shiftedEntries,
+      );
+
+      ref.read(subtitleProvider.notifier).loadSubtitles(mergedEntries);
+      ref.read(editorProvider.notifier).setTimeline(nextTimeline);
+      _scheduleProjectSave(immediate: true);
+
+      if (!processingClosed && mounted && Navigator.of(context).canPop()) {
+        Navigator.of(context).pop();
+      }
+      if (mounted) {
+        SnackBarHelper.showSuccess(
+          context,
+          'Generated ${shiftedEntries.length} subtitles for ${targetClip.label}',
+        );
+      }
+    } catch (e) {
+      if (!processingClosed && mounted && Navigator.of(context).canPop()) {
+        Navigator.of(context).pop();
+      }
+      if (mounted) {
+        SnackBarHelper.showError(
+          context,
+          e.toString().replaceFirst('Exception: ', ''),
+        );
+      }
+    } finally {
+      pipeline.dispose();
+    }
+  }
+
+  EditorTimeline _timelineWithGeneratedSubtitles({
+    required EditorTimeline timeline,
+    required TimelineClip targetClip,
+    required List<SubtitleEntry> generatedEntries,
+  }) {
+    final subtitleTrack = timeline.primarySubtitleTrack;
+    final subtitleTrackId = subtitleTrack?.id ?? 'track_subtitles';
+    final existingSubtitleClips = timeline.tracks
+        .where((track) => track.type == TimelineTrackType.subtitle)
+        .expand((track) => track.clips)
+        .where((clip) => clip.linkedClipId != targetClip.id)
+        .toList();
+
+    final generatedSubtitleClips = generatedEntries
+        .map(
+          (entry) => TimelineClip.fromSubtitleEntry(
+            entry,
+            trackId: subtitleTrackId,
+            linkedClipId: targetClip.id,
+          ),
+        )
+        .toList();
+
+    final mergedTrack = TimelineTrack(
+      id: subtitleTrackId,
+      name: subtitleTrack?.name ?? 'Subtitles',
+      type: TimelineTrackType.subtitle,
+      section: TimelineTrackSection.textSubtitle,
+      clips: [...existingSubtitleClips, ...generatedSubtitleClips]
+        ..sort((a, b) => a.startTime.compareTo(b.startTime)),
+    );
+
+    return timeline.copyWith(
+      tracks: [
+        ...timeline.tracks.where(
+          (track) => track.type != TimelineTrackType.subtitle,
+        ),
+        mergedTrack,
+      ],
+    );
+  }
+
   void _scheduleProjectSave({bool immediate = false}) {
     _saveDebounce?.cancel();
     if (immediate) {
@@ -340,9 +637,15 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
 
   Future<void> _saveProjectState() async {
     final subtitleState = ref.read(subtitleProvider);
+    final editorState = ref.read(editorProvider);
+    final mergedTimeline = editorState.timeline.mergeSubtitleEntries(
+      subtitles: subtitleState.entries,
+      globalStyle: subtitleState.globalStyle,
+    );
     final updatedProject = widget.project.copyWith(
       subtitles: subtitleState.entries,
       globalStyle: subtitleState.globalStyle,
+      timeline: mergedTimeline,
       lastModifiedAt: DateTime.now(),
     );
 
@@ -370,7 +673,24 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
     return cleaned.isEmpty ? 'caption_craft' : cleaned;
   }
 
-  Widget _buildPortrait(BuildContext context, SubtitleEntry? selectedEntry) {
+  TimelineClip? _selectedClipFromState(EditorState editorState) {
+    if (editorState.selectedClipId == null) return null;
+    for (final track in editorState.timeline.tracks) {
+      for (final clip in track.clips) {
+        if (clip.id == editorState.selectedClipId) {
+          return clip;
+        }
+      }
+    }
+    return null;
+  }
+
+  Widget _buildPortrait(
+    BuildContext context,
+    SubtitleEntry? selectedEntry,
+    TimelineClip? selectedClip,
+    EditorState editorState,
+  ) {
     return Column(
       children: [
         SizedBox(
@@ -384,13 +704,19 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
           flex: 2,
           child: TimelinePanel(onEditRequested: _openSubtitleTextEditor),
         ),
-        _buildBottomEditorBar(selectedEntry),
-        _buildStyleTabButton(context),
+        _buildBottomEditorBar(selectedEntry, selectedClip),
+        _buildBottomToolTabs(editorState),
+        _buildBottomPanelSummary(context, editorState, selectedClip),
       ],
     );
   }
 
-  Widget _buildLandscape(BuildContext context, SubtitleEntry? selectedEntry) {
+  Widget _buildLandscape(
+    BuildContext context,
+    SubtitleEntry? selectedEntry,
+    TimelineClip? selectedClip,
+    EditorState editorState,
+  ) {
     return Row(
       children: [
         Expanded(
@@ -408,7 +734,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
                 flex: 2,
                 child: TimelinePanel(onEditRequested: _openSubtitleTextEditor),
               ),
-              _buildBottomEditorBar(selectedEntry),
+              _buildBottomEditorBar(selectedEntry, selectedClip),
+              _buildBottomToolTabs(editorState),
+              _buildBottomPanelSummary(context, editorState, selectedClip),
             ],
           ),
         ),
@@ -521,10 +849,425 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
     );
   }
 
-  Widget _buildBottomEditorBar(SubtitleEntry? selectedEntry) {
+  Future<void> _pickOverlayMedia() async {
+    final result = await FilePicker.platform.pickFiles(
+      allowMultiple: false,
+      type: FileType.custom,
+      allowedExtensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'mp4', 'mov'],
+    );
+    if (result == null || result.files.isEmpty) return;
+
+    final file = result.files.first;
+    final filePath = file.path;
+    if (filePath == null) return;
+
+    final extension = path.extension(filePath).toLowerCase();
+    final assetType = switch (extension) {
+      '.png' || '.jpg' || '.jpeg' || '.webp' => EditorAssetType.image,
+      '.gif' => EditorAssetType.gif,
+      '.mp4' || '.mov' => EditorAssetType.video,
+      _ => EditorAssetType.unknown,
+    };
+    if (assetType == EditorAssetType.unknown) {
+      SnackBarHelper.showWarning(context, 'Unsupported overlay file type.');
+      return;
+    }
+
+    final clipType = switch (assetType) {
+      EditorAssetType.image => TimelineTrackType.image,
+      EditorAssetType.gif => TimelineTrackType.gif,
+      EditorAssetType.video => TimelineTrackType.video,
+      _ => TimelineTrackType.image,
+    };
+
+    Duration? sourceDuration;
+    Map<String, dynamic> metadata = const {};
+    if (assetType == EditorAssetType.video) {
+      final mediaInfo = await FFmpegService.getMediaInfo(filePath);
+      sourceDuration = Duration(
+        milliseconds: (mediaInfo['durationMs'] as int?) ?? 0,
+      );
+      metadata = {
+        'durationMs': mediaInfo['durationMs'],
+        'width': mediaInfo['width'],
+        'height': mediaInfo['height'],
+      };
+    }
+
+    _insertClipIntoTimeline(
+      section: TimelineTrackSection.overlay,
+      assetType: assetType,
+      clipType: clipType,
+      filePath: filePath,
+      label: file.name,
+      sourceDuration: sourceDuration,
+      metadata: metadata,
+    );
+  }
+
+  Future<void> _pickAudioMedia() async {
+    final result = await FilePicker.platform.pickFiles(
+      allowMultiple: false,
+      type: FileType.audio,
+    );
+    if (result == null || result.files.isEmpty) return;
+
+    final file = result.files.first;
+    final filePath = file.path;
+    if (filePath == null) return;
+
+    final mediaInfo = await FFmpegService.getMediaInfo(filePath);
+    final duration = Duration(
+      milliseconds: (mediaInfo['durationMs'] as int?) ?? 0,
+    );
+
+    _insertClipIntoTimeline(
+      section: TimelineTrackSection.audio,
+      assetType: EditorAssetType.audio,
+      clipType: TimelineTrackType.audio,
+      filePath: filePath,
+      label: file.name,
+      sourceDuration: duration,
+      metadata: {'durationMs': mediaInfo['durationMs']},
+    );
+  }
+
+  void _insertClipIntoTimeline({
+    required TimelineTrackSection section,
+    required EditorAssetType assetType,
+    required TimelineTrackType clipType,
+    required String filePath,
+    required String label,
+    required Duration? sourceDuration,
+    Map<String, dynamic> metadata = const {},
+  }) {
+    final editorState = ref.read(editorProvider);
+    final timeline = editorState.timeline;
+    final targetTrack = _resolveInsertionTrack(timeline, section);
+    if (targetTrack == null) {
+      SnackBarHelper.showError(
+        context,
+        'No ${section == TimelineTrackSection.audio ? 'audio' : 'overlay'} track available.',
+      );
+      return;
+    }
+
+    final playhead = ref.read(playbackProvider).position;
+    final maxDuration = Duration(milliseconds: widget.project.durationMs);
+    final defaultDuration =
+        sourceDuration == null || sourceDuration == Duration.zero
+        ? const Duration(seconds: 4)
+        : sourceDuration;
+    final endTime = playhead + defaultDuration > maxDuration
+        ? maxDuration
+        : playhead + defaultDuration;
+    if (endTime <= playhead) {
+      SnackBarHelper.showInfo(
+        context,
+        'Move the playhead earlier to add media.',
+      );
+      return;
+    }
+
+    final asset = EditorAssetReference(
+      type: assetType,
+      label: label,
+      sourcePath: filePath,
+      metadata: metadata,
+    );
+    final audioMix =
+        assetType == EditorAssetType.video &&
+            section == TimelineTrackSection.overlay
+        ? const AudioMixSettings(muted: true, volume: 1)
+        : const AudioMixSettings();
+    final clip = TimelineClip(
+      trackId: targetTrack.id,
+      type: clipType,
+      label: label,
+      assetId: asset.id,
+      startTime: playhead,
+      endTime: endTime,
+      sourceStartTime: Duration.zero,
+      sourceDuration: sourceDuration ?? (endTime - playhead),
+      fitMode: section == TimelineTrackSection.overlay
+          ? ClipFitMode.contain
+          : ClipFitMode.cover,
+      audioMix: audioMix,
+    );
+
+    final nextTracks = timeline.tracks.map((track) {
+      if (track.id != targetTrack.id) return track;
+      return track.copyWith(clips: [...track.clips, clip]);
+    }).toList();
+    final nextTimeline = timeline.copyWith(
+      assets: [...timeline.assets, asset],
+      tracks: nextTracks,
+    );
+
+    ref.read(editorProvider.notifier).setTimeline(nextTimeline);
+    ref.read(editorProvider.notifier).selectTrack(targetTrack.id);
+    ref.read(editorProvider.notifier).selectClip(clip.id);
+    SnackBarHelper.showSuccess(context, '$label added at playhead');
+  }
+
+  Future<void> _addTextClipAtPlayhead() async {
+    final enteredText = await _showTextClipDialog();
+    if (enteredText == null || enteredText.trim().isEmpty) return;
+
+    final editorState = ref.read(editorProvider);
+    final timeline = editorState.timeline;
+    final targetTrack = _resolveInsertionTrack(
+      timeline,
+      TimelineTrackSection.textSubtitle,
+    );
+    if (targetTrack == null) {
+      SnackBarHelper.showError(context, 'No text track available.');
+      return;
+    }
+
+    final playhead = ref.read(playbackProvider).position;
+    final maxDuration = Duration(milliseconds: widget.project.durationMs);
+    final endTime = (playhead + const Duration(seconds: 4)) > maxDuration
+        ? maxDuration
+        : playhead + const Duration(seconds: 4);
+    if (endTime <= playhead) {
+      SnackBarHelper.showInfo(
+        context,
+        'Move the playhead earlier to add text.',
+      );
+      return;
+    }
+
+    final clip = TimelineClip(
+      trackId: targetTrack.id,
+      type: TimelineTrackType.text,
+      label: enteredText.trim(),
+      text: enteredText.trim(),
+      startTime: playhead,
+      endTime: endTime,
+      subtitleStyle: const SubtitleStyleModel(
+        position: SubtitlePosition.center,
+        fontSize: 32,
+        maxWidthFactor: 0.75,
+      ),
+      fitMode: ClipFitMode.contain,
+    );
+
+    final nextTracks = timeline.tracks.map((track) {
+      if (track.id != targetTrack.id) return track;
+      return track.copyWith(clips: [...track.clips, clip]);
+    }).toList();
+
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(timeline.copyWith(tracks: nextTracks));
+    ref.read(editorProvider.notifier).selectTrack(targetTrack.id);
+    ref.read(editorProvider.notifier).selectClip(clip.id);
+    SnackBarHelper.showSuccess(context, 'Text clip added at playhead');
+  }
+
+  Future<void> _editTextClip(TimelineClip clip) async {
+    final enteredText = await _showTextClipDialog(
+      initialValue: clip.text ?? '',
+    );
+    if (enteredText == null || enteredText.trim().isEmpty) return;
+
+    final editorState = ref.read(editorProvider);
+    final nextTracks = editorState.timeline.tracks.map((track) {
+      final nextClips = track.clips
+          .map(
+            (candidate) => candidate.id == clip.id
+                ? candidate.copyWith(
+                    label: enteredText.trim(),
+                    text: enteredText.trim(),
+                  )
+                : candidate,
+          )
+          .toList();
+      return track.copyWith(clips: nextClips);
+    }).toList();
+
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(editorState.timeline.copyWith(tracks: nextTracks));
+    SnackBarHelper.showSuccess(context, 'Text updated');
+  }
+
+  Future<String?> _showTextClipDialog({String initialValue = ''}) async {
+    final controller = TextEditingController(text: initialValue);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: kSurface,
+        title: Text(
+          initialValue.isEmpty ? 'Add Text Clip' : 'Edit Text Clip',
+          style: GoogleFonts.inter(
+            color: kTextPrimary,
+            fontSize: 18,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLines: 4,
+          minLines: 2,
+          style: GoogleFonts.inter(color: kTextPrimary),
+          decoration: InputDecoration(
+            hintText: 'Type your text',
+            hintStyle: GoogleFonts.inter(color: kTextSecondary),
+            filled: true,
+            fillColor: kSurfaceElevated,
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(10),
+              borderSide: const BorderSide(color: kBorder),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, controller.text),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    return result;
+  }
+
+  void _deleteSelectedClip(TimelineClip clip) {
+    final editorState = ref.read(editorProvider);
+    final nextTracks = editorState.timeline.tracks
+        .map(
+          (track) => track.copyWith(
+            clips: track.clips
+                .where((candidate) => candidate.id != clip.id)
+                .toList(),
+          ),
+        )
+        .toList();
+
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(editorState.timeline.copyWith(tracks: nextTracks));
+    ref.read(editorProvider.notifier).selectClip(null);
+  }
+
+  void _updateSelectedClipTransition({
+    required TimelineClip clip,
+    TransitionType? type,
+    int? durationMs,
+  }) {
+    final editorState = ref.read(editorProvider);
+    final nextTracks = editorState.timeline.tracks.map((track) {
+      final nextClips = track.clips
+          .map(
+            (candidate) => candidate.id == clip.id
+                ? candidate.copyWith(
+                    outroTransition: candidate.outroTransition.copyWith(
+                      type: type ?? candidate.outroTransition.type,
+                      durationMs:
+                          durationMs ?? candidate.outroTransition.durationMs,
+                    ),
+                  )
+                : candidate,
+          )
+          .toList();
+      return track.copyWith(clips: nextClips);
+    }).toList();
+
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(editorState.timeline.copyWith(tracks: nextTracks));
+  }
+
+  void _updateSelectedClipAudioMix(
+    TimelineClip clip, {
+    bool? muted,
+    double? volume,
+  }) {
+    final editorState = ref.read(editorProvider);
+    final nextTracks = editorState.timeline.tracks.map((track) {
+      final nextClips = track.clips
+          .map(
+            (candidate) => candidate.id == clip.id
+                ? candidate.copyWith(
+                    audioMix: candidate.audioMix.copyWith(
+                      muted: muted ?? candidate.audioMix.muted,
+                      volume: volume ?? candidate.audioMix.volume,
+                    ),
+                  )
+                : candidate,
+          )
+          .toList();
+      return track.copyWith(clips: nextClips);
+    }).toList();
+
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(editorState.timeline.copyWith(tracks: nextTracks));
+  }
+
+  TimelineTrack? _resolveInsertionTrack(
+    EditorTimeline timeline,
+    TimelineTrackSection section,
+  ) {
+    final editorState = ref.read(editorProvider);
+    if (editorState.selectedTrackId != null) {
+      for (final track in timeline.tracks) {
+        if (track.id == editorState.selectedTrackId &&
+            track.section == section) {
+          return track;
+        }
+      }
+    }
+
+    final sectionTracks = timeline.tracksForSection(section);
+    if (section == TimelineTrackSection.overlay) {
+      for (final track in sectionTracks) {
+        if (track.name == 'Overlay 1') {
+          return track;
+        }
+      }
+    }
+    if (section == TimelineTrackSection.audio) {
+      for (final track in sectionTracks) {
+        if (track.name == 'Audio 1') {
+          return track;
+        }
+      }
+    }
+    if (section == TimelineTrackSection.textSubtitle) {
+      for (final track in sectionTracks) {
+        if (track.type == TimelineTrackType.text && track.name == 'Text 1') {
+          return track;
+        }
+      }
+      for (final track in sectionTracks) {
+        if (track.type == TimelineTrackType.text) {
+          return track;
+        }
+      }
+    }
+    return sectionTracks.isEmpty ? null : sectionTracks.first;
+  }
+
+  Widget _buildBottomEditorBar(
+    SubtitleEntry? selectedEntry,
+    TimelineClip? selectedClip,
+  ) {
     final subtitleNotifier = ref.read(subtitleProvider.notifier);
     final playbackState = ref.watch(playbackProvider);
+    final editorNotifier = ref.read(editorProvider.notifier);
     final hasSelection = selectedEntry != null;
+    final hasVideoSelection = selectedClip?.type == TimelineTrackType.video;
+    final hasTextClipSelection = selectedClip?.type == TimelineTrackType.text;
+    final canDeleteClip = selectedClip != null && !hasSelection;
 
     return Container(
       height: 52,
@@ -564,12 +1307,14 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
             tooltip: 'Edit text',
             icon: Icon(
               Icons.edit_note_rounded,
-              color: hasSelection
+              color: (hasSelection || hasTextClipSelection)
                   ? kTextPrimary
                   : kTextPrimary.withValues(alpha: 0.3),
             ),
             onPressed: hasSelection
                 ? () => _openSubtitleTextEditor(selectedEntry)
+                : hasTextClipSelection
+                ? () => _editTextClip(selectedClip!)
                 : null,
           ),
           IconButton(
@@ -612,15 +1357,37 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
             tooltip: 'Delete',
             icon: Icon(
               Icons.delete_rounded,
-              color: hasSelection ? kError : kError.withValues(alpha: 0.3),
+              color: (hasSelection || canDeleteClip)
+                  ? kError
+                  : kError.withValues(alpha: 0.3),
             ),
             onPressed: hasSelection
                 ? () => subtitleNotifier.deleteEntry(selectedEntry.id)
+                : canDeleteClip
+                ? () => _deleteSelectedClip(selectedClip!)
+                : null,
+          ),
+          IconButton(
+            tooltip: 'Transitions',
+            icon: Icon(
+              Icons.auto_awesome_motion_rounded,
+              color: hasVideoSelection
+                  ? kTextPrimary
+                  : kTextPrimary.withValues(alpha: 0.3),
+            ),
+            onPressed: hasVideoSelection
+                ? () => editorNotifier.setActivePanel(
+                    EditorBottomPanel.transitions,
+                  )
                 : null,
           ),
           const Spacer(),
           Text(
-            hasSelection ? '1 selected' : 'No selection',
+            hasSelection
+                ? 'Subtitle selected'
+                : hasVideoSelection
+                ? selectedClip!.label
+                : 'No selection',
             style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
           ),
           const SizedBox(width: 4),
@@ -629,85 +1396,387 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
     );
   }
 
-  Widget _buildStyleTabButton(BuildContext context) {
-    return GestureDetector(
-      onTap: () {
-        showModalBottomSheet(
-          context: context,
-          isScrollControlled: true,
-          barrierColor: Colors.black.withValues(alpha: 0.2),
-          backgroundColor: Colors.transparent,
-          builder: (_) => DraggableScrollableSheet(
-            initialChildSize: 0.45,
-            maxChildSize: 0.85,
-            minChildSize: 0.22,
-            expand: false,
-            builder: (_, controller) {
-              return Container(
-                decoration: const BoxDecoration(
-                  color: kSurface,
-                  borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-                ),
-                child: Column(
-                  children: [
-                    const SizedBox(height: 12),
-                    Container(
-                      width: 40,
-                      height: 4,
-                      decoration: BoxDecoration(
-                        color: kBorder,
-                        borderRadius: BorderRadius.circular(2),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      'Subtitle Style',
-                      style: GoogleFonts.inter(
-                        color: kTextPrimary,
-                        fontSize: 16,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    Text(
-                      'Keep sheet lower to preview changes on video',
-                      style: GoogleFonts.inter(
-                        color: kTextSecondary,
-                        fontSize: 11,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    const Expanded(child: SubtitleStylePanel()),
-                  ],
-                ),
-              );
-            },
-          ),
-        );
-      },
-      child: Container(
-        height: 48,
+  Widget _buildBottomToolTabs(EditorState editorState) {
+    const tabs = [
+      (EditorBottomPanel.timeline, 'Edit', Icons.tune_rounded),
+      (EditorBottomPanel.media, 'Media', Icons.perm_media_rounded),
+      (EditorBottomPanel.text, 'Text', Icons.text_fields_rounded),
+      (EditorBottomPanel.audio, 'Audio', Icons.graphic_eq_rounded),
+      (EditorBottomPanel.stickers, 'Sticker', Icons.emoji_emotions_outlined),
+      (
+        EditorBottomPanel.transitions,
+        'Transitions',
+        Icons.auto_awesome_motion_rounded,
+      ),
+      (EditorBottomPanel.style, 'Style', Icons.palette_rounded),
+    ];
+
+    return Container(
+      height: 54,
+      decoration: const BoxDecoration(
         color: kSurface,
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const Icon(Icons.palette_rounded, color: kAccent, size: 18),
-            const SizedBox(width: 8),
-            Text(
-              'Subtitle Style',
-              style: GoogleFonts.inter(
-                color: kAccent,
-                fontSize: 14,
-                fontWeight: FontWeight.w500,
+        border: Border(top: BorderSide(color: kBorder)),
+      ),
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        itemCount: tabs.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 8),
+        itemBuilder: (_, index) {
+          final tab = tabs[index];
+          final isActive = editorState.activePanel == tab.$1;
+          return InkWell(
+            borderRadius: BorderRadius.circular(10),
+            onTap: () =>
+                ref.read(editorProvider.notifier).setActivePanel(tab.$1),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: isActive ? kAccent.withValues(alpha: 0.16) : kSurface,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: isActive ? kAccent : kBorder),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    tab.$3,
+                    size: 16,
+                    color: isActive ? kAccent : kTextSecondary,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    tab.$2,
+                    style: GoogleFonts.inter(
+                      color: isActive ? kAccent : kTextSecondary,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
               ),
             ),
-            const SizedBox(width: 4),
-            const Icon(
-              Icons.keyboard_arrow_up_rounded,
-              color: kAccent,
-              size: 18,
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildBottomPanelSummary(
+    BuildContext context,
+    EditorState editorState,
+    TimelineClip? selectedClip,
+  ) {
+    if (editorState.activePanel == EditorBottomPanel.transitions &&
+        selectedClip?.type == TimelineTrackType.video) {
+      return _buildTransitionEditor(selectedClip!);
+    }
+    if (editorState.activePanel == EditorBottomPanel.audio &&
+        selectedClip != null &&
+        (selectedClip.type == TimelineTrackType.audio ||
+            selectedClip.type == TimelineTrackType.video)) {
+      return _buildAudioControls(selectedClip);
+    }
+
+    final summary = switch (editorState.activePanel) {
+      EditorBottomPanel.timeline =>
+        'Use the timeline to select clips, trim flow later, and place transitions between base videos.',
+      EditorBottomPanel.media =>
+        'Media panel will add overlay video, image, gif, and sticker assets onto overlay tracks.',
+      EditorBottomPanel.text =>
+        'Text panel manages title clips on text tracks and selected subtitle clips.',
+      EditorBottomPanel.audio =>
+        'Audio panel will add music, voiceover, and effects onto bottom audio tracks.',
+      EditorBottomPanel.stickers =>
+        'Sticker panel will use online sticker and Giphy sources in the next core pass.',
+      EditorBottomPanel.transitions =>
+        selectedClip == null
+            ? 'Tap the marker between base video clips to set a transition for that cut.'
+            : 'Transition editing is focused on ${selectedClip.label}.',
+      EditorBottomPanel.style =>
+        'Style panel controls subtitle/text appearance and canvas look.',
+    };
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
+      decoration: const BoxDecoration(
+        color: kSurface,
+        border: Border(top: BorderSide(color: kBorder)),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              summary,
+              style: GoogleFonts.inter(
+                color: kTextSecondary,
+                fontSize: 12,
+                height: 1.4,
+              ),
             ),
-          ],
-        ),
+          ),
+          if (editorState.activePanel == EditorBottomPanel.media)
+            TextButton.icon(
+              onPressed: _pickOverlayMedia,
+              icon: const Icon(Icons.add_photo_alternate_outlined, size: 16),
+              label: const Text('Add'),
+            ),
+          if (editorState.activePanel == EditorBottomPanel.text)
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextButton.icon(
+                  onPressed: _addTextClipAtPlayhead,
+                  icon: const Icon(Icons.title_rounded, size: 16),
+                  label: const Text('Add'),
+                ),
+                if (selectedClip?.type == TimelineTrackType.text)
+                  TextButton.icon(
+                    onPressed: () => _editTextClip(selectedClip!),
+                    icon: const Icon(Icons.edit_rounded, size: 16),
+                    label: const Text('Edit'),
+                  ),
+              ],
+            ),
+          if (editorState.activePanel == EditorBottomPanel.audio)
+            TextButton.icon(
+              onPressed: _pickAudioMedia,
+              icon: const Icon(Icons.library_music_rounded, size: 16),
+              label: const Text('Add'),
+            ),
+          if (editorState.activePanel == EditorBottomPanel.style)
+            TextButton.icon(
+              onPressed: () => _openStylePanelSheet(context),
+              icon: const Icon(Icons.open_in_new_rounded, size: 16),
+              label: const Text('Open'),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAudioControls(TimelineClip clip) {
+    final isVideoClip = clip.type == TimelineTrackType.video;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
+      decoration: const BoxDecoration(
+        color: kSurface,
+        border: Border(top: BorderSide(color: kBorder)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            isVideoClip ? 'Video Clip Audio' : 'Audio Clip Controls',
+            style: GoogleFonts.inter(
+              color: kTextPrimary,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              TextButton.icon(
+                onPressed: () => _updateSelectedClipAudioMix(
+                  clip,
+                  muted: !clip.audioMix.muted,
+                ),
+                icon: Icon(
+                  clip.audioMix.muted
+                      ? Icons.volume_off_rounded
+                      : Icons.volume_up_rounded,
+                  size: 16,
+                ),
+                label: Text(clip.audioMix.muted ? 'Unmute' : 'Mute'),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                clip.audioMix.muted
+                    ? 'Muted'
+                    : '${(clip.audioMix.volume * 100).round()}%',
+                style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
+              ),
+            ],
+          ),
+          SliderTheme(
+            data: SliderThemeData(
+              activeTrackColor: kAccent,
+              inactiveTrackColor: kBorder,
+              thumbColor: kAccent,
+              overlayColor: kAccent.withValues(alpha: 0.14),
+            ),
+            child: Slider(
+              value: clip.audioMix.volume.clamp(0.0, 1.0),
+              min: 0,
+              max: 1,
+              divisions: 20,
+              onChanged: (value) => _updateSelectedClipAudioMix(
+                clip,
+                volume: value,
+                muted: value == 0 ? true : false,
+              ),
+            ),
+          ),
+          Text(
+            isVideoClip
+                ? 'Overlay videos start muted by default. Use mute/unmute and volume here.'
+                : 'Basic clip audio controls are active now. Deeper mixing will come in the advanced audio pass.',
+            style: GoogleFonts.inter(
+              color: kTextSecondary,
+              fontSize: 12,
+              height: 1.35,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTransitionEditor(TimelineClip clip) {
+    const transitionOptions = [
+      (TransitionType.cut, 'Cut'),
+      (TransitionType.fade, 'Fade'),
+      (TransitionType.dissolve, 'Dissolve'),
+      (TransitionType.slideLeft, 'Slide'),
+      (TransitionType.zoom, 'Zoom'),
+    ];
+    const durationOptions = [0, 200, 400, 600, 800];
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
+      decoration: const BoxDecoration(
+        color: kSurface,
+        border: Border(top: BorderSide(color: kBorder)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Transition from ${clip.label}',
+            style: GoogleFonts.inter(
+              color: kTextPrimary,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: transitionOptions.map((option) {
+              final isSelected =
+                  clip.outroTransition.type == option.$1 ||
+                  (clip.outroTransition.type == TransitionType.none &&
+                      option.$1 == TransitionType.cut);
+              return ChoiceChip(
+                label: Text(option.$2),
+                selected: isSelected,
+                selectedColor: kAccent.withValues(alpha: 0.18),
+                backgroundColor: kSurfaceElevated,
+                side: BorderSide(color: isSelected ? kAccent : kBorder),
+                labelStyle: GoogleFonts.inter(
+                  color: isSelected ? kAccent : kTextSecondary,
+                  fontSize: 12,
+                ),
+                onSelected: (_) => _updateSelectedClipTransition(
+                  clip: clip,
+                  type: option.$1,
+                  durationMs: option.$1 == TransitionType.cut
+                      ? 0
+                      : (clip.outroTransition.durationMs == 0
+                            ? 400
+                            : clip.outroTransition.durationMs),
+                ),
+              );
+            }).toList(),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            'Duration',
+            style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: durationOptions.map((duration) {
+              final isSelected = clip.outroTransition.durationMs == duration;
+              return ChoiceChip(
+                label: Text('${duration}ms'),
+                selected: isSelected,
+                selectedColor: kAccent.withValues(alpha: 0.18),
+                backgroundColor: kSurfaceElevated,
+                side: BorderSide(color: isSelected ? kAccent : kBorder),
+                labelStyle: GoogleFonts.inter(
+                  color: isSelected ? kAccent : kTextSecondary,
+                  fontSize: 12,
+                ),
+                onSelected:
+                    clip.outroTransition.type == TransitionType.cut &&
+                        duration > 0
+                    ? null
+                    : (_) => _updateSelectedClipTransition(
+                        clip: clip,
+                        durationMs: duration,
+                      ),
+              );
+            }).toList(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _openStylePanelSheet(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      barrierColor: Colors.black.withValues(alpha: 0.2),
+      backgroundColor: Colors.transparent,
+      builder: (_) => DraggableScrollableSheet(
+        initialChildSize: 0.45,
+        maxChildSize: 0.85,
+        minChildSize: 0.22,
+        expand: false,
+        builder: (_, controller) {
+          return Container(
+            decoration: const BoxDecoration(
+              color: kSurface,
+              borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+            ),
+            child: Column(
+              children: [
+                const SizedBox(height: 12),
+                Container(
+                  width: 40,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: kBorder,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Subtitle Style',
+                  style: GoogleFonts.inter(
+                    color: kTextPrimary,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                Text(
+                  'Keep sheet lower to preview changes on video',
+                  style: GoogleFonts.inter(color: kTextSecondary, fontSize: 11),
+                ),
+                const SizedBox(height: 8),
+                const Expanded(child: SubtitleStylePanel()),
+              ],
+            ),
+          );
+        },
       ),
     );
   }
