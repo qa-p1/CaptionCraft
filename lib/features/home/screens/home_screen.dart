@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -31,18 +31,19 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   bool _isLoadingProjects = true;
   bool _showDeviceQuotaNotice = false;
   String? _loadWarning;
+  int _loadRequestId = 0;
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      _loadData();
-    });
+    unawaited(_loadData());
   }
 
   Future<void> _loadData() async {
-    if (mounted) {
+    final requestId = ++_loadRequestId;
+    final shouldShowBlockingLoader = _projects.isEmpty;
+
+    if (mounted && shouldShowBlockingLoader) {
       setState(() {
         _isLoadingProjects = true;
         _loadWarning = null;
@@ -50,66 +51,104 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     }
 
     final user = ref.read(currentUserProvider);
-    var showDeviceNotice = false;
-    String? warning;
-    List<Project> projects = [];
-    List<Project> localProjects = [];
+    unawaited(_refreshQuotaAndDeviceNotice(user, requestId));
 
+    final localProjects = await _loadLocalProjects(requestId);
+    if (user == null) return;
+
+    unawaited(_syncCloudProjects(user.uid, localProjects, requestId));
+  }
+
+  Future<List<Project>> _loadLocalProjects(int requestId) async {
     try {
-      await ref
-          .read(quotaProvider.notifier)
-          .loadQuota()
-          .timeout(const Duration(seconds: 8), onTimeout: () {});
+      final localProjects = await ProjectLocalStorage.loadProjects();
+      await _cacheVideoAvailability(localProjects);
 
-      if (user != null) {
-        try {
-          final boundUid = await DeviceQuotaService.getBoundUid();
-          showDeviceNotice = boundUid != null && boundUid != user.uid;
-        } catch (_) {
-          showDeviceNotice = false;
-        }
+      if (!mounted || requestId != _loadRequestId) {
+        return localProjects;
       }
 
-      localProjects = await ProjectLocalStorage.loadProjects();
-      projects = localProjects;
+      setState(() {
+        _projects = localProjects;
+        _isLoadingProjects = false;
+        _loadWarning = null;
+      });
 
-      // Merge cloud projects on top when available, but keep local access as the
-      // primary experience so transient Firestore issues do not block the home
-      // screen or produce a misleading warning for local-only usage.
-      if (user != null) {
-        try {
-          final firestoreData = await FirebaseService.loadProjects(
-            user.uid,
-          ).timeout(const Duration(seconds: 10));
-          final cloudProjects = firestoreData
-              .map((d) => Project.fromFirestore(d))
-              .toList();
-          projects = _mergeProjects(localProjects, cloudProjects);
-        } catch (_) {
-          projects = localProjects;
-          if (localProjects.isEmpty) {
-            warning = 'Cloud sync is unavailable right now.';
-          }
-        }
-      }
+      return localProjects;
     } catch (_) {
-      warning = localProjects.isEmpty ? 'Load failed. Please try again.' : null;
+      if (mounted && requestId == _loadRequestId) {
+        setState(() {
+          _projects = [];
+          _isLoadingProjects = false;
+          _loadWarning = 'Load failed. Please try again.';
+        });
+      }
+      return [];
+    }
+  }
+
+  Future<void> _syncCloudProjects(
+    String uid,
+    List<Project> localProjects,
+    int requestId,
+  ) async {
+    try {
+      final firestoreData = await FirebaseService.loadProjects(
+        uid,
+      ).timeout(const Duration(seconds: 4));
+      final cloudProjects = firestoreData
+          .map((data) => Project.fromFirestore(data))
+          .toList();
+      await _cacheVideoAvailability(cloudProjects);
+
+      if (!mounted || requestId != _loadRequestId) return;
+
+      setState(() {
+        _projects = _mergeProjects(localProjects, cloudProjects);
+        _loadWarning = null;
+      });
+    } catch (_) {
+      if (!mounted || requestId != _loadRequestId || localProjects.isNotEmpty) {
+        return;
+      }
+
+      setState(() {
+        _loadWarning = 'Cloud sync is unavailable right now.';
+      });
+    }
+  }
+
+  Future<void> _refreshQuotaAndDeviceNotice(dynamic user, int requestId) async {
+    try {
+      await ref.read(quotaProvider.notifier).loadQuota();
+    } catch (_) {
+      // Ignore quota refresh failures and keep the latest known state.
+    }
+
+    var showDeviceNotice = false;
+    if (user != null) {
       try {
-        projects = localProjects.isNotEmpty
-            ? localProjects
-            : await ProjectLocalStorage.loadProjects();
+        final boundUid = await DeviceQuotaService.getBoundUid();
+        showDeviceNotice = boundUid != null && boundUid != user.uid;
       } catch (_) {
-        projects = [];
+        showDeviceNotice = false;
       }
     }
 
-    if (mounted) {
+    if (mounted && requestId == _loadRequestId) {
       setState(() {
-        _projects = projects;
-        _isLoadingProjects = false;
         _showDeviceQuotaNotice = showDeviceNotice;
-        _loadWarning = warning;
       });
+    }
+  }
+
+  Future<void> _cacheVideoAvailability(List<Project> projects) async {
+    final availability = await Future.wait(
+      projects.map((project) => File(project.videoPath).exists()),
+    );
+
+    for (var index = 0; index < projects.length; index++) {
+      projects[index].cacheVideoAvailability(availability[index]);
     }
   }
 
@@ -652,7 +691,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               ),
             ),
             TextButton(
-              onPressed: _loadData,
+              onPressed: () {
+                unawaited(_loadData());
+              },
               child: Text(
                 'Retry',
                 style: GoogleFonts.inter(
@@ -670,6 +711,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   Widget _buildProjectCard(Project project) {
     final isVideoMissing = !project.isVideoAvailable;
+    final thumbnailBytes = project.thumbnailBytes;
 
     return GestureDetector(
       onTap: isVideoMissing ? null : () => _openEditor(project),
@@ -718,10 +760,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                   child: Container(
                     width: double.infinity,
                     color: kSurfaceElevated,
-                    child: project.thumbnailBase64 != null
+                    child: thumbnailBytes != null
                         ? Image.memory(
-                            base64Decode(project.thumbnailBase64!),
+                            thumbnailBytes,
                             fit: BoxFit.cover,
+                            filterQuality: FilterQuality.low,
+                            gaplessPlayback: true,
                           )
                         : const Center(
                             child: Icon(
