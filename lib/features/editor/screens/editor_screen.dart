@@ -9,6 +9,7 @@ import 'package:path_provider/path_provider.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/utils/ffmpeg_service.dart';
 import '../../../core/utils/firebase_service.dart';
+import '../../../core/utils/giphy_service.dart';
 import '../../../core/utils/subtitle_export_service.dart';
 import '../../../shared/models/project_model.dart';
 import '../../../shared/widgets/snack_bar_helper.dart';
@@ -45,7 +46,14 @@ enum _CanvasAspectRatio { original, ratio16x9, ratio9x16, ratio1x1, ratio4x5 }
 
 class _EditorScreenState extends ConsumerState<EditorScreen> {
   Timer? _saveDebounce;
+  Timer? _giphySearchDebounce;
   _CanvasAspectRatio _canvasAspectRatio = _CanvasAspectRatio.original;
+  final TextEditingController _giphySearchController = TextEditingController();
+  List<GiphyAssetResult> _giphyResults = const [];
+  bool _isLoadingGiphy = false;
+  bool _hasLoadedInitialGiphyResults = false;
+  String? _giphyError;
+  GiphySearchKind _giphySearchKind = GiphySearchKind.both;
 
   @override
   void initState() {
@@ -72,6 +80,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
   @override
   void dispose() {
     _saveDebounce?.cancel();
+    _giphySearchDebounce?.cancel();
+    _giphySearchController.dispose();
     super.dispose();
   }
 
@@ -899,7 +909,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
       section: TimelineTrackSection.overlay,
       assetType: assetType,
       clipType: clipType,
-      filePath: filePath,
+      sourcePath: filePath,
       label: file.name,
       sourceDuration: sourceDuration,
       metadata: metadata,
@@ -926,7 +936,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
       section: TimelineTrackSection.audio,
       assetType: EditorAssetType.audio,
       clipType: TimelineTrackType.audio,
-      filePath: filePath,
+      sourcePath: filePath,
       label: file.name,
       sourceDuration: duration,
       metadata: {'durationMs': mediaInfo['durationMs']},
@@ -937,7 +947,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
     required TimelineTrackSection section,
     required EditorAssetType assetType,
     required TimelineTrackType clipType,
-    required String filePath,
+    String? sourcePath,
+    String? remoteUrl,
+    bool isNetworkBacked = false,
     required String label,
     required Duration? sourceDuration,
     Map<String, dynamic> metadata = const {},
@@ -973,7 +985,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
     final asset = EditorAssetReference(
       type: assetType,
       label: label,
-      sourcePath: filePath,
+      sourcePath: sourcePath,
+      remoteUrl: remoteUrl,
+      isNetworkBacked: isNetworkBacked,
       metadata: metadata,
     );
     final audioMix =
@@ -1009,6 +1023,63 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
     ref.read(editorProvider.notifier).selectTrack(targetTrack.id);
     ref.read(editorProvider.notifier).selectClip(clip.id);
     SnackBarHelper.showSuccess(context, '$label added at playhead');
+  }
+
+  void _onGiphyQueryChanged(String value) {
+    setState(() {});
+    _giphySearchDebounce?.cancel();
+    _giphySearchDebounce = Timer(const Duration(milliseconds: 350), () {
+      unawaited(_refreshGiphyResults());
+    });
+  }
+
+  Future<void> _refreshGiphyResults() async {
+    setState(() {
+      _isLoadingGiphy = true;
+      _giphyError = null;
+    });
+
+    try {
+      final results = await GiphyService.search(
+        query: _giphySearchController.text,
+        kind: _giphySearchKind,
+      );
+      if (!mounted) return;
+      setState(() {
+        _giphyResults = results;
+        _isLoadingGiphy = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _giphyResults = const [];
+        _giphyError = e.toString().replaceFirst('Exception: ', '');
+        _isLoadingGiphy = false;
+      });
+    }
+  }
+
+  Future<void> _insertGiphyAsset(GiphyAssetResult result) async {
+    _insertClipIntoTimeline(
+      section: TimelineTrackSection.overlay,
+      assetType: result.isSticker
+          ? EditorAssetType.sticker
+          : EditorAssetType.gif,
+      clipType: result.isSticker
+          ? TimelineTrackType.sticker
+          : TimelineTrackType.gif,
+      label: result.title,
+      sourceDuration: const Duration(seconds: 4),
+      remoteUrl: result.originalUrl,
+      isNetworkBacked: true,
+      metadata: {
+        'previewUrl': result.previewUrl,
+        'giphyId': result.id,
+        'width': result.width,
+        'height': result.height,
+        'provider': 'giphy',
+      },
+    );
   }
 
   Future<void> _addTextClipAtPlayhead() async {
@@ -1365,7 +1436,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
             onPressed: hasSelection
                 ? () => subtitleNotifier.deleteEntry(selectedEntry.id)
                 : canDeleteClip
-                ? () => _deleteSelectedClip(selectedClip!)
+                ? () => _deleteSelectedClip(selectedClip)
                 : null,
           ),
           IconButton(
@@ -1467,6 +1538,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
     EditorState editorState,
     TimelineClip? selectedClip,
   ) {
+    if (editorState.activePanel == EditorBottomPanel.stickers) {
+      return _buildStickerPanel();
+    }
     if (editorState.activePanel == EditorBottomPanel.transitions &&
         selectedClip?.type == TimelineTrackType.video) {
       return _buildTransitionEditor(selectedClip!);
@@ -1488,7 +1562,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
       EditorBottomPanel.audio =>
         'Audio panel will add music, voiceover, and effects onto bottom audio tracks.',
       EditorBottomPanel.stickers =>
-        'Sticker panel will use online sticker and Giphy sources in the next core pass.',
+        'Search Giphy GIFs and stickers, then add them directly to overlay tracks at the playhead.',
       EditorBottomPanel.transitions =>
         selectedClip == null
             ? 'Tap the marker between base video clips to set a transition for that cut.'
@@ -1552,6 +1626,238 @@ class _EditorScreenState extends ConsumerState<EditorScreen> {
               label: const Text('Open'),
             ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildStickerPanel() {
+    if (!_hasLoadedInitialGiphyResults && !_isLoadingGiphy) {
+      _hasLoadedInitialGiphyResults = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        unawaited(_refreshGiphyResults());
+      });
+    }
+
+    return Container(
+      width: double.infinity,
+      height: 250,
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
+      decoration: const BoxDecoration(
+        color: kSurface,
+        border: Border(top: BorderSide(color: kBorder)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _giphySearchController,
+                  onChanged: _onGiphyQueryChanged,
+                  style: GoogleFonts.inter(color: kTextPrimary),
+                  decoration: InputDecoration(
+                    isDense: true,
+                    hintText: 'Search Giphy GIFs and stickers',
+                    prefixIcon: const Icon(Icons.search_rounded, size: 18),
+                    suffixIcon: _giphySearchController.text.isEmpty
+                        ? null
+                        : IconButton(
+                            tooltip: 'Clear',
+                            icon: const Icon(Icons.close_rounded, size: 18),
+                            onPressed: () {
+                              _giphySearchController.clear();
+                              _refreshGiphyResults();
+                            },
+                          ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconButton(
+                tooltip: 'Refresh',
+                onPressed: _isLoadingGiphy ? null : _refreshGiphyResults,
+                icon: const Icon(Icons.refresh_rounded, color: kTextSecondary),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 8,
+            children: [
+              _buildGiphyKindChip(
+                label: 'GIFs + Stickers',
+                kind: GiphySearchKind.both,
+              ),
+              _buildGiphyKindChip(label: 'GIFs', kind: GiphySearchKind.gifs),
+              _buildGiphyKindChip(
+                label: 'Stickers',
+                kind: GiphySearchKind.stickers,
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Expanded(
+            child: Builder(
+              builder: (context) {
+                if (_isLoadingGiphy) {
+                  return const Center(
+                    child: CircularProgressIndicator(
+                      color: kAccent,
+                      strokeWidth: 2,
+                    ),
+                  );
+                }
+                if (_giphyError != null) {
+                  return _buildGiphyMessage(
+                    icon: Icons.key_off_rounded,
+                    message: _giphyError!,
+                  );
+                }
+                if (_giphyResults.isEmpty) {
+                  return _buildGiphyMessage(
+                    icon: Icons.gif_box_outlined,
+                    message: _giphySearchController.text.trim().isEmpty
+                        ? 'No trending items available right now.'
+                        : 'No Giphy results for this search.',
+                  );
+                }
+
+                return GridView.builder(
+                  padding: EdgeInsets.zero,
+                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 4,
+                    mainAxisSpacing: 8,
+                    crossAxisSpacing: 8,
+                    childAspectRatio: 0.8,
+                  ),
+                  itemCount: _giphyResults.length,
+                  itemBuilder: (context, index) {
+                    final result = _giphyResults[index];
+                    return InkWell(
+                      borderRadius: BorderRadius.circular(12),
+                      onTap: () => _insertGiphyAsset(result),
+                      child: Ink(
+                        decoration: BoxDecoration(
+                          color: kSurfaceElevated,
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: kBorder),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Expanded(
+                              child: ClipRRect(
+                                borderRadius: const BorderRadius.vertical(
+                                  top: Radius.circular(12),
+                                ),
+                                child: Image.network(
+                                  result.previewUrl,
+                                  fit: BoxFit.cover,
+                                  filterQuality: FilterQuality.low,
+                                  errorBuilder: (_, _, _) => Container(
+                                    color: kSurface,
+                                    child: const Center(
+                                      child: Icon(
+                                        Icons.broken_image_outlined,
+                                        color: kTextSecondary,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                            Padding(
+                              padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    result.isSticker ? 'Sticker' : 'GIF',
+                                    style: GoogleFonts.inter(
+                                      color: kAccent,
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    result.title,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: GoogleFonts.inter(
+                                      color: kTextPrimary,
+                                      fontSize: 11,
+                                      height: 1.25,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildGiphyKindChip({
+    required String label,
+    required GiphySearchKind kind,
+  }) {
+    final isSelected = _giphySearchKind == kind;
+    return ChoiceChip(
+      label: Text(label),
+      selected: isSelected,
+      selectedColor: kAccent.withValues(alpha: 0.18),
+      backgroundColor: kSurfaceElevated,
+      side: BorderSide(color: isSelected ? kAccent : kBorder),
+      labelStyle: GoogleFonts.inter(
+        color: isSelected ? kAccent : kTextSecondary,
+        fontSize: 12,
+      ),
+      onSelected: (_) {
+        setState(() => _giphySearchKind = kind);
+        unawaited(_refreshGiphyResults());
+      },
+    );
+  }
+
+  Widget _buildGiphyMessage({required IconData icon, required String message}) {
+    return Container(
+      decoration: BoxDecoration(
+        color: kSurfaceElevated,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: kBorder),
+      ),
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, color: kTextSecondary),
+              const SizedBox(height: 8),
+              Text(
+                message,
+                textAlign: TextAlign.center,
+                style: GoogleFonts.inter(
+                  color: kTextSecondary,
+                  fontSize: 12,
+                  height: 1.4,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
