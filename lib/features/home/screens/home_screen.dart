@@ -5,22 +5,19 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:shimmer/shimmer.dart';
+import 'package:path/path.dart' as path;
 import '../../../core/theme/app_theme.dart';
 import '../../../core/theme/text_styles.dart';
-import '../../../core/constants/groq_constants.dart';
 import '../../../core/utils/device_quota_service.dart';
-import '../../../core/utils/ffmpeg_service.dart';
 import '../../../core/utils/firebase_service.dart';
+import '../../../core/utils/project_creation_service.dart';
 import '../../../shared/widgets/app_button.dart';
 import '../../../shared/widgets/snack_bar_helper.dart';
 import '../../../shared/models/project_model.dart';
 import '../../auth/providers/auth_provider.dart';
 import '../../quota/providers/quota_provider.dart';
-import '../../quota/screens/quota_exhausted_screen.dart';
 import '../../editor/screens/editor_screen.dart';
 import '../../profile/screens/profile_screen.dart';
-import '../providers/transcription_pipeline.dart';
-import 'processing_screen.dart';
 
 class HomeScreen extends ConsumerStatefulWidget {
   const HomeScreen({super.key});
@@ -139,55 +136,28 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     return result;
   }
 
-  Future<void> _importVideo() async {
-    final quota = ref.read(quotaProvider);
-    if (!quota.canRun) {
-      Navigator.push(
-        context,
-        MaterialPageRoute(builder: (_) => const QuotaExhaustedScreen()),
-      );
-      return;
-    }
-
+  Future<void> _importVideos() async {
     try {
       final result = await FilePicker.platform.pickFiles(
         type: FileType.video,
-        allowMultiple: false,
+        allowMultiple: true,
       );
 
       if (result == null || result.files.isEmpty) return;
-      final filePath = result.files.first.path;
-      if (filePath == null) return;
 
-      final mediaInfo = await FFmpegService.getMediaInfo(filePath);
-      if (!(mediaInfo['hasAudio'] as bool)) {
-        if (mounted) {
-          SnackBarHelper.showError(
-            context,
-            'This video has no audio track. Subtitles require audio.',
-          );
-        }
-        return;
-      }
-
-      final durationMs = mediaInfo['durationMs'] as int? ?? 0;
-      final maxDurationMs = GroqConstants.maxVideoDurationMinutes * 60 * 1000;
-      if (durationMs > maxDurationMs) {
-        if (mounted) {
-          SnackBarHelper.showError(
-            context,
-            'Maximum supported video length is ${GroqConstants.maxVideoDurationMinutes} minutes.',
-          );
-        }
-        return;
-      }
+      final sources = result.files
+          .where((file) => file.path != null)
+          .map(
+            (file) => ImportedVideoSource(
+              filePath: file.path!,
+              displayName: file.name,
+            ),
+          )
+          .toList();
+      if (sources.isEmpty) return;
 
       if (mounted) {
-        _showImportSheet(
-          videoPath: filePath,
-          fileName: result.files.first.name,
-          mediaInfo: mediaInfo,
-        );
+        _showImportSheet(sources: sources);
       }
     } catch (e) {
       if (mounted) {
@@ -196,32 +166,14 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     }
   }
 
-  void _showImportSheet({
-    required String videoPath,
-    required String fileName,
-    required Map<String, dynamic> mediaInfo,
-  }) {
-    const languageOptions = <MapEntry<String, String>>[
-      MapEntry('', 'Auto Detect'),
-      MapEntry('en', 'English'),
-      MapEntry('es', 'Spanish'),
-      MapEntry('fr', 'French'),
-      MapEntry('de', 'German'),
-      MapEntry('hi', 'Hindi'),
-      MapEntry('ja', 'Japanese'),
-    ];
-
-    var selectedLanguage = '';
-    final durationMs = mediaInfo['durationMs'] as int? ?? 0;
-    final width = mediaInfo['width'] as int? ?? 0;
-    final height = mediaInfo['height'] as int? ?? 0;
-    final fileSize = mediaInfo['fileSize'] as int? ?? 0;
-
-    // Pre-fill project name from filename without extension
-    final baseName = fileName.contains('.')
-        ? fileName.substring(0, fileName.lastIndexOf('.'))
-        : fileName;
-    final projectNameController = TextEditingController(text: baseName);
+  void _showImportSheet({required List<ImportedVideoSource> sources}) {
+    final baseName = path.basenameWithoutExtension(sources.first.displayName);
+    final defaultProjectName = sources.length == 1
+        ? baseName
+        : '$baseName montage';
+    final projectNameController = TextEditingController(
+      text: defaultProjectName,
+    );
 
     showModalBottomSheet(
       context: context,
@@ -254,7 +206,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               ),
               const SizedBox(height: 20),
               Text(
-                'Import Video',
+                'Create Project',
                 style: GoogleFonts.inter(
                   color: kTextPrimary,
                   fontSize: 20,
@@ -299,16 +251,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 ),
               ),
               const SizedBox(height: 12),
-              _infoRow('File', fileName),
+              _infoRow('Clips', '${sources.length} selected'),
               const SizedBox(height: 8),
-              _infoRow('Duration', _formatDuration(durationMs)),
-              const SizedBox(height: 8),
-              _infoRow('Resolution', '${width}x$height'),
-              const SizedBox(height: 8),
-              _infoRow('Size', _formatBytes(fileSize)),
+              _infoRow('First', sources.first.displayName),
               const SizedBox(height: 16),
               Text(
-                'Language',
+                'Imported Videos',
                 style: GoogleFonts.inter(
                   color: kTextSecondary,
                   fontSize: 13,
@@ -317,30 +265,39 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               ),
               const SizedBox(height: 6),
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
+                width: double.infinity,
+                constraints: const BoxConstraints(maxHeight: 180),
+                padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
                   color: kSurfaceElevated,
                   borderRadius: BorderRadius.circular(10),
                   border: Border.all(color: kBorder),
                 ),
-                child: DropdownButtonHideUnderline(
-                  child: DropdownButton<String>(
-                    value: selectedLanguage,
-                    isExpanded: true,
-                    dropdownColor: kSurfaceElevated,
-                    style: GoogleFonts.inter(color: kTextPrimary),
-                    items: languageOptions
-                        .map(
-                          (entry) => DropdownMenuItem<String>(
-                            value: entry.key,
-                            child: Text(entry.value),
-                          ),
-                        )
-                        .toList(),
-                    onChanged: (value) {
-                      setSheetState(() => selectedLanguage = value ?? '');
-                    },
-                  ),
+                child: ListView.separated(
+                  shrinkWrap: true,
+                  itemCount: sources.length,
+                  separatorBuilder: (_, _) => const Divider(color: kBorder),
+                  itemBuilder: (_, index) {
+                    final source = sources[index];
+                    return Text(
+                      source.displayName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: GoogleFonts.inter(
+                        color: kTextPrimary,
+                        fontSize: 13,
+                      ),
+                    );
+                  },
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Subtitle generation happens inside the editor per selected clip.',
+                style: GoogleFonts.inter(
+                  color: kTextSecondary,
+                  fontSize: 12,
+                  height: 1.4,
                 ),
               ),
               const SizedBox(height: 24),
@@ -356,15 +313,16 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                   const SizedBox(width: 12),
                   Expanded(
                     child: AppButton(
-                      label: 'Transcribe',
-                      icon: Icons.auto_awesome_rounded,
+                      label: 'Open Editor',
+                      icon: Icons.video_settings_rounded,
                       onPressed: () {
                         final name = projectNameController.text.trim();
                         Navigator.pop(sheetContext);
-                        _startTranscription(
-                          videoPath,
-                          language: selectedLanguage,
-                          projectName: name.isNotEmpty ? name : baseName,
+                        _createEditorProject(
+                          sources,
+                          projectName: name.isNotEmpty
+                              ? name
+                              : defaultProjectName,
                         );
                       },
                     ),
@@ -405,119 +363,38 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 
-  String _formatDuration(int durationMs) {
-    final duration = Duration(milliseconds: durationMs);
-    final hours = duration.inHours;
-    final minutes = (duration.inMinutes % 60).toString().padLeft(2, '0');
-    final seconds = (duration.inSeconds % 60).toString().padLeft(2, '0');
-    if (hours > 0) {
-      return '$hours:$minutes:$seconds';
-    }
-    return '${duration.inMinutes}:$seconds';
-  }
-
-  String _formatBytes(int bytes) {
-    if (bytes <= 0) return '0 B';
-    const kb = 1024;
-    const mb = kb * 1024;
-    const gb = mb * 1024;
-    if (bytes >= gb) return '${(bytes / gb).toStringAsFixed(2)} GB';
-    if (bytes >= mb) return '${(bytes / mb).toStringAsFixed(1)} MB';
-    if (bytes >= kb) return '${(bytes / kb).toStringAsFixed(1)} KB';
-    return '$bytes B';
-  }
-
-  Future<void> _startTranscription(
-    String videoPath, {
-    String language = '',
+  Future<void> _createEditorProject(
+    List<ImportedVideoSource> sources, {
     String? projectName,
   }) async {
     final user = ref.read(currentUserProvider);
-    if (user == null) return;
-
-    final pipeline = TranscriptionPipeline();
-    var processingClosed = false;
-
-    unawaited(
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (processingContext) => ProcessingScreen(
-            progressStream: pipeline.progressStream,
-            onCancel: () {
-              pipeline.cancel();
-              if (Navigator.of(processingContext).canPop()) {
-                Navigator.of(processingContext).pop();
-              }
-            },
-          ),
-        ),
-      ).then((_) {
-        processingClosed = true;
-      }),
-    );
 
     try {
-      final consumed = await ref
-          .read(quotaProvider.notifier)
-          .consumeRun(user.uid);
-      if (!consumed) {
-        pipeline.cancel();
-        if (!processingClosed && mounted) {
-          Navigator.of(context).pop();
-        }
-        if (mounted) {
-          SnackBarHelper.showError(context, 'No free runs remaining.');
-        }
-        return;
-      }
-
-      final result = await pipeline.run(
-        videoPath: videoPath,
-        language: language,
-        uid: user.uid,
+      final result = await ProjectCreationService.createProjectFromVideos(
+        sources: sources,
         projectName: projectName,
       );
 
-      if (result != null && mounted) {
-        if (!processingClosed && Navigator.of(context).canPop()) {
-          Navigator.of(context).pop();
-        }
-
-        // Save project locally and to Firestore
-        await ProjectLocalStorage.saveProject(result);
+      await ProjectLocalStorage.saveProject(result);
+      if (user != null) {
         try {
           await FirebaseService.saveProject(
             user.uid,
             result.id,
             result.toFirestore(),
           );
-        } catch (e) {
-          // Firestore save failed — local copy exists as fallback
+        } catch (_) {
+          // Local save already succeeded.
         }
-
-        // Reload projects
-        await _loadData();
-
-        // Navigate to editor
-        _openEditor(result);
-      } else if (!processingClosed &&
-          mounted &&
-          Navigator.of(context).canPop()) {
-        Navigator.of(context).pop();
       }
+
+      if (!mounted) return;
+      await _loadData();
+      _openEditor(result);
     } catch (e) {
       if (mounted) {
-        if (!processingClosed && Navigator.of(context).canPop()) {
-          Navigator.of(context).pop();
-        }
-        SnackBarHelper.showError(
-          context,
-          e.toString().replaceFirst('Exception: ', ''),
-        );
+        SnackBarHelper.showError(context, 'Project creation failed: $e');
       }
-    } finally {
-      pipeline.dispose();
     }
   }
 
@@ -569,23 +446,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       ),
       floatingActionButton: _projects.isNotEmpty
           ? FloatingActionButton.extended(
-              onPressed: quota.canRun
-                  ? _importVideo
-                  : () {
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => const QuotaExhaustedScreen(),
-                        ),
-                      );
-                    },
-              backgroundColor: quota.canRun ? kAccent : kWarning,
-              icon: Icon(
-                quota.canRun ? Icons.add_rounded : Icons.rocket_launch_rounded,
-                color: Colors.white,
-              ),
+              onPressed: _importVideos,
+              backgroundColor: kAccent,
+              icon: const Icon(Icons.add_rounded, color: Colors.white),
               label: Text(
-                quota.canRun ? 'Import Video' : 'Upgrade',
+                'Import Videos',
                 style: GoogleFonts.inter(
                   color: Colors.white,
                   fontWeight: FontWeight.w600,
@@ -662,7 +527,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           border: Border.all(color: kWarning.withValues(alpha: 0.25)),
         ),
         child: Text(
-          'This device has used ${quota.runsUsed} of ${quota.maxRuns} free transcriptions. Free runs are device-limited.',
+          'This device has used ${quota.runsUsed} of ${quota.maxRuns} free subtitle generations. Limits apply when generating subtitles from clips.',
           style: GoogleFonts.inter(color: kWarning, fontSize: 12, height: 1.4),
         ),
       ),
@@ -670,7 +535,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   Widget _buildEmptyState() {
-    final quota = ref.watch(quotaProvider);
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(40),
@@ -694,7 +558,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             Text('No projects yet', style: AppTextStyles.heading3),
             const SizedBox(height: 8),
             Text(
-              'Import a video to get started with\nautomatic subtitle generation',
+              'Import one or more videos to start editing.\nGenerate subtitles later for selected clips.',
               textAlign: TextAlign.center,
               style: GoogleFonts.inter(
                 fontSize: 15,
@@ -704,20 +568,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             ),
             const SizedBox(height: 32),
             AppButton(
-              label: quota.canRun ? 'Import Video' : 'Upgrade',
-              icon: quota.canRun
-                  ? Icons.file_upload_rounded
-                  : Icons.rocket_launch_rounded,
-              onPressed: quota.canRun
-                  ? _importVideo
-                  : () {
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => const QuotaExhaustedScreen(),
-                        ),
-                      );
-                    },
+              label: 'Import Videos',
+              icon: Icons.file_upload_rounded,
+              onPressed: _importVideos,
               width: 200,
             ),
           ],
@@ -897,7 +750,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                       ),
                       const SizedBox(height: 4),
                       Text(
-                        '${project.subtitles.length} subtitles',
+                        '${project.timeline.videoClips.length} clips • ${project.subtitles.length} subtitles',
                         style: AppTextStyles.bodySmall,
                       ),
                     ],

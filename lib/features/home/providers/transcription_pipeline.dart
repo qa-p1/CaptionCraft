@@ -8,6 +8,7 @@ import '../../../core/utils/ffmpeg_service.dart';
 import '../../../core/utils/groq_service.dart';
 import '../../../shared/models/processing_state.dart';
 import '../../../shared/models/project_model.dart';
+import '../../editor/models/subtitle_entry.dart';
 import '../../editor/models/word_timing.dart';
 
 /// Orchestrates the full transcription pipeline:
@@ -27,6 +28,64 @@ class TranscriptionPipeline {
     required String uid,
     String? projectName,
   }) async {
+    final finalEntries = await transcribeVideoSegment(
+      videoPath: videoPath,
+      language: language,
+    );
+    if (finalEntries == null) return null;
+
+    try {
+      _emitProgress(
+        ProcessingStage.assemblingSubtitles,
+        0.92,
+        'Generating thumbnail...',
+      );
+
+      final mediaInfo = await FFmpegService.getMediaInfo(videoPath);
+      final durationMs = mediaInfo['durationMs'] as int;
+      String? thumbnailBase64;
+      try {
+        final thumbPath = await FFmpegService.generateThumbnail(videoPath);
+        if (thumbPath.isNotEmpty) {
+          final thumbFile = File(thumbPath);
+          if (await thumbFile.exists()) {
+            final bytes = await thumbFile.readAsBytes();
+            if (bytes.length <= 50 * 1024) {
+              thumbnailBase64 = base64Encode(bytes);
+            }
+          }
+        }
+      } catch (_) {
+        // Non-critical — skip thumbnail
+      }
+
+      _emitProgress(ProcessingStage.done, 1.0, 'Done!');
+
+      final projectId = const Uuid().v4();
+      final videoName = projectName?.isNotEmpty == true
+          ? projectName!
+          : p.basenameWithoutExtension(videoPath);
+
+      return Project(
+        id: projectId,
+        name: videoName,
+        videoPath: videoPath,
+        thumbnailBase64: thumbnailBase64,
+        durationMs: durationMs,
+        subtitles: finalEntries,
+      );
+    } catch (e) {
+      _emitProgress(ProcessingStage.error, 0, e.toString());
+      rethrow;
+    }
+  }
+
+  Future<List<SubtitleEntry>?> transcribeVideoSegment({
+    required String videoPath,
+    Duration startTime = Duration.zero,
+    Duration? clipDuration,
+    String language = '',
+  }) async {
     _cancelled = false;
 
     try {
@@ -42,7 +101,8 @@ class TranscriptionPipeline {
         );
       }
 
-      final durationMs = mediaInfo['durationMs'] as int;
+      final sourceDurationMs = mediaInfo['durationMs'] as int;
+      final durationMs = clipDuration?.inMilliseconds ?? sourceDurationMs;
       final maxDurationMs = GroqConstants.maxVideoDurationMinutes * 60 * 1000;
       if (durationMs > maxDurationMs) {
         throw Exception(
@@ -60,6 +120,8 @@ class TranscriptionPipeline {
 
       final audioPath = await FFmpegService.extractAudio(
         videoPath,
+        startTime: startTime,
+        clipDuration: clipDuration,
         onProgress: (p) {
           _emitProgress(
             ProcessingStage.extractingAudio,
@@ -133,46 +195,7 @@ class TranscriptionPipeline {
         throw Exception('No speech was detected in this video.');
       }
 
-      // ── Step 6: Generate thumbnail ──
-      _emitProgress(
-        ProcessingStage.assemblingSubtitles,
-        0.92,
-        'Generating thumbnail...',
-      );
-
-      String? thumbnailBase64;
-      try {
-        final thumbPath = await FFmpegService.generateThumbnail(videoPath);
-        if (thumbPath.isNotEmpty) {
-          final thumbFile = File(thumbPath);
-          if (await thumbFile.exists()) {
-            final bytes = await thumbFile.readAsBytes();
-            if (bytes.length <= 50 * 1024) {
-              // Keep under 50KB
-              thumbnailBase64 = base64Encode(bytes);
-            }
-          }
-        }
-      } catch (e) {
-        // Non-critical — skip thumbnail
-      }
-
-      // ── Done ──
-      _emitProgress(ProcessingStage.done, 1.0, 'Done!');
-
-      final projectId = const Uuid().v4();
-      final videoName = projectName?.isNotEmpty == true
-          ? projectName!
-          : p.basenameWithoutExtension(videoPath);
-
-      return Project(
-        id: projectId,
-        name: videoName,
-        videoPath: videoPath,
-        thumbnailBase64: thumbnailBase64,
-        durationMs: durationMs,
-        subtitles: finalEntries,
-      );
+      return finalEntries;
     } catch (e) {
       _emitProgress(ProcessingStage.error, 0, e.toString());
       rethrow;

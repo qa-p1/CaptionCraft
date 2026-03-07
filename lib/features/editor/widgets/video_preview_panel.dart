@@ -5,6 +5,8 @@ import 'package:video_player/video_player.dart';
 import '../../../core/theme/app_theme.dart';
 import '../models/subtitle_entry.dart';
 import '../models/subtitle_style_model.dart';
+import '../models/timeline_models.dart';
+import '../providers/editor_provider.dart';
 import '../providers/playback_provider.dart';
 import '../providers/subtitle_provider.dart';
 import '../widgets/animated_subtitle_overlay.dart';
@@ -130,6 +132,203 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     ref.read(subtitleProvider.notifier).endStyleGestureEdit();
   }
 
+  List<_OverlayCanvasItem> _activeOverlayItems(
+    EditorTimeline timeline,
+    Duration position,
+  ) {
+    final items = <_OverlayCanvasItem>[];
+    for (
+      var trackIndex = 0;
+      trackIndex < timeline.tracks.length;
+      trackIndex++
+    ) {
+      final track = timeline.tracks[trackIndex];
+      if (track.section != TimelineTrackSection.overlay || track.isHidden) {
+        continue;
+      }
+      for (final clip in track.clips) {
+        if (position < clip.startTime || position > clip.endTime) continue;
+        EditorAssetReference? asset;
+        for (final candidate in timeline.assets) {
+          if (candidate.id == clip.assetId) {
+            asset = candidate;
+            break;
+          }
+        }
+        if (asset == null) continue;
+        items.add(
+          _OverlayCanvasItem(
+            trackIndex: trackIndex,
+            trackId: track.id,
+            clip: clip,
+            asset: asset,
+          ),
+        );
+      }
+    }
+
+    items.sort((a, b) {
+      final trackCompare = a.trackIndex.compareTo(b.trackIndex);
+      if (trackCompare != 0) return trackCompare;
+      return a.clip.layer.compareTo(b.clip.layer);
+    });
+    return items;
+  }
+
+  List<_TextCanvasItem> _activeTextItems(
+    EditorTimeline timeline,
+    Duration position,
+  ) {
+    final items = <_TextCanvasItem>[];
+    for (
+      var trackIndex = 0;
+      trackIndex < timeline.tracks.length;
+      trackIndex++
+    ) {
+      final track = timeline.tracks[trackIndex];
+      if (track.type != TimelineTrackType.text || track.isHidden) continue;
+      for (final clip in track.clips) {
+        if (position < clip.startTime || position > clip.endTime) continue;
+        items.add(
+          _TextCanvasItem(
+            trackIndex: trackIndex,
+            trackId: track.id,
+            clip: clip,
+          ),
+        );
+      }
+    }
+
+    items.sort((a, b) {
+      final trackCompare = a.trackIndex.compareTo(b.trackIndex);
+      if (trackCompare != 0) return trackCompare;
+      return a.clip.layer.compareTo(b.clip.layer);
+    });
+    return items;
+  }
+
+  void _selectOverlayClip(_OverlayCanvasItem item) {
+    final editorNotifier = ref.read(editorProvider.notifier);
+    editorNotifier.selectTrack(item.trackId);
+    editorNotifier.selectClip(item.clip.id);
+    ref.read(subtitleProvider.notifier).selectEntry(null);
+  }
+
+  void _updateOverlayTransform(
+    String clipId,
+    TimelineTransform Function(TimelineTransform current) mapper,
+  ) {
+    final editorState = ref.read(editorProvider);
+    final nextTracks = editorState.timeline.tracks.map((track) {
+      final updatedClips = track.clips.map((clip) {
+        if (clip.id != clipId) return clip;
+        return clip.copyWith(transform: mapper(clip.transform));
+      }).toList();
+      return track.copyWith(clips: updatedClips);
+    }).toList();
+
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(editorState.timeline.copyWith(tracks: nextTracks));
+  }
+
+  Widget _buildOverlayAsset(
+    _OverlayCanvasItem item,
+    BoxConstraints constraints,
+    PlaybackState playbackState,
+  ) {
+    final file = File(item.asset.sourcePath ?? '');
+    if (!file.existsSync()) {
+      return _buildMissingOverlay(item.clip.label);
+    }
+
+    final baseWidth = (constraints.maxWidth * 0.32).clamp(90.0, 220.0);
+    final child = switch (item.asset.type) {
+      EditorAssetType.image || EditorAssetType.gif => ClipRRect(
+        borderRadius: BorderRadius.circular(10),
+        child: Image.file(
+          file,
+          width: baseWidth,
+          fit: BoxFit.contain,
+          filterQuality: FilterQuality.medium,
+        ),
+      ),
+      EditorAssetType.video => _OverlayVideoPreview(
+        videoPath: file.path,
+        clip: item.clip,
+        playbackPosition: playbackState.position,
+        isPlaying: playbackState.isPlaying,
+        width: baseWidth,
+      ),
+      EditorAssetType.sticker => ClipRRect(
+        borderRadius: BorderRadius.circular(10),
+        child: Image.file(
+          file,
+          width: baseWidth,
+          fit: BoxFit.contain,
+          filterQuality: FilterQuality.medium,
+        ),
+      ),
+      _ => _buildMissingOverlay(item.clip.label),
+    };
+
+    return Opacity(
+      opacity: item.clip.transform.opacity.clamp(0.1, 1.0),
+      child: Transform.rotate(
+        angle: item.clip.transform.rotation,
+        child: Transform.scale(scale: item.clip.transform.scale, child: child),
+      ),
+    );
+  }
+
+  Widget _buildMissingOverlay(String label) {
+    return Container(
+      width: 140,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: kSurfaceElevated,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: kBorder),
+      ),
+      child: Text(
+        label,
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(color: kTextPrimary, fontSize: 12),
+      ),
+    );
+  }
+
+  Widget _buildVideoOverlayPlaceholder(String label, double width) {
+    return Container(
+      width: width,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.65),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: kBorder),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(
+            Icons.video_library_rounded,
+            color: Colors.white,
+            size: 28,
+          ),
+          const SizedBox(height: 6),
+          Text(
+            label,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white, fontSize: 11),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     ref.listen(playbackProvider.select((state) => state.seekRequestId ?? 0), (
@@ -150,6 +349,15 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
 
     final playbackState = ref.watch(playbackProvider);
     final subtitleState = ref.watch(subtitleProvider);
+    final editorState = ref.watch(editorProvider);
+    final activeOverlayItems = _activeOverlayItems(
+      editorState.timeline,
+      playbackState.position,
+    );
+    final activeTextItems = _activeTextItems(
+      editorState.timeline,
+      playbackState.position,
+    );
 
     SubtitleEntry? activeSubtitle;
     for (final entry in subtitleState.entries) {
@@ -203,6 +411,242 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                           ),
                         ),
                       ),
+                      if (activeOverlayItems.isNotEmpty)
+                        Positioned.fill(
+                          child: LayoutBuilder(
+                            builder: (context, constraints) {
+                              final maxX = (constraints.maxWidth / 2 - 28)
+                                  .clamp(0.0, 99999.0);
+                              final maxY = (constraints.maxHeight / 2 - 28)
+                                  .clamp(0.0, 99999.0);
+
+                              return Stack(
+                                children: activeOverlayItems.map((item) {
+                                  final isSelected =
+                                      editorState.selectedClipId ==
+                                      item.clip.id;
+                                  final transform = item.clip.transform;
+                                  return Align(
+                                    child: Transform.translate(
+                                      offset: Offset(
+                                        transform.offsetX.clamp(-maxX, maxX),
+                                        transform.offsetY.clamp(-maxY, maxY),
+                                      ),
+                                      child: _OverlayTransformBox(
+                                        isSelected: isSelected,
+                                        onTap: () => _selectOverlayClip(item),
+                                        onMoveStart: () =>
+                                            _selectOverlayClip(item),
+                                        onMoveUpdate: (delta) {
+                                          _updateOverlayTransform(
+                                            item.clip.id,
+                                            (current) => current.copyWith(
+                                              offsetX:
+                                                  (current.offsetX + delta.dx)
+                                                      .clamp(-maxX, maxX)
+                                                      .toDouble(),
+                                              offsetY:
+                                                  (current.offsetY + delta.dy)
+                                                      .clamp(-maxY, maxY)
+                                                      .toDouble(),
+                                            ),
+                                          );
+                                        },
+                                        onMoveEnd: () {},
+                                        onWidthResizeStart: () =>
+                                            _selectOverlayClip(item),
+                                        onWidthResizeUpdate: (delta) {
+                                          _updateOverlayTransform(
+                                            item.clip.id,
+                                            (current) => current.copyWith(
+                                              scale:
+                                                  (current.scale +
+                                                          (delta.dx /
+                                                              constraints
+                                                                  .maxWidth))
+                                                      .clamp(0.2, 4.0)
+                                                      .toDouble(),
+                                            ),
+                                          );
+                                        },
+                                        onWidthResizeEnd: () {},
+                                        onHeightResizeStart: () =>
+                                            _selectOverlayClip(item),
+                                        onHeightResizeUpdate: (delta) {
+                                          _updateOverlayTransform(
+                                            item.clip.id,
+                                            (current) => current.copyWith(
+                                              scale:
+                                                  (current.scale +
+                                                          (delta.dy /
+                                                              constraints
+                                                                  .maxHeight))
+                                                      .clamp(0.2, 4.0)
+                                                      .toDouble(),
+                                            ),
+                                          );
+                                        },
+                                        onHeightResizeEnd: () {},
+                                        child: _buildOverlayAsset(
+                                          item,
+                                          constraints,
+                                          playbackState,
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                }).toList(),
+                              );
+                            },
+                          ),
+                        ),
+                      if (activeTextItems.isNotEmpty)
+                        Positioned.fill(
+                          child: LayoutBuilder(
+                            builder: (context, constraints) {
+                              final maxX = (constraints.maxWidth / 2 - 28)
+                                  .clamp(0.0, 99999.0);
+                              final maxY = (constraints.maxHeight / 2 - 28)
+                                  .clamp(0.0, 99999.0);
+
+                              return Stack(
+                                children: activeTextItems.map((item) {
+                                  final isSelected =
+                                      editorState.selectedClipId ==
+                                      item.clip.id;
+                                  final style =
+                                      item.clip.subtitleStyle ??
+                                      const SubtitleStyleModel(
+                                        position: SubtitlePosition.center,
+                                        fontSize: 32,
+                                      );
+                                  return Align(
+                                    child: Transform.translate(
+                                      offset: Offset(
+                                        item.clip.transform.offsetX.clamp(
+                                          -maxX,
+                                          maxX,
+                                        ),
+                                        item.clip.transform.offsetY.clamp(
+                                          -maxY,
+                                          maxY,
+                                        ),
+                                      ),
+                                      child: _OverlayTransformBox(
+                                        isSelected: isSelected,
+                                        onTap: () {
+                                          ref
+                                              .read(editorProvider.notifier)
+                                              .selectTrack(item.trackId);
+                                          ref
+                                              .read(editorProvider.notifier)
+                                              .selectClip(item.clip.id);
+                                          ref
+                                              .read(subtitleProvider.notifier)
+                                              .selectEntry(null);
+                                        },
+                                        onMoveStart: () {
+                                          ref
+                                              .read(editorProvider.notifier)
+                                              .selectTrack(item.trackId);
+                                          ref
+                                              .read(editorProvider.notifier)
+                                              .selectClip(item.clip.id);
+                                        },
+                                        onMoveUpdate: (delta) {
+                                          _updateOverlayTransform(
+                                            item.clip.id,
+                                            (current) => current.copyWith(
+                                              offsetX:
+                                                  (current.offsetX + delta.dx)
+                                                      .clamp(-maxX, maxX)
+                                                      .toDouble(),
+                                              offsetY:
+                                                  (current.offsetY + delta.dy)
+                                                      .clamp(-maxY, maxY)
+                                                      .toDouble(),
+                                            ),
+                                          );
+                                        },
+                                        onMoveEnd: () {},
+                                        onWidthResizeStart: () {
+                                          ref
+                                              .read(editorProvider.notifier)
+                                              .selectTrack(item.trackId);
+                                          ref
+                                              .read(editorProvider.notifier)
+                                              .selectClip(item.clip.id);
+                                        },
+                                        onWidthResizeUpdate: (delta) {
+                                          _updateOverlayTransform(
+                                            item.clip.id,
+                                            (current) => current.copyWith(
+                                              scale:
+                                                  (current.scale +
+                                                          (delta.dx /
+                                                              constraints
+                                                                  .maxWidth))
+                                                      .clamp(0.25, 4.0)
+                                                      .toDouble(),
+                                            ),
+                                          );
+                                        },
+                                        onWidthResizeEnd: () {},
+                                        onHeightResizeStart: () {
+                                          ref
+                                              .read(editorProvider.notifier)
+                                              .selectTrack(item.trackId);
+                                          ref
+                                              .read(editorProvider.notifier)
+                                              .selectClip(item.clip.id);
+                                        },
+                                        onHeightResizeUpdate: (delta) {
+                                          _updateOverlayTransform(
+                                            item.clip.id,
+                                            (current) => current.copyWith(
+                                              scale:
+                                                  (current.scale +
+                                                          (delta.dy /
+                                                              constraints
+                                                                  .maxHeight))
+                                                      .clamp(0.25, 4.0)
+                                                      .toDouble(),
+                                            ),
+                                          );
+                                        },
+                                        onHeightResizeEnd: () {},
+                                        child: Transform.scale(
+                                          scale: item.clip.transform.scale,
+                                          child: ConstrainedBox(
+                                            constraints: BoxConstraints(
+                                              maxWidth:
+                                                  constraints.maxWidth *
+                                                  style.maxWidthFactor,
+                                            ),
+                                            child: Text(
+                                              item.clip.text ?? item.clip.label,
+                                              textAlign: style.textAlignment,
+                                              style: TextStyle(
+                                                color: style.textColor,
+                                                fontSize: style.fontSize,
+                                                fontWeight: style.isBold
+                                                    ? FontWeight.w700
+                                                    : FontWeight.w500,
+                                                fontStyle: style.isItalic
+                                                    ? FontStyle.italic
+                                                    : FontStyle.normal,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                }).toList(),
+                              );
+                            },
+                          ),
+                        ),
                       if (activeSubtitle != null)
                         Positioned.fill(
                           child: LayoutBuilder(
@@ -460,6 +904,167 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
       case SubtitlePosition.bottom:
         return Alignment.bottomCenter;
     }
+  }
+}
+
+class _OverlayCanvasItem {
+  final int trackIndex;
+  final String trackId;
+  final TimelineClip clip;
+  final EditorAssetReference asset;
+
+  const _OverlayCanvasItem({
+    required this.trackIndex,
+    required this.trackId,
+    required this.clip,
+    required this.asset,
+  });
+}
+
+class _TextCanvasItem {
+  final int trackIndex;
+  final String trackId;
+  final TimelineClip clip;
+
+  const _TextCanvasItem({
+    required this.trackIndex,
+    required this.trackId,
+    required this.clip,
+  });
+}
+
+class _OverlayVideoPreview extends StatefulWidget {
+  final String videoPath;
+  final TimelineClip clip;
+  final Duration playbackPosition;
+  final bool isPlaying;
+  final double width;
+
+  const _OverlayVideoPreview({
+    required this.videoPath,
+    required this.clip,
+    required this.playbackPosition,
+    required this.isPlaying,
+    required this.width,
+  });
+
+  @override
+  State<_OverlayVideoPreview> createState() => _OverlayVideoPreviewState();
+}
+
+class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
+  VideoPlayerController? _controller;
+  bool _ready = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _initialize();
+  }
+
+  @override
+  void didUpdateWidget(covariant _OverlayVideoPreview oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.videoPath != widget.videoPath) {
+      _disposeController();
+      _initialize();
+      return;
+    }
+    _syncPlayback();
+  }
+
+  Future<void> _initialize() async {
+    final controller = VideoPlayerController.file(File(widget.videoPath));
+    await controller.initialize();
+    await controller.setVolume(0);
+    if (!mounted) {
+      await controller.dispose();
+      return;
+    }
+    setState(() {
+      _controller = controller;
+      _ready = true;
+    });
+    _syncPlayback(forceSeek: true);
+  }
+
+  Future<void> _syncPlayback({bool forceSeek = false}) async {
+    final controller = _controller;
+    if (!_ready || controller == null || !controller.value.isInitialized) {
+      return;
+    }
+
+    final relative =
+        widget.playbackPosition -
+        widget.clip.startTime +
+        widget.clip.sourceStartTime;
+    final targetMs = relative.inMilliseconds
+        .clamp(0, controller.value.duration.inMilliseconds)
+        .toInt();
+    final currentMs = controller.value.position.inMilliseconds;
+    if (forceSeek || (currentMs - targetMs).abs() > 200) {
+      await controller.seekTo(Duration(milliseconds: targetMs));
+    }
+    await controller.setVolume(
+      widget.clip.audioMix.muted ? 0 : widget.clip.audioMix.volume.clamp(0, 1),
+    );
+    if (!mounted) return;
+    if (widget.isPlaying) {
+      if (!controller.value.isPlaying) {
+        await controller.play();
+      }
+    } else {
+      if (controller.value.isPlaying) {
+        await controller.pause();
+      }
+    }
+  }
+
+  Future<void> _disposeController() async {
+    final controller = _controller;
+    _controller = null;
+    _ready = false;
+    if (controller != null) {
+      await controller.dispose();
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposeController();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = _controller;
+    if (!_ready || controller == null || !controller.value.isInitialized) {
+      return Container(
+        width: widget.width,
+        height: widget.width * 0.6,
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.65),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: kBorder),
+        ),
+        child: const Center(
+          child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+        ),
+      );
+    }
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(10),
+      child: SizedBox(
+        width: widget.width,
+        child: AspectRatio(
+          aspectRatio: controller.value.aspectRatio == 0
+              ? 16 / 9
+              : controller.value.aspectRatio,
+          child: VideoPlayer(controller),
+        ),
+      ),
+    );
   }
 }
 

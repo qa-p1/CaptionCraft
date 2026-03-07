@@ -1,4 +1,4 @@
-﻿import 'dart:io';
+import 'dart:io';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit_config.dart';
 import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
@@ -32,13 +32,17 @@ class FFmpegService {
   /// Returns the path to the extracted audio file.
   static Future<String> extractAudio(
     String videoPath, {
+    Duration? startTime,
+    Duration? clipDuration,
     void Function(double progress)? onProgress,
   }) async {
     final tempDir = await getTemporaryDirectory();
     final flacPath = p.join(tempDir.path, 'caption_craft_audio.flac');
 
     // Get video duration for progress reporting
-    final durationMs = await _getMediaDurationMs(videoPath);
+    final durationMs =
+        clipDuration?.inMilliseconds.toDouble() ??
+        await _getMediaDurationMs(videoPath);
 
     // Enable statistics callback for progress
     if (onProgress != null && durationMs > 0) {
@@ -50,9 +54,14 @@ class FFmpegService {
       });
     }
 
+    final segmentArgs = <String>[
+      if (startTime != null) '-ss ${_formatDurationForFfmpeg(startTime)}',
+      if (clipDuration != null) '-t ${_formatDurationForFfmpeg(clipDuration)}',
+    ].join(' ');
+
     // Try FLAC first (lossless, good compression for speech)
     final flacCommand =
-        '-i "$videoPath" -vn -ar ${GroqConstants.targetAudioSampleRate} '
+        '-i "$videoPath" $segmentArgs -vn -ar ${GroqConstants.targetAudioSampleRate} '
         '-ac ${GroqConstants.targetAudioChannels} -c:a flac "$flacPath" -y';
 
     final session = await FFmpegKit.execute(flacCommand);
@@ -69,7 +78,7 @@ class FFmpegService {
     // Fallback to MP3 (smaller but still fine for speech)
     final mp3Path = p.join(tempDir.path, 'caption_craft_audio.mp3');
     final mp3Command =
-        '-i "$videoPath" -vn -ar ${GroqConstants.targetAudioSampleRate} '
+        '-i "$videoPath" $segmentArgs -vn -ar ${GroqConstants.targetAudioSampleRate} '
         '-ac ${GroqConstants.targetAudioChannels} -b:a 64k "$mp3Path" -y';
 
     final mp3Session = await FFmpegKit.execute(mp3Command);
@@ -129,12 +138,14 @@ class FFmpegService {
         throw Exception('Audio chunking failed at chunk $index: $logs');
       }
 
-      chunks.add(AudioChunk(
-        index: index,
-        startTime: Duration(seconds: startSec),
-        endTime: Duration(seconds: endSec.toInt()),
-        filePath: chunkPath,
-      ));
+      chunks.add(
+        AudioChunk(
+          index: index,
+          startTime: Duration(seconds: startSec),
+          endTime: Duration(seconds: endSec.toInt()),
+          filePath: chunkPath,
+        ),
+      );
 
       startSec = endSec.toInt() - overlapSec;
       if (startSec >= totalSeconds) break;
@@ -153,7 +164,8 @@ class FFmpegService {
     final tempDir = await getTemporaryDirectory();
     final outputPath = p.join(tempDir.path, 'caption_craft_waveform.png');
 
-    final command = '-i "$audioPath" '
+    final command =
+        '-i "$audioPath" '
         '-filter_complex "showwavespic=s=${width}x$height:colors=white" '
         '-frames:v 1 "$outputPath" -y';
 
@@ -202,16 +214,19 @@ class FFmpegService {
       throw Exception('ASS subtitle file is empty. Cannot burn subtitles.');
     }
     final assContent = await safeAssFile.readAsString();
-    final dialogueCount = RegExp(r'^Dialogue:', multiLine: true)
-        .allMatches(assContent)
-        .length;
+    final dialogueCount = RegExp(
+      r'^Dialogue:',
+      multiLine: true,
+    ).allMatches(assContent).length;
     if (dialogueCount == 0) {
       throw Exception('ASS subtitle file contains no dialogue entries.');
     }
 
     // ignore: avoid_print
-    print('[FFmpeg] ASS path: $safeAssPath (size: $assSize bytes, '
-        'dialogues: $dialogueCount)');
+    print(
+      '[FFmpeg] ASS path: $safeAssPath (size: $assSize bytes, '
+      'dialogues: $dialogueCount)',
+    );
 
     String scaleFilter = '';
     switch (quality) {
@@ -226,18 +241,23 @@ class FFmpegService {
         break;
     }
 
-
     final vfFilter = scaleFilter.isNotEmpty
         ? '${scaleFilter}ass=$safeAssPath'
         : 'ass=$safeAssPath';
 
     final session = await FFmpegKit.executeWithArguments([
-      '-i', videoPath,
-      '-vf', vfFilter,
-      '-c:v', 'libx264',
-      '-crf', '23',
-      '-preset', 'fast',
-      '-c:a', 'copy',
+      '-i',
+      videoPath,
+      '-vf',
+      vfFilter,
+      '-c:v',
+      'libx264',
+      '-crf',
+      '23',
+      '-preset',
+      'fast',
+      '-c:a',
+      'copy',
       outputPath,
       '-y',
     ]);
@@ -262,8 +282,10 @@ class FFmpegService {
     }
 
     // ignore: avoid_print
-    print('[FFmpeg] Burn subtitles SUCCESS. Output: $outputPath '
-        '(${(outputSize / 1024 / 1024).toStringAsFixed(1)} MB)');
+    print(
+      '[FFmpeg] Burn subtitles SUCCESS. Output: $outputPath '
+      '(${(outputSize / 1024 / 1024).toStringAsFixed(1)} MB)',
+    );
 
     return outputPath;
   }
@@ -345,5 +367,18 @@ class FFmpegService {
     } catch (e) {
       return 0;
     }
+  }
+
+  static String _formatDurationForFfmpeg(Duration duration) {
+    final totalMilliseconds = duration.inMilliseconds;
+    final hours = totalMilliseconds ~/ 3600000;
+    final minutes = (totalMilliseconds % 3600000) ~/ 60000;
+    final seconds = (totalMilliseconds % 60000) ~/ 1000;
+    final milliseconds = totalMilliseconds % 1000;
+    final hoursText = hours.toString().padLeft(2, '0');
+    final minutesText = minutes.toString().padLeft(2, '0');
+    final secondsText = seconds.toString().padLeft(2, '0');
+    final millisText = milliseconds.toString().padLeft(3, '0');
+    return '$hoursText:$minutesText:$secondsText.$millisText';
   }
 }
