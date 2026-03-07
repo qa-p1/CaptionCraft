@@ -18,6 +18,7 @@ import '../../auth/providers/auth_provider.dart';
 import '../../quota/providers/quota_provider.dart';
 import '../../quota/screens/quota_exhausted_screen.dart';
 import '../../editor/screens/editor_screen.dart';
+import '../../profile/screens/profile_screen.dart';
 import '../providers/transcription_pipeline.dart';
 import 'processing_screen.dart';
 
@@ -553,7 +554,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       body: SafeArea(
         child: Column(
           children: [
-            _buildTopBar(user, quota),
+            _buildTopBar(user),
             if (_showDeviceQuotaNotice) _buildDeviceQuotaNotice(quota),
             if (_loadWarning != null) _buildLoadWarning(),
             Expanded(
@@ -595,12 +596,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 
-  Widget _buildTopBar(dynamic user, QuotaState quota) {
+  Widget _buildTopBar(dynamic user) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
       child: Row(
         children: [
-          // App logo
           Container(
             width: 40,
             height: 40,
@@ -618,107 +618,32 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               size: 20,
             ),
           ),
-          const SizedBox(width: 12),
-          Text(
-            'CaptionCraft',
-            style: GoogleFonts.inter(
-              fontSize: 22,
-              fontWeight: FontWeight.w700,
-              color: kTextPrimary,
-            ),
-          ),
           const Spacer(),
-
-          // Quota badge
-          if (!quota.isLoading)
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              decoration: BoxDecoration(
-                color: quota.canRun
-                    ? kAccent.withValues(alpha: 0.1)
-                    : kWarning.withValues(alpha: 0.1),
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(
-                  color: quota.canRun
-                      ? kAccent.withValues(alpha: 0.3)
-                      : kWarning.withValues(alpha: 0.3),
-                ),
-              ),
-              child: Text(
-                '${quota.remaining} / ${quota.maxRuns} free',
-                style: GoogleFonts.spaceMono(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w500,
-                  color: quota.canRun ? kAccent : kWarning,
-                ),
-              ),
-            ),
-          const SizedBox(width: 12),
-
-          // User avatar / logout
-          PopupMenuButton<String>(
-            offset: const Offset(0, 48),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(12),
-            ),
-            color: kSurface,
-            icon: CircleAvatar(
-              radius: 18,
-              backgroundColor: kSurfaceElevated,
-              child: Text(
-                (user?.displayName?.isNotEmpty == true)
-                    ? user!.displayName![0].toUpperCase()
-                    : '?',
-                style: GoogleFonts.inter(
-                  color: kTextPrimary,
-                  fontWeight: FontWeight.w600,
-                  fontSize: 16,
-                ),
-              ),
-            ),
-            onSelected: (value) {
-              if (value == 'logout') {
-                ref.read(authNotifierProvider.notifier).signOut();
-              }
+          InkWell(
+            onTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const ProfileScreen()),
+              );
             },
-            itemBuilder: (context) => [
-              PopupMenuItem(
-                enabled: false,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      user?.displayName ?? '',
-                      style: GoogleFonts.inter(
-                        color: kTextPrimary,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                    Text(
-                      user?.email ?? '',
-                      style: GoogleFonts.inter(
-                        color: kTextSecondary,
-                        fontSize: 12,
-                      ),
-                    ),
-                  ],
+            borderRadius: BorderRadius.circular(24),
+            child: Padding(
+              padding: const EdgeInsets.all(2),
+              child: CircleAvatar(
+                radius: 18,
+                backgroundColor: kSurfaceElevated,
+                child: Text(
+                  (user?.displayName?.isNotEmpty == true)
+                      ? user!.displayName![0].toUpperCase()
+                      : '?',
+                  style: GoogleFonts.inter(
+                    color: kTextPrimary,
+                    fontWeight: FontWeight.w600,
+                    fontSize: 16,
+                  ),
                 ),
               ),
-              const PopupMenuDivider(),
-              PopupMenuItem(
-                value: 'logout',
-                child: Row(
-                  children: [
-                    const Icon(Icons.logout_rounded, color: kError, size: 18),
-                    const SizedBox(width: 8),
-                    Text(
-                      'Sign Out',
-                      style: GoogleFonts.inter(color: kError, fontSize: 14),
-                    ),
-                  ],
-                ),
-              ),
-            ],
+            ),
           ),
         ],
       ),
