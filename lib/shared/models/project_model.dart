@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
@@ -17,6 +18,9 @@ class Project {
   SubtitleStyleModel globalStyle;
   final DateTime createdAt;
   DateTime lastModifiedAt;
+  Uint8List? _thumbnailBytesCache;
+  bool _thumbnailDecoded = false;
+  bool? _videoAvailableCache;
 
   Project({
     required this.id,
@@ -28,11 +32,40 @@ class Project {
     this.globalStyle = const SubtitleStyleModel(),
     DateTime? createdAt,
     DateTime? lastModifiedAt,
-  })  : createdAt = createdAt ?? DateTime.now(),
-        lastModifiedAt = lastModifiedAt ?? DateTime.now();
+  }) : createdAt = createdAt ?? DateTime.now(),
+       lastModifiedAt = lastModifiedAt ?? DateTime.now();
 
   /// Whether the source video file still exists on device.
-  bool get isVideoAvailable => File(videoPath).existsSync();
+  bool get isVideoAvailable {
+    final cached = _videoAvailableCache;
+    if (cached != null) return cached;
+
+    final exists = File(videoPath).existsSync();
+    _videoAvailableCache = exists;
+    return exists;
+  }
+
+  Uint8List? get thumbnailBytes {
+    if (_thumbnailDecoded) return _thumbnailBytesCache;
+
+    _thumbnailDecoded = true;
+    final encodedThumbnail = thumbnailBase64;
+    if (encodedThumbnail == null || encodedThumbnail.isEmpty) {
+      return null;
+    }
+
+    try {
+      _thumbnailBytesCache = base64Decode(encodedThumbnail);
+    } catch (_) {
+      _thumbnailBytesCache = null;
+    }
+
+    return _thumbnailBytesCache;
+  }
+
+  void cacheVideoAvailability(bool isAvailable) {
+    _videoAvailableCache = isAvailable;
+  }
 
   Duration get duration => Duration(milliseconds: durationMs);
 
@@ -57,14 +90,15 @@ class Project {
       videoPath: data['videoPath'] as String? ?? '',
       thumbnailBase64: data['thumbnailBase64'] as String?,
       durationMs: (data['durationMs'] as num?)?.toInt() ?? 0,
-      subtitles: (data['subtitles'] as List<dynamic>?)
-              ?.map((e) =>
-                  SubtitleEntry.fromJson(e as Map<String, dynamic>))
+      subtitles:
+          (data['subtitles'] as List<dynamic>?)
+              ?.map((e) => SubtitleEntry.fromJson(e as Map<String, dynamic>))
               .toList() ??
           [],
       globalStyle: data['globalStyle'] != null
           ? SubtitleStyleModel.fromJson(
-              data['globalStyle'] as Map<String, dynamic>)
+              data['globalStyle'] as Map<String, dynamic>,
+            )
           : const SubtitleStyleModel(),
       createdAt: (data['createdAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
       lastModifiedAt:
@@ -93,20 +127,22 @@ class Project {
       videoPath: data['videoPath'] as String? ?? '',
       thumbnailBase64: data['thumbnailBase64'] as String?,
       durationMs: (data['durationMs'] as num?)?.toInt() ?? 0,
-      subtitles: (data['subtitles'] as List<dynamic>?)
-              ?.map((e) =>
-                  SubtitleEntry.fromJson(e as Map<String, dynamic>))
+      subtitles:
+          (data['subtitles'] as List<dynamic>?)
+              ?.map((e) => SubtitleEntry.fromJson(e as Map<String, dynamic>))
               .toList() ??
           [],
       globalStyle: data['globalStyle'] != null
           ? SubtitleStyleModel.fromJson(
-              data['globalStyle'] as Map<String, dynamic>)
+              data['globalStyle'] as Map<String, dynamic>,
+            )
           : const SubtitleStyleModel(),
-      createdAt: DateTime.tryParse(data['createdAt'] as String? ?? '') ??
+      createdAt:
+          DateTime.tryParse(data['createdAt'] as String? ?? '') ??
           DateTime.now(),
       lastModifiedAt:
           DateTime.tryParse(data['lastModifiedAt'] as String? ?? '') ??
-              DateTime.now(),
+          DateTime.now(),
     );
   }
 
@@ -158,19 +194,26 @@ class ProjectLocalStorage {
 
     if (!await directory.exists()) return [];
 
-    final projects = <Project>[];
-    await for (final entity in directory.list()) {
-      if (entity is File && entity.path.endsWith('.json')) {
+    final entities = await directory.list().toList();
+    final files = entities
+        .whereType<File>()
+        .where((file) => file.path.endsWith('.json'))
+        .toList();
+
+    final loadedProjects = await Future.wait(
+      files.map((file) async {
         try {
-          final content = await entity.readAsString();
+          final content = await file.readAsString();
           final data = jsonDecode(content) as Map<String, dynamic>;
-          projects.add(Project.fromJson(data));
-        } catch (e) {
-          // Skip corrupted files
-          continue;
+          return Project.fromJson(data);
+        } catch (_) {
+          // Skip corrupted files.
+          return null;
         }
-      }
-    }
+      }),
+    );
+
+    final projects = loadedProjects.whereType<Project>().toList();
 
     projects.sort((a, b) => b.lastModifiedAt.compareTo(a.lastModifiedAt));
     return projects;
