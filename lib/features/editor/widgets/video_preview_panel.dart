@@ -32,6 +32,23 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
   bool _playbackSyncQueued = false;
   double _playbackSpeed = 1.0;
 
+  Duration _timelineDuration() {
+    final timeline = ref.read(editorProvider).timeline;
+    return timeline.tracks
+        .expand((track) => track.clips)
+        .fold<Duration>(
+          Duration.zero,
+          (current, clip) => clip.endTime > current ? clip.endTime : current,
+        );
+  }
+
+  Duration _editorPlaybackDuration(Duration controllerDuration) {
+    final timelineDuration = _timelineDuration();
+    return timelineDuration > controllerDuration
+        ? timelineDuration
+        : controllerDuration;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -48,7 +65,9 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       final playbackNotifier = ref.read(playbackProvider.notifier);
-      playbackNotifier.updateDuration(_controller.value.duration);
+      playbackNotifier.updateDuration(
+        _editorPlaybackDuration(_controller.value.duration),
+      );
       playbackNotifier.setReady(true);
     });
 
@@ -65,8 +84,9 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
       if (!mounted) return;
       final controllerValue = _controller.value;
       final playback = ref.read(playbackProvider.notifier);
-      if (controllerValue.duration > Duration.zero) {
-        playback.updateDuration(controllerValue.duration);
+      final editorDuration = _editorPlaybackDuration(controllerValue.duration);
+      if (editorDuration > Duration.zero) {
+        playback.updateDuration(editorDuration);
       }
       playback.updatePosition(controllerValue.position);
       playback.setPlaying(controllerValue.isPlaying);

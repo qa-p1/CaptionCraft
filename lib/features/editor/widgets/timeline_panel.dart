@@ -791,7 +791,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
           Duration.zero,
           (current, clip) => clip.endTime > current ? clip.endTime : current,
         );
-    final totalDuration = playbackState.duration > Duration.zero
+    final totalDuration = playbackState.duration > fallbackDuration
         ? playbackState.duration
         : fallbackDuration;
     final viewportWidth = MediaQuery.of(context).size.width;
