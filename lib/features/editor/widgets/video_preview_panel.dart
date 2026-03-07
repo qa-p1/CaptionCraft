@@ -63,9 +63,13 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _playbackSyncQueued = false;
       if (!mounted) return;
+      final controllerValue = _controller.value;
       final playback = ref.read(playbackProvider.notifier);
-      playback.updatePosition(_controller.value.position);
-      playback.setPlaying(_controller.value.isPlaying);
+      if (controllerValue.duration > Duration.zero) {
+        playback.updateDuration(controllerValue.duration);
+      }
+      playback.updatePosition(controllerValue.position);
+      playback.setPlaying(controllerValue.isPlaying);
     });
   }
 

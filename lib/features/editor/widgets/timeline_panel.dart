@@ -781,13 +781,20 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
     final subtitleNotifier = ref.read(subtitleProvider.notifier);
     final editorState = ref.watch(editorProvider);
     final editorNotifier = ref.read(editorProvider.notifier);
-    final totalDuration = playbackState.duration;
-    final viewportWidth = MediaQuery.of(context).size.width;
-
     final timeline = editorState.timeline.mergeSubtitleEntries(
       subtitles: subtitleState.entries,
       globalStyle: subtitleState.globalStyle,
     );
+    final fallbackDuration = timeline.tracks
+        .expand((track) => track.clips)
+        .fold<Duration>(
+          Duration.zero,
+          (current, clip) => clip.endTime > current ? clip.endTime : current,
+        );
+    final totalDuration = playbackState.duration > Duration.zero
+        ? playbackState.duration
+        : fallbackDuration;
+    final viewportWidth = MediaQuery.of(context).size.width;
     final selectedSelection = _selectedClipSelection(
       timeline,
       editorState.selectedClipId,
