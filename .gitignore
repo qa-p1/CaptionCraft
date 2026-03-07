@@ -147,3 +147,4 @@ tags
 .swiftpm/
 .Trash-*
 migrate_working_dir/
+/.idea/
