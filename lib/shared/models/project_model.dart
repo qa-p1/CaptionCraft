@@ -16,8 +16,8 @@ class Project {
   final String? thumbnailBase64;
   final int durationMs;
   final List<SubtitleEntry> subtitles;
-  SubtitleStyleModel globalStyle;
   final EditorTimeline timeline;
+  SubtitleStyleModel globalStyle;
   final DateTime createdAt;
   DateTime lastModifiedAt;
   Uint8List? _thumbnailBytesCache;
@@ -31,19 +31,11 @@ class Project {
     this.thumbnailBase64,
     required this.durationMs,
     this.subtitles = const [],
+    this.timeline = const EditorTimeline(),
     this.globalStyle = const SubtitleStyleModel(),
-    EditorTimeline? timeline,
     DateTime? createdAt,
     DateTime? lastModifiedAt,
-  }) : timeline =
-           timeline ??
-           EditorTimeline.fromLegacy(
-             subtitles: subtitles,
-             globalStyle: globalStyle,
-             videoPath: videoPath,
-             durationMs: durationMs,
-           ),
-       createdAt = createdAt ?? DateTime.now(),
+  }) : createdAt = createdAt ?? DateTime.now(),
        lastModifiedAt = lastModifiedAt ?? DateTime.now();
 
   /// Whether the source video file still exists on device.
@@ -88,43 +80,26 @@ class Project {
       'thumbnailBase64': thumbnailBase64,
       'durationMs': durationMs,
       'subtitles': subtitles.map((e) => e.toJson()).toList(),
-      'globalStyle': globalStyle.toJson(),
       'timeline': timeline.toJson(),
+      'globalStyle': globalStyle.toJson(),
       'createdAt': Timestamp.fromDate(createdAt),
       'lastModifiedAt': Timestamp.fromDate(lastModifiedAt),
     };
   }
 
   factory Project.fromFirestore(Map<String, dynamic> data) {
-    final legacySubtitles =
+    final subtitles =
         (data['subtitles'] as List<dynamic>?)
             ?.map((e) => SubtitleEntry.fromJson(e as Map<String, dynamic>))
             .toList() ??
         [];
-    final legacyStyle = data['globalStyle'] != null
+    final globalStyle = data['globalStyle'] != null
         ? SubtitleStyleModel.fromJson(
             data['globalStyle'] as Map<String, dynamic>,
           )
         : const SubtitleStyleModel();
     final videoPath = data['videoPath'] as String? ?? '';
     final durationMs = (data['durationMs'] as num?)?.toInt() ?? 0;
-    final timeline = data['timeline'] is Map<String, dynamic>
-        ? EditorTimeline.fromJson(data['timeline'] as Map<String, dynamic>)
-        : EditorTimeline.fromLegacy(
-            subtitles: legacySubtitles,
-            globalStyle: legacyStyle,
-            videoPath: videoPath,
-            durationMs: durationMs,
-          );
-    final normalizedTimeline =
-        timeline.primarySubtitleTrack != null || legacySubtitles.isEmpty
-        ? timeline
-        : timeline.syncLegacySubtitles(
-            subtitles: legacySubtitles,
-            globalStyle: legacyStyle,
-            videoPath: videoPath,
-            durationMs: durationMs,
-          );
 
     return Project(
       id: data['id'] as String,
@@ -132,9 +107,15 @@ class Project {
       videoPath: videoPath,
       thumbnailBase64: data['thumbnailBase64'] as String?,
       durationMs: durationMs,
-      subtitles: normalizedTimeline.subtitleEntries,
-      globalStyle: normalizedTimeline.subtitleStyle,
-      timeline: normalizedTimeline,
+      subtitles: subtitles,
+      timeline: _timelineFromData(
+        data['timeline'],
+        subtitles: subtitles,
+        globalStyle: globalStyle,
+        videoPath: videoPath,
+        durationMs: durationMs,
+      ),
+      globalStyle: globalStyle,
       createdAt: (data['createdAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
       lastModifiedAt:
           (data['lastModifiedAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
@@ -149,43 +130,26 @@ class Project {
       'thumbnailBase64': thumbnailBase64,
       'durationMs': durationMs,
       'subtitles': subtitles.map((e) => e.toJson()).toList(),
-      'globalStyle': globalStyle.toJson(),
       'timeline': timeline.toJson(),
+      'globalStyle': globalStyle.toJson(),
       'createdAt': createdAt.toIso8601String(),
       'lastModifiedAt': lastModifiedAt.toIso8601String(),
     };
   }
 
   factory Project.fromJson(Map<String, dynamic> data) {
-    final legacySubtitles =
+    final subtitles =
         (data['subtitles'] as List<dynamic>?)
             ?.map((e) => SubtitleEntry.fromJson(e as Map<String, dynamic>))
             .toList() ??
         [];
-    final legacyStyle = data['globalStyle'] != null
+    final globalStyle = data['globalStyle'] != null
         ? SubtitleStyleModel.fromJson(
             data['globalStyle'] as Map<String, dynamic>,
           )
         : const SubtitleStyleModel();
     final videoPath = data['videoPath'] as String? ?? '';
     final durationMs = (data['durationMs'] as num?)?.toInt() ?? 0;
-    final timeline = data['timeline'] is Map<String, dynamic>
-        ? EditorTimeline.fromJson(data['timeline'] as Map<String, dynamic>)
-        : EditorTimeline.fromLegacy(
-            subtitles: legacySubtitles,
-            globalStyle: legacyStyle,
-            videoPath: videoPath,
-            durationMs: durationMs,
-          );
-    final normalizedTimeline =
-        timeline.primarySubtitleTrack != null || legacySubtitles.isEmpty
-        ? timeline
-        : timeline.syncLegacySubtitles(
-            subtitles: legacySubtitles,
-            globalStyle: legacyStyle,
-            videoPath: videoPath,
-            durationMs: durationMs,
-          );
 
     return Project(
       id: data['id'] as String,
@@ -193,9 +157,15 @@ class Project {
       videoPath: videoPath,
       thumbnailBase64: data['thumbnailBase64'] as String?,
       durationMs: durationMs,
-      subtitles: normalizedTimeline.subtitleEntries,
-      globalStyle: normalizedTimeline.subtitleStyle,
-      timeline: normalizedTimeline,
+      subtitles: subtitles,
+      timeline: _timelineFromData(
+        data['timeline'],
+        subtitles: subtitles,
+        globalStyle: globalStyle,
+        videoPath: videoPath,
+        durationMs: durationMs,
+      ),
+      globalStyle: globalStyle,
       createdAt:
           DateTime.tryParse(data['createdAt'] as String? ?? '') ??
           DateTime.now(),
@@ -208,31 +178,41 @@ class Project {
   Project copyWith({
     String? name,
     List<SubtitleEntry>? subtitles,
-    SubtitleStyleModel? globalStyle,
     EditorTimeline? timeline,
+    SubtitleStyleModel? globalStyle,
     DateTime? lastModifiedAt,
     String? thumbnailBase64,
   }) {
-    final nextSubtitles = subtitles ?? this.subtitles;
-    final nextStyle = globalStyle ?? this.globalStyle;
-    final nextTimeline =
-        timeline ??
-        this.timeline.mergeSubtitleEntries(
-          subtitles: nextSubtitles,
-          globalStyle: nextStyle,
-        );
-
     return Project(
       id: id,
       name: name ?? this.name,
       videoPath: videoPath,
       thumbnailBase64: thumbnailBase64 ?? this.thumbnailBase64,
       durationMs: durationMs,
-      subtitles: nextSubtitles,
-      globalStyle: nextStyle,
-      timeline: nextTimeline,
+      subtitles: subtitles ?? this.subtitles,
+      timeline: timeline ?? this.timeline,
+      globalStyle: globalStyle ?? this.globalStyle,
       createdAt: createdAt,
       lastModifiedAt: lastModifiedAt ?? this.lastModifiedAt,
+    );
+  }
+
+  static EditorTimeline _timelineFromData(
+    Object? value, {
+    required List<SubtitleEntry> subtitles,
+    required SubtitleStyleModel globalStyle,
+    required String videoPath,
+    required int durationMs,
+  }) {
+    if (value is Map) {
+      return EditorTimeline.fromJson(Map<String, dynamic>.from(value));
+    }
+
+    return const EditorTimeline().syncLegacySubtitles(
+      subtitles: subtitles,
+      globalStyle: globalStyle,
+      videoPath: videoPath,
+      durationMs: durationMs,
     );
   }
 }
