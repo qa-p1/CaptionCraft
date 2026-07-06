@@ -174,6 +174,16 @@ class TranscriptionPipeline {
         );
 
         allWords.addAll(words);
+
+        _emitProgress(
+          ProcessingStage.transcribing,
+          0.30 + ((i + 1) / chunks.length) * 0.55,
+          chunks.length > 1
+              ? 'Finished chunk ${i + 1} of ${chunks.length}...'
+              : 'Transcription received...',
+          currentChunk: i,
+          totalChunks: chunks.length,
+        );
       }
 
       if (_cancelled) return null;

@@ -123,10 +123,14 @@ class FFmpegService {
 
     while (startSec < totalSeconds) {
       final endSec = (startSec + chunkDurationSec).clamp(0, totalSeconds);
+      final durationSec = endSec - startSec;
+      if (durationSec <= 0) {
+        break;
+      }
       final chunkPath = p.join(tempDir.path, 'cc_chunk_$index.mp3');
 
       final command =
-          '-i "$audioPath" -ss $startSec -t ${endSec - startSec} '
+          '-i "$audioPath" -ss $startSec -t $durationSec '
           '-ar ${GroqConstants.targetAudioSampleRate} '
           '-ac ${GroqConstants.targetAudioChannels} -b:a 64k "$chunkPath" -y';
 
@@ -147,8 +151,15 @@ class FFmpegService {
         ),
       );
 
-      startSec = endSec.toInt() - overlapSec;
-      if (startSec >= totalSeconds) break;
+      if (endSec >= totalSeconds) {
+        break;
+      }
+      final nextStartSec = endSec.toInt() - overlapSec;
+      if (nextStartSec <= startSec) {
+        startSec = endSec.toInt();
+      } else {
+        startSec = nextStartSec;
+      }
       index++;
     }
 

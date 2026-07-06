@@ -145,11 +145,6 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           actions: [
             _buildAspectRatioPicker(),
             IconButton(
-              tooltip: 'Generate subtitles',
-              icon: const Icon(Icons.subtitles_rounded, color: kTextPrimary),
-              onPressed: _handleGenerateSubtitles,
-            ),
-            IconButton(
               tooltip: 'Export / Import',
               icon: const Icon(Icons.ios_share_rounded, color: kTextPrimary),
               onPressed: _showExportActions,
@@ -406,74 +401,117 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     }
 
     final timeline = ref.read(editorProvider).timeline;
-    final targetClip = await _resolveTargetVideoClip(timeline);
+    final targetClip = await _chooseCaptionSourceClip(timeline);
     if (targetClip == null || !mounted) return;
 
-    await _generateSubtitlesForClip(targetClip, timeline);
+    await _generateSubtitlesForMediaClip(targetClip, timeline);
   }
 
-  Future<TimelineClip?> _resolveTargetVideoClip(EditorTimeline timeline) async {
-    final videoClips = timeline.videoClips;
-    if (videoClips.isEmpty) {
-      SnackBarHelper.showInfo(context, 'Import a video clip first.');
+  Future<TimelineClip?> _chooseCaptionSourceClip(
+    EditorTimeline timeline,
+  ) async {
+    final captionSources =
+        timeline.tracks
+            .expand((track) => track.clips)
+            .where(
+              (clip) =>
+                  clip.type == TimelineTrackType.video ||
+                  clip.type == TimelineTrackType.audio,
+            )
+            .toList()
+          ..sort((a, b) {
+            final startCompare = a.startTime.compareTo(b.startTime);
+            if (startCompare != 0) return startCompare;
+            return a.type.index.compareTo(b.type.index);
+          });
+
+    if (captionSources.isEmpty) {
+      SnackBarHelper.showInfo(
+        context,
+        'Add a video or audio clip before generating captions.',
+      );
       return null;
-    }
-
-    final selectedClipId = ref.read(editorProvider).selectedClipId;
-    if (selectedClipId != null) {
-      for (final clip in videoClips) {
-        if (clip.id == selectedClipId) {
-          return clip;
-        }
-      }
-    }
-
-    if (videoClips.length == 1) {
-      return videoClips.first;
     }
 
     return showModalBottomSheet<TimelineClip>(
       context: context,
       backgroundColor: kSurface,
+      isScrollControlled: true,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
       builder: (_) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const SizedBox(height: 10),
-            Text(
-              'Choose Video Clip',
-              style: GoogleFonts.inter(
-                color: kTextPrimary,
-                fontSize: 16,
-                fontWeight: FontWeight.w600,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.of(context).size.height * 0.72,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(height: 10),
+              Container(
+                width: 42,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: kBorder,
+                  borderRadius: BorderRadius.circular(999),
+                ),
               ),
-            ),
-            const SizedBox(height: 8),
-            ...videoClips.map((clip) {
-              return ListTile(
-                leading: const Icon(Icons.movie_creation_outlined),
-                title: Text(
-                  clip.label,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+              const SizedBox(height: 14),
+              Text(
+                'Choose caption source',
+                style: GoogleFonts.inter(
+                  color: kTextPrimary,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
                 ),
-                subtitle: Text(
-                  '${SubtitleEntry.formatDisplayTime(clip.startTime)} - ${SubtitleEntry.formatDisplayTime(clip.endTime)}',
+              ),
+              const SizedBox(height: 8),
+              Flexible(
+                child: ListView.separated(
+                  shrinkWrap: true,
+                  itemCount: captionSources.length,
+                  separatorBuilder: (_, _) =>
+                      const Divider(color: kBorder, height: 1),
+                  itemBuilder: (_, index) {
+                    final clip = captionSources[index];
+                    final isAudio = clip.type == TimelineTrackType.audio;
+                    return ListTile(
+                      leading: Icon(
+                        isAudio
+                            ? Icons.graphic_eq_rounded
+                            : Icons.movie_creation_outlined,
+                        color: kTextPrimary,
+                      ),
+                      title: Text(
+                        clip.label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: GoogleFonts.inter(color: kTextPrimary),
+                      ),
+                      subtitle: Text(
+                        '${isAudio ? 'Audio' : 'Video'} • '
+                        '${SubtitleEntry.formatDisplayTime(clip.startTime)} - '
+                        '${SubtitleEntry.formatDisplayTime(clip.endTime)}',
+                        style: GoogleFonts.inter(
+                          color: kTextSecondary,
+                          fontSize: 12,
+                        ),
+                      ),
+                      onTap: () => Navigator.pop(context, clip),
+                    );
+                  },
                 ),
-                onTap: () => Navigator.pop(context, clip),
-              );
-            }),
-            const SizedBox(height: 6),
-          ],
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
         ),
       ),
     );
   }
 
-  Future<void> _generateSubtitlesForClip(
+  Future<void> _generateSubtitlesForMediaClip(
     TimelineClip targetClip,
     EditorTimeline timeline,
   ) async {
@@ -490,11 +528,15 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         break;
       }
     }
-    final videoPath = sourceAsset?.sourcePath ?? widget.project.videoPath;
-    if (videoPath.isEmpty) {
+    final mediaPath =
+        sourceAsset?.sourcePath ??
+        (targetClip.type == TimelineTrackType.video
+            ? widget.project.videoPath
+            : '');
+    if (mediaPath.isEmpty) {
       SnackBarHelper.showError(
         context,
-        'Video source is missing for this clip.',
+        'Media source is missing for this clip.',
       );
       return;
     }
@@ -536,7 +578,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
 
     try {
       final generatedEntries = await pipeline.transcribeVideoSegment(
-        videoPath: videoPath,
+        videoPath: mediaPath,
         startTime: targetClip.sourceStartTime,
         clipDuration: targetClip.sourceDuration,
       );
@@ -594,7 +636,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       if (mounted) {
         SnackBarHelper.showSuccess(
           context,
-          'Generated ${shiftedEntries.length} subtitles for ${targetClip.label}',
+          'Generated ${shiftedEntries.length} captions for ${targetClip.label}',
         );
       }
     } catch (e) {
@@ -1472,6 +1514,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                     onTap: canAdjustAudio
                         ? () => _openAudioControlsSheet(selectedClip)
                         : _pickAudioMedia,
+                  ),
+                  _buildQuickActionButton(
+                    tooltip: 'Generate captions',
+                    icon: Icons.closed_caption_rounded,
+                    onTap: _handleGenerateSubtitles,
                   ),
                   _buildQuickActionButton(
                     tooltip: 'Open GIF picker',

@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:convert';
 import 'package:dio/dio.dart';
 import '../constants/groq_constants.dart';
 import '../../features/editor/models/subtitle_entry.dart';
@@ -8,14 +9,15 @@ import '../../features/editor/models/word_timing.dart';
 class GroqService {
   GroqService._();
 
-  static final Dio _dio = Dio(BaseOptions(
-    baseUrl: GroqConstants.baseUrl,
-    headers: {
-      'Authorization': 'Bearer ${GroqConstants.apiKey}',
-    },
-    connectTimeout: const Duration(seconds: 30),
-    receiveTimeout: const Duration(seconds: 120),
-  ));
+  static final Dio _dio = Dio(
+    BaseOptions(
+      baseUrl: GroqConstants.baseUrl,
+      headers: {'Authorization': 'Bearer ${GroqConstants.apiKey}'},
+      connectTimeout: const Duration(seconds: 30),
+      sendTimeout: const Duration(seconds: 120),
+      receiveTimeout: const Duration(seconds: 120),
+    ),
+  );
 
   /// Transcribe a single audio chunk and return a list of WordTiming.
   /// [chunkStartOffset] is added to all word timestamps for multi-chunk alignment.
@@ -42,10 +44,9 @@ class GroqService {
           if (language.isNotEmpty) 'language': language,
         });
 
-        final response = await _dio.post(
-          GroqConstants.transcriptionsEndpoint,
-          data: formData,
-        );
+        final response = await _dio
+            .post(GroqConstants.transcriptionsEndpoint, data: formData)
+            .timeout(const Duration(minutes: 4));
 
         return _parseWords(response.data, chunkStartOffset);
       } on DioException catch (e) {
@@ -68,32 +69,75 @@ class GroqService {
     }
 
     throw Exception(
-        'Transcription failed after $maxRetries retries for chunk $chunkIndex');
+      'Transcription failed after $maxRetries retries for chunk $chunkIndex',
+    );
   }
 
   /// Parse Groq's verbose_json response words array into WordTiming list.
-  static List<WordTiming> _parseWords(
-    dynamic responseData,
-    Duration offset,
-  ) {
-    final words = responseData['words'] as List<dynamic>? ?? [];
+  static List<WordTiming> _parseWords(dynamic responseData, Duration offset) {
+    final data = responseData is String
+        ? jsonDecode(responseData) as Map<String, dynamic>
+        : responseData as Map<String, dynamic>;
+    final words = _extractWordItems(data);
     final timings = <WordTiming>[];
 
     for (final word in words) {
-      final startSec = (word['start'] as num).toDouble();
-      final endSec = (word['end'] as num).toDouble();
-      final text = (word['word'] as String).trim();
+      final text = ((word['word'] ?? word['text']) as String? ?? '').trim();
+      final startValue = word['start'];
+      final endValue = word['end'];
 
-      if (text.isEmpty) continue;
+      if (text.isEmpty || startValue is! num || endValue is! num) continue;
 
-      timings.add(WordTiming(
-        word: text,
-        startTime: Duration(milliseconds: (startSec * 1000).round()) + offset,
-        endTime: Duration(milliseconds: (endSec * 1000).round()) + offset,
-      ));
+      timings.add(
+        WordTiming(
+          word: text,
+          startTime:
+              Duration(milliseconds: (startValue.toDouble() * 1000).round()) +
+              offset,
+          endTime:
+              Duration(milliseconds: (endValue.toDouble() * 1000).round()) +
+              offset,
+        ),
+      );
     }
 
     return timings;
+  }
+
+  static List<Map<String, dynamic>> _extractWordItems(
+    Map<String, dynamic> data,
+  ) {
+    final topLevelWords = data['words'];
+    if (topLevelWords is List) {
+      return topLevelWords
+          .whereType<Map>()
+          .map((word) => Map<String, dynamic>.from(word))
+          .toList();
+    }
+
+    final segments = data['segments'];
+    if (segments is! List) return const [];
+
+    final words = <Map<String, dynamic>>[];
+    for (final segment in segments.whereType<Map>()) {
+      final segmentWords = segment['words'];
+      if (segmentWords is List) {
+        words.addAll(
+          segmentWords.whereType<Map>().map(
+            (word) => Map<String, dynamic>.from(word),
+          ),
+        );
+        continue;
+      }
+
+      final text = segment['text'];
+      final start = segment['start'];
+      final end = segment['end'];
+      if (text is String && start is num && end is num) {
+        words.add({'word': text, 'start': start, 'end': end});
+      }
+    }
+    return words;
   }
 
   /// Group consecutive words into line-level SubtitleEntry blocks.
@@ -117,19 +161,22 @@ class GroqService {
       // Check for natural pause gap (> 400ms between current word's end and next word's start)
       bool hasGap = false;
       if (!isLastWord) {
-        final gapMs = allWords[i + 1].startTime.inMilliseconds -
+        final gapMs =
+            allWords[i + 1].startTime.inMilliseconds -
             allWords[i].endTime.inMilliseconds;
         hasGap = gapMs > 400;
       }
 
       // Decide whether to flush the current group
       if (isLastWord || hasMaxWords || (hasEnoughWords && hasGap)) {
-        entries.add(SubtitleEntry(
-          startTime: currentGroupWords.first.startTime,
-          endTime: currentGroupWords.last.endTime,
-          text: currentGroupWords.map((w) => w.word).join(' '),
-          words: List<WordTiming>.from(currentGroupWords),
-        ));
+        entries.add(
+          SubtitleEntry(
+            startTime: currentGroupWords.first.startTime,
+            endTime: currentGroupWords.last.endTime,
+            text: currentGroupWords.map((w) => w.word).join(' '),
+            words: List<WordTiming>.from(currentGroupWords),
+          ),
+        );
         currentGroupWords = <WordTiming>[];
       }
     }
@@ -139,7 +186,8 @@ class GroqService {
 
   /// Deduplicate overlapping entries that arise from chunk overlap.
   static List<SubtitleEntry> deduplicateOverlaps(
-      List<SubtitleEntry> allEntries) {
+    List<SubtitleEntry> allEntries,
+  ) {
     if (allEntries.length <= 1) return allEntries;
 
     // Sort by start time
@@ -152,10 +200,9 @@ class GroqService {
 
       // If entries overlap significantly (>50% of shorter duration), skip the later one
       final overlapStart = current.startTime;
-      final overlapEnd =
-          prev.endTime.compareTo(current.endTime) < 0
-              ? prev.endTime
-              : current.endTime;
+      final overlapEnd = prev.endTime.compareTo(current.endTime) < 0
+          ? prev.endTime
+          : current.endTime;
 
       if (overlapStart < overlapEnd) {
         final overlapDuration = overlapEnd - overlapStart;
