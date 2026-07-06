@@ -46,6 +46,8 @@ class EditorScreen extends ConsumerStatefulWidget {
 
 enum _CanvasAspectRatio { original, ratio16x9, ratio9x16, ratio1x1, ratio4x5 }
 
+enum _BottomActionCategory { overlay, text, audio, motion }
+
 class _EditorScreenState extends ConsumerState<EditorScreen>
     with WidgetsBindingObserver {
   Timer? _saveDebounce;
@@ -53,6 +55,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   bool _queuedProjectSave = false;
   bool _queuedRemoteSync = false;
   _CanvasAspectRatio _canvasAspectRatio = _CanvasAspectRatio.original;
+  _BottomActionCategory? _activeBottomCategory;
 
   @override
   void initState() {
@@ -1481,70 +1484,259 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         selectedTrack != null &&
         (selectedTrack.section == TimelineTrackSection.overlay ||
             selectedTrack.section == TimelineTrackSection.baseVideo);
+    final canTransition =
+        selectedClip != null &&
+        selectedTrack?.section == TimelineTrackSection.baseVideo;
 
     return Container(
-      height: 60,
+      height: 64,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: const BoxDecoration(
         color: kSurface,
         border: Border(top: BorderSide(color: kBorder)),
       ),
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          return SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: ConstrainedBox(
-              constraints: BoxConstraints(minWidth: constraints.maxWidth),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceAround,
-                children: [
-                  _buildQuickActionButton(
-                    tooltip: 'Add overlay',
-                    icon: Icons.perm_media_rounded,
-                    onTap: _pickOverlayMedia,
-                  ),
-                  _buildQuickActionButton(
-                    tooltip: 'Add text',
-                    icon: Icons.title_rounded,
-                    onTap: _addTextClipAtPlayhead,
-                  ),
-                  _buildQuickActionButton(
-                    tooltip: 'Add audio',
-                    icon: Icons.music_note_rounded,
-                    onTap: canAdjustAudio
-                        ? () => _openAudioControlsSheet(selectedClip)
-                        : _pickAudioMedia,
-                  ),
-                  _buildQuickActionButton(
-                    tooltip: 'Generate captions',
-                    icon: Icons.closed_caption_rounded,
-                    onTap: _handleGenerateSubtitles,
-                  ),
-                  _buildQuickActionButton(
-                    tooltip: 'Open GIF picker',
-                    icon: Icons.emoji_emotions_outlined,
-                    onTap: _openGiphyPickerSheet,
-                  ),
-                  _buildQuickActionButton(
-                    tooltip: 'Clip animation',
-                    icon: Icons.auto_awesome_motion_rounded,
-                    onTap: canAnimateClip
-                        ? () =>
-                              _openClipAnimationSheetForSelection(selectedClip)
-                        : null,
-                  ),
-                  _buildQuickActionButton(
-                    tooltip: 'Subtitle style',
-                    icon: Icons.palette_outlined,
-                    onTap: () => _openStylePanelSheet(context),
-                  ),
-                ],
-              ),
-            ),
+      child: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 220),
+        switchInCurve: Curves.easeOutCubic,
+        switchOutCurve: Curves.easeInCubic,
+        transitionBuilder: (child, animation) {
+          final isCategoryRow = child.key == const ValueKey('categories');
+          final offset = Tween<Offset>(
+            begin: isCategoryRow
+                ? const Offset(-0.18, 0)
+                : const Offset(0.18, 0),
+            end: Offset.zero,
+          ).animate(animation);
+          return FadeTransition(
+            opacity: animation,
+            child: SlideTransition(position: offset, child: child),
           );
         },
+        child: _activeBottomCategory == null
+            ? _buildCategoryRow()
+            : _buildToolRow(
+                category: _activeBottomCategory!,
+                selectedClip: selectedClip,
+                canAdjustAudio: canAdjustAudio,
+                canAnimateClip: canAnimateClip,
+                canTransition: canTransition,
+              ),
       ),
     );
+  }
+
+  Widget _buildCategoryRow() {
+    final categories = [
+      _ActionSpec(
+        label: 'Overlay',
+        tooltip: 'Overlay tools',
+        icon: Icons.layers_rounded,
+        onTap: () => setState(
+          () => _activeBottomCategory = _BottomActionCategory.overlay,
+        ),
+      ),
+      _ActionSpec(
+        label: 'Text',
+        tooltip: 'Text tools',
+        icon: Icons.title_rounded,
+        onTap: () =>
+            setState(() => _activeBottomCategory = _BottomActionCategory.text),
+      ),
+      _ActionSpec(
+        label: 'Audio',
+        tooltip: 'Audio tools',
+        icon: Icons.graphic_eq_rounded,
+        onTap: () =>
+            setState(() => _activeBottomCategory = _BottomActionCategory.audio),
+      ),
+      _ActionSpec(
+        label: 'Motion',
+        tooltip: 'Motion tools',
+        icon: Icons.auto_awesome_motion_rounded,
+        onTap: () => setState(
+          () => _activeBottomCategory = _BottomActionCategory.motion,
+        ),
+      ),
+    ];
+    return _buildActionScroller(
+      key: const ValueKey('categories'),
+      actions: categories,
+      spread: true,
+    );
+  }
+
+  Widget _buildToolRow({
+    required _BottomActionCategory category,
+    required TimelineClip? selectedClip,
+    required bool canAdjustAudio,
+    required bool canAnimateClip,
+    required bool canTransition,
+  }) {
+    final actions = switch (category) {
+      _BottomActionCategory.overlay => [
+        _ActionSpec(
+          label: 'Media',
+          tooltip: 'Add image or video overlay',
+          icon: Icons.perm_media_rounded,
+          onTap: _pickOverlayMedia,
+        ),
+        _ActionSpec(
+          label: 'GIFs',
+          tooltip: 'Add GIF or sticker',
+          icon: Icons.emoji_emotions_outlined,
+          onTap: _openGiphyPickerSheet,
+        ),
+        _ActionSpec(
+          label: 'Lane',
+          tooltip: 'Add overlay lane',
+          icon: Icons.playlist_add_rounded,
+          onTap: () => _addTimelineTrack(TimelineTrackSection.overlay),
+        ),
+      ],
+      _BottomActionCategory.text => [
+        _ActionSpec(
+          label: 'Add',
+          tooltip: 'Add text',
+          icon: Icons.title_rounded,
+          onTap: _addTextClipAtPlayhead,
+        ),
+        _ActionSpec(
+          label: 'Edit',
+          tooltip: 'Edit selected text',
+          icon: Icons.edit_rounded,
+          onTap: selectedClip?.type == TimelineTrackType.text
+              ? () => _editTextClip(selectedClip!)
+              : selectedClip?.type == TimelineTrackType.subtitle
+              ? () {
+                  final entry = selectedClip!.toSubtitleEntry();
+                  if (entry != null) _openSubtitleTextEditor(entry);
+                }
+              : null,
+        ),
+        _ActionSpec(
+          label: 'Style',
+          tooltip: 'Subtitle style',
+          icon: Icons.palette_outlined,
+          onTap: () => _openStylePanelSheet(context),
+        ),
+        _ActionSpec(
+          label: 'Captions',
+          tooltip: 'Generate captions',
+          icon: Icons.closed_caption_rounded,
+          onTap: _handleGenerateSubtitles,
+        ),
+      ],
+      _BottomActionCategory.audio => [
+        _ActionSpec(
+          label: 'Add',
+          tooltip: 'Add audio',
+          icon: Icons.music_note_rounded,
+          onTap: _pickAudioMedia,
+        ),
+        _ActionSpec(
+          label: 'Mix',
+          tooltip: 'Volume and fades',
+          icon: Icons.tune_rounded,
+          onTap: canAdjustAudio
+              ? () => _openAudioControlsSheet(selectedClip!)
+              : null,
+        ),
+      ],
+      _BottomActionCategory.motion => [
+        _ActionSpec(
+          label: 'Animate',
+          tooltip: 'Clip animation',
+          icon: Icons.auto_awesome_motion_rounded,
+          onTap: canAnimateClip
+              ? () => _openClipAnimationSheetForSelection(selectedClip!)
+              : null,
+        ),
+        _ActionSpec(
+          label: 'Transition',
+          tooltip: 'Base clip transition',
+          icon: Icons.join_inner_rounded,
+          onTap: canTransition
+              ? () => _openTransitionSheet(selectedClip!)
+              : null,
+        ),
+      ],
+    };
+
+    return _buildActionScroller(
+      key: ValueKey('tools_${category.name}'),
+      actions: [
+        ...actions,
+        _ActionSpec(
+          label: 'Back',
+          tooltip: 'Back to categories',
+          icon: Icons.arrow_back_rounded,
+          onTap: () => setState(() => _activeBottomCategory = null),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildActionScroller({
+    required Key key,
+    required List<_ActionSpec> actions,
+    bool spread = false,
+  }) {
+    return LayoutBuilder(
+      key: key,
+      builder: (context, constraints) {
+        return SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(minWidth: constraints.maxWidth),
+            child: Row(
+              mainAxisAlignment: spread
+                  ? MainAxisAlignment.spaceAround
+                  : MainAxisAlignment.start,
+              children: [
+                for (final action in actions) ...[
+                  _buildQuickActionButton(
+                    tooltip: action.tooltip,
+                    icon: action.icon,
+                    label: action.label,
+                    onTap: action.onTap,
+                  ),
+                  if (!spread) const SizedBox(width: 8),
+                ],
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  void _addTimelineTrack(TimelineTrackSection section) {
+    final timeline = ref.read(editorProvider).timeline;
+    final nextTrack = switch (section) {
+      TimelineTrackSection.overlay => TimelineTrack(
+        name: timeline.nextTrackNameForSection(section),
+        type: TimelineTrackType.video,
+        section: TimelineTrackSection.overlay,
+      ),
+      TimelineTrackSection.textSubtitle => TimelineTrack(
+        name: timeline.nextTrackNameForSection(section),
+        type: TimelineTrackType.text,
+        section: TimelineTrackSection.textSubtitle,
+      ),
+      TimelineTrackSection.audio => TimelineTrack(
+        name: timeline.nextTrackNameForSection(section),
+        type: TimelineTrackType.audio,
+        section: TimelineTrackSection.audio,
+      ),
+      TimelineTrackSection.baseVideo => null,
+    };
+    if (nextTrack == null) return;
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(
+          timeline.copyWith(tracks: [...timeline.tracks, nextTrack]),
+        );
+    ref.read(editorProvider.notifier).selectTrack(nextTrack.id);
   }
 
   Future<void> _openAudioControlsSheet(TimelineClip clip) async {
@@ -1564,6 +1756,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   Widget _buildQuickActionButton({
     required String tooltip,
     required IconData icon,
+    required String label,
     required VoidCallback? onTap,
   }) {
     final isEnabled = onTap != null;
@@ -1573,7 +1766,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         borderRadius: BorderRadius.circular(16),
         onTap: onTap,
         child: Ink(
-          width: 44,
+          width: 70,
           height: 44,
           decoration: BoxDecoration(
             color: kSurfaceElevated,
@@ -1582,12 +1775,31 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               color: isEnabled ? kBorder : kBorder.withValues(alpha: 0.45),
             ),
           ),
-          child: Icon(
-            icon,
-            color: isEnabled
-                ? kTextPrimary
-                : kTextPrimary.withValues(alpha: 0.32),
-            size: 20,
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                icon,
+                color: isEnabled
+                    ? kTextPrimary
+                    : kTextPrimary.withValues(alpha: 0.32),
+                size: 18,
+              ),
+              const SizedBox(height: 2),
+              Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: GoogleFonts.inter(
+                  color: isEnabled
+                      ? kTextPrimary
+                      : kTextPrimary.withValues(alpha: 0.32),
+                  fontSize: 10,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
           ),
         ),
       ),
@@ -2123,6 +2335,20 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       ),
     );
   }
+}
+
+class _ActionSpec {
+  final String label;
+  final String tooltip;
+  final IconData icon;
+  final VoidCallback? onTap;
+
+  const _ActionSpec({
+    required this.label,
+    required this.tooltip,
+    required this.icon,
+    required this.onTap,
+  });
 }
 
 class _GiphyPickerSheet extends StatefulWidget {
