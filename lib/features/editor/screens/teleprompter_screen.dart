@@ -24,6 +24,8 @@ class _TeleprompterScreenState extends State<TeleprompterScreen> {
   static const double _itemExtent = 168;
 
   final ScrollController _scrollController = ScrollController();
+  late final List<SubtitleEntry> _entries;
+  late final Duration _endPosition;
   Timer? _ticker;
   DateTime? _lastTickAt;
   Duration _position = Duration.zero;
@@ -33,25 +35,13 @@ class _TeleprompterScreenState extends State<TeleprompterScreen> {
   double _fontSize = 38;
   int _currentIndex = 0;
 
-  List<SubtitleEntry> get _entries {
-    return List<SubtitleEntry>.from(widget.entries)
-      ..sort((a, b) => a.startTime.compareTo(b.startTime));
-  }
-
-  Duration get _endPosition {
-    final entries = _entries;
-    return entries.isEmpty ? Duration.zero : entries.last.endTime;
-  }
-
   @override
   void initState() {
     super.initState();
-    final entries = _entries;
-    _position = entries.isEmpty ? Duration.zero : entries.first.startTime;
-    _ticker = Timer.periodic(
-      const Duration(milliseconds: 50),
-      (_) => _onTick(),
-    );
+    _entries = List<SubtitleEntry>.from(widget.entries)
+      ..sort((a, b) => a.startTime.compareTo(b.startTime));
+    _endPosition = _entries.isEmpty ? Duration.zero : _entries.last.endTime;
+    _position = _entries.isEmpty ? Duration.zero : _entries.first.startTime;
   }
 
   @override
@@ -62,10 +52,7 @@ class _TeleprompterScreenState extends State<TeleprompterScreen> {
   }
 
   void _onTick() {
-    if (!_isRunning || !mounted) {
-      _lastTickAt = null;
-      return;
-    }
+    if (!_isRunning || !mounted) return;
     final now = DateTime.now();
     final previous = _lastTickAt ?? now;
     _lastTickAt = now;
@@ -77,6 +64,7 @@ class _TeleprompterScreenState extends State<TeleprompterScreen> {
         _position = _endPosition;
         _isRunning = false;
       });
+      _stopTicker();
     } else {
       setState(() => _position = next);
     }
@@ -84,19 +72,33 @@ class _TeleprompterScreenState extends State<TeleprompterScreen> {
   }
 
   void _syncCurrentCaption() {
-    final entries = _entries;
-    if (entries.isEmpty) return;
+    if (_entries.isEmpty) return;
     var nextIndex = _currentIndex;
-    for (var index = 0; index < entries.length; index++) {
-      if (_position >= entries[index].startTime) {
-        nextIndex = index;
-      } else {
-        break;
-      }
+    while (nextIndex + 1 < _entries.length &&
+        _position >= _entries[nextIndex + 1].startTime) {
+      nextIndex++;
+    }
+    while (nextIndex > 0 && _position < _entries[nextIndex].startTime) {
+      nextIndex--;
     }
     if (nextIndex == _currentIndex) return;
     _currentIndex = nextIndex;
     _scrollToCurrent();
+  }
+
+  void _startTicker() {
+    _ticker?.cancel();
+    _lastTickAt = DateTime.now();
+    _ticker = Timer.periodic(
+      const Duration(milliseconds: 50),
+      (_) => _onTick(),
+    );
+  }
+
+  void _stopTicker() {
+    _ticker?.cancel();
+    _ticker = null;
+    _lastTickAt = null;
   }
 
   void _scrollToCurrent() {
@@ -115,23 +117,29 @@ class _TeleprompterScreenState extends State<TeleprompterScreen> {
 
   void _togglePlayback() {
     if (_entries.isEmpty) return;
+    late final bool shouldRun;
     setState(() {
       if (_position >= _endPosition) {
         _position = _entries.first.startTime;
         _currentIndex = 0;
       }
       _isRunning = !_isRunning;
-      _lastTickAt = null;
+      shouldRun = _isRunning;
     });
+    if (shouldRun) {
+      _startTicker();
+    } else {
+      _stopTicker();
+    }
   }
 
   void _reset() {
     if (_entries.isEmpty) return;
+    _stopTicker();
     setState(() {
       _isRunning = false;
       _position = _entries.first.startTime;
       _currentIndex = 0;
-      _lastTickAt = null;
     });
     _scrollController.animateTo(
       0,
@@ -141,13 +149,12 @@ class _TeleprompterScreenState extends State<TeleprompterScreen> {
   }
 
   void _skip(int direction) {
-    final entries = _entries;
-    if (entries.isEmpty) return;
-    final nextIndex = (_currentIndex + direction).clamp(0, entries.length - 1);
+    if (_entries.isEmpty) return;
+    final nextIndex = (_currentIndex + direction).clamp(0, _entries.length - 1);
     setState(() {
       _currentIndex = nextIndex;
-      _position = entries[nextIndex].startTime;
-      _lastTickAt = null;
+      _position = _entries[nextIndex].startTime;
+      if (_isRunning) _lastTickAt = DateTime.now();
     });
     _scrollToCurrent();
   }

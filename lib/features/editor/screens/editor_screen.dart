@@ -5,6 +5,7 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
@@ -75,6 +76,7 @@ enum _BottomActionSubgroup {
 class _EditorScreenState extends ConsumerState<EditorScreen>
     with WidgetsBindingObserver {
   Timer? _saveDebounce;
+  Timer? _remoteSaveDebounce;
   bool _isSavingProject = false;
   Project? _queuedProjectSnapshot;
   bool _queuedRemoteSync = false;
@@ -93,6 +95,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   _CanvasAspectRatio _canvasAspectRatio = _CanvasAspectRatio.original;
   _BottomActionCategory? _activeBottomCategory;
   _BottomActionSubgroup? _activeBottomSubgroup;
+  final GlobalKey _previewKey = GlobalKey(debugLabel: 'editor-video-preview');
+  bool _isPreviewFullscreen = false;
 
   @override
   void initState() {
@@ -171,7 +175,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final userUid = _currentUserUid;
     _isClosing = true;
     _saveDebounce?.cancel();
+    _remoteSaveDebounce?.cancel();
     WidgetsBinding.instance.removeObserver(this);
+    if (_isPreviewFullscreen) {
+      unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
+    }
     unawaited(
       _saveProjectState(
         project: finalSnapshot,
@@ -232,8 +240,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     });
 
     return PopScope(
-      canPop: true,
+      canPop: !_isPreviewFullscreen,
       onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _isPreviewFullscreen) {
+          _setPreviewFullscreen(false);
+          return;
+        }
         if (didPop) {
           unawaited(
             _flushProjectSave(syncRemote: false, changeType: 'editor_popped'),
@@ -242,8 +254,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       },
       child: Scaffold(
         backgroundColor: kBackground,
-        appBar: _buildEditorToolbar(context, editorState),
-        body: isLandscape
+        appBar: _isPreviewFullscreen ? null : _buildEditorToolbar(context),
+        body: _isPreviewFullscreen
+            ? _buildFullscreenPreview()
+            : isLandscape
             ? _buildLandscape(context, selectedClip)
             : _buildPortrait(context, selectedClip),
       ),
@@ -330,10 +344,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     );
   }
 
-  PreferredSizeWidget _buildEditorToolbar(
-    BuildContext context,
-    EditorState editorState,
-  ) {
+  PreferredSizeWidget _buildEditorToolbar(BuildContext context) {
     final width = MediaQuery.sizeOf(context).width;
     final compact = width < 560;
     final phoneToolbar = width < 480;
@@ -366,111 +377,72 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               ),
             ),
           Expanded(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  widget.project.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: kTextPrimary,
-                    fontSize: compact ? 13 : 15,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: -0.25,
-                  ),
-                ),
-                const SizedBox(height: 3),
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    AnimatedContainer(
-                      duration: const Duration(milliseconds: 180),
-                      width: 6,
-                      height: 6,
-                      decoration: BoxDecoration(
-                        color: _localSaveError != null
-                            ? kError
-                            : _isSavingProject
-                            ? kWarning
-                            : _remoteSyncPending
-                            ? kInfo
-                            : kSuccess,
-                        shape: BoxShape.circle,
-                      ),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    widget.project.name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: kTextPrimary,
+                      fontSize: compact ? 13 : 15,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: -0.25,
                     ),
-                    const SizedBox(width: 5),
-                    Flexible(
-                      child: Text(
-                        _localSaveError != null
-                            ? 'LOCAL SAVE FAILED'
-                            : _isSavingProject
-                            ? 'SAVING LOCALLY'
-                            : _remoteSyncPending
-                            ? 'LOCAL SAVED · SYNC PENDING'
-                            : _lastSavedAt == null
-                            ? 'AUTOSAVE READY'
-                            : 'SAVED LOCALLY',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: kTextSecondary,
-                          fontSize: 7.5,
-                          fontWeight: FontWeight.w900,
-                          letterSpacing: 0.85,
+                  ),
+                  const SizedBox(height: 3),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      AnimatedContainer(
+                        duration: const Duration(milliseconds: 180),
+                        width: 6,
+                        height: 6,
+                        decoration: BoxDecoration(
+                          color: _localSaveError != null
+                              ? kError
+                              : _isSavingProject
+                              ? kWarning
+                              : _remoteSyncPending
+                              ? kInfo
+                              : kSuccess,
+                          shape: BoxShape.circle,
                         ),
                       ),
-                    ),
-                  ],
-                ),
-              ],
+                      const SizedBox(width: 5),
+                      Flexible(
+                        child: Text(
+                          _localSaveError != null
+                              ? 'LOCAL SAVE FAILED'
+                              : _isSavingProject
+                              ? 'SAVING LOCALLY'
+                              : _remoteSyncPending
+                              ? 'LOCAL SAVED · SYNC PENDING'
+                              : _lastSavedAt == null
+                              ? 'AUTOSAVE READY'
+                              : 'SAVED LOCALLY',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: kTextSecondary,
+                            fontSize: 7.5,
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: 0.85,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
             ),
           ),
         ],
       ),
       actions: [
-        if (phoneToolbar) ...[
-          _compactToolbarButton(
-            tooltip: 'Undo',
-            icon: Icons.undo_rounded,
-            enabled: editorState.canUndo,
-            onTap: ref.read(editorProvider.notifier).undo,
-          ),
-          _compactToolbarButton(
-            tooltip: 'Redo',
-            icon: Icons.redo_rounded,
-            enabled: editorState.canRedo,
-            onTap: ref.read(editorProvider.notifier).redo,
-          ),
-        ] else
-          Container(
-            height: 34,
-            margin: const EdgeInsets.symmetric(vertical: 14),
-            decoration: BoxDecoration(
-              color: kSurface,
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: kBorder),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                _toolbarHistoryButton(
-                  tooltip: 'Undo',
-                  icon: Icons.undo_rounded,
-                  enabled: editorState.canUndo,
-                  onTap: ref.read(editorProvider.notifier).undo,
-                ),
-                Container(width: 1, height: 18, color: kBorder),
-                _toolbarHistoryButton(
-                  tooltip: 'Redo',
-                  icon: Icons.redo_rounded,
-                  enabled: editorState.canRedo,
-                  onTap: ref.read(editorProvider.notifier).redo,
-                ),
-              ],
-            ),
-          ),
         if (showAspect) ...[
           const SizedBox(width: 8),
           _buildAspectRatioPicker(),
@@ -531,35 +503,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     );
   }
 
-  Widget _toolbarHistoryButton({
-    required String tooltip,
-    required IconData icon,
-    required bool enabled,
-    required VoidCallback onTap,
-  }) {
-    return Tooltip(
-      message: tooltip,
-      child: InkWell(
-        onTap: enabled ? onTap : null,
-        borderRadius: BorderRadius.circular(9),
-        child: SizedBox(
-          width: 33,
-          height: 33,
-          child: Icon(
-            icon,
-            size: 17,
-            color: enabled
-                ? kTextPrimary
-                : kTextSecondary.withValues(alpha: 0.35),
-          ),
-        ),
-      ),
-    );
-  }
-
   void _showExportActions() {
     showModalBottomSheet(
       context: context,
+      isScrollControlled: true,
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.sizeOf(context).height * 0.40,
+      ),
       backgroundColor: kSurface,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
@@ -567,8 +517,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       builder: (_) {
         final state = ref.read(subtitleProvider);
         return SafeArea(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
+          child: ListView(
+            shrinkWrap: true,
             children: [
               ListTile(
                 leading: const Icon(
@@ -872,7 +822,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       builder: (_) => SafeArea(
         child: ConstrainedBox(
           constraints: BoxConstraints(
-            maxHeight: MediaQuery.of(context).size.height * 0.72,
+            maxHeight: MediaQuery.of(context).size.height * 0.56,
           ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -1146,6 +1096,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }) {
     if (!_editorInitialized) return;
     _saveDebounce?.cancel();
+    _remoteSaveDebounce?.cancel();
     final userUid = ref.read(currentUserProvider)?.uid;
     final project = _captureProjectSnapshot(
       captionsChanged: _changeAffectsCaptions(changeType),
@@ -1153,20 +1104,32 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     if (userUid != null) {
       _remoteSyncPending = true;
     }
-    unawaited(
-      _saveProjectState(
-        project: project,
-        userUid: userUid,
-        syncRemote: immediate,
-        changeType: changeType,
-      ),
-    );
-
     if (immediate) {
+      unawaited(
+        _saveProjectState(
+          project: project,
+          userUid: userUid,
+          syncRemote: true,
+          changeType: changeType,
+        ),
+      );
       return;
     }
 
-    _saveDebounce = Timer(const Duration(seconds: 2), () {
+    // Timeline drags can publish dozens of revisions per second. Keep the
+    // latest snapshot in memory, then coalesce disk writes after the gesture
+    // settles instead of serializing the entire project for every pointer move.
+    _saveDebounce = Timer(const Duration(milliseconds: 650), () {
+      unawaited(
+        _saveProjectState(
+          project: _projectSnapshot,
+          userUid: userUid,
+          syncRemote: false,
+          changeType: changeType,
+        ),
+      );
+    });
+    _remoteSaveDebounce = Timer(const Duration(seconds: 2), () {
       unawaited(
         _saveProjectState(
           project: _projectSnapshot,
@@ -1183,6 +1146,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     String changeType = 'editor_flush',
   }) async {
     _saveDebounce?.cancel();
+    _remoteSaveDebounce?.cancel();
     final userUid = ref.read(currentUserProvider)?.uid;
     final project = _captureProjectSnapshot();
     await _saveProjectState(
@@ -1379,48 +1343,70 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }) {
     final editorState = ref.read(editorProvider);
     final timeline = editorState.timeline;
-    final track = _trackForClip(target, editorState);
+    final liveTarget = _clipById(target.id, editorState) ?? target;
+    final track = _trackForClip(liveTarget, editorState);
     if (track == null || track.isLocked) {
       SnackBarHelper.showInfo(context, 'Unlock the track to change speed.');
       return;
     }
     final safeRate = playbackRate.clamp(0.25, 4).toDouble();
-    final sourceDurationMs = target.sourceDuration.inMilliseconds > 0
-        ? target.sourceDuration.inMilliseconds
-        : target.duration.inMilliseconds;
+    final sourceDurationMs = liveTarget.sourceDuration.inMilliseconds > 0
+        ? liveTarget.sourceDuration.inMilliseconds
+        : liveTarget.duration.inMilliseconds;
     final nextDuration = Duration(
       milliseconds: math.max(100, (sourceDurationMs / safeRate).round()),
     );
-    final nextEnd = target.startTime + nextDuration;
-    final rippleDelta = nextDuration - target.duration;
+    final nextEnd = liveTarget.startTime + nextDuration;
+    final rippleDelta = nextDuration - liveTarget.duration;
     final isBase = track.section == TimelineTrackSection.baseVideo;
-    final oldEnd = target.endTime;
+    final oldEnd = liveTarget.endTime;
+    final oldDurationMs = math.max(1, liveTarget.duration.inMilliseconds);
 
-    final nextTracks = timeline.tracks.map((timelineTrack) {
+    final retimedTracks = timeline.tracks.map((timelineTrack) {
       final clips = timelineTrack.clips.map((clip) {
-        if (clip.id == target.id) {
+        if (clip.id == liveTarget.id) {
           return clip.copyWith(playbackRate: safeRate, endTime: nextEnd);
         }
-        if (clip.linkedClipId == target.id) {
-          final oldDurationMs = math.max(1, target.duration.inMilliseconds);
-          final startRatio =
-              (clip.startTime - target.startTime).inMilliseconds /
-              oldDurationMs;
-          final endRatio =
-              (clip.endTime - target.startTime).inMilliseconds / oldDurationMs;
+
+        final isSubtitleClip =
+            timelineTrack.type == TimelineTrackType.subtitle ||
+            clip.type == TimelineTrackType.subtitle;
+        final intersectsChangedClip =
+            clip.startTime < oldEnd && clip.endTime > liveTarget.startTime;
+        final belongsToChangedClip =
+            clip.linkedClipId == liveTarget.id ||
+            (isBase &&
+                isSubtitleClip &&
+                clip.linkedClipId == null &&
+                intersectsChangedClip);
+        if (belongsToChangedClip) {
+          final relativeStartMs = (clip.startTime - liveTarget.startTime)
+              .inMilliseconds
+              .clamp(0, oldDurationMs)
+              .toInt();
+          final relativeEndMs = (clip.endTime - liveTarget.startTime)
+              .inMilliseconds
+              .clamp(relativeStartMs + 1, oldDurationMs)
+              .toInt();
+          final startRatio = relativeStartMs / oldDurationMs;
+          final endRatio = relativeEndMs / oldDurationMs;
+          final nextStart =
+              liveTarget.startTime +
+              Duration(
+                milliseconds: (nextDuration.inMilliseconds * startRatio)
+                    .round(),
+              );
+          final scaledEnd =
+              liveTarget.startTime +
+              Duration(
+                milliseconds: (nextDuration.inMilliseconds * endRatio).round(),
+              );
           return clip.copyWith(
-            startTime:
-                target.startTime +
-                Duration(
-                  milliseconds: (nextDuration.inMilliseconds * startRatio)
-                      .round(),
-                ),
-            endTime:
-                target.startTime +
-                Duration(
-                  milliseconds: (nextDuration.inMilliseconds * endRatio)
-                      .round(),
-                ),
+            linkedClipId: liveTarget.id,
+            startTime: nextStart,
+            endTime: scaledEnd > nextStart + const Duration(milliseconds: 80)
+                ? scaledEnd
+                : nextStart + const Duration(milliseconds: 80),
           );
         }
         if (isBase && clip.startTime >= oldEnd) {
@@ -1433,6 +1419,15 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
       return timelineTrack.copyWith(clips: clips);
     }).toList();
+    final nextTracks = retimedTracks
+        .map(
+          (timelineTrack) => timelineTrack.type == TimelineTrackType.subtitle
+              ? timelineTrack.copyWith(
+                  clips: _removeSubtitleTimingCollisions(timelineTrack.clips),
+                )
+              : timelineTrack,
+        )
+        .toList();
     final markers = timeline.markers.map((marker) {
       if (isBase && marker.position >= oldEnd) {
         return marker.copyWith(position: marker.position + rippleDelta);
@@ -1449,6 +1444,23 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     ref
         .read(subtitleProvider.notifier)
         .syncFromTimeline(nextTimeline.subtitleEntries);
+  }
+
+  List<TimelineClip> _removeSubtitleTimingCollisions(List<TimelineClip> clips) {
+    final sorted = [...clips]
+      ..sort((a, b) => a.startTime.compareTo(b.startTime));
+    final result = <TimelineClip>[];
+    var nextAvailable = Duration.zero;
+    for (final clip in sorted) {
+      final start = clip.startTime < nextAvailable
+          ? nextAvailable
+          : clip.startTime;
+      final minimumEnd = start + const Duration(milliseconds: 80);
+      final end = clip.endTime < minimumEnd ? minimumEnd : clip.endTime;
+      result.add(clip.copyWith(startTime: start, endTime: end));
+      nextAvailable = end + const Duration(milliseconds: 20);
+    }
+    return result;
   }
 
   bool _isVisualClip(TimelineClip? clip) {
@@ -1531,34 +1543,75 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     );
   }
 
-  void _setClipBlurMode(TimelineClip clip, ClipBlurMode mode) {
-    if (!_isVisualClip(clip)) return;
-    _updateTimelineClip(
-      clip,
-      (current) => current.copyWith(blur: current.blur.copyWith(mode: mode)),
+  void _addEffectOverlay({
+    required TimelineClip anchor,
+    required TimelineEffectKind kind,
+    required String label,
+    ClipBlurSettings blur = const ClipBlurSettings(),
+    ClipColorAdjustments colorAdjustments = const ClipColorAdjustments(),
+  }) {
+    if (!_isVisualClip(anchor)) return;
+    final editorState = ref.read(editorProvider);
+    final timeline = editorState.timeline;
+    TimelineTrack? effectTrack;
+    for (final track in timeline.tracks) {
+      if (track.type == TimelineTrackType.effect) {
+        effectTrack = track;
+        break;
+      }
+    }
+    effectTrack ??= TimelineTrack(
+      name: 'Effects 1',
+      type: TimelineTrackType.effect,
+      section: TimelineTrackSection.overlay,
     );
+    final effectClip = TimelineClip.effect(
+      trackId: effectTrack.id,
+      effectKind: kind,
+      label: label,
+      startTime: anchor.startTime,
+      endTime: anchor.endTime,
+      blur: blur,
+      colorAdjustments: colorAdjustments,
+      layer: effectTrack.clips.length,
+    );
+    final updatedEffectTrack = effectTrack.copyWith(
+      clips: [...effectTrack.clips, effectClip],
+    );
+    final hasEffectTrack = timeline.tracks.any(
+      (track) => track.id == effectTrack!.id,
+    );
+    final nextTracks = hasEffectTrack
+        ? timeline.tracks
+              .map(
+                (track) =>
+                    track.id == effectTrack!.id ? updatedEffectTrack : track,
+              )
+              .toList()
+        : [...timeline.tracks, updatedEffectTrack];
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(timeline.copyWith(tracks: nextTracks));
+    ref.read(editorProvider.notifier)
+      ..selectTrack(effectTrack.id)
+      ..selectClip(effectClip.id);
+    if (mounted) {
+      SnackBarHelper.showSuccess(
+        context,
+        '$label added as a movable timeline overlay',
+      );
+    }
   }
 
-  void _resetClipColor(TimelineClip clip) {
-    if (!_isVisualClip(clip)) return;
+  void _replaceFilterEffect(TimelineClip effectClip, ClipFilterPreset preset) {
+    final adjustments = ClipColorAdjustments.forPreset(
+      preset,
+    ).copyWith(sharpen: 0);
     _updateTimelineClip(
-      clip,
-      (current) =>
-          current.copyWith(colorAdjustments: const ClipColorAdjustments()),
-    );
-  }
-
-  void _autoEnhanceClip(TimelineClip clip) {
-    if (!_isVisualClip(clip)) return;
-    _updateTimelineClip(
-      clip,
+      effectClip,
       (current) => current.copyWith(
-        colorAdjustments: const ClipColorAdjustments(
-          brightness: 0.025,
-          contrast: 1.08,
-          saturation: 1.12,
-          sharpen: 0.14,
-        ),
+        label: '${_filterPresetLabel(preset)} filter',
+        colorAdjustments: adjustments,
       ),
     );
   }
@@ -2441,334 +2494,50 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     );
   }
 
-  Future<void> _openBlurSheet(TimelineClip initialClip) async {
-    if (!_isVisualClip(initialClip)) return;
-    var clip = initialClip;
-    await showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (_) => StatefulBuilder(
-        builder: (context, setSheetState) {
-          void update(ClipBlurSettings blur, {bool recordHistory = true}) {
-            _updateTimelineClip(
-              clip,
-              (current) => current.copyWith(blur: blur),
-              recordHistory: recordHistory,
-            );
-            final latest = _clipById(clip.id, ref.read(editorProvider));
-            if (latest != null) setSheetState(() => clip = latest);
-          }
-
-          Widget regionSlider({
-            required String label,
-            required double value,
-            required double max,
-            required ClipBlurSettings Function(double value) mapper,
-          }) {
-            return Column(
-              children: [
-                _sheetSliderHeader(label, '${(value * 100).round()}%'),
-                Slider(
-                  value: value.clamp(0, max),
-                  min: 0,
-                  max: math.max(0.01, max),
-                  divisions: math.max(1, (max * 100).round()),
-                  onChangeStart: (_) => ref
-                      .read(editorProvider.notifier)
-                      .beginTimelineGestureEdit(),
-                  onChanged: (next) =>
-                      update(mapper(next), recordHistory: false),
-                  onChangeEnd: (_) => ref
-                      .read(editorProvider.notifier)
-                      .endTimelineGestureEdit(),
-                ),
-              ],
-            );
-          }
-
-          final blur = clip.blur;
-          return _buildEditorSheet(
-            title: 'Blur & privacy',
-            subtitle: 'One effect for video, images, GIFs and stickers',
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _sheetSectionTitle('MODE'),
-                const SizedBox(height: 8),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    for (final option in const [
-                      (ClipBlurMode.none, 'Off', Icons.block_rounded),
-                      (ClipBlurMode.full, 'Whole clip', Icons.blur_on_rounded),
-                      (
-                        ClipBlurMode.region,
-                        'Privacy region',
-                        Icons.center_focus_strong_rounded,
-                      ),
-                    ])
-                      ChoiceChip(
-                        avatar: Icon(option.$3, size: 16),
-                        label: Text(option.$2),
-                        selected: blur.mode == option.$1,
-                        onSelected: (_) =>
-                            update(blur.copyWith(mode: option.$1)),
-                      ),
-                  ],
-                ),
-                const SizedBox(height: 16),
-                _sheetSliderHeader(
-                  'Blur strength',
-                  blur.safeStrength.toStringAsFixed(0),
-                ),
-                Slider(
-                  value: blur.safeStrength,
-                  min: 1,
-                  max: 30,
-                  divisions: 29,
-                  onChangeStart: (_) => ref
-                      .read(editorProvider.notifier)
-                      .beginTimelineGestureEdit(),
-                  onChanged: (value) => update(
-                    blur.copyWith(strength: value),
-                    recordHistory: false,
-                  ),
-                  onChangeEnd: (_) => ref
-                      .read(editorProvider.notifier)
-                      .endTimelineGestureEdit(),
-                ),
-                if (blur.mode == ClipBlurMode.region) ...[
-                  const SizedBox(height: 10),
-                  _sheetSectionTitle('REGION PRESETS'),
-                  const SizedBox(height: 8),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: [
-                      ActionChip(
-                        label: const Text('Face'),
-                        onPressed: () => update(
-                          blur.copyWith(
-                            regionX: 0.25,
-                            regionY: 0.12,
-                            regionWidth: 0.5,
-                            regionHeight: 0.34,
-                          ),
-                        ),
-                      ),
-                      ActionChip(
-                        label: const Text('Center'),
-                        onPressed: () => update(
-                          blur.copyWith(
-                            regionX: 0.2,
-                            regionY: 0.3,
-                            regionWidth: 0.6,
-                            regionHeight: 0.4,
-                          ),
-                        ),
-                      ),
-                      ActionChip(
-                        label: const Text('Lower third'),
-                        onPressed: () => update(
-                          blur.copyWith(
-                            regionX: 0.08,
-                            regionY: 0.7,
-                            regionWidth: 0.84,
-                            regionHeight: 0.2,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  regionSlider(
-                    label: 'Horizontal position',
-                    value: blur.safeRegionX,
-                    max: 1 - blur.safeRegionWidth,
-                    mapper: (value) => blur.copyWith(regionX: value),
-                  ),
-                  regionSlider(
-                    label: 'Vertical position',
-                    value: blur.safeRegionY,
-                    max: 1 - blur.safeRegionHeight,
-                    mapper: (value) => blur.copyWith(regionY: value),
-                  ),
-                  regionSlider(
-                    label: 'Region width',
-                    value: blur.safeRegionWidth,
-                    max: 1,
-                    mapper: (value) =>
-                        blur.copyWith(regionWidth: value.clamp(0.08, 1)),
-                  ),
-                  regionSlider(
-                    label: 'Region height',
-                    value: blur.safeRegionHeight,
-                    max: 1,
-                    mapper: (value) =>
-                        blur.copyWith(regionHeight: value.clamp(0.08, 1)),
-                  ),
-                ],
-              ],
-            ),
-          );
-        },
-      ),
-    );
-  }
-
   Future<void> _openFilterSheet(TimelineClip initialClip) async {
-    var clip = initialClip;
+    final isExistingFilter =
+        initialClip.type == TimelineTrackType.effect &&
+        initialClip.effectKind == TimelineEffectKind.filter;
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      builder: (_) => StatefulBuilder(
-        builder: (context, setSheetState) {
-          void updateAdjustments(
-            ClipColorAdjustments adjustments, {
-            bool recordHistory = true,
-          }) {
-            _updateTimelineClip(
-              clip,
-              (current) => current.copyWith(colorAdjustments: adjustments),
-              recordHistory: recordHistory,
-            );
-            final latest = _clipById(clip.id, ref.read(editorProvider));
-            if (latest != null) {
-              setSheetState(() => clip = latest);
-            }
-          }
-
-          Widget adjustmentSlider({
-            required String label,
-            required double value,
-            required double min,
-            required double max,
-            required double neutral,
-            required ClipColorAdjustments Function(double value) mapper,
-          }) {
-            return Column(
-              children: [
-                _sheetSliderHeader(
-                  label,
-                  value == neutral
-                      ? '0'
-                      : (value > neutral ? '+' : '') +
-                            ((value - neutral) * 100).round().toString(),
-                ),
-                Slider(
-                  value: value.clamp(min, max),
-                  min: min,
-                  max: max,
-                  onChangeStart: (_) => ref
-                      .read(editorProvider.notifier)
-                      .beginTimelineGestureEdit(),
-                  onChanged: (next) =>
-                      updateAdjustments(mapper(next), recordHistory: false),
-                  onChangeEnd: (_) => ref
-                      .read(editorProvider.notifier)
-                      .endTimelineGestureEdit(),
-                ),
-              ],
-            );
-          }
-
-          final adjustments = clip.colorAdjustments;
-          return _buildEditorSheet(
-            title: 'Color & filters',
-            subtitle: clip.label,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _sheetSectionTitle('LOOKS'),
-                const SizedBox(height: 8),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: ClipFilterPreset.values.map((preset) {
-                    return ActionChip(
-                      avatar: preset == ClipFilterPreset.original
-                          ? const Icon(Icons.block_rounded, size: 16)
-                          : const Icon(Icons.tonality_rounded, size: 16),
-                      label: Text(_filterPresetLabel(preset)),
-                      onPressed: () => updateAdjustments(
-                        ClipColorAdjustments.forPreset(preset),
-                      ),
-                    );
-                  }).toList(),
-                ),
-                const SizedBox(height: 20),
-                _sheetSectionTitle('FINE TUNE'),
-                const SizedBox(height: 8),
-                adjustmentSlider(
-                  label: 'Brightness',
-                  value: adjustments.brightness,
-                  min: -0.5,
-                  max: 0.5,
-                  neutral: 0,
-                  mapper: (value) => adjustments.copyWith(brightness: value),
-                ),
-                adjustmentSlider(
-                  label: 'Contrast',
-                  value: adjustments.contrast,
-                  min: 0.5,
-                  max: 1.5,
-                  neutral: 1,
-                  mapper: (value) => adjustments.copyWith(contrast: value),
-                ),
-                adjustmentSlider(
-                  label: 'Saturation',
-                  value: adjustments.saturation,
-                  min: 0,
-                  max: 2,
-                  neutral: 1,
-                  mapper: (value) => adjustments.copyWith(saturation: value),
-                ),
-                adjustmentSlider(
-                  label: 'Temperature',
-                  value: adjustments.temperature,
-                  min: -1,
-                  max: 1,
-                  neutral: 0,
-                  mapper: (value) => adjustments.copyWith(temperature: value),
-                ),
-                adjustmentSlider(
-                  label: 'Fade',
-                  value: adjustments.fade,
-                  min: 0,
-                  max: 1,
-                  neutral: 0,
-                  mapper: (value) => adjustments.copyWith(fade: value),
-                ),
-                adjustmentSlider(
-                  label: 'Vignette',
-                  value: adjustments.vignette,
-                  min: 0,
-                  max: 1,
-                  neutral: 0,
-                  mapper: (value) => adjustments.copyWith(vignette: value),
-                ),
-                adjustmentSlider(
-                  label: 'Sharpen',
-                  value: adjustments.sharpen,
-                  min: 0,
-                  max: 1,
-                  neutral: 0,
-                  mapper: (value) => adjustments.copyWith(sharpen: value),
-                ),
-                const SizedBox(height: 8),
-                OutlinedButton.icon(
-                  onPressed: () =>
-                      updateAdjustments(const ClipColorAdjustments()),
-                  icon: const Icon(Icons.restart_alt_rounded),
-                  label: const Text('Reset color'),
-                ),
-              ],
-            ),
-          );
-        },
+      builder: (_) => _buildEditorSheet(
+        title: isExistingFilter
+            ? 'Change filter overlay'
+            : 'Add filter overlay',
+        subtitle: isExistingFilter
+            ? 'Choose a preset for this timeline overlay'
+            : 'The preset becomes a draggable, resizable timeline clip',
+        child: Wrap(
+          spacing: 10,
+          runSpacing: 10,
+          children: ClipFilterPreset.values
+              .where((preset) => preset != ClipFilterPreset.original)
+              .map((preset) {
+                return ActionChip(
+                  avatar: const Icon(Icons.tonality_rounded, size: 17),
+                  label: Text(_filterPresetLabel(preset)),
+                  onPressed: () {
+                    if (isExistingFilter) {
+                      _replaceFilterEffect(initialClip, preset);
+                    } else {
+                      final adjustments = ClipColorAdjustments.forPreset(
+                        preset,
+                      ).copyWith(sharpen: 0);
+                      _addEffectOverlay(
+                        anchor: initialClip,
+                        kind: TimelineEffectKind.filter,
+                        label: '${_filterPresetLabel(preset)} filter',
+                        colorAdjustments: adjustments,
+                      );
+                    }
+                    Navigator.pop(context);
+                  },
+                );
+              })
+              .toList(),
+        ),
       ),
     );
   }
@@ -2898,6 +2667,23 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   onChanged: (value) =>
                       update(canvas.copyWith(snapToGuides: value)),
                 ),
+                const SizedBox(height: 4),
+                OutlinedButton.icon(
+                  onPressed:
+                      !canvas.showGrid &&
+                          !canvas.showSafeAreas &&
+                          !canvas.snapToGuides
+                      ? null
+                      : () => update(
+                          canvas.copyWith(
+                            showGrid: false,
+                            showSafeAreas: false,
+                            snapToGuides: false,
+                          ),
+                        ),
+                  icon: const Icon(Icons.layers_clear_rounded),
+                  label: const Text('Clear all guides'),
+                ),
               ],
             ),
           );
@@ -2996,20 +2782,6 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                         .toList(),
                   ),
                 ],
-                const SizedBox(height: 18),
-                _sheetSectionTitle('CREATOR LAB'),
-                const SizedBox(height: 8),
-                _sheetListAction(
-                  icon: Icons.auto_awesome_rounded,
-                  title: 'Open Creator Lab',
-                  subtitle:
-                      '23 precision and wow tools for captions, moments, '
-                      'chapters, B-roll, launch copy, and rehearsal',
-                  onTap: () async {
-                    await _openCreatorLab();
-                    refreshReport();
-                  },
-                ),
                 const SizedBox(height: 14),
                 _sheetSectionTitle('EDIT'),
                 const SizedBox(height: 8),
@@ -3240,7 +3012,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       top: false,
       child: Container(
         constraints: BoxConstraints(
-          maxHeight: MediaQuery.of(context).size.height * 0.86,
+          maxHeight: MediaQuery.of(context).size.height * 0.40,
         ),
         decoration: const BoxDecoration(
           color: kSurface,
@@ -3428,8 +3200,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         SizedBox(
           height: MediaQuery.of(context).size.height * 0.35,
           child: VideoPreviewPanel(
+            key: _previewKey,
             videoPath: widget.project.videoPath,
             targetAspectRatio: _selectedAspectRatioValue,
+            onFullscreenToggle: () => _setPreviewFullscreen(true),
           ),
         ),
         Expanded(
@@ -3452,8 +3226,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         Expanded(
           flex: 3,
           child: VideoPreviewPanel(
+            key: _previewKey,
             videoPath: widget.project.videoPath,
             targetAspectRatio: _selectedAspectRatioValue,
+            onFullscreenToggle: () => _setPreviewFullscreen(true),
           ),
         ),
         Expanded(
@@ -3467,6 +3243,31 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         ),
         _buildBottomQuickActions(context, selectedClip),
       ],
+    );
+  }
+
+  Widget _buildFullscreenPreview() {
+    return ColoredBox(
+      color: Colors.black,
+      child: SafeArea(
+        child: VideoPreviewPanel(
+          key: _previewKey,
+          videoPath: widget.project.videoPath,
+          targetAspectRatio: _selectedAspectRatioValue,
+          isFullscreen: true,
+          onFullscreenToggle: () => _setPreviewFullscreen(false),
+        ),
+      ),
+    );
+  }
+
+  void _setPreviewFullscreen(bool fullscreen) {
+    if (_isPreviewFullscreen == fullscreen || !mounted) return;
+    setState(() => _isPreviewFullscreen = fullscreen);
+    unawaited(
+      SystemChrome.setEnabledSystemUIMode(
+        fullscreen ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
+      ),
     );
   }
 
@@ -3706,14 +3507,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }) {
     final editorState = ref.read(editorProvider);
     final timeline = editorState.timeline;
-    final targetTrack = _resolveInsertionTrack(timeline, section);
-    if (targetTrack == null) {
-      SnackBarHelper.showError(
-        context,
-        'No ${section == TimelineTrackSection.audio ? 'audio' : 'overlay'} track available.',
-      );
-      return;
-    }
+    final existingTrack = _resolveInsertionTrack(timeline, section);
+    final targetTrack =
+        existingTrack ?? _createOptionalTrack(timeline, section);
+    if (targetTrack == null) return;
+    final workingTracks = existingTrack == null
+        ? [...timeline.tracks, targetTrack]
+        : timeline.tracks;
 
     final playhead = ref.read(playbackProvider).position;
     final maxDuration = Duration(milliseconds: widget.project.durationMs);
@@ -3760,7 +3560,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       audioMix: audioMix,
     );
 
-    final nextTracks = timeline.tracks.map((track) {
+    final nextTracks = workingTracks.map((track) {
       if (track.id != targetTrack.id) return track;
       return track.copyWith(clips: [...track.clips, clip]);
     }).toList();
@@ -3779,6 +3579,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.sizeOf(context).height * 0.40,
+      ),
       backgroundColor: Colors.transparent,
       barrierColor: Colors.black.withValues(alpha: 0.4),
       builder: (_) => _GiphyPickerSheet(onSelected: _insertGiphyAsset),
@@ -3814,14 +3617,17 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
 
     final editorState = ref.read(editorProvider);
     final timeline = editorState.timeline;
-    final targetTrack = _resolveInsertionTrack(
+    final existingTrack = _resolveInsertionTrack(
       timeline,
       TimelineTrackSection.textSubtitle,
     );
-    if (targetTrack == null) {
-      SnackBarHelper.showError(context, 'No text track available.');
-      return;
-    }
+    final targetTrack =
+        existingTrack ??
+        _createOptionalTrack(timeline, TimelineTrackSection.textSubtitle);
+    if (targetTrack == null) return;
+    final workingTracks = existingTrack == null
+        ? [...timeline.tracks, targetTrack]
+        : timeline.tracks;
 
     final playhead = ref.read(playbackProvider).position;
     final maxDuration = Duration(milliseconds: widget.project.durationMs);
@@ -3851,7 +3657,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       fitMode: ClipFitMode.contain,
     );
 
-    final nextTracks = timeline.tracks.map((track) {
+    final nextTracks = workingTracks.map((track) {
       if (track.id != targetTrack.id) return track;
       return track.copyWith(clips: [...track.clips, clip]);
     }).toList();
@@ -3904,6 +3710,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final result = await showModalBottomSheet<String>(
       context: context,
       isScrollControlled: true,
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.sizeOf(context).height * 0.40,
+      ),
       backgroundColor: Colors.transparent,
       builder: (sheetContext) {
         final viewInsets = MediaQuery.of(sheetContext).viewInsets;
@@ -4118,6 +3927,30 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       }
     }
     return sectionTracks.isEmpty ? null : sectionTracks.first;
+  }
+
+  TimelineTrack? _createOptionalTrack(
+    EditorTimeline timeline,
+    TimelineTrackSection section,
+  ) {
+    return switch (section) {
+      TimelineTrackSection.overlay => TimelineTrack(
+        name: timeline.nextTrackNameForSection(section),
+        type: TimelineTrackType.video,
+        section: section,
+      ),
+      TimelineTrackSection.textSubtitle => TimelineTrack(
+        name: timeline.nextTrackNameForSection(section),
+        type: TimelineTrackType.text,
+        section: section,
+      ),
+      TimelineTrackSection.audio => TimelineTrack(
+        name: timeline.nextTrackNameForSection(section),
+        type: TimelineTrackType.audio,
+        section: section,
+      ),
+      TimelineTrackSection.baseVideo => null,
+    };
   }
 
   Widget _buildBottomQuickActions(
@@ -4369,6 +4202,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     required bool canTransition,
   }) {
     final isVisual = _isVisualClip(selectedClip);
+    final isFilterEffect =
+        selectedClip?.type == TimelineTrackType.effect &&
+        selectedClip?.effectKind == TimelineEffectKind.filter;
+    final isBlurEffect =
+        selectedClip?.type == TimelineTrackType.effect &&
+        selectedClip?.effectKind == TimelineEffectKind.blur;
     final actions = switch (subgroup) {
       _BottomActionSubgroup.addMedia => [
         _ActionSpec(
@@ -4582,53 +4421,57 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       _BottomActionSubgroup.effectsLooks => [
         _ActionSpec(
           label: 'Filters',
-          tooltip: 'Looks and fine color correction',
+          tooltip: 'Add a prebuilt filter as a timeline overlay',
           icon: Icons.tonality_rounded,
-          onTap: isVisual ? () => _openFilterSheet(selectedClip!) : null,
+          onTap: isVisual || isFilterEffect
+              ? () => _openFilterSheet(selectedClip!)
+              : null,
         ),
         _ActionSpec(
-          label: 'Enhance',
-          tooltip: 'Apply balanced automatic enhancement',
-          icon: Icons.auto_fix_high_rounded,
-          onTap: isVisual ? () => _autoEnhanceClip(selectedClip!) : null,
-        ),
-        _ActionSpec(
-          label: 'Reset',
-          tooltip: 'Reset color adjustments',
-          icon: Icons.restart_alt_rounded,
-          onTap: isVisual ? () => _resetClipColor(selectedClip!) : null,
+          label: 'Remove',
+          tooltip: 'Remove the selected filter overlay',
+          icon: Icons.layers_clear_rounded,
+          onTap: isFilterEffect ? () => _deleteClip(selectedClip!) : null,
         ),
       ],
       _BottomActionSubgroup.effectsBlur => [
         _ActionSpec(
-          label: 'Controls',
-          tooltip: 'Configure whole or privacy-region blur',
-          icon: Icons.blur_on_rounded,
-          onTap: isVisual ? () => _openBlurSheet(selectedClip!) : null,
-        ),
-        _ActionSpec(
           label: 'Whole',
-          tooltip: 'Blur the whole selected visual',
+          tooltip: 'Add whole-frame blur as a timeline overlay',
           icon: Icons.blur_circular_rounded,
           onTap: isVisual
-              ? () => _setClipBlurMode(selectedClip!, ClipBlurMode.full)
+              ? () => _addEffectOverlay(
+                  anchor: selectedClip!,
+                  kind: TimelineEffectKind.blur,
+                  label: 'Whole blur',
+                  blur: const ClipBlurSettings(
+                    mode: ClipBlurMode.full,
+                    strength: 12,
+                  ),
+                )
               : null,
         ),
         _ActionSpec(
           label: 'Region',
-          tooltip: 'Blur a movable privacy region',
+          tooltip: 'Add a blur region you can move on the preview',
           icon: Icons.center_focus_strong_rounded,
           onTap: isVisual
-              ? () => _setClipBlurMode(selectedClip!, ClipBlurMode.region)
+              ? () => _addEffectOverlay(
+                  anchor: selectedClip!,
+                  kind: TimelineEffectKind.blur,
+                  label: 'Region blur',
+                  blur: const ClipBlurSettings(
+                    mode: ClipBlurMode.region,
+                    strength: 12,
+                  ),
+                )
               : null,
         ),
         _ActionSpec(
-          label: 'Clear',
-          tooltip: 'Remove blur',
-          icon: Icons.blur_off_rounded,
-          onTap: isVisual
-              ? () => _setClipBlurMode(selectedClip!, ClipBlurMode.none)
-              : null,
+          label: 'Remove',
+          tooltip: 'Remove the selected blur overlay',
+          icon: Icons.layers_clear_rounded,
+          onTap: isBlurEffect ? () => _deleteClip(selectedClip!) : null,
         ),
       ],
       _BottomActionSubgroup.effectsMotion => [
@@ -4823,6 +4666,18 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             ),
           ),
         ),
+        _ActionSpec(
+          label: 'Clear',
+          tooltip: 'Hide guides and turn guide snapping off',
+          icon: Icons.layers_clear_rounded,
+          onTap: () => _updateCanvasSettings(
+            (canvas) => canvas.copyWith(
+              showGrid: false,
+              showSafeAreas: false,
+              snapToGuides: false,
+            ),
+          ),
+        ),
       ],
       _BottomActionSubgroup.canvasStudio => [
         _ActionSpec(
@@ -4839,7 +4694,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         ),
         _ActionSpec(
           label: 'Creator Lab',
-          tooltip: 'Open 23 creator tools',
+          tooltip: 'Open grouped caption and publishing workflows',
           icon: Icons.auto_awesome_rounded,
           onTap: _openCreatorLab,
         ),
@@ -4896,24 +4751,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
 
   void _addTimelineTrack(TimelineTrackSection section) {
     final timeline = ref.read(editorProvider).timeline;
-    final nextTrack = switch (section) {
-      TimelineTrackSection.overlay => TimelineTrack(
-        name: timeline.nextTrackNameForSection(section),
-        type: TimelineTrackType.video,
-        section: TimelineTrackSection.overlay,
-      ),
-      TimelineTrackSection.textSubtitle => TimelineTrack(
-        name: timeline.nextTrackNameForSection(section),
-        type: TimelineTrackType.text,
-        section: TimelineTrackSection.textSubtitle,
-      ),
-      TimelineTrackSection.audio => TimelineTrack(
-        name: timeline.nextTrackNameForSection(section),
-        type: TimelineTrackType.audio,
-        section: TimelineTrackSection.audio,
-      ),
-      TimelineTrackSection.baseVideo => null,
-    };
+    final nextTrack = _createOptionalTrack(timeline, section);
     if (nextTrack == null) return;
     ref
         .read(editorProvider.notifier)
@@ -4927,12 +4765,15 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.sizeOf(context).height * 0.40,
+      ),
       backgroundColor: Colors.transparent,
       builder: (_) => Consumer(
         builder: (context, ref, _) {
           final editorState = ref.watch(editorProvider);
           final liveClip = _clipById(clip.id, editorState) ?? clip;
-          return _buildAudioControls(liveClip);
+          return SingleChildScrollView(child: _buildAudioControls(liveClip));
         },
       ),
     );
@@ -5165,13 +5006,16 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.sizeOf(context).height * 0.40,
+      ),
       backgroundColor: Colors.transparent,
       barrierColor: Colors.black.withValues(alpha: 0.35),
       builder: (_) => Consumer(
         builder: (context, ref, _) {
           final editorState = ref.watch(editorProvider);
           final liveClip = _clipById(clip.id, editorState) ?? clip;
-          return _buildTransitionEditor(liveClip);
+          return SingleChildScrollView(child: _buildTransitionEditor(liveClip));
         },
       ),
     );
@@ -5184,6 +5028,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.sizeOf(context).height * 0.40,
+      ),
       backgroundColor: Colors.transparent,
       barrierColor: Colors.black.withValues(alpha: 0.35),
       builder: (_) => Consumer(
@@ -5191,7 +5038,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           final editorState = ref.watch(editorProvider);
           final liveClip = _clipById(clip.id, editorState) ?? clip;
           final liveTrack = _trackForClip(liveClip, editorState) ?? track;
-          return _buildClipAnimationSheet(liveClip, liveTrack);
+          return SingleChildScrollView(
+            child: _buildClipAnimationSheet(liveClip, liveTrack),
+          );
         },
       ),
     );
@@ -5513,8 +5362,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       barrierColor: Colors.black.withValues(alpha: 0.2),
       backgroundColor: Colors.transparent,
       builder: (_) => DraggableScrollableSheet(
-        initialChildSize: 0.45,
-        maxChildSize: 0.85,
+        initialChildSize: 0.38,
+        maxChildSize: 0.40,
         minChildSize: 0.22,
         expand: false,
         builder: (_, controller) {
@@ -5647,9 +5496,9 @@ class _GiphyPickerSheetState extends State<_GiphyPickerSheet> {
   @override
   Widget build(BuildContext context) {
     return DraggableScrollableSheet(
-      initialChildSize: 0.82,
-      minChildSize: 0.5,
-      maxChildSize: 0.94,
+      initialChildSize: 0.72,
+      minChildSize: 0.48,
+      maxChildSize: 0.82,
       expand: false,
       builder: (_, scrollController) {
         return Container(

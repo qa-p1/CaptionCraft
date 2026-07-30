@@ -1,7 +1,7 @@
   name: caption_craft
   description: "CaptionCraft — AI-powered subtitle editor"
   publish_to: 'none'
-  version: 0.1.0+1
+  version: 0.1.0+2002
 
   environment:
     sdk: ^3.11.0
@@ -61,9 +61,6 @@
     # Google Sign-In
     google_sign_in: ^7.2.0
 
-    # Google Fonts
-    google_fonts: ^8.0.2
-
     # Crypto for device fingerprint hashing
     crypto: ^3.0.3
 
@@ -76,3 +73,77 @@
     uses-material-design: true
     assets:
       - .env
+      - assets/fonts/licenses/
+    fonts:
+      - family: Roboto
+        fonts:
+          - asset: assets/fonts/Roboto-Variable.ttf
+            weight: 400
+          - asset: assets/fonts/Roboto-Variable.ttf
+            weight: 700
+          - asset: assets/fonts/Roboto-Italic-Variable.ttf
+            weight: 400
+            style: italic
+          - asset: assets/fonts/Roboto-Italic-Variable.ttf
+            weight: 700
+            style: italic
+      - family: Inter
+        fonts:
+          - asset: assets/fonts/Inter-Variable.ttf
+            weight: 400
+          - asset: assets/fonts/Inter-Variable.ttf
+            weight: 700
+          - asset: assets/fonts/Inter-Italic-Variable.ttf
+            weight: 400
+            style: italic
+          - asset: assets/fonts/Inter-Italic-Variable.ttf
+            weight: 700
+            style: italic
+      - family: Poppins
+        fonts:
+          - asset: assets/fonts/Poppins-Regular.ttf
+            weight: 400
+          - asset: assets/fonts/Poppins-Bold.ttf
+            weight: 700
+          - asset: assets/fonts/Poppins-Italic.ttf
+            weight: 400
+            style: italic
+          - asset: assets/fonts/Poppins-BoldItalic.ttf
+            weight: 700
+            style: italic
+      - family: Montserrat
+        fonts:
+          - asset: assets/fonts/Montserrat-Variable.ttf
+            weight: 400
+          - asset: assets/fonts/Montserrat-Variable.ttf
+            weight: 700
+          - asset: assets/fonts/Montserrat-Italic-Variable.ttf
+            weight: 400
+            style: italic
+          - asset: assets/fonts/Montserrat-Italic-Variable.ttf
+            weight: 700
+            style: italic
+      - family: Playfair Display
+        fonts:
+          - asset: assets/fonts/PlayfairDisplay-Variable.ttf
+            weight: 400
+          - asset: assets/fonts/PlayfairDisplay-Variable.ttf
+            weight: 700
+          - asset: assets/fonts/PlayfairDisplay-Italic-Variable.ttf
+            weight: 400
+            style: italic
+          - asset: assets/fonts/PlayfairDisplay-Italic-Variable.ttf
+            weight: 700
+            style: italic
+      - family: Space Mono
+        fonts:
+          - asset: assets/fonts/SpaceMono-Regular.ttf
+            weight: 400
+          - asset: assets/fonts/SpaceMono-Bold.ttf
+            weight: 700
+          - asset: assets/fonts/SpaceMono-Italic.ttf
+            weight: 400
+            style: italic
+          - asset: assets/fonts/SpaceMono-BoldItalic.ttf
+            weight: 700
+            style: italic

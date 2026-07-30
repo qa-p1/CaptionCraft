@@ -13,9 +13,20 @@ import 'subtitle_style_model.dart';
 const double kTimelineDesignWidth = 390;
 const double kTimelineDesignHeight = 360;
 
-enum TimelineTrackType { video, audio, subtitle, text, image, sticker, gif }
+enum TimelineTrackType {
+  video,
+  audio,
+  subtitle,
+  text,
+  image,
+  sticker,
+  gif,
+  effect,
+}
 
 enum TimelineTrackSection { overlay, baseVideo, textSubtitle, audio }
+
+enum TimelineEffectKind { blur, filter }
 
 enum EditorAssetType { video, audio, image, gif, sticker, unknown }
 
@@ -598,6 +609,7 @@ class TimelineClip {
   final String id;
   final String trackId;
   final TimelineTrackType type;
+  final TimelineEffectKind? effectKind;
   final String label;
   final String? assetId;
   final String? linkedClipId;
@@ -624,6 +636,7 @@ class TimelineClip {
     String? id,
     required this.trackId,
     required this.type,
+    this.effectKind,
     required this.label,
     required this.startTime,
     required this.endTime,
@@ -650,13 +663,46 @@ class TimelineClip {
        sourceDuration = sourceDuration ?? (endTime - startTime);
 
   Duration get duration => endTime - startTime;
+  bool get isEffect => type == TimelineTrackType.effect && effectKind != null;
+
+  factory TimelineClip.effect({
+    String? id,
+    required String trackId,
+    required TimelineEffectKind effectKind,
+    required String label,
+    required Duration startTime,
+    required Duration endTime,
+    ClipBlurSettings blur = const ClipBlurSettings(),
+    ClipColorAdjustments colorAdjustments = const ClipColorAdjustments(),
+    int layer = 0,
+    bool enabled = true,
+  }) {
+    return TimelineClip(
+      id: id,
+      trackId: trackId,
+      type: TimelineTrackType.effect,
+      effectKind: effectKind,
+      label: label,
+      startTime: startTime,
+      endTime: endTime,
+      sourceDuration: endTime - startTime,
+      layer: layer,
+      enabled: enabled,
+      blur: blur,
+      colorAdjustments: colorAdjustments,
+      fitMode: ClipFitMode.cover,
+    );
+  }
 
   TimelineClip copyWith({
     String? id,
     String? trackId,
     TimelineTrackType? type,
+    TimelineEffectKind? effectKind,
+    bool clearEffectKind = false,
     String? label,
     String? assetId,
+    bool clearAssetId = false,
     String? linkedClipId,
     bool clearLinkedClipId = false,
     Duration? startTime,
@@ -683,8 +729,9 @@ class TimelineClip {
       id: id ?? this.id,
       trackId: trackId ?? this.trackId,
       type: type ?? this.type,
+      effectKind: clearEffectKind ? null : (effectKind ?? this.effectKind),
       label: label ?? this.label,
-      assetId: assetId ?? this.assetId,
+      assetId: clearAssetId ? null : (assetId ?? this.assetId),
       linkedClipId: clearLinkedClipId
           ? null
           : (linkedClipId ?? this.linkedClipId),
@@ -716,6 +763,7 @@ class TimelineClip {
       'id': id,
       'trackId': trackId,
       'type': type.name,
+      'effectKind': effectKind?.name,
       'label': label,
       'assetId': assetId,
       'linkedClipId': linkedClipId,
@@ -748,6 +796,9 @@ class TimelineClip {
         (value) => value.name == json['type'],
         orElse: () => TimelineTrackType.subtitle,
       ),
+      effectKind: TimelineEffectKind.values
+          .where((value) => value.name == json['effectKind'])
+          .firstOrNull,
       label: json['label'] as String? ?? 'Untitled clip',
       assetId: json['assetId'] as String?,
       linkedClipId: json['linkedClipId'] as String?,
@@ -1081,6 +1132,16 @@ class EditorTimeline {
         );
   }
 
+  Duration get baseVideoDuration {
+    return tracks
+        .where((track) => track.section == TimelineTrackSection.baseVideo)
+        .expand((track) => track.clips)
+        .fold<Duration>(
+          Duration.zero,
+          (current, clip) => clip.endTime > current ? clip.endTime : current,
+        );
+  }
+
   EditorAssetReference? assetForClip(TimelineClip clip) {
     final assetId = clip.assetId;
     if (assetId == null) return null;
@@ -1117,33 +1178,33 @@ class EditorTimeline {
     );
   }
 
+  EditorTimeline canonicalized() {
+    return copyWith(
+      assets: _canonicalizeAssets(assets),
+      tracks: _canonicalizeTimelineTracks(tracks),
+    );
+  }
+
   EditorTimeline syncLegacySubtitles({
     required List<SubtitleEntry> subtitles,
     required SubtitleStyleModel globalStyle,
     required String videoPath,
     required int durationMs,
   }) {
-    final subtitleTrackId = primarySubtitleTrack?.id ?? 'track_subtitles';
-    final subtitleTrack = TimelineTrack(
-      id: subtitleTrackId,
-      name: 'Subtitles',
-      type: TimelineTrackType.subtitle,
-      section: TimelineTrackSection.textSubtitle,
-      clips: subtitles
-          .map(
-            (entry) =>
-                TimelineClip.fromSubtitleEntry(entry, trackId: subtitleTrackId),
-          )
-          .toList(),
+    final canonicalTracks = _canonicalizeTimelineTracks(tracks);
+    final subtitleTrack = _mergedSubtitleTrack(
+      canonicalTracks,
+      subtitles: subtitles,
+    );
+    var nextTracks = _replaceTrackGroup(
+      canonicalTracks,
+      matches: (track) => track.type == TimelineTrackType.subtitle,
+      replacement: subtitleTrack,
     );
 
-    final nextTracks = <TimelineTrack>[
-      ...tracks.where((track) => track.type != TimelineTrackType.subtitle),
-      subtitleTrack,
-    ];
-
+    final canonicalAssets = _canonicalizeAssets(assets);
     EditorAssetReference? existingSourceAsset;
-    for (final asset in assets) {
+    for (final asset in canonicalAssets) {
       if (asset.type == EditorAssetType.video &&
           asset.sourcePath == videoPath) {
         existingSourceAsset = asset;
@@ -1159,75 +1220,60 @@ class EditorTimeline {
           metadata: {'durationMs': durationMs},
         );
     final nextAssets = existingSourceAsset == null
-        ? [resolvedSourceAsset, ...assets]
-        : assets;
+        ? [resolvedSourceAsset, ...canonicalAssets]
+        : canonicalAssets;
 
-    final hasVideoTrack = nextTracks.any(
-      (track) =>
-          track.type == TimelineTrackType.video &&
-          track.section == TimelineTrackSection.baseVideo &&
-          track.clips.isNotEmpty,
+    final baseTracks = nextTracks
+        .where((track) => track.section == TimelineTrackSection.baseVideo)
+        .toList();
+    final baseTrack = _coalesceTrackGroup(
+      baseTracks,
+      fallback: () => TimelineTrack(
+        id: 'track_video_primary',
+        name: 'Video 1',
+        type: TimelineTrackType.video,
+        section: TimelineTrackSection.baseVideo,
+      ),
     );
-    final completeTracks = hasVideoTrack
-        ? nextTracks
-        : [
-            TimelineTrack(
-              id: 'track_overlay_primary',
-              name: 'Overlay 1',
-              type: TimelineTrackType.video,
-              section: TimelineTrackSection.overlay,
-              clips: const [],
-            ),
-            TimelineTrack(
-              id: 'track_video_primary',
-              name: 'Video 1',
-              type: TimelineTrackType.video,
-              section: TimelineTrackSection.baseVideo,
-              clips: [
-                TimelineClip(
-                  trackId: 'track_video_primary',
-                  type: TimelineTrackType.video,
-                  label: 'Source video',
-                  assetId: resolvedSourceAsset.id,
-                  startTime: Duration.zero,
-                  endTime: Duration(milliseconds: durationMs),
-                ),
-              ],
-            ),
-            TimelineTrack(
-              id: 'track_text_primary',
-              name: 'Text 1',
-              type: TimelineTrackType.text,
-              section: TimelineTrackSection.textSubtitle,
-              clips: const [],
-            ),
-            ...nextTracks,
-            TimelineTrack(
-              id: 'track_audio_primary',
-              name: 'Audio 1',
-              type: TimelineTrackType.audio,
-              section: TimelineTrackSection.audio,
-              clips: const [],
-            ),
-          ];
-
-    final linkedTracks = completeTracks.map((track) {
-      if (track.section != TimelineTrackSection.baseVideo) return track;
-      return track.copyWith(
-        clips: track.clips
-            .map(
-              (clip) => clip.assetId == null
-                  ? clip.copyWith(assetId: resolvedSourceAsset.id)
-                  : clip,
-            )
-            .toList(),
-      );
-    }).toList();
+    final hasBaseClips = baseTrack.clips.any(
+      (clip) => clip.type == TimelineTrackType.video,
+    );
+    final normalizedBaseTrack = baseTrack.copyWith(
+      type: TimelineTrackType.video,
+      section: TimelineTrackSection.baseVideo,
+      clips: hasBaseClips
+          ? baseTrack.clips
+                .map(
+                  (clip) => clip.copyWith(
+                    trackId: baseTrack.id,
+                    assetId: clip.assetId ?? resolvedSourceAsset.id,
+                  ),
+                )
+                .toList()
+          : [
+              TimelineClip(
+                trackId: baseTrack.id,
+                type: TimelineTrackType.video,
+                label: 'Source video',
+                assetId: resolvedSourceAsset.id,
+                startTime: Duration.zero,
+                endTime: Duration(milliseconds: math.max(0, durationMs)),
+                sourceStartTime: Duration.zero,
+                sourceDuration: Duration(milliseconds: math.max(0, durationMs)),
+              ),
+            ],
+    );
+    nextTracks = _replaceTrackGroup(
+      nextTracks,
+      matches: (track) => track.section == TimelineTrackSection.baseVideo,
+      replacement: normalizedBaseTrack,
+      insertAtStartWhenMissing: true,
+    );
 
     return copyWith(
       subtitleStyle: globalStyle,
       assets: nextAssets,
-      tracks: linkedTracks,
+      tracks: _canonicalizeTimelineTracks(nextTracks),
     );
   }
 
@@ -1235,44 +1281,20 @@ class EditorTimeline {
     required List<SubtitleEntry> subtitles,
     required SubtitleStyleModel globalStyle,
   }) {
-    final subtitleTrackId = primarySubtitleTrack?.id ?? 'track_subtitles';
-    final existingSubtitleClips = tracks
-        .where((track) => track.type == TimelineTrackType.subtitle)
-        .expand((track) => track.clips)
-        .fold<Map<String, TimelineClip>>({}, (map, clip) {
-          map[clip.id] = clip;
-          return map;
-        });
-
-    final mergedTrack = TimelineTrack(
-      id: subtitleTrackId,
-      name: primarySubtitleTrack?.name ?? 'Subtitles',
-      type: TimelineTrackType.subtitle,
-      section: TimelineTrackSection.textSubtitle,
-      clips: subtitles.map((entry) {
-        final existing = existingSubtitleClips[entry.id];
-        if (existing == null) {
-          return TimelineClip.fromSubtitleEntry(
-            entry,
-            trackId: subtitleTrackId,
-          );
-        }
-        return existing.copyWith(
-          label: entry.text,
-          startTime: entry.startTime,
-          endTime: entry.endTime,
-          text: entry.text,
-          subtitleStyle: entry.styleOverride,
-        );
-      }).toList(),
+    final canonicalTracks = _canonicalizeTimelineTracks(tracks);
+    final mergedTrack = _mergedSubtitleTrack(
+      canonicalTracks,
+      subtitles: subtitles,
+    );
+    final nextTracks = _replaceTrackGroup(
+      canonicalTracks,
+      matches: (track) => track.type == TimelineTrackType.subtitle,
+      replacement: mergedTrack,
     );
 
     return copyWith(
       subtitleStyle: globalStyle,
-      tracks: [
-        ...tracks.where((track) => track.type != TimelineTrackType.subtitle),
-        mergedTrack,
-      ],
+      tracks: _canonicalizeTimelineTracks(nextTracks),
     );
   }
 
@@ -1288,7 +1310,7 @@ class EditorTimeline {
   }
 
   factory EditorTimeline.fromJson(Map<String, dynamic> json) {
-    return EditorTimeline(
+    final parsed = EditorTimeline(
       schemaVersion: (json['schemaVersion'] as num?)?.toInt() ?? 2,
       canvasSettings: json['canvasSettings'] is Map<String, dynamic>
           ? CanvasSettings.fromJson(
@@ -1302,30 +1324,34 @@ class EditorTimeline {
           : const SubtitleStyleModel(),
       assets:
           (json['assets'] as List<dynamic>?)
-              ?.map(
+              ?.whereType<Map>()
+              .map(
                 (asset) => EditorAssetReference.fromJson(
-                  asset as Map<String, dynamic>,
+                  Map<String, dynamic>.from(asset),
                 ),
               )
               .toList() ??
           const [],
       tracks:
           (json['tracks'] as List<dynamic>?)
-              ?.map(
+              ?.whereType<Map>()
+              .map(
                 (track) =>
-                    TimelineTrack.fromJson(track as Map<String, dynamic>),
+                    TimelineTrack.fromJson(Map<String, dynamic>.from(track)),
               )
               .toList() ??
           const [],
       markers:
           (json['markers'] as List<dynamic>?)
-              ?.map(
+              ?.whereType<Map>()
+              .map(
                 (marker) =>
-                    TimelineMarker.fromJson(marker as Map<String, dynamic>),
+                    TimelineMarker.fromJson(Map<String, dynamic>.from(marker)),
               )
               .toList() ??
           const [],
     );
+    return parsed.canonicalized();
   }
 
   factory EditorTimeline.fromLegacy({
@@ -1341,6 +1367,178 @@ class EditorTimeline {
       durationMs: durationMs,
     );
   }
+}
+
+TimelineTrack _mergedSubtitleTrack(
+  List<TimelineTrack> tracks, {
+  required List<SubtitleEntry> subtitles,
+}) {
+  final subtitleTracks = tracks
+      .where((track) => track.type == TimelineTrackType.subtitle)
+      .toList();
+  final primary = _coalesceTrackGroup(
+    subtitleTracks,
+    fallback: () => TimelineTrack(
+      id: 'track_subtitles',
+      name: 'Subtitles',
+      type: TimelineTrackType.subtitle,
+      section: TimelineTrackSection.textSubtitle,
+    ),
+  );
+  final existingById = <String, TimelineClip>{};
+  for (final track in subtitleTracks) {
+    for (final clip in track.clips) {
+      existingById.putIfAbsent(clip.id, () => clip);
+    }
+  }
+  final clips = subtitles.map((entry) {
+    final existing = existingById[entry.id];
+    if (existing == null) {
+      return TimelineClip.fromSubtitleEntry(entry, trackId: primary.id);
+    }
+    return existing.copyWith(
+      trackId: primary.id,
+      type: TimelineTrackType.subtitle,
+      label: entry.text,
+      startTime: entry.startTime,
+      endTime: entry.endTime,
+      text: entry.text,
+      subtitleStyle: entry.styleOverride,
+      clearSubtitleStyle: entry.styleOverride == null,
+    );
+  }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
+  return primary.copyWith(
+    type: TimelineTrackType.subtitle,
+    section: TimelineTrackSection.textSubtitle,
+    clips: clips,
+  );
+}
+
+TimelineTrack _coalesceTrackGroup(
+  List<TimelineTrack> tracks, {
+  required TimelineTrack Function() fallback,
+}) {
+  if (tracks.isEmpty) return fallback();
+  final primary = tracks.firstWhere(
+    (track) => track.clips.isNotEmpty,
+    orElse: () => tracks.first,
+  );
+  final clipsById = <String, TimelineClip>{};
+  for (final track in tracks) {
+    for (final clip in track.clips) {
+      clipsById.putIfAbsent(clip.id, () => clip.copyWith(trackId: primary.id));
+    }
+  }
+  final clips = clipsById.values.toList()
+    ..sort((a, b) => a.startTime.compareTo(b.startTime));
+  return primary.copyWith(
+    isCollapsed: tracks.any((track) => track.isCollapsed),
+    isLocked: tracks.any((track) => track.isLocked),
+    isMuted: tracks.any((track) => track.isMuted),
+    isHidden: tracks.any((track) => track.isHidden),
+    isSolo: tracks.any((track) => track.isSolo),
+    clips: clips,
+  );
+}
+
+List<TimelineTrack> _replaceTrackGroup(
+  List<TimelineTrack> tracks, {
+  required bool Function(TimelineTrack track) matches,
+  required TimelineTrack replacement,
+  bool insertAtStartWhenMissing = false,
+}) {
+  final next = <TimelineTrack>[];
+  var inserted = false;
+  for (final track in tracks) {
+    if (!matches(track)) {
+      next.add(track);
+      continue;
+    }
+    if (!inserted) {
+      next.add(replacement);
+      inserted = true;
+    }
+  }
+  if (!inserted) {
+    if (insertAtStartWhenMissing) {
+      next.insert(0, replacement);
+    } else {
+      next.add(replacement);
+    }
+  }
+  return next;
+}
+
+List<EditorAssetReference> _canonicalizeAssets(
+  Iterable<EditorAssetReference> assets,
+) {
+  final byId = <String, EditorAssetReference>{};
+  for (final asset in assets) {
+    byId.putIfAbsent(asset.id, () => asset);
+  }
+  return byId.values.toList();
+}
+
+List<TimelineTrack> _canonicalizeTimelineTracks(
+  Iterable<TimelineTrack> tracks,
+) {
+  final byId = <String, TimelineTrack>{};
+  for (final sourceTrack in tracks) {
+    final trackId = sourceTrack.id.trim().isEmpty
+        ? const Uuid().v4()
+        : sourceTrack.id;
+    final localClipIds = <String>{};
+    final normalizedClips = <TimelineClip>[];
+    for (final sourceClip in sourceTrack.clips) {
+      final clipId = sourceClip.id.trim().isEmpty
+          ? const Uuid().v4()
+          : sourceClip.id;
+      if (!localClipIds.add(clipId)) continue;
+      normalizedClips.add(
+        sourceClip.copyWith(
+          id: clipId,
+          trackId: trackId,
+          clearAssetId: sourceClip.type == TimelineTrackType.effect,
+        ),
+      );
+    }
+    final normalizedTrack = sourceTrack.copyWith(
+      id: trackId,
+      clips: normalizedClips,
+    );
+    final existing = byId[trackId];
+    if (existing == null) {
+      byId[trackId] = normalizedTrack;
+      continue;
+    }
+    final primary = existing.clips.isEmpty && normalizedTrack.clips.isNotEmpty
+        ? normalizedTrack
+        : existing;
+    final mergedClips = <String, TimelineClip>{};
+    for (final clip in [...existing.clips, ...normalizedTrack.clips]) {
+      mergedClips.putIfAbsent(clip.id, () => clip.copyWith(trackId: trackId));
+    }
+    byId[trackId] = primary.copyWith(
+      id: trackId,
+      isCollapsed: existing.isCollapsed || normalizedTrack.isCollapsed,
+      isLocked: existing.isLocked || normalizedTrack.isLocked,
+      isMuted: existing.isMuted || normalizedTrack.isMuted,
+      isHidden: existing.isHidden || normalizedTrack.isHidden,
+      isSolo: existing.isSolo || normalizedTrack.isSolo,
+      clips: mergedClips.values.toList(),
+    );
+  }
+
+  final globalClipIds = <String>{};
+  return byId.values.map((track) {
+    final uniqueClips =
+        track.clips
+            .where((clip) => globalClipIds.add(clip.id))
+            .map((clip) => clip.copyWith(trackId: track.id))
+            .toList()
+          ..sort((a, b) => a.startTime.compareTo(b.startTime));
+    return track.copyWith(clips: uniqueClips);
+  }).toList();
 }
 
 TimelineTrackType _trackTypeFromJson(dynamic value) {
@@ -1362,6 +1560,7 @@ TimelineTrackSection _defaultSectionForType(TimelineTrackType type) {
     case TimelineTrackType.image:
     case TimelineTrackType.sticker:
     case TimelineTrackType.gif:
+    case TimelineTrackType.effect:
       return TimelineTrackSection.overlay;
   }
 }

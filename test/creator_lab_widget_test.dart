@@ -3,6 +3,7 @@ import 'package:caption_craft/features/editor/models/subtitle_entry.dart';
 import 'package:caption_craft/features/editor/models/subtitle_style_model.dart';
 import 'package:caption_craft/features/editor/models/timeline_models.dart';
 import 'package:caption_craft/features/editor/providers/editor_provider.dart';
+import 'package:caption_craft/features/editor/providers/playback_provider.dart';
 import 'package:caption_craft/features/editor/providers/subtitle_provider.dart';
 import 'package:caption_craft/features/editor/screens/creator_lab_screen.dart';
 import 'package:caption_craft/features/editor/screens/teleprompter_screen.dart';
@@ -11,7 +12,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  testWidgets('Creator Lab exposes repair, wow, and review experiences', (
+  testWidgets('Creator Lab starts with recommendations and groups every tool', (
     tester,
   ) async {
     await tester.binding.setSurfaceSize(const Size(1180, 820));
@@ -19,44 +20,183 @@ void main() {
     await _pumpLab(tester);
 
     expect(find.text('Creator Lab'), findsOneWidget);
-    expect(find.textContaining('23 creative tools'), findsOneWidget);
+    expect(find.textContaining('Offline workflow tools'), findsOneWidget);
+    expect(find.text('REVIEW & RECOMMENDED'), findsOneWidget);
+    expect(find.text('RECOMMENDED NOW'), findsOneWidget);
     expect(find.text('Smart Line Balance'), findsOneWidget);
     expect(find.text('Reading-Speed Retimer'), findsOneWidget);
+    expect(find.text('Estimated Word Timing'), findsOneWidget);
 
-    await tester.tap(find.text('Wow Lab'));
+    await tester.tap(find.text('Fix'));
     await tester.pumpAndSettle();
-    expect(find.text('Viral Moment Radar'), findsOneWidget);
-    expect(find.text('Magic Chapter Director'), findsOneWidget);
+    expect(find.text('Layout & timing'), findsOneWidget);
+    expect(find.text('Text cleanup'), findsOneWidget);
+    await tester.scrollUntilVisible(
+      find.text('Names & safety'),
+      260,
+      scrollable: find.byType(Scrollable).last,
+    );
+    expect(find.text('Names & safety'), findsOneWidget);
+    expect(find.text('Edits captions'), findsWidgets);
 
-    await tester.tap(find.text('Review'));
+    await tester.tap(find.text('Create'));
     await tester.pumpAndSettle();
-    expect(find.text('Pace Heatmap & Confidence Desk'), findsOneWidget);
-    expect(find.text('PACE HEATMAP'), findsOneWidget);
-    expect(find.text('Fix track pace'), findsOneWidget);
+    expect(find.text('Planning markers'), findsOneWidget);
+    expect(find.text('Moment Suggestions'), findsOneWidget);
+    expect(find.text('Automatic Chapter Markers'), findsOneWidget);
+    expect(find.text('B-roll Prompt Markers'), findsOneWidget);
+    expect(find.text('Adds markers'), findsNWidgets(3));
+    expect(find.text('Viral Moment Radar'), findsNothing);
+    expect(find.text('Magic Chapter Director'), findsNothing);
   });
 
-  testWidgets('repair cards apply transformations through editor providers', (
+  testWidgets('caption batch is one atomic editor undo and redo step', (
     tester,
   ) async {
     await tester.binding.setSurfaceSize(const Size(430, 860));
     addTearDown(() => tester.binding.setSurfaceSize(null));
     final container = await _pumpLab(tester);
 
-    await tester.dragUntilVisible(
+    await tester.tap(find.text('Fix'));
+    await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(
+      find.text('Text cleanup'),
+      260,
+      scrollable: find.byType(Scrollable).last,
+    );
+    await tester.tap(find.text('Text cleanup'));
+    await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(
       find.text('Filler Word Cleaner'),
-      find.byType(CustomScrollView),
-      const Offset(0, -250),
+      260,
+      scrollable: find.byType(Scrollable).last,
     );
     await tester.tap(find.text('Filler Word Cleaner'));
     await tester.pumpAndSettle();
 
-    final captions = container.read(subtitleProvider).entries;
-    expect(captions.first.text, 'this workflow is ready.');
+    final editor = container.read(editorProvider.notifier);
+    expect(
+      container.read(subtitleProvider).entries.first.text,
+      'this workflow is ready.',
+    );
     expect(
       container.read(editorProvider).timeline.subtitleEntries.first.text,
       'this workflow is ready.',
     );
+    expect(container.read(editorProvider).canUndo, isTrue);
     expect(find.textContaining('Undo available'), findsOneWidget);
+
+    editor.undo();
+    await tester.pump();
+    expect(container.read(editorProvider).canUndo, isFalse);
+    expect(container.read(editorProvider).canRedo, isTrue);
+    expect(
+      container.read(subtitleProvider).entries.first.text,
+      'Um, this workflow is ready.',
+    );
+    expect(
+      container.read(editorProvider).timeline.subtitleEntries.first.text,
+      'Um, this workflow is ready.',
+    );
+
+    editor.redo();
+    await tester.pump();
+    expect(container.read(editorProvider).canUndo, isTrue);
+    expect(container.read(editorProvider).canRedo, isFalse);
+    expect(
+      container.read(subtitleProvider).entries.first.text,
+      'this workflow is ready.',
+    );
+    expect(
+      container.read(editorProvider).timeline.subtitleEntries.first.text,
+      'this workflow is ready.',
+    );
+  });
+
+  testWidgets('caption-dependent catalog explains and disables empty state', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(430, 860));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final container = await _pumpLab(tester, seededEntries: const []);
+
+    expect(find.textContaining('Add or generate captions'), findsOneWidget);
+    await tester.tap(find.text('Fix'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Needs captions'), findsWidgets);
+    final cardInkWell = find
+        .ancestor(
+          of: find.text('Smart Line Balance'),
+          matching: find.byType(InkWell),
+        )
+        .first;
+    expect(tester.widget<InkWell>(cardInkWell).onTap, isNull);
+    expect(container.read(subtitleProvider).entries, isEmpty);
+  });
+
+  testWidgets('result sheet is compact and a result returns to editor seek', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1180, 820));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      ProviderScope(
+        child: MaterialApp(
+          theme: AppTheme.darkTheme,
+          home: const _CreatorLabHost(),
+        ),
+      ),
+    );
+    await tester.pump();
+    final container = ProviderScope.containerOf(
+      tester.element(find.byKey(const Key('open_creator_lab'))),
+    );
+    _seedProviders(container, _sampleEntries());
+
+    await tester.tap(find.byKey(const Key('open_creator_lab')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Create'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('B-roll Prompt Markers'));
+    await tester.pumpAndSettle();
+
+    final sheet = find.byKey(const Key('creator_lab_result_sheet'));
+    expect(sheet, findsOneWidget);
+    final labScaffold = find.descendant(
+      of: find.byType(CreatorLabScreen),
+      matching: find.byType(Scaffold),
+    );
+    final availableHeight = tester.getSize(labScaffold).height;
+    expect(
+      tester.getSize(sheet).height,
+      lessThanOrEqualTo(availableHeight * 0.42),
+    );
+    expect(
+      tester.getSize(sheet).height,
+      greaterThanOrEqualTo(availableHeight * 0.25),
+    );
+
+    final secondSuggestion = find.textContaining(
+      'FROM: A cinematic camera moves',
+    );
+    await tester.scrollUntilVisible(
+      secondSuggestion,
+      180,
+      scrollable: find
+          .descendant(of: sheet, matching: find.byType(Scrollable))
+          .last,
+    );
+    await tester.tap(secondSuggestion);
+    await tester.pumpAndSettle();
+
+    expect(find.byType(CreatorLabScreen), findsNothing);
+    expect(find.text('Editor preview host'), findsOneWidget);
+    expect(
+      container.read(playbackProvider).position,
+      const Duration(seconds: 10),
+    );
+    expect(container.read(playbackProvider).seekRequestId, greaterThan(0));
   });
 
   testWidgets('Teleprompter Stage remains usable on a phone', (tester) async {
@@ -98,7 +238,10 @@ void main() {
   });
 }
 
-Future<ProviderContainer> _pumpLab(WidgetTester tester) async {
+Future<ProviderContainer> _pumpLab(
+  WidgetTester tester, {
+  List<SubtitleEntry>? seededEntries,
+}) async {
   await tester.pumpWidget(
     ProviderScope(
       child: MaterialApp(
@@ -112,7 +255,13 @@ Future<ProviderContainer> _pumpLab(WidgetTester tester) async {
   final container = ProviderScope.containerOf(
     tester.element(find.byType(CreatorLabScreen)),
   );
-  final entries = [
+  _seedProviders(container, seededEntries ?? _sampleEntries());
+  await tester.pumpAndSettle();
+  return container;
+}
+
+List<SubtitleEntry> _sampleEntries() {
+  return [
     _entry(
       id: 'one',
       text: 'Um, this workflow is ready.',
@@ -132,6 +281,9 @@ Future<ProviderContainer> _pumpLab(WidgetTester tester) async {
       endMs: 12500,
     ),
   ];
+}
+
+void _seedProviders(ProviderContainer container, List<SubtitleEntry> entries) {
   const style = SubtitleStyleModel();
   final timeline = const EditorTimeline().syncLegacySubtitles(
     subtitles: entries,
@@ -150,8 +302,32 @@ Future<ProviderContainer> _pumpLab(WidgetTester tester) async {
         projectName: 'Creator Lab Test',
         timeline: timeline,
       );
-  await tester.pumpAndSettle();
-  return container;
+  container
+      .read(playbackProvider.notifier)
+      .updateDuration(const Duration(seconds: 15));
+}
+
+class _CreatorLabHost extends StatelessWidget {
+  const _CreatorLabHost();
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: FilledButton(
+          key: const Key('open_creator_lab'),
+          onPressed: () => Navigator.push<void>(
+            context,
+            MaterialPageRoute(
+              builder: (_) =>
+                  const CreatorLabScreen(projectName: 'Creator Lab Test'),
+            ),
+          ),
+          child: const Text('Editor preview host'),
+        ),
+      ),
+    );
+  }
 }
 
 SubtitleEntry _entry({

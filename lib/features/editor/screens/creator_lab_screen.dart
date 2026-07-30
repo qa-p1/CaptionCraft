@@ -29,8 +29,10 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
   @override
   Widget build(BuildContext context) {
     final subtitleState = ref.watch(subtitleProvider);
+    final catalog = _buildToolCatalog(subtitleState);
     return DefaultTabController(
       length: 3,
+      initialIndex: 0,
       child: Scaffold(
         backgroundColor: kBackground,
         appBar: AppBar(
@@ -69,7 +71,7 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
                     const Text('Creator Lab'),
                     Text(
                       '${subtitleState.entries.length} captions • '
-                      '23 creative tools',
+                      'Offline workflow tools',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
@@ -88,20 +90,18 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
               margin: const EdgeInsets.only(right: 12),
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
               decoration: BoxDecoration(
-                color: const Color(0xFFC84DFF).withValues(alpha: 0.1),
+                color: kSuccess.withValues(alpha: 0.1),
                 borderRadius: BorderRadius.circular(99),
-                border: Border.all(
-                  color: const Color(0xFFC84DFF).withValues(alpha: 0.3),
-                ),
+                border: Border.all(color: kSuccess.withValues(alpha: 0.3)),
               ),
               child: const Row(
                 children: [
-                  Icon(Icons.bolt_rounded, size: 14, color: Color(0xFFE0A7FF)),
+                  Icon(Icons.offline_bolt_rounded, size: 14, color: kSuccess),
                   SizedBox(width: 4),
                   Text(
-                    '7 WOW',
+                    'ON DEVICE',
                     style: TextStyle(
-                      color: Color(0xFFE0A7FF),
+                      color: kSuccess,
                       fontSize: 9,
                       fontWeight: FontWeight.w900,
                       letterSpacing: 0.7,
@@ -113,27 +113,37 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
           ],
           bottom: const TabBar(
             tabs: [
-              Tab(icon: Icon(Icons.build_circle_outlined), text: 'Repair'),
-              Tab(icon: Icon(Icons.auto_awesome_rounded), text: 'Wow Lab'),
               Tab(icon: Icon(Icons.monitor_heart_outlined), text: 'Review'),
+              Tab(icon: Icon(Icons.build_circle_outlined), text: 'Fix'),
+              Tab(icon: Icon(Icons.auto_awesome_rounded), text: 'Create'),
             ],
           ),
         ),
         body: TabBarView(
           children: [
-            _buildRepairTab(),
-            _buildWowTab(subtitleState),
-            _buildReviewTab(subtitleState),
+            _buildReviewTab(subtitleState, catalog),
+            _buildCatalogTab(
+              subtitleState: subtitleState,
+              catalog: catalog,
+              area: _LabCatalogArea.fix,
+            ),
+            _buildCatalogTab(
+              subtitleState: subtitleState,
+              catalog: catalog,
+              area: _LabCatalogArea.create,
+            ),
           ],
         ),
       ),
     );
   }
 
-  Widget _buildRepairTab() {
-    final tools = <_LabFeature>[
+  List<_LabFeature> _buildToolCatalog(SubtitleState subtitleState) {
+    return <_LabFeature>[
       _LabFeature(
-        number: 1,
+        id: 'balance_lines',
+        group: _LabToolGroup.layoutTiming,
+        effectLabel: 'Edits captions',
         icon: Icons.splitscreen_rounded,
         title: 'Smart Line Balance',
         description:
@@ -141,7 +151,9 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
         onTap: () => _applyResult(CaptionStudioService.balanceLines(_entries)),
       ),
       _LabFeature(
-        number: 2,
+        id: 'reading_speed',
+        group: _LabToolGroup.layoutTiming,
+        effectLabel: 'Edits captions',
         icon: Icons.speed_rounded,
         title: 'Reading-Speed Retimer',
         description:
@@ -149,7 +161,9 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
         onTap: _showReadingSpeedDialog,
       ),
       _LabFeature(
-        number: 3,
+        id: 'split_long',
+        group: _LabToolGroup.layoutTiming,
+        effectLabel: 'Edits captions',
         icon: Icons.call_split_rounded,
         title: 'Auto Split Long Cues',
         description:
@@ -157,7 +171,9 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
         onTap: _showSplitDialog,
       ),
       _LabFeature(
-        number: 4,
+        id: 'merge_short',
+        group: _LabToolGroup.layoutTiming,
+        effectLabel: 'Edits captions',
         icon: Icons.merge_rounded,
         title: 'Tiny Cue Merger',
         description:
@@ -166,7 +182,9 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
             _applyResult(CaptionStudioService.mergeShortCues(_entries)),
       ),
       _LabFeature(
-        number: 5,
+        id: 'filler_cleaner',
+        group: _LabToolGroup.textCleanup,
+        effectLabel: 'Edits captions',
         icon: Icons.cleaning_services_rounded,
         title: 'Filler Word Cleaner',
         description:
@@ -175,7 +193,9 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
             _applyResult(CaptionStudioService.removeFillerWords(_entries)),
       ),
       _LabFeature(
-        number: 6,
+        id: 'echo_cleaner',
+        group: _LabToolGroup.textCleanup,
+        effectLabel: 'Edits captions',
         icon: Icons.repeat_one_rounded,
         title: 'Echo Cleaner',
         description:
@@ -184,7 +204,9 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
             _applyResult(CaptionStudioService.removeRepeatedWords(_entries)),
       ),
       _LabFeature(
-        number: 7,
+        id: 'punctuation',
+        group: _LabToolGroup.textCleanup,
+        effectLabel: 'Edits captions',
         icon: Icons.auto_fix_high_rounded,
         title: 'Punctuation Polish',
         description:
@@ -193,14 +215,18 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
             _applyResult(CaptionStudioService.polishPunctuation(_entries)),
       ),
       _LabFeature(
-        number: 8,
+        id: 'frame_snap',
+        group: _LabToolGroup.layoutTiming,
+        effectLabel: 'Edits captions',
         icon: Icons.grid_4x4_rounded,
         title: 'Frame-Perfect Snap',
         description: 'Quantizes all in/out points to the delivery frame grid.',
         onTap: _showFrameRateDialog,
       ),
       _LabFeature(
-        number: 9,
+        id: 'empty_cues',
+        group: _LabToolGroup.textCleanup,
+        effectLabel: 'Edits captions',
         icon: Icons.comments_disabled_outlined,
         title: 'Empty Cue Sweeper',
         description:
@@ -212,7 +238,9 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
         ),
       ),
       _LabFeature(
-        number: 10,
+        id: 'sound_cues',
+        group: _LabToolGroup.textCleanup,
+        effectLabel: 'Edits captions',
         icon: Icons.music_off_rounded,
         title: 'Sound Cue Cleaner',
         description:
@@ -224,7 +252,9 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
         ),
       ),
       _LabFeature(
-        number: 11,
+        id: 'mask_terms',
+        group: _LabToolGroup.namesSafety,
+        effectLabel: 'Edits captions',
         icon: Icons.visibility_off_rounded,
         title: 'Sensitive Word Mask',
         description:
@@ -232,14 +262,18 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
         onTap: _showMaskTermsDialog,
       ),
       _LabFeature(
-        number: 12,
+        id: 'speaker_labels',
+        group: _LabToolGroup.namesSafety,
+        effectLabel: 'Edits captions',
         icon: Icons.record_voice_over_rounded,
         title: 'Speaker Labeler',
         description: 'Adds rotating speaker names in configurable cue groups.',
         onTap: _showSpeakerDialog,
       ),
       _LabFeature(
-        number: 13,
+        id: 'remove_speaker_labels',
+        group: _LabToolGroup.namesSafety,
+        effectLabel: 'Edits captions',
         icon: Icons.person_off_outlined,
         title: 'Speaker Label Remover',
         description:
@@ -249,7 +283,9 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
         ),
       ),
       _LabFeature(
-        number: 14,
+        id: 'glossary',
+        group: _LabToolGroup.namesSafety,
+        effectLabel: 'Edits captions',
         icon: Icons.spellcheck_rounded,
         title: 'Glossary Guard',
         description:
@@ -257,7 +293,9 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
         onTap: _showGlossaryDialog,
       ),
       _LabFeature(
-        number: 15,
+        id: 'timing_air',
+        group: _LabToolGroup.layoutTiming,
+        effectLabel: 'Edits captions',
         icon: Icons.air_rounded,
         title: 'Timing Air',
         description:
@@ -269,49 +307,36 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
           ),
         ),
       ),
-    ];
-    return _FeatureGrid(
-      intro: const _LabIntro(
-        eyebrow: 'PRECISION TOOLKIT',
-        title: 'Repair a complete caption track in seconds',
-        description:
-            'Every action is local, deterministic, persisted automatically, '
-            'and can be undone from the editor.',
-        icon: Icons.handyman_rounded,
-      ),
-      features: tools,
-    );
-  }
-
-  Widget _buildWowTab(SubtitleState subtitleState) {
-    final tools = <_LabFeature>[
       _LabFeature(
-        number: 17,
-        wow: true,
+        id: 'moment_suggestions',
+        group: _LabToolGroup.planningMarkers,
+        effectLabel: 'Adds markers',
         icon: Icons.local_fire_department_rounded,
-        title: 'Viral Moment Radar',
+        title: 'Moment Suggestions',
         description:
-            'Scores hook density, curiosity, pace, energy, and specificity to find standout moments.',
+            'Ranks transcript windows with offline hook, pace, and clarity signals.',
         onTap: _showViralMomentRadar,
       ),
       _LabFeature(
-        number: 18,
-        wow: true,
+        id: 'chapter_markers',
+        group: _LabToolGroup.planningMarkers,
+        effectLabel: 'Adds markers',
         icon: Icons.view_timeline_rounded,
-        title: 'Magic Chapter Director',
+        title: 'Automatic Chapter Markers',
         description:
-            'Finds topic boundaries and turns them into named chapter markers automatically.',
+            'Uses long pauses and section length to draft named chapter markers.',
         onTap: _showChapterDirector,
       ),
       _LabFeature(
-        number: 19,
-        wow: true,
+        id: 'caption_motion',
+        group: _LabToolGroup.captionMotion,
+        effectLabel: 'Edits captions',
         icon: Icons.animation_rounded,
-        title: 'Kinetic Caption Director',
+        title: 'Auto Caption Motion',
         description:
-            'Directs animation, color, and emphasis cue-by-cue from the emotional shape of the words.',
+            'Assigns animation, color, and emphasis from punctuation and word timing.',
         onTap: () => _confirmAndApply(
-          title: 'Direct the complete caption performance?',
+          title: 'Apply automatic motion to every caption?',
           result: CaptionStudioService.directKineticCaptions(
             _entries,
             globalStyle: subtitleState.globalStyle,
@@ -320,61 +345,163 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
         ),
       ),
       _LabFeature(
-        number: 20,
-        wow: true,
+        id: 'broll_prompts',
+        group: _LabToolGroup.planningMarkers,
+        effectLabel: 'Adds markers',
         icon: Icons.movie_filter_rounded,
-        title: 'B-roll Storyboard',
+        title: 'B-roll Prompt Markers',
         description:
-            'Builds timestamped visual prompts from concrete ideas in the transcript.',
+            'Drafts keyword-based visual prompts and places them as timeline markers.',
         onTap: _showBrollStoryboard,
       ),
       _LabFeature(
-        number: 21,
-        wow: true,
+        id: 'social_copy',
+        group: _LabToolGroup.publish,
+        effectLabel: 'Copies text',
         icon: Icons.rocket_launch_rounded,
-        title: 'Social Launch Pack',
+        title: 'Draft Social Copy',
         description:
-            'Generates title options, opening hooks, a description, and ready-to-copy hashtags.',
+            'Drafts template-based titles, hooks, a description, and hashtags.',
         onTap: _showSocialLaunchPack,
       ),
       _LabFeature(
-        number: 22,
-        wow: true,
+        id: 'estimated_word_timing',
+        group: _LabToolGroup.captionMotion,
+        effectLabel: 'Edits captions',
         icon: Icons.graphic_eq_rounded,
-        title: 'Karaoke Time Machine',
+        title: 'Estimated Word Timing',
         description:
-            'Synthesizes word-level timing for imported or manually written captions.',
+            'Estimates word timing by text length for karaoke-style animation.',
         onTap: () => _applyResult(
           CaptionStudioService.synthesizeKaraokeTimings(_entries),
         ),
       ),
       _LabFeature(
-        number: 23,
-        wow: true,
+        id: 'teleprompter',
+        group: _LabToolGroup.rehearsal,
+        effectLabel: 'Rehearsal',
         icon: Icons.live_tv_rounded,
         title: 'Teleprompter Stage',
         description:
-            'Rehearse full-screen with auto-scroll, mirror glass mode, pace control, and large type.',
+            'Rehearse with auto-scroll, mirror glass mode, pace control, and large type.',
         onTap: _openTeleprompter,
       ),
     ];
-    return _FeatureGrid(
-      intro: const _LabIntro(
-        eyebrow: 'SIGNATURE EXPERIENCES',
-        title: 'Turn a transcript into a creative co-director',
-        description:
-            'Seven offline-first workflows that surface moments, build launch '
-            'assets, and direct a more expressive cut.',
-        icon: Icons.auto_awesome_rounded,
-        wow: true,
+  }
+
+  Widget _buildCatalogTab({
+    required SubtitleState subtitleState,
+    required List<_LabFeature> catalog,
+    required _LabCatalogArea area,
+  }) {
+    final groups = _LabToolGroup.values
+        .where((group) => group.area == area)
+        .toList();
+    return _GroupedFeatureCatalog(
+      intro: _LabIntro(
+        eyebrow: area == _LabCatalogArea.fix
+            ? 'CAPTION WORKSHOP'
+            : 'CREATE & PUBLISH',
+        title: area == _LabCatalogArea.fix
+            ? 'Focused fixes, grouped by the job'
+            : 'Offline drafts, markers, motion, and rehearsal',
+        description: area == _LabCatalogArea.fix
+            ? 'Open only the section you need. Every action states exactly '
+                  'what it changes.'
+            : 'These tools use deterministic transcript rules. They never '
+                  'upload media or pretend to replace editorial judgment.',
+        icon: area == _LabCatalogArea.fix
+            ? Icons.handyman_rounded
+            : Icons.auto_awesome_rounded,
       ),
-      features: tools,
-      wow: true,
+      groups: groups,
+      features: catalog,
+      captionsAvailable: subtitleState.entries.isNotEmpty,
     );
   }
 
-  Widget _buildReviewTab(SubtitleState subtitleState) {
+  List<_LabRecommendation> _buildRecommendations(
+    SubtitleState subtitleState,
+    List<_LabFeature> catalog,
+  ) {
+    if (subtitleState.entries.isEmpty) return const [];
+    final byId = {for (final feature in catalog) feature.id: feature};
+    final recommendations = <_LabRecommendation>[];
+
+    void add(String id, String reason) {
+      final feature = byId[id];
+      if (feature == null ||
+          recommendations.any((item) => item.feature.id == id)) {
+        return;
+      }
+      recommendations.add(_LabRecommendation(feature, reason));
+    }
+
+    final entries = subtitleState.entries;
+    final pace = CaptionStudioService.analyzePace(entries);
+    final emptyCount = entries
+        .where((entry) => entry.text.trim().isEmpty)
+        .length;
+    final longCount = entries
+        .where(
+          (entry) =>
+              entry.text.replaceAll(RegExp(r'\s+'), ' ').trim().length > 72,
+        )
+        .length;
+    final fastCount = pace
+        .where(
+          (metric) =>
+              metric.band == CaptionPaceBand.fast ||
+              metric.band == CaptionPaceBand.extreme,
+        )
+        .length;
+    final missingTiming = entries
+        .where((entry) => entry.words?.isNotEmpty != true)
+        .length;
+
+    if (emptyCount > 0) {
+      add(
+        'empty_cues',
+        '$emptyCount empty cue${emptyCount == 1 ? '' : 's'} found',
+      );
+    }
+    if (fastCount > 0) {
+      add(
+        'reading_speed',
+        '$fastCount fast cue${fastCount == 1 ? '' : 's'} need breathing room',
+      );
+    }
+    if (longCount > 0) {
+      add(
+        'split_long',
+        '$longCount long cue${longCount == 1 ? '' : 's'} may be hard to scan',
+      );
+    }
+    if (missingTiming > 0) {
+      add(
+        'estimated_word_timing',
+        '$missingTiming cue${missingTiming == 1 ? '' : 's'} lack word timing',
+      );
+    }
+
+    if (recommendations.length < 3) {
+      add('balance_lines', 'A reliable first pass for mobile readability');
+    }
+    if (recommendations.length < 3) {
+      add('punctuation', 'Clean casing and sentence endings in one pass');
+    }
+    if (recommendations.length < 3) {
+      add('timing_air', 'Add small, collision-aware timing margins');
+    }
+    return recommendations.take(4).toList();
+  }
+
+  Widget _buildReviewTab(
+    SubtitleState subtitleState,
+    List<_LabFeature> catalog,
+  ) {
     final metrics = CaptionStudioService.analyzePace(subtitleState.entries);
+    final recommendations = _buildRecommendations(subtitleState, catalog);
     final filtered = _paceFilter == null
         ? metrics
         : metrics.where((metric) => metric.band == _paceFilter).toList();
@@ -401,14 +528,29 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const _LabIntro(
-                  eyebrow: 'FEATURE 16 • REVIEW QUEUE',
+                  eyebrow: 'REVIEW & RECOMMENDED',
                   title: 'Pace Heatmap & Confidence Desk',
                   description:
-                      'See exactly where viewers may struggle, then jump to or '
-                      'repair the affected cue.',
+                      'Start with the few actions this project needs, then '
+                      'inspect pace, confidence, and word timing cue by cue.',
                   icon: Icons.monitor_heart_rounded,
                 ),
                 const SizedBox(height: 18),
+                const _SectionHeading(
+                  title: 'RECOMMENDED NOW',
+                  subtitle: 'Based on the current caption track',
+                ),
+                const SizedBox(height: 10),
+                if (subtitleState.entries.isEmpty)
+                  const _CaptionRequirementNotice()
+                else
+                  _RecommendationGrid(recommendations: recommendations),
+                const SizedBox(height: 20),
+                const _SectionHeading(
+                  title: 'TRACK HEALTH',
+                  subtitle: 'Live readability and timing signals',
+                ),
+                const SizedBox(height: 10),
                 LayoutBuilder(
                   builder: (context, constraints) {
                     final width = constraints.maxWidth;
@@ -496,7 +638,7 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
                                 ),
                               ),
                         icon: const Icon(Icons.graphic_eq_rounded),
-                        label: const Text('Fill word timing'),
+                        label: const Text('Estimate word timing'),
                       ),
                     ),
                   ],
@@ -889,20 +1031,21 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
       SnackBarHelper.showInfo(context, 'No complete moments found yet.');
       return;
     }
-    await _showLabResultSheet(
-      title: 'Viral Moment Radar',
-      subtitle: '${moments.length} non-overlapping moments ranked',
-      actionLabel: 'Add radar markers',
+    final selectedPosition = await _showLabResultSheet(
+      title: 'Moment Suggestions',
+      subtitle:
+          '${moments.length} non-overlapping transcript windows ranked locally',
+      actionLabel: 'Add moment markers',
       onAction: () {
         _addMarkers(
           moments.map(
             (moment) => TimelineMarker(
               position: moment.start,
-              label: 'Viral ${moment.score} • ${_shortLabel(moment.snippet)}',
+              label: 'Moment ${moment.score} • ${_shortLabel(moment.snippet)}',
               color: kAccentSecondary,
             ),
           ),
-          'viral moment',
+          'moment',
         );
         Navigator.pop(context);
       },
@@ -917,19 +1060,22 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
             title: _formatRange(moment.start, moment.end),
             body: moment.snippet,
             tags: moment.reasons,
-            onTap: () => _requestSeek(moment.start),
+            onTap: () => Navigator.pop(context, moment.start),
           );
         },
       ),
     );
+    if (selectedPosition != null && mounted) {
+      _returnToEditorAt(selectedPosition);
+    }
   }
 
   Future<void> _showChapterDirector() async {
     if (!_ensureCaptions()) return;
     final chapters = CaptionStudioService.generateChapters(_entries);
-    await _showLabResultSheet(
-      title: 'Magic Chapter Director',
-      subtitle: '${chapters.length} topic sections detected',
+    final selectedPosition = await _showLabResultSheet(
+      title: 'Automatic Chapter Markers',
+      subtitle: '${chapters.length} pause- and length-based sections drafted',
       actionLabel: 'Add chapter markers',
       onAction: () {
         _addMarkers(
@@ -960,12 +1106,15 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
             title: chapter.title,
             body:
                 '${_formatTime(chapter.position)} • '
-                '${(chapter.confidence * 100).round()}% boundary confidence',
-            onTap: () => _requestSeek(chapter.position),
+                '${(chapter.confidence * 100).round()}% structure score',
+            onTap: () => Navigator.pop(context, chapter.position),
           );
         },
       ),
     );
+    if (selectedPosition != null && mounted) {
+      _returnToEditorAt(selectedPosition);
+    }
   }
 
   Future<void> _showBrollStoryboard() async {
@@ -978,8 +1127,8 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
       );
       return;
     }
-    await _showLabResultSheet(
-      title: 'B-roll Storyboard',
+    final selectedPosition = await _showLabResultSheet(
+      title: 'B-roll Prompt Markers',
       subtitle: '${suggestions.length} timestamped visual directions',
       actionLabel: 'Add B-roll markers',
       onAction: () {
@@ -1016,11 +1165,14 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
                   _copyText(suggestion.prompt, message: 'B-roll prompt copied'),
               icon: const Icon(Icons.copy_rounded),
             ),
-            onTap: () => _requestSeek(suggestion.position),
+            onTap: () => Navigator.pop(context, suggestion.position),
           );
         },
       ),
     );
+    if (selectedPosition != null && mounted) {
+      _returnToEditorAt(selectedPosition);
+    }
   }
 
   Future<void> _showSocialLaunchPack() async {
@@ -1030,9 +1182,9 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
       projectName: widget.projectName,
     );
     await _showLabResultSheet(
-      title: 'Social Launch Pack',
-      subtitle: 'Offline copy kit generated from your transcript',
-      actionLabel: 'Copy complete pack',
+      title: 'Draft Social Copy',
+      subtitle: 'Template-based copy drafted locally from transcript keywords',
+      actionLabel: 'Copy all drafts',
       onAction: () =>
           _copyText(pack.asPlainText, message: 'Complete launch pack copied'),
       child: ListView(
@@ -1079,21 +1231,23 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
     );
   }
 
-  Future<void> _showLabResultSheet({
+  Future<Duration?> _showLabResultSheet({
     required String title,
     required String subtitle,
     required Widget child,
     required String actionLabel,
     required VoidCallback onAction,
   }) {
-    return showModalBottomSheet<void>(
+    final sheetHeight = MediaQuery.sizeOf(context).height * 0.4;
+    return showModalBottomSheet<Duration>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
       builder: (sheetContext) {
         return SafeArea(
           child: Container(
-            height: MediaQuery.sizeOf(sheetContext).height * 0.86,
+            key: const Key('creator_lab_result_sheet'),
+            height: sheetHeight,
             decoration: const BoxDecoration(
               color: kBackground,
               borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
@@ -1211,17 +1365,7 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
       SnackBarHelper.showInfo(context, 'Everything already looks good.');
       return;
     }
-    ref.read(subtitleProvider.notifier).loadSubtitles(result.entries);
-    final subtitleState = ref.read(subtitleProvider);
-    final editorState = ref.read(editorProvider);
-    ref
-        .read(editorProvider.notifier)
-        .setTimeline(
-          editorState.timeline.mergeSubtitleEntries(
-            subtitles: subtitleState.entries,
-            globalStyle: subtitleState.globalStyle,
-          ),
-        );
+    ref.read(editorProvider.notifier).replaceSubtitleEntries(result.entries);
     SnackBarHelper.showSuccess(
       context,
       '${result.changedCount} item'
@@ -1274,6 +1418,11 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
     ref.read(playbackProvider.notifier).requestSeek(position);
   }
 
+  void _returnToEditorAt(Duration position) {
+    _requestSeek(position);
+    Navigator.pop(context);
+  }
+
   Future<void> _copyText(
     String value, {
     String message = 'Copied to clipboard',
@@ -1318,35 +1467,105 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
   }
 }
 
+enum _LabCatalogArea { fix, create }
+
+enum _LabToolGroup {
+  layoutTiming(
+    area: _LabCatalogArea.fix,
+    title: 'Layout & timing',
+    description: 'Line shape, cue length, frame boundaries, and breathing room',
+    icon: Icons.schedule_rounded,
+  ),
+  textCleanup(
+    area: _LabCatalogArea.fix,
+    title: 'Text cleanup',
+    description: 'Speech clutter, punctuation, blank cues, and sound labels',
+    icon: Icons.cleaning_services_rounded,
+  ),
+  namesSafety(
+    area: _LabCatalogArea.fix,
+    title: 'Names & safety',
+    description: 'Sensitive terms, speakers, and consistent brand spelling',
+    icon: Icons.shield_outlined,
+  ),
+  planningMarkers(
+    area: _LabCatalogArea.create,
+    title: 'Planning markers',
+    description: 'Transcript-based moment, chapter, and B-roll prompt markers',
+    icon: Icons.bookmarks_outlined,
+  ),
+  captionMotion(
+    area: _LabCatalogArea.create,
+    title: 'Caption motion',
+    description: 'Rule-based animation direction and estimated word timing',
+    icon: Icons.animation_rounded,
+  ),
+  publish(
+    area: _LabCatalogArea.create,
+    title: 'Publish drafts',
+    description: 'Ready-to-copy titles, hooks, descriptions, and hashtags',
+    icon: Icons.outbox_outlined,
+  ),
+  rehearsal(
+    area: _LabCatalogArea.create,
+    title: 'Rehearsal',
+    description: 'Practice the current script without changing the edit',
+    icon: Icons.live_tv_outlined,
+  );
+
+  final _LabCatalogArea area;
+  final String title;
+  final String description;
+  final IconData icon;
+
+  const _LabToolGroup({
+    required this.area,
+    required this.title,
+    required this.description,
+    required this.icon,
+  });
+}
+
 class _LabFeature {
-  final int number;
+  final String id;
+  final _LabToolGroup group;
+  final String effectLabel;
   final IconData icon;
   final String title;
   final String description;
   final VoidCallback onTap;
-  final bool wow;
   final bool destructive;
 
   const _LabFeature({
-    required this.number,
+    required this.id,
+    required this.group,
+    required this.effectLabel,
     required this.icon,
     required this.title,
     required this.description,
     required this.onTap,
-    this.wow = false,
     this.destructive = false,
   });
 }
 
-class _FeatureGrid extends StatelessWidget {
-  final Widget intro;
-  final List<_LabFeature> features;
-  final bool wow;
+class _LabRecommendation {
+  final _LabFeature feature;
+  final String reason;
 
-  const _FeatureGrid({
+  const _LabRecommendation(this.feature, this.reason);
+}
+
+class _GroupedFeatureCatalog extends StatelessWidget {
+  final Widget intro;
+  final List<_LabToolGroup> groups;
+  final List<_LabFeature> features;
+  final bool captionsAvailable;
+
+  const _GroupedFeatureCatalog({
     required this.intro,
+    required this.groups,
     required this.features,
-    this.wow = false,
+    required this.captionsAvailable,
   });
 
   @override
@@ -1359,27 +1578,29 @@ class _FeatureGrid extends StatelessWidget {
             child: intro,
           ),
         ),
+        if (!captionsAvailable)
+          const SliverToBoxAdapter(
+            child: Padding(
+              padding: EdgeInsets.fromLTRB(18, 0, 18, 12),
+              child: _CaptionRequirementNotice(),
+            ),
+          ),
         SliverPadding(
           padding: const EdgeInsets.fromLTRB(18, 0, 18, 30),
-          sliver: SliverLayoutBuilder(
-            builder: (context, constraints) {
-              final width = constraints.crossAxisExtent;
-              final columns = width >= 1080
-                  ? 3
-                  : width >= 680
-                  ? 2
-                  : 1;
-              return SliverGrid.builder(
-                itemCount: features.length,
-                gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: columns,
-                  crossAxisSpacing: 12,
-                  mainAxisSpacing: 12,
-                  mainAxisExtent: wow ? 184 : 170,
+          sliver: SliverList.builder(
+            itemCount: groups.length,
+            itemBuilder: (context, index) {
+              final group = groups[index];
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: _ToolGroupSection(
+                  group: group,
+                  features: features
+                      .where((feature) => feature.group == group)
+                      .toList(),
+                  captionsAvailable: captionsAvailable,
+                  initiallyExpanded: index == 0,
                 ),
-                itemBuilder: (context, index) {
-                  return _FeatureCard(feature: features[index]);
-                },
               );
             },
           ),
@@ -1389,135 +1610,365 @@ class _FeatureGrid extends StatelessWidget {
   }
 }
 
-class _FeatureCard extends StatelessWidget {
-  final _LabFeature feature;
+class _ToolGroupSection extends StatelessWidget {
+  final _LabToolGroup group;
+  final List<_LabFeature> features;
+  final bool captionsAvailable;
+  final bool initiallyExpanded;
 
-  const _FeatureCard({required this.feature});
+  const _ToolGroupSection({
+    required this.group,
+    required this.features,
+    required this.captionsAvailable,
+    required this.initiallyExpanded,
+  });
 
   @override
   Widget build(BuildContext context) {
-    final accent = feature.wow ? const Color(0xFFC84DFF) : kAccent;
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        onTap: feature.onTap,
+    return Container(
+      decoration: BoxDecoration(
+        color: kSurface,
         borderRadius: BorderRadius.circular(18),
-        child: Ink(
-          padding: const EdgeInsets.all(15),
+        border: Border.all(color: kBorder),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: ExpansionTile(
+        key: PageStorageKey<String>('creator_lab_group_${group.name}'),
+        initiallyExpanded: initiallyExpanded,
+        maintainState: true,
+        tilePadding: const EdgeInsets.symmetric(horizontal: 15, vertical: 4),
+        childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+        leading: Container(
+          width: 38,
+          height: 38,
           decoration: BoxDecoration(
-            gradient: feature.wow
-                ? LinearGradient(
-                    colors: [const Color(0xFF1D1324), kSurface, kSurface],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                  )
-                : null,
-            color: feature.wow ? null : kSurface,
-            borderRadius: BorderRadius.circular(18),
-            border: Border.all(
-              color: feature.wow ? accent.withValues(alpha: 0.3) : kBorder,
-            ),
-            boxShadow: feature.wow
-                ? [
-                    BoxShadow(
-                      color: accent.withValues(alpha: 0.07),
-                      blurRadius: 24,
-                    ),
-                  ]
-                : null,
+            color: kAccent.withValues(alpha: 0.1),
+            borderRadius: BorderRadius.circular(11),
           ),
+          child: Icon(group.icon, color: kAccent, size: 20),
+        ),
+        title: Text(
+          group.title,
+          style: const TextStyle(
+            color: kTextPrimary,
+            fontSize: 14,
+            fontWeight: FontWeight.w900,
+          ),
+        ),
+        subtitle: Text(
+          '${group.description} • ${features.length} tool'
+          '${features.length == 1 ? '' : 's'}',
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(
+            color: kTextSecondary,
+            fontSize: 10.5,
+            height: 1.35,
+          ),
+        ),
+        children: [
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final columns = constraints.maxWidth >= 1000
+                  ? 3
+                  : constraints.maxWidth >= 620
+                  ? 2
+                  : 1;
+              const spacing = 10.0;
+              final itemWidth =
+                  (constraints.maxWidth - spacing * (columns - 1)) / columns;
+              return Wrap(
+                spacing: spacing,
+                runSpacing: spacing,
+                children: [
+                  for (final feature in features)
+                    SizedBox(
+                      width: itemWidth,
+                      height: 178,
+                      child: _FeatureCard(
+                        feature: feature,
+                        captionsAvailable: captionsAvailable,
+                      ),
+                    ),
+                ],
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RecommendationGrid extends StatelessWidget {
+  final List<_LabRecommendation> recommendations;
+
+  const _RecommendationGrid({required this.recommendations});
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final columns = constraints.maxWidth >= 920
+            ? 3
+            : constraints.maxWidth >= 620
+            ? 2
+            : 1;
+        const spacing = 10.0;
+        final itemWidth =
+            (constraints.maxWidth - spacing * (columns - 1)) / columns;
+        return Wrap(
+          spacing: spacing,
+          runSpacing: spacing,
+          children: [
+            for (final recommendation in recommendations)
+              SizedBox(
+                width: itemWidth,
+                height: 192,
+                child: _FeatureCard(
+                  feature: recommendation.feature,
+                  captionsAvailable: true,
+                  contextLabel: recommendation.reason,
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _FeatureCard extends StatelessWidget {
+  final _LabFeature feature;
+  final bool captionsAvailable;
+  final String? contextLabel;
+
+  const _FeatureCard({
+    required this.feature,
+    required this.captionsAvailable,
+    this.contextLabel,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = captionsAvailable;
+    final accent = feature.group.area == _LabCatalogArea.create
+        ? const Color(0xFFC84DFF)
+        : kAccent;
+    return Semantics(
+      button: true,
+      enabled: enabled,
+      label: '${feature.title}. ${feature.effectLabel}.',
+      child: Opacity(
+        opacity: enabled ? 1 : 0.48,
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            onTap: enabled ? feature.onTap : null,
+            borderRadius: BorderRadius.circular(15),
+            child: Ink(
+              padding: const EdgeInsets.all(13),
+              decoration: BoxDecoration(
+                color: kSurfaceHigh,
+                borderRadius: BorderRadius.circular(15),
+                border: Border.all(
+                  color: enabled ? accent.withValues(alpha: 0.2) : kBorder,
+                ),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        width: 36,
+                        height: 36,
+                        decoration: BoxDecoration(
+                          color: accent.withValues(alpha: 0.1),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Icon(feature.icon, color: accent, size: 19),
+                      ),
+                      const Spacer(),
+                      if (feature.destructive)
+                        const Padding(
+                          padding: EdgeInsets.only(right: 7),
+                          child: Icon(
+                            Icons.warning_amber_rounded,
+                            color: kWarning,
+                            size: 16,
+                          ),
+                        ),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 7,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: enabled
+                              ? accent.withValues(alpha: 0.08)
+                              : kBorder.withValues(alpha: 0.35),
+                          borderRadius: BorderRadius.circular(99),
+                        ),
+                        child: Text(
+                          enabled ? feature.effectLabel : 'Needs captions',
+                          style: TextStyle(
+                            color: enabled ? accent : kTextSecondary,
+                            fontSize: 8,
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: 0.45,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    feature.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: kTextPrimary,
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: -0.2,
+                    ),
+                  ),
+                  const SizedBox(height: 5),
+                  Expanded(
+                    child: Text(
+                      feature.description,
+                      maxLines: contextLabel == null ? 3 : 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: kTextSecondary,
+                        fontSize: 10.8,
+                        height: 1.35,
+                      ),
+                    ),
+                  ),
+                  if (contextLabel != null) ...[
+                    const SizedBox(height: 4),
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.insights_rounded,
+                          color: kInfo,
+                          size: 13,
+                        ),
+                        const SizedBox(width: 5),
+                        Expanded(
+                          child: Text(
+                            contextLabel!,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: kInfo,
+                              fontSize: 9.5,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                  const SizedBox(height: 5),
+                  Row(
+                    children: [
+                      Text(
+                        enabled ? 'OPEN' : 'ADD CAPTIONS TO USE',
+                        style: TextStyle(
+                          color: enabled ? accent : kTextSecondary,
+                          fontSize: 8.5,
+                          fontWeight: FontWeight.w900,
+                          letterSpacing: 0.75,
+                        ),
+                      ),
+                      if (enabled) ...[
+                        const SizedBox(width: 4),
+                        Icon(
+                          Icons.arrow_forward_rounded,
+                          color: accent,
+                          size: 14,
+                        ),
+                      ],
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SectionHeading extends StatelessWidget {
+  final String title;
+  final String subtitle;
+
+  const _SectionHeading({required this.title, required this.subtitle});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Row(
-                children: [
-                  Container(
-                    width: 40,
-                    height: 40,
-                    decoration: BoxDecoration(
-                      color: accent.withValues(alpha: 0.11),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: Icon(feature.icon, color: accent, size: 21),
-                  ),
-                  const Spacer(),
-                  if (feature.destructive)
-                    const Padding(
-                      padding: EdgeInsets.only(right: 8),
-                      child: Icon(
-                        Icons.warning_amber_rounded,
-                        color: kWarning,
-                        size: 17,
-                      ),
-                    ),
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 7,
-                      vertical: 4,
-                    ),
-                    decoration: BoxDecoration(
-                      color: accent.withValues(alpha: 0.08),
-                      borderRadius: BorderRadius.circular(99),
-                    ),
-                    child: Text(
-                      feature.wow
-                          ? '${feature.number.toString().padLeft(2, '0')} • WOW'
-                          : feature.number.toString().padLeft(2, '0'),
-                      style: TextStyle(
-                        color: feature.wow
-                            ? const Color(0xFFE0A7FF)
-                            : kTextSecondary,
-                        fontSize: 8,
-                        fontWeight: FontWeight.w900,
-                        letterSpacing: 0.7,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 12),
               Text(
-                feature.title,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
+                title,
                 style: const TextStyle(
                   color: kTextPrimary,
-                  fontSize: 14,
+                  fontSize: 10,
                   fontWeight: FontWeight.w900,
-                  letterSpacing: -0.2,
+                  letterSpacing: 1,
                 ),
               ),
-              const SizedBox(height: 6),
-              Expanded(
-                child: Text(
-                  feature.description,
-                  maxLines: 3,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: kTextSecondary,
-                    fontSize: 11.5,
-                    height: 1.4,
-                  ),
-                ),
-              ),
-              Row(
-                children: [
-                  Text(
-                    feature.wow ? 'OPEN EXPERIENCE' : 'RUN TOOL',
-                    style: TextStyle(
-                      color: accent,
-                      fontSize: 8.5,
-                      fontWeight: FontWeight.w900,
-                      letterSpacing: 0.8,
-                    ),
-                  ),
-                  const SizedBox(width: 4),
-                  Icon(Icons.arrow_forward_rounded, color: accent, size: 14),
-                ],
+              const SizedBox(height: 2),
+              Text(
+                subtitle,
+                style: const TextStyle(color: kTextSecondary, fontSize: 10.5),
               ),
             ],
           ),
         ),
+      ],
+    );
+  }
+}
+
+class _CaptionRequirementNotice extends StatelessWidget {
+  const _CaptionRequirementNotice();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: kWarning.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: kWarning.withValues(alpha: 0.25)),
+      ),
+      child: const Row(
+        children: [
+          Icon(Icons.subtitles_off_rounded, color: kWarning, size: 21),
+          SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Add or generate captions in the editor first. Caption-dependent '
+              'tools are shown below but stay disabled until then.',
+              style: TextStyle(
+                color: kTextPrimary,
+                fontSize: 11.5,
+                height: 1.4,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1528,28 +1979,23 @@ class _LabIntro extends StatelessWidget {
   final String title;
   final String description;
   final IconData icon;
-  final bool wow;
 
   const _LabIntro({
     required this.eyebrow,
     required this.title,
     required this.description,
     required this.icon,
-    this.wow = false,
   });
 
   @override
   Widget build(BuildContext context) {
-    final accent = wow ? const Color(0xFFC84DFF) : kAccent;
+    const accent = kAccent;
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
         gradient: LinearGradient(
-          colors: [
-            accent.withValues(alpha: wow ? 0.12 : 0.08),
-            kSurface,
-          ],
+          colors: [accent.withValues(alpha: 0.08), kSurface],
         ),
         borderRadius: BorderRadius.circular(20),
         border: Border.all(color: accent.withValues(alpha: 0.22)),

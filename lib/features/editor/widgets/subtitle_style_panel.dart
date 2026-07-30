@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:flutter_colorpicker/flutter_colorpicker.dart';
 import '../../../core/theme/app_theme.dart';
+import '../../../core/utils/caption_font_service.dart';
 import '../models/subtitle_style_model.dart';
 import '../providers/subtitle_provider.dart';
 import 'animated_subtitle_overlay.dart';
@@ -12,14 +12,7 @@ class SubtitleStylePanel extends ConsumerWidget {
   const SubtitleStylePanel({super.key});
 
   // Available fonts
-  static const _fonts = [
-    'Roboto',
-    'Inter',
-    'Poppins',
-    'Montserrat',
-    'Playfair Display',
-    'Space Mono',
-  ];
+  static const _fonts = CaptionFontService.supportedFamilies;
 
   // Pre-built style presets
   static final _presets = <String, SubtitleStyleModel>{
@@ -226,8 +219,8 @@ class SubtitleStylePanel extends ConsumerWidget {
                         value: f,
                         child: Text(
                           f,
-                          style: GoogleFonts.getFont(
-                            f,
+                          style: TextStyle(
+                            fontFamily: f,
                             color: kTextPrimary,
                             fontSize: 14,
                           ),
@@ -675,8 +668,8 @@ class _PresetChip extends StatelessWidget {
         ),
         child: Text(
           name,
-          style: GoogleFonts.getFont(
-            style.fontFamily,
+          style: TextStyle(
+            fontFamily: CaptionFontService.resolveFamily(style.fontFamily),
             color: style.textColor,
             fontSize: 12,
             fontWeight: style.isBold ? FontWeight.bold : FontWeight.normal,

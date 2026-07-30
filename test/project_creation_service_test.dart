@@ -32,6 +32,11 @@ void main() {
       expect(project.durationMs, 4250);
       expect(project.thumbnailBase64, isNull);
       expect(project.timeline.assets, hasLength(2));
+      expect(project.timeline.tracks, hasLength(2));
+      expect(project.timeline.tracks.map((track) => track.type), [
+        TimelineTrackType.video,
+        TimelineTrackType.subtitle,
+      ]);
       final clips = project.timeline.tracks
           .firstWhere(
             (track) => track.section == TimelineTrackSection.baseVideo,

@@ -11,13 +11,8 @@ import 'package:caption_craft/shared/models/project_model.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:google_fonts/google_fonts.dart';
 
 void main() {
-  setUpAll(() {
-    GoogleFonts.config.allowRuntimeFetching = false;
-  });
-
   testWidgets('a newly created project mounts the editor on a phone', (
     tester,
   ) async {
@@ -128,7 +123,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 260));
     expect(find.text('Whole'), findsOneWidget);
     expect(find.text('Region'), findsOneWidget);
-    expect(find.text('Clear'), findsOneWidget);
+    expect(find.text('Remove'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 

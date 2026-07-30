@@ -6,10 +6,142 @@ import '../theme/app_theme.dart';
 import '../../features/editor/models/subtitle_entry.dart';
 import '../../features/editor/models/subtitle_style_model.dart';
 import '../../features/editor/models/timeline_models.dart';
+import 'caption_font_service.dart';
+
+class AssSubtitlePreflight {
+  final String path;
+  final int fileSize;
+  final int dialogueCount;
+
+  const AssSubtitlePreflight({
+    required this.path,
+    required this.fileSize,
+    required this.dialogueCount,
+  });
+}
 
 /// Service for generating subtitle files in SRT, VTT, and ASS formats.
 class SubtitleExportService {
   SubtitleExportService._();
+
+  /// Resolves the caption list that both preview and export should render.
+  ///
+  /// Timeline clips control visibility/enabled state while the richer provider
+  /// entries retain word timing and per-cue styling. Legacy projects without a
+  /// subtitle track continue to render their valid provider entries.
+  static List<SubtitleEntry> effectiveTimelineCaptions({
+    required EditorTimeline timeline,
+    required List<SubtitleEntry> entries,
+  }) {
+    bool isValid(SubtitleEntry entry) {
+      return entry.endTime > entry.startTime && entry.text.trim().isNotEmpty;
+    }
+
+    final validEntries = entries.where(isValid).toList(growable: false);
+    final subtitleTracks = timeline.tracks
+        .where((track) => track.type == TimelineTrackType.subtitle)
+        .toList(growable: false);
+    if (subtitleTracks.isEmpty) {
+      return _sortedUniqueEntries(validEntries);
+    }
+
+    final visibleTracks = subtitleTracks
+        .where((track) => !track.isHidden)
+        .toList(growable: false);
+    if (visibleTracks.isEmpty) return const [];
+
+    final entriesById = {for (final entry in validEntries) entry.id: entry};
+    final representedIds = subtitleTracks
+        .expand((track) => track.clips)
+        .map((clip) => clip.id)
+        .toSet();
+    final enabledClips = visibleTracks
+        .expand((track) => track.clips)
+        .where(
+          (clip) =>
+              clip.enabled &&
+              clip.endTime > clip.startTime &&
+              (clip.text ?? clip.label).trim().isNotEmpty,
+        )
+        .toList(growable: false);
+
+    final resolved = <SubtitleEntry>[];
+    for (final clip in enabledClips) {
+      final providerEntry = entriesById[clip.id];
+      if (providerEntry != null) {
+        resolved.add(providerEntry);
+        continue;
+      }
+      final fallbackEntry = clip.toSubtitleEntry();
+      if (fallbackEntry != null && isValid(fallbackEntry)) {
+        resolved.add(fallbackEntry);
+      }
+    }
+
+    // An entry not represented by any timeline clip can occur while importing
+    // or migrating an older project. Keep it visible instead of silently
+    // dropping a valid caption. Explicitly disabled/hidden clips stay omitted.
+    resolved.addAll(
+      validEntries.where((entry) => !representedIds.contains(entry.id)),
+    );
+    return _sortedUniqueEntries(resolved);
+  }
+
+  static List<SubtitleEntry> _sortedUniqueEntries(
+    Iterable<SubtitleEntry> entries,
+  ) {
+    final byId = <String, SubtitleEntry>{};
+    for (final entry in entries) {
+      byId.putIfAbsent(entry.id, () => entry);
+    }
+    final sorted = byId.values.toList()
+      ..sort((a, b) {
+        final timeComparison = a.startTime.compareTo(b.startTime);
+        return timeComparison != 0 ? timeComparison : a.id.compareTo(b.id);
+      });
+    return sorted;
+  }
+
+  /// Verifies that an ASS file is present and contains renderable dialogue.
+  static Future<AssSubtitlePreflight> preflightAssFile(String filePath) async {
+    final file = File(filePath);
+    if (!await file.exists()) {
+      throw StateError(
+        'Caption export could not start because the subtitle file is missing.',
+      );
+    }
+    final fileSize = await file.length();
+    if (fileSize <= 0) {
+      throw StateError(
+        'Caption export could not start because the subtitle file is empty.',
+      );
+    }
+
+    String contents;
+    try {
+      contents = await file.readAsString();
+    } on FileSystemException catch (error) {
+      throw StateError(
+        'Caption export could not read the generated subtitle file: '
+        '${error.message}',
+      );
+    }
+    final dialogueCount = RegExp(
+      r'^Dialogue\s*:',
+      multiLine: true,
+      caseSensitive: false,
+    ).allMatches(contents).length;
+    if (dialogueCount == 0) {
+      throw StateError(
+        'Caption export found no renderable dialogue in the subtitle file.',
+      );
+    }
+    return AssSubtitlePreflight(
+      path: file.path,
+      fileSize: fileSize,
+      dialogueCount: dialogueCount,
+    );
+  }
 
   /// Generate an SRT file.
   static Future<String> generateSrt(List<SubtitleEntry> entries) async {
@@ -306,7 +438,7 @@ class SubtitleExportService {
     required int playResX,
     required int playResY,
   }) {
-    final fontName = style.fontFamily;
+    final fontName = CaptionFontService.resolveFamily(style.fontFamily);
     final fontSize = (style.fontSize * (playResY / kTimelineDesignHeight))
         .clamp(8, playResY * 0.24)
         .round();

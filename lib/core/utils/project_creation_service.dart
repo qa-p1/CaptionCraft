@@ -101,13 +101,6 @@ class ProjectCreationService {
       assets: assets,
       tracks: [
         TimelineTrack(
-          id: 'track_overlay_primary',
-          name: 'Overlay 1',
-          type: TimelineTrackType.video,
-          section: TimelineTrackSection.overlay,
-          clips: const [],
-        ),
-        TimelineTrack(
           id: 'track_video_primary',
           name: 'Video 1',
           type: TimelineTrackType.video,
@@ -115,24 +108,10 @@ class ProjectCreationService {
           clips: clips,
         ),
         TimelineTrack(
-          id: 'track_text_primary',
-          name: 'Text 1',
-          type: TimelineTrackType.text,
-          section: TimelineTrackSection.textSubtitle,
-          clips: const [],
-        ),
-        TimelineTrack(
           id: 'track_subtitles',
           name: 'Subtitles',
           type: TimelineTrackType.subtitle,
           section: TimelineTrackSection.textSubtitle,
-          clips: const [],
-        ),
-        TimelineTrack(
-          id: 'track_audio_primary',
-          name: 'Audio 1',
-          type: TimelineTrackType.audio,
-          section: TimelineTrackSection.audio,
           clips: const [],
         ),
       ],

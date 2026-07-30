@@ -67,9 +67,9 @@ class ExportSettings {
       case ExportQuality.balanced:
         return 'fast';
       case ExportQuality.high:
-        return 'medium';
+        return 'faster';
       case ExportQuality.maximum:
-        return 'slow';
+        return 'fast';
     }
   }
 

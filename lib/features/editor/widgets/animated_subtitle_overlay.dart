@@ -1,6 +1,6 @@
 import 'dart:math';
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
+import '../../../core/utils/caption_font_service.dart';
 import '../models/subtitle_entry.dart';
 import '../models/subtitle_style_model.dart';
 import '../../../core/theme/app_theme.dart';
@@ -338,8 +338,8 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
   // ─── Shared helpers ───
 
   TextStyle _textStyle(SubtitleStyleModel style) {
-    return GoogleFonts.getFont(
-      style.fontFamily,
+    return TextStyle(
+      fontFamily: CaptionFontService.resolveFamily(style.fontFamily),
       fontSize: style.fontSize * scaleFactor,
       color: style.textColor,
       fontWeight: style.isBold ? FontWeight.bold : FontWeight.normal,

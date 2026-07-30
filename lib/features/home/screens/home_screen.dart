@@ -328,7 +328,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       useSafeArea: true,
       builder: (sheetContext) {
         return FractionallySizedBox(
-          heightFactor: 0.82,
+          heightFactor: 0.72,
           child: Container(
             decoration: const BoxDecoration(
               color: kSurface,
@@ -394,7 +394,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                         const SizedBox(height: 8),
                         TextField(
                           controller: projectNameController,
-                          autofocus: true,
                           textInputAction: TextInputAction.done,
                           decoration: const InputDecoration(
                             hintText: 'Give this edit a name',

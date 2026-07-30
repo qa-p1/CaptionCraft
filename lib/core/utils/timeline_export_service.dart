@@ -15,6 +15,7 @@ import '../../features/editor/models/subtitle_entry.dart';
 import '../../features/editor/models/subtitle_style_model.dart';
 import '../../features/editor/models/timeline_models.dart';
 import '../../shared/models/project_model.dart';
+import 'caption_font_service.dart';
 import 'ffmpeg_service.dart';
 import 'subtitle_export_service.dart';
 
@@ -97,17 +98,39 @@ class TimelineExportService {
     final downloadCancelToken = CancelToken();
     _activeDownloadCancelToken = downloadCancelToken;
     String? assPath;
+    String? captionFontDirectory;
     var exportCompleted = false;
 
     try {
-      final firstSourcePath = await _sourcePathForClip(
-        project: project,
-        timeline: timeline,
-        clip: baseClips.first.$2,
-        workingDirectory: workingDirectory,
-        downloadCancelToken: downloadCancelToken,
-      );
-      final firstMediaInfo = await FFmpegService.getMediaInfo(firstSourcePath);
+      final sourcePaths = <String, Future<String>>{};
+      Future<String> resolveSourcePath(TimelineClip clip) {
+        final sourceKey =
+            clip.assetId ??
+            (clip.type == TimelineTrackType.video
+                ? 'project-video:${project.videoPath}'
+                : 'clip:${clip.id}');
+        return sourcePaths.putIfAbsent(
+          sourceKey,
+          () => _sourcePathForClip(
+            project: project,
+            timeline: timeline,
+            clip: clip,
+            workingDirectory: workingDirectory,
+            downloadCancelToken: downloadCancelToken,
+          ),
+        );
+      }
+
+      final mediaInfoByPath = <String, Future<Map<String, dynamic>>>{};
+      Future<Map<String, dynamic>> probeMedia(String sourcePath) {
+        return mediaInfoByPath.putIfAbsent(
+          sourcePath,
+          () => FFmpegService.getMediaInfo(sourcePath),
+        );
+      }
+
+      final firstSourcePath = await resolveSourcePath(baseClips.first.$2);
+      final firstMediaInfo = await probeMedia(firstSourcePath);
       final canvasSize = resolveCanvasSize(
         timeline.canvasSettings,
         settings,
@@ -129,7 +152,8 @@ class TimelineExportService {
         for (final clip in track.clips) {
           if (!clip.enabled || clip.endTime <= clip.startTime) continue;
           if (clip.type == TimelineTrackType.text ||
-              clip.type == TimelineTrackType.subtitle) {
+              clip.type == TimelineTrackType.subtitle ||
+              clip.type == TimelineTrackType.effect) {
             continue;
           }
           if (track.section != TimelineTrackSection.baseVideo &&
@@ -138,15 +162,13 @@ class TimelineExportService {
             continue;
           }
 
-          final sourcePath = await _sourcePathForClip(
-            project: project,
-            timeline: timeline,
-            clip: clip,
-            workingDirectory: workingDirectory,
-            downloadCancelToken: downloadCancelToken,
-          );
+          final sourcePath = await resolveSourcePath(clip);
           final asset = timeline.assetForClip(clip);
-          final mediaInfo = await _mediaInfoForInput(asset, sourcePath);
+          final mediaInfo = await _mediaInfoForInput(
+            asset,
+            sourcePath,
+            mediaInfoLoader: probeMedia,
+          );
           renderInputs.add(
             TimelineRenderInput(
               index: nextInputIndex++,
@@ -181,6 +203,11 @@ class TimelineExportService {
         settings: settings,
         canvasSize: canvasSize,
       );
+      if (assPath != null) {
+        await SubtitleExportService.preflightAssFile(assPath);
+        final fontBundle = await CaptionFontService.prepareForExport();
+        captionFontDirectory = fontBundle.directoryPath;
+      }
       final args = buildFfmpegArguments(
         timeline: timeline,
         inputs: renderInputs,
@@ -188,6 +215,7 @@ class TimelineExportService {
         canvasSize: canvasSize,
         timelineDuration: timelineDuration,
         assPath: assPath,
+        captionFontDirectory: captionFontDirectory,
         outputPath: outputPath,
       );
 
@@ -201,6 +229,7 @@ class TimelineExportService {
       await _execute(
         args,
         expectedDuration: timelineDuration,
+        captionsExpected: assPath != null,
         onProgress: (value) {
           onProgress?.call(0.1 + value * 0.84);
         },
@@ -283,6 +312,7 @@ class TimelineExportService {
     required ExportCanvasSize canvasSize,
     required Duration timelineDuration,
     required String? assPath,
+    String? captionFontDirectory,
     required String outputPath,
   }) {
     final args = <String>['-hide_banner', '-y'];
@@ -297,6 +327,7 @@ class TimelineExportService {
       canvasSize: canvasSize,
       timelineDuration: timelineDuration,
       assPath: assPath,
+      captionFontDirectory: captionFontDirectory,
     );
     args
       ..addAll(['-filter_complex', filterGraph])
@@ -327,8 +358,6 @@ class TimelineExportService {
       '${settings.crf}',
       '-pix_fmt',
       'yuv420p',
-      '-r',
-      '${canvasSize.framesPerSecond}',
       '-t',
       _seconds(timelineDuration),
       '-movflags',
@@ -477,8 +506,9 @@ class TimelineExportService {
 
   static Future<Map<String, dynamic>> _mediaInfoForInput(
     EditorAssetReference? asset,
-    String sourcePath,
-  ) async {
+    String sourcePath, {
+    Future<Map<String, dynamic>> Function(String sourcePath)? mediaInfoLoader,
+  }) async {
     final metadata = asset?.metadata ?? const <String, dynamic>{};
     if (metadata['durationMs'] is num &&
         (metadata['hasAudio'] is bool ||
@@ -494,7 +524,8 @@ class TimelineExportService {
       };
     }
     try {
-      return await FFmpegService.getMediaInfo(sourcePath);
+      return await (mediaInfoLoader?.call(sourcePath) ??
+          FFmpegService.getMediaInfo(sourcePath));
     } catch (_) {
       return {...metadata, 'hasAudio': asset?.type == EditorAssetType.audio};
     }
@@ -545,6 +576,7 @@ class TimelineExportService {
     required ExportCanvasSize canvasSize,
     required Duration timelineDuration,
     required String? assPath,
+    required String? captionFontDirectory,
   }) {
     final filters = <String>[];
     final background = _ffmpegColor(timeline.canvasSettings.backgroundColor);
@@ -585,7 +617,6 @@ class TimelineExportService {
           'reverse',
         'setpts=(PTS-STARTPTS)/${_number(clip.playbackRate)}',
         'trim=duration=${_seconds(clipDuration)}',
-        'fps=${canvasSize.framesPerSecond}',
         ..._cropFilters(clip.crop),
         ..._colorFilters(clip.colorAdjustments),
         ..._fitFilters(clip, canvasSize: canvasSize, isBase: isBase),
@@ -598,8 +629,14 @@ class TimelineExportService {
           'scale=w=trunc(iw*${_number(clip.transform.scale)}/2)*2:'
               'h=trunc(ih*${_number(clip.transform.scale)}/2)*2',
       ];
+      final needsAlpha =
+          !isBase ||
+          clip.transform.opacity < 0.999 ||
+          clip.transform.rotation.abs() > 0.0001 ||
+          _transitionUsesAlpha(clip.introTransition.type) ||
+          _transitionUsesAlpha(clip.outroTransition.type);
       final finishing = <String>[
-        'format=rgba',
+        if (needsAlpha) 'format=rgba',
         if (clip.transform.opacity < 0.999)
           'colorchannelmixer=aa=${_number(clip.transform.opacity.clamp(0, 1))}',
         ..._transitionAlphaFilters(clip),
@@ -657,10 +694,20 @@ class TimelineExportService {
     }
 
     var videoSource = 'canvas$canvasIndex';
+    videoSource = _appendTimelineEffects(
+      filters: filters,
+      timeline: timeline,
+      sourceLabel: videoSource,
+    );
     if (assPath != null) {
       const assOutput = 'captioned';
+      final fontsDirectoryOption =
+          captionFontDirectory == null || captionFontDirectory.trim().isEmpty
+          ? ''
+          : ":fontsdir='${_escapeFilterPath(captionFontDirectory)}'";
       filters.add(
         '[$videoSource]ass=filename=\'${_escapeFilterPath(assPath)}\''
+        '$fontsDirectoryOption'
         '[$assOutput]',
       );
       videoSource = assOutput;
@@ -740,6 +787,91 @@ class TimelineExportService {
     return filters.join(';');
   }
 
+  static String _appendTimelineEffects({
+    required List<String> filters,
+    required EditorTimeline timeline,
+    required String sourceLabel,
+  }) {
+    final effectClips = <(int, TimelineClip)>[];
+    for (final trackEntry in timeline.tracks.asMap().entries) {
+      final track = trackEntry.value;
+      if (track.isHidden) continue;
+      for (final clip in track.clips) {
+        if (clip.isEffect && clip.enabled && clip.endTime > clip.startTime) {
+          effectClips.add((trackEntry.key, clip));
+        }
+      }
+    }
+    effectClips.sort((a, b) {
+      final trackComparison = a.$1.compareTo(b.$1);
+      if (trackComparison != 0) return trackComparison;
+      final layerComparison = a.$2.layer.compareTo(b.$2.layer);
+      if (layerComparison != 0) return layerComparison;
+      return a.$2.startTime.compareTo(b.$2.startTime);
+    });
+
+    var currentSource = sourceLabel;
+    var appliedEffectIndex = 0;
+    for (final effectEntry in effectClips) {
+      final clip = effectEntry.$2;
+      final enableExpression =
+          'between(t,${_seconds(clip.startTime)},${_seconds(clip.endTime)})';
+      final outputLabel = 'timelineEffect$appliedEffectIndex';
+
+      switch (clip.effectKind!) {
+        case TimelineEffectKind.blur:
+          final blur = clip.blur;
+          if (!blur.isEnabled) continue;
+          if (blur.mode == ClipBlurMode.region) {
+            final cleanLabel = 'effectClean$appliedEffectIndex';
+            final blurSourceLabel = 'effectBlurSource$appliedEffectIndex';
+            final blurredRegionLabel = 'effectBlurRegion$appliedEffectIndex';
+            filters.add(
+              '[$currentSource]split=2[$cleanLabel][$blurSourceLabel]',
+            );
+            filters.add(
+              '[$blurSourceLabel]'
+              'crop=w=iw*${_number(blur.safeRegionWidth)}:'
+              'h=ih*${_number(blur.safeRegionHeight)}:'
+              'x=iw*${_number(blur.safeRegionX)}:'
+              'y=ih*${_number(blur.safeRegionY)},'
+              "gblur=sigma=${_number(blur.safeStrength)}:"
+              "enable='$enableExpression'"
+              '[$blurredRegionLabel]',
+            );
+            filters.add(
+              '[$cleanLabel][$blurredRegionLabel]'
+              'overlay=x=main_w*${_number(blur.safeRegionX)}:'
+              'y=main_h*${_number(blur.safeRegionY)}:'
+              "enable='$enableExpression':"
+              'eof_action=pass:shortest=0:format=auto'
+              '[$outputLabel]',
+            );
+          } else {
+            filters.add(
+              '[$currentSource]'
+              "gblur=sigma=${_number(blur.safeStrength)}:"
+              "enable='$enableExpression'"
+              '[$outputLabel]',
+            );
+          }
+          break;
+        case TimelineEffectKind.filter:
+          final colorFilters = _colorFilters(clip.colorAdjustments);
+          if (colorFilters.isEmpty) continue;
+          final timedFilters = colorFilters
+              .map((filter) => "$filter:enable='$enableExpression'")
+              .join(',');
+          filters.add('[$currentSource]$timedFilters[$outputLabel]');
+          break;
+      }
+
+      currentSource = outputLabel;
+      appliedEffectIndex++;
+    }
+    return currentSource;
+  }
+
   static List<String> _cropFilters(ClipCropSettings crop) {
     if (crop.isIdentity) return const [];
     return [
@@ -789,8 +921,11 @@ class TimelineExportService {
           'saturation=${_number(adjustments.saturation.clamp(0, 3))}',
     ];
     if (adjustments.temperature.abs() > 0.001) {
-      final warmth = (adjustments.temperature * 0.18).clamp(-0.25, 0.25);
-      filters.add('colorbalance=rs=${_number(warmth)}:bs=${_number(-warmth)}');
+      final warmth = (adjustments.temperature * 0.16).clamp(-0.2, 0.2);
+      filters.add(
+        'colorchannelmixer=rr=${_number(1 + warmth)}:'
+        'bb=${_number(1 - warmth)}',
+      );
     }
     if (adjustments.vignette > 0.001) {
       final angle =
@@ -895,27 +1030,11 @@ class TimelineExportService {
     required ExportCanvasSize canvasSize,
   }) async {
     final entries = <SubtitleEntry>[];
-    final subtitleTracksVisible = timeline.tracks.any(
-      (track) =>
-          track.type == TimelineTrackType.subtitle &&
-          !track.isHidden &&
-          track.clips.any((clip) => clip.enabled),
-    );
-    if (settings.burnSubtitles && subtitleTracksVisible) {
-      final enabledSubtitleIds = timeline.tracks
-          .where(
-            (track) =>
-                track.type == TimelineTrackType.subtitle && !track.isHidden,
-          )
-          .expand((track) => track.clips)
-          .where((clip) => clip.enabled)
-          .map((clip) => clip.id)
-          .toSet();
+    if (settings.burnSubtitles) {
       entries.addAll(
-        subtitleEntries.where(
-          (entry) =>
-              enabledSubtitleIds.isEmpty ||
-              enabledSubtitleIds.contains(entry.id),
+        SubtitleExportService.effectiveTimelineCaptions(
+          timeline: timeline,
+          entries: subtitleEntries,
         ),
       );
     }
@@ -1013,6 +1132,7 @@ class TimelineExportService {
   static Future<void> _execute(
     List<String> arguments, {
     required Duration expectedDuration,
+    bool captionsExpected = false,
     void Function(double progress)? onProgress,
   }) async {
     if (onProgress != null && expectedDuration.inMilliseconds > 0) {
@@ -1024,17 +1144,39 @@ class TimelineExportService {
     }
     final session = await FFmpegKit.executeWithArguments(arguments);
     final returnCode = await session.getReturnCode();
-    if (ReturnCode.isSuccess(returnCode)) return;
+    final logs = captionsExpected || !ReturnCode.isSuccess(returnCode)
+        ? await session.getAllLogsAsString() ?? ''
+        : '';
+    if (ReturnCode.isSuccess(returnCode)) {
+      if (captionsExpected && _hasCaptionFontFailure(logs)) {
+        throw StateError(
+          'The video rendered, but its caption font could not be loaded. '
+          'No captionless file was saved. Reopen the app and try again.\n'
+          '${_lastMeaningfulLogLines(logs)}',
+        );
+      }
+      return;
+    }
     if (ReturnCode.isCancel(returnCode)) {
       throw Exception('Export cancelled.');
     }
-    final logs = await session.getAllLogsAsString();
-    final usefulLog = _lastMeaningfulLogLines(logs ?? '');
+    final usefulLog = _lastMeaningfulLogLines(logs);
     throw Exception(
       usefulLog.isEmpty
           ? 'FFmpeg could not render the timeline.'
           : 'FFmpeg could not render the timeline:\n$usefulLog',
     );
+  }
+
+  static bool _hasCaptionFontFailure(String logs) {
+    final normalized = logs.toLowerCase();
+    return const [
+      'fontselect: failed',
+      'could not find/open font',
+      'no usable fontconfig',
+      'cannot find a valid font',
+      'fontconfig error',
+    ].any(normalized.contains);
   }
 
   static String _lastMeaningfulLogLines(String logs) {

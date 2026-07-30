@@ -156,6 +156,37 @@ class EditorNotifier extends StateNotifier<EditorState> {
     );
   }
 
+  /// Replaces the complete caption track as one editor-wide history action.
+  ///
+  /// Caption batch tools must capture history before mutating [subtitleProvider].
+  /// Calling `loadSubtitles` followed by [setTimeline] records the already-mutated
+  /// subtitle state and makes the visible caption change impossible to undo from
+  /// the editor toolbar. This method keeps both representations in lockstep.
+  void replaceSubtitleEntries(List<SubtitleEntry> entries) {
+    final subtitleState = _ref.read(subtitleProvider);
+    final sortedEntries = List<SubtitleEntry>.from(entries)
+      ..sort((a, b) => a.startTime.compareTo(b.startTime));
+    final nextTimeline = state.timeline.mergeSubtitleEntries(
+      subtitles: sortedEntries,
+      globalStyle: subtitleState.globalStyle,
+    );
+
+    _pushUndoSnapshot();
+    _ref
+        .read(subtitleProvider.notifier)
+        .restoreFromEditorHistory(
+          entries: sortedEntries,
+          globalStyle: subtitleState.globalStyle,
+          selectedEntryId: subtitleState.selectedEntryId,
+        );
+    state = state.copyWith(
+      timeline: nextTimeline,
+      canUndo: _undoStack.isNotEmpty,
+      canRedo: _redoStack.isNotEmpty,
+      editRevision: state.editRevision + 1,
+    );
+  }
+
   void beginTimelineGestureEdit() {
     if (_isTimelineGestureEditing) return;
     _isTimelineGestureEditing = true;

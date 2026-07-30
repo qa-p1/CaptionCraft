@@ -35,6 +35,12 @@ void main() {
       final overlayImage = p.join(workingDirectory.path, 'overlay.bmp');
       final captions = p.join(workingDirectory.path, 'captions.ass');
       final output = p.join(workingDirectory.path, 'master.mp4');
+      final outputWithoutCaptions = p.join(
+        workingDirectory.path,
+        'master_without_captions.mp4',
+      );
+      final captionFontDirectory = Directory('assets/fonts').absolute.path;
+      expect(Directory(captionFontDirectory).existsSync(), isTrue);
 
       await _runFfmpeg([
         '-f',
@@ -114,21 +120,23 @@ void main() {
                 ),
               ],
               styleOverride: const SubtitleStyleModel(
-                fontFamily: 'Arial',
-                fontSize: 34,
+                fontFamily: 'Inter',
+                fontSize: 42,
                 isBold: true,
-                backgroundType: SubtitleBackground.fullBar,
-                backgroundColor: Color(0xFF111412),
-                backgroundOpacity: 0.82,
+                backgroundType: SubtitleBackground.outlineShadow,
                 animationPreset: SubtitleAnimationPreset.karaokeHighlight,
               ),
             ),
           ],
-          const SubtitleStyleModel(fontFamily: 'Arial', fontSize: 34),
+          const SubtitleStyleModel(fontFamily: 'Inter', fontSize: 42),
           playResX: 640,
           playResY: 360,
         ),
       );
+      final captionPreflight = await SubtitleExportService.preflightAssFile(
+        captions,
+      );
+      expect(captionPreflight.dialogueCount, greaterThan(0));
 
       final overlayAsset = EditorAssetReference(
         id: 'overlay_asset',
@@ -261,13 +269,48 @@ void main() {
         section: TimelineTrackSection.baseVideo,
         clips: [firstClip, secondClip],
       );
+      final effectTrack = TimelineTrack(
+        id: 'effect_track',
+        name: 'Effects',
+        type: TimelineTrackType.effect,
+        section: TimelineTrackSection.overlay,
+        clips: [
+          TimelineClip.effect(
+            id: 'privacy_blur',
+            trackId: 'effect_track',
+            effectKind: TimelineEffectKind.blur,
+            label: 'Privacy blur',
+            startTime: const Duration(milliseconds: 100),
+            endTime: const Duration(milliseconds: 400),
+            blur: const ClipBlurSettings(
+              mode: ClipBlurMode.region,
+              strength: 6,
+              regionX: 0.08,
+              regionY: 0.12,
+              regionWidth: 0.26,
+              regionHeight: 0.25,
+            ),
+          ),
+          TimelineClip.effect(
+            id: 'warm_filter',
+            trackId: 'effect_track',
+            effectKind: TimelineEffectKind.filter,
+            label: 'Warm',
+            startTime: const Duration(milliseconds: 2600),
+            endTime: const Duration(milliseconds: 2900),
+            colorAdjustments: ClipColorAdjustments.forPreset(
+              ClipFilterPreset.warm,
+            ),
+          ),
+        ],
+      );
       final timeline = EditorTimeline(
         canvasSettings: const CanvasSettings(
           aspectRatioPreset: CanvasAspectRatioPreset.ratio16x9,
           backgroundColor: Color(0xFF101210),
         ),
         assets: [overlayAsset, firstAsset, secondAsset],
-        tracks: [overlayTrack, baseTrack],
+        tracks: [overlayTrack, effectTrack, baseTrack],
       );
       final inputs = [
         TimelineRenderInput(
@@ -281,7 +324,7 @@ void main() {
         ),
         TimelineRenderInput(
           index: 1,
-          trackIndex: 1,
+          trackIndex: 2,
           track: baseTrack,
           clip: firstClip,
           asset: firstAsset,
@@ -290,7 +333,7 @@ void main() {
         ),
         TimelineRenderInput(
           index: 2,
-          trackIndex: 1,
+          trackIndex: 2,
           track: baseTrack,
           clip: secondClip,
           asset: secondAsset,
@@ -315,6 +358,7 @@ void main() {
         ),
         timelineDuration: const Duration(seconds: 3),
         assPath: captions,
+        captionFontDirectory: captionFontDirectory,
         outputPath: output,
       );
       final filterGraph = arguments[arguments.indexOf('-filter_complex') + 1];
@@ -323,13 +367,68 @@ void main() {
       expect(filterGraph, contains('gblur=sigma='));
       expect(filterGraph, contains('crop=w=trunc(iw*'));
       expect(filterGraph, contains('blurRegion'));
+      expect(filterGraph, contains('timelineEffect'));
+      expect(filterGraph, contains('between(t,0.100000,0.400000)'));
+      expect(filterGraph, contains('between(t,2.600000,2.900000)'));
 
       final render = await Process.run('ffmpeg', arguments);
       expect(render.exitCode, 0, reason: '${render.stdout}\n${render.stderr}');
 
+      final baselineArguments = TimelineExportService.buildFfmpegArguments(
+        timeline: timeline,
+        inputs: inputs,
+        settings: const ExportSettings(
+          resolution: ExportResolution.p480,
+          frameRate: ExportFrameRate.fps30,
+          quality: ExportQuality.compact,
+          saveToGallery: false,
+        ),
+        canvasSize: const ExportCanvasSize(
+          width: 640,
+          height: 360,
+          framesPerSecond: 30,
+        ),
+        timelineDuration: const Duration(seconds: 3),
+        assPath: null,
+        outputPath: outputWithoutCaptions,
+      );
+      final baselineRender = await Process.run('ffmpeg', baselineArguments);
+      expect(
+        baselineRender.exitCode,
+        0,
+        reason: '${baselineRender.stdout}\n${baselineRender.stderr}',
+      );
+
       final outputFile = File(output);
       expect(await outputFile.exists(), isTrue);
       expect(await outputFile.length(), greaterThan(20 * 1024));
+      final captionRoi = await _extractRgbRoi(
+        output,
+        timestampSeconds: 2.1,
+        crop: '640:110:0:250',
+      );
+      final baselineRoi = await _extractRgbRoi(
+        outputWithoutCaptions,
+        timestampSeconds: 2.1,
+        crop: '640:110:0:250',
+      );
+      expect(captionRoi, hasLength(baselineRoi.length));
+      var changedPixels = 0;
+      var totalDifference = 0;
+      for (var index = 0; index < captionRoi.length; index += 3) {
+        final pixelDifference =
+            (captionRoi[index] - baselineRoi[index]).abs() +
+            (captionRoi[index + 1] - baselineRoi[index + 1]).abs() +
+            (captionRoi[index + 2] - baselineRoi[index + 2]).abs();
+        totalDifference += pixelDifference;
+        if (pixelDifference >= 24) changedPixels++;
+      }
+      expect(
+        changedPixels,
+        greaterThan(300),
+        reason: 'The exported caption did not change enough pixels in its ROI.',
+      );
+      expect(totalDifference, greaterThan(30000));
 
       final probe = await Process.run('ffprobe', [
         '-v',
@@ -386,4 +485,33 @@ Future<void> _runFfmpeg(List<String> arguments) async {
       '${result.stdout}\n${result.stderr}',
     );
   }
+}
+
+Future<List<int>> _extractRgbRoi(
+  String videoPath, {
+  required double timestampSeconds,
+  required String crop,
+}) async {
+  final result = await Process.run('ffmpeg', [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-i',
+    videoPath,
+    '-ss',
+    timestampSeconds.toStringAsFixed(3),
+    '-frames:v',
+    '1',
+    '-vf',
+    'crop=$crop',
+    '-pix_fmt',
+    'rgb24',
+    '-f',
+    'rawvideo',
+    'pipe:1',
+  ], stdoutEncoding: null);
+  if (result.exitCode != 0) {
+    throw StateError('Frame extraction failed:\n${result.stderr}');
+  }
+  return result.stdout as List<int>;
 }

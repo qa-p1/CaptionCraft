@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../shared/widgets/snack_bar_helper.dart';
 import '../models/subtitle_entry.dart';
+import '../models/subtitle_style_model.dart';
 import '../models/timeline_models.dart';
 import '../providers/editor_provider.dart';
 import '../providers/playback_provider.dart';
@@ -33,19 +34,25 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
   final ScrollController _horizontalScrollController = ScrollController();
   final ScrollController _verticalScrollController = ScrollController();
   double _pixelsPerSecond = 50;
-  double? _scaleStartPixelsPerSecond;
   bool _rippleEditingEnabled = false;
   TimelineClip? _clipboardClip;
   TimelineTrack? _clipboardTrack;
   SubtitleEntry? _clipboardSubtitle;
+  EditorTimeline? _cachedSourceTimeline;
+  List<SubtitleEntry>? _cachedSubtitleEntries;
+  SubtitleStyleModel? _cachedSubtitleStyle;
+  EditorTimeline? _cachedMergedTimeline;
+  String? _activeDragClipId;
+  String? _activeTrimClipId;
+  double _activeDragDy = 0;
 
   static const double _minPixelsPerSecond = 10;
   static const double _maxPixelsPerSecond = 150;
   static const double _toolbarHeight = 48;
   static const double _rulerHeight = 30;
-  static const double _labelColumnWidth = 128;
-  static const double _sectionHeaderHeight = 24;
-  static const double _laneGap = 8;
+  static const double _labelColumnWidth = 86;
+  static const double _sectionHeaderHeight = 18;
+  static const double _laneGap = 5;
   static const int _minClipDurationMs = 300;
 
   void _addTrack(TimelineTrackSection section) {
@@ -78,6 +85,28 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         );
   }
 
+  EditorTimeline _timelineForBuild(
+    EditorTimeline source,
+    List<SubtitleEntry> subtitles,
+    SubtitleStyleModel subtitleStyle,
+  ) {
+    if (identical(_cachedSourceTimeline, source) &&
+        identical(_cachedSubtitleEntries, subtitles) &&
+        identical(_cachedSubtitleStyle, subtitleStyle) &&
+        _cachedMergedTimeline != null) {
+      return _cachedMergedTimeline!;
+    }
+    final merged = source.mergeSubtitleEntries(
+      subtitles: subtitles,
+      globalStyle: subtitleStyle,
+    );
+    _cachedSourceTimeline = source;
+    _cachedSubtitleEntries = subtitles;
+    _cachedSubtitleStyle = subtitleStyle;
+    _cachedMergedTimeline = merged;
+    return merged;
+  }
+
   void _applyTimeline(EditorTimeline timeline) {
     ref.read(editorProvider.notifier).setTimeline(timeline);
     ref
@@ -94,64 +123,6 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         .map((track) => track.id == target.id ? mapper(track) : track)
         .toList();
     _applyTimeline(timeline.copyWith(tracks: tracks));
-  }
-
-  void _reorderTrack(TimelineTrack track, int direction) {
-    final timeline = ref.read(editorProvider).timeline;
-    final sectionTracks = timeline.tracksForSection(track.section);
-    final sectionIndex = sectionTracks.indexWhere(
-      (candidate) => candidate.id == track.id,
-    );
-    final targetSectionIndex = sectionIndex + direction;
-    if (sectionIndex < 0 ||
-        targetSectionIndex < 0 ||
-        targetSectionIndex >= sectionTracks.length) {
-      return;
-    }
-    final targetTrack = sectionTracks[targetSectionIndex];
-    final nextTracks = List<TimelineTrack>.from(timeline.tracks);
-    final currentGlobalIndex = nextTracks.indexWhere(
-      (candidate) => candidate.id == track.id,
-    );
-    final targetGlobalIndex = nextTracks.indexWhere(
-      (candidate) => candidate.id == targetTrack.id,
-    );
-    final temporary = nextTracks[currentGlobalIndex];
-    nextTracks[currentGlobalIndex] = nextTracks[targetGlobalIndex];
-    nextTracks[targetGlobalIndex] = temporary;
-    _applyTimeline(timeline.copyWith(tracks: nextTracks));
-  }
-
-  Future<void> _renameTrack(TimelineTrack track) async {
-    final controller = TextEditingController(text: track.name);
-    final nextName = await showDialog<String>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Rename track'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          maxLength: 32,
-          textInputAction: TextInputAction.done,
-          onSubmitted: (value) => Navigator.pop(dialogContext, value),
-          decoration: const InputDecoration(hintText: 'Track name'),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(dialogContext, controller.text),
-            child: const Text('Rename'),
-          ),
-        ],
-      ),
-    );
-    controller.dispose();
-    final cleaned = nextName?.trim();
-    if (cleaned == null || cleaned.isEmpty || cleaned == track.name) return;
-    _updateTrack(track, (current) => current.copyWith(name: cleaned));
   }
 
   void _addMarker(Duration position) {
@@ -227,6 +198,10 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
 
   void _removeTrack(TimelineTrack track) {
     if (!_canRemoveTrack(track)) return;
+    if (track.isLocked) {
+      SnackBarHelper.showInfo(context, 'Unlock the track before deleting it.');
+      return;
+    }
 
     final editorState = ref.read(editorProvider);
     final timeline = editorState.timeline;
@@ -265,21 +240,151 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
   }
 
   bool _canRemoveTrack(TimelineTrack track) {
-    if (track.isLocked) return false;
-    final timeline = ref.read(editorProvider).timeline;
     switch (track.section) {
       case TimelineTrackSection.overlay:
       case TimelineTrackSection.audio:
-        return timeline.tracksForSection(track.section).length > 1;
+        return true;
       case TimelineTrackSection.textSubtitle:
-        if (track.type != TimelineTrackType.text) return false;
-        return timeline
-                .tracksForSection(track.section)
-                .where((candidate) => candidate.type == TimelineTrackType.text)
-                .length >
-            1;
+        return track.type == TimelineTrackType.text;
       case TimelineTrackSection.baseVideo:
         return false;
+    }
+  }
+
+  Future<void> _requestRemoveTrack(TimelineTrack track) async {
+    if (!_canRemoveTrack(track)) return;
+    if (track.clips.isNotEmpty) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('Delete track?'),
+          content: Text(
+            'Delete ${track.name} and its ${track.clips.length} '
+            '${track.clips.length == 1 ? 'clip' : 'clips'}?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              style: FilledButton.styleFrom(backgroundColor: kError),
+              child: const Text('Delete'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted) return;
+    }
+    final liveTrack = ref
+        .read(editorProvider)
+        .timeline
+        .tracks
+        .where((candidate) => candidate.id == track.id)
+        .firstOrNull;
+    if (liveTrack != null) _removeTrack(liveTrack);
+  }
+
+  Future<void> _showTrackActions(
+    TimelineTrack track,
+    Offset globalPosition,
+  ) async {
+    final overlay =
+        Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
+    final local = overlay.globalToLocal(globalPosition);
+    final liveTrack = ref
+        .read(editorProvider)
+        .timeline
+        .tracks
+        .where((candidate) => candidate.id == track.id)
+        .firstOrNull;
+    if (liveTrack == null) return;
+    final canHide = liveTrack.section != TimelineTrackSection.audio;
+    final canMute =
+        liveTrack.section == TimelineTrackSection.audio ||
+        liveTrack.type == TimelineTrackType.video;
+    final action = await showMenu<_TrackQuickAction>(
+      context: context,
+      color: kSurfaceElevated,
+      position: RelativeRect.fromLTRB(
+        local.dx,
+        local.dy,
+        math.max(0, overlay.size.width - local.dx),
+        math.max(0, overlay.size.height - local.dy),
+      ),
+      items: [
+        if (canHide)
+          PopupMenuItem(
+            value: _TrackQuickAction.visibility,
+            child: _TrackActionMenuItem(
+              icon: liveTrack.isHidden
+                  ? Icons.visibility_rounded
+                  : Icons.visibility_off_rounded,
+              label: liveTrack.isHidden ? 'Show' : 'Hide',
+            ),
+          ),
+        if (canMute)
+          PopupMenuItem(
+            value: _TrackQuickAction.mute,
+            child: _TrackActionMenuItem(
+              icon: liveTrack.isMuted
+                  ? Icons.volume_up_rounded
+                  : Icons.volume_off_rounded,
+              label: liveTrack.isMuted ? 'Unmute' : 'Mute',
+            ),
+          ),
+        PopupMenuItem(
+          value: _TrackQuickAction.lock,
+          child: _TrackActionMenuItem(
+            icon: liveTrack.isLocked
+                ? Icons.lock_open_rounded
+                : Icons.lock_rounded,
+            label: liveTrack.isLocked ? 'Unlock' : 'Lock',
+          ),
+        ),
+        if (_canRemoveTrack(liveTrack))
+          const PopupMenuItem(
+            value: _TrackQuickAction.delete,
+            child: _TrackActionMenuItem(
+              icon: Icons.delete_outline_rounded,
+              label: 'Delete',
+              color: kError,
+            ),
+          ),
+      ],
+    );
+    if (!mounted || action == null) return;
+    final latest = ref
+        .read(editorProvider)
+        .timeline
+        .tracks
+        .where((candidate) => candidate.id == liveTrack.id)
+        .firstOrNull;
+    if (latest == null) return;
+    switch (action) {
+      case _TrackQuickAction.visibility:
+        _updateTrack(
+          latest,
+          (current) => current.copyWith(isHidden: !current.isHidden),
+        );
+        break;
+      case _TrackQuickAction.mute:
+        _updateTrack(
+          latest,
+          (current) => current.copyWith(isMuted: !current.isMuted),
+        );
+        break;
+      case _TrackQuickAction.lock:
+        _updateTrack(
+          latest,
+          (current) => current.copyWith(isLocked: !current.isLocked),
+        );
+        break;
+      case _TrackQuickAction.delete:
+        await _requestRemoveTrack(latest);
+        break;
     }
   }
 
@@ -292,7 +397,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         }
       }
     }
-    return clip.sourceDuration.inMilliseconds;
+    return (clip.sourceStartTime + clip.sourceDuration).inMilliseconds;
   }
 
   int _snapStartMs(
@@ -422,6 +527,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
     final pasted = TimelineClip(
       trackId: sourceTrack.id,
       type: sourceClip.type,
+      effectKind: sourceClip.effectKind,
       label: sourceClip.label,
       assetId: sourceClip.assetId,
       linkedClipId: sourceClip.linkedClipId,
@@ -435,6 +541,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       audioMix: sourceClip.audioMix,
       fitMode: sourceClip.fitMode,
       playbackRate: sourceClip.playbackRate,
+      isReversed: sourceClip.isReversed,
+      crop: sourceClip.crop,
+      blur: sourceClip.blur,
       colorAdjustments: sourceClip.colorAdjustments,
       text: sourceClip.text,
       subtitleStyle: sourceClip.subtitleStyle,
@@ -450,6 +559,14 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
     _applyTimeline(timeline.copyWith(tracks: nextTracks));
     ref.read(editorProvider.notifier).selectTrack(sourceTrack.id);
     ref.read(editorProvider.notifier).selectClip(pasted.id);
+  }
+
+  int _compositionDurationMs(EditorTimeline timeline) {
+    final baseDuration = timeline.baseVideoDuration;
+    final resolved = baseDuration > Duration.zero
+        ? baseDuration
+        : timeline.duration;
+    return math.max(0, resolved.inMilliseconds);
   }
 
   void _moveBaseClip(
@@ -474,8 +591,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
     final durationMs = clip.duration.inMilliseconds;
     final minimumStart = previous?.endTime.inMilliseconds ?? 0;
     final maximumStart =
-        (next?.startTime.inMilliseconds ??
-            timeline.videoClips.last.endTime.inMilliseconds) -
+        (next?.startTime.inMilliseconds ?? _compositionDurationMs(timeline)) -
         durationMs;
     final proposedStart = (clip.startTime.inMilliseconds + deltaMs)
         .clamp(minimumStart, maximumStart)
@@ -538,9 +654,10 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
 
     final deltaMs = (delta.dx / _pixelsPerSecond * 1000).round();
     final durationMs = clip.duration.inMilliseconds;
-    final maxTimelineMs = timeline.videoClips.isEmpty
-        ? clip.endTime.inMilliseconds
-        : timeline.videoClips.last.endTime.inMilliseconds;
+    final maxTimelineMs = math.max(
+      clip.endTime.inMilliseconds,
+      _compositionDurationMs(timeline),
+    );
     final maximumStart = (maxTimelineMs - durationMs).clamp(0, maxTimelineMs);
     final proposedStart = (clip.startTime.inMilliseconds + deltaMs)
         .clamp(0, maximumStart)
@@ -553,29 +670,28 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
     ).clamp(0, maximumStart).toInt();
 
     var targetTrack = track;
-    if (track.section == TimelineTrackSection.overlay) {
-      final overlayTracks = timeline.tracksForSection(
-        TimelineTrackSection.overlay,
-      );
-      final currentIndex = overlayTracks.indexWhere(
+    _activeDragDy += delta.dy;
+    final laneThreshold = math.max(16.0, _laneHeightForTrack(track.type) / 2);
+    if (_activeDragDy.abs() >= laneThreshold &&
+        track.section != TimelineTrackSection.baseVideo) {
+      final sectionTracks = timeline.tracksForSection(track.section);
+      final currentIndex = sectionTracks.indexWhere(
         (candidate) => candidate.id == track.id,
       );
       if (currentIndex != -1) {
-        var targetIndex = currentIndex;
-        if (delta.dy.abs() > delta.dx.abs() &&
-            delta.dy > 8 &&
-            currentIndex < overlayTracks.length - 1) {
-          targetIndex += 1;
-        } else if (delta.dy.abs() > delta.dx.abs() &&
-            delta.dy < -8 &&
-            currentIndex > 0) {
-          targetIndex -= 1;
-        }
-        final candidateTrack = overlayTracks[targetIndex];
-        if (!candidateTrack.isLocked) {
-          targetTrack = candidateTrack;
+        final direction = _activeDragDy > 0 ? 1 : -1;
+        var targetIndex = currentIndex + direction;
+        while (targetIndex >= 0 && targetIndex < sectionTracks.length) {
+          final candidateTrack = sectionTracks[targetIndex];
+          if (!candidateTrack.isLocked &&
+              _trackAcceptsClip(candidateTrack, clip)) {
+            targetTrack = candidateTrack;
+            break;
+          }
+          targetIndex += direction;
         }
       }
+      _activeDragDy = 0;
     }
 
     final updatedClip = clip.copyWith(
@@ -583,10 +699,21 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       startTime: Duration(milliseconds: nextStartMs),
       endTime: Duration(milliseconds: nextStartMs + durationMs),
     );
+    final appliedDelta = Duration(
+      milliseconds: nextStartMs - clip.startTime.inMilliseconds,
+    );
 
     final nextTracks = timeline.tracks.map((candidateTrack) {
       final nextClips = candidateTrack.clips
           .where((candidate) => candidate.id != clip.id)
+          .map(
+            (candidate) => candidate.linkedClipId == clip.id
+                ? candidate.copyWith(
+                    startTime: candidate.startTime + appliedDelta,
+                    endTime: candidate.endTime + appliedDelta,
+                  )
+                : candidate,
+          )
           .toList();
       if (candidateTrack.id == targetTrack.id) {
         nextClips.add(updatedClip);
@@ -598,6 +725,54 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
     _applyTimeline(timeline.copyWith(tracks: nextTracks));
     ref.read(editorProvider.notifier).selectTrack(targetTrack.id);
     ref.read(editorProvider.notifier).selectClip(updatedClip.id);
+  }
+
+  bool _trackAcceptsClip(TimelineTrack track, TimelineClip clip) {
+    switch (track.section) {
+      case TimelineTrackSection.overlay:
+        return clip.type == TimelineTrackType.effect
+            ? track.type == TimelineTrackType.effect
+            : track.type != TimelineTrackType.effect;
+      case TimelineTrackSection.audio:
+        return clip.type == TimelineTrackType.audio;
+      case TimelineTrackSection.textSubtitle:
+        return track.type == clip.type;
+      case TimelineTrackSection.baseVideo:
+        return clip.type == TimelineTrackType.video;
+    }
+  }
+
+  void _beginClipMove(TimelineClip clip) {
+    _activeDragClipId = clip.id;
+    _activeDragDy = 0;
+    final selection = _selectedClipSelection(
+      ref.read(editorProvider).timeline,
+      clip.id,
+    );
+    if (selection == null) return;
+    final editorNotifier = ref.read(editorProvider.notifier);
+    editorNotifier.beginTimelineGestureEdit();
+    editorNotifier.selectTrack(selection.$1.id);
+    editorNotifier.selectClip(selection.$2.id);
+    if (selection.$2.type == TimelineTrackType.subtitle) {
+      ref.read(subtitleProvider.notifier).selectEntry(selection.$2.id);
+    } else {
+      ref.read(subtitleProvider.notifier).selectEntry(null);
+    }
+  }
+
+  void _moveClipById(String clipId, Offset delta) {
+    if (_activeDragClipId != clipId) return;
+    final timeline = ref.read(editorProvider).timeline;
+    final selection = _selectedClipSelection(timeline, clipId);
+    if (selection == null) return;
+    _moveClip(timeline, selection.$1, selection.$2, delta);
+  }
+
+  void _endClipMove() {
+    _activeDragClipId = null;
+    _activeDragDy = 0;
+    ref.read(editorProvider.notifier).endTimelineGestureEdit();
   }
 
   void _trimBaseClipStart(
@@ -773,6 +948,197 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
     _applyTimeline(timeline.copyWith(tracks: nextTracks));
   }
 
+  bool _usesSourceBounds(TimelineClip clip) {
+    return clip.type == TimelineTrackType.video ||
+        clip.type == TimelineTrackType.audio ||
+        clip.type == TimelineTrackType.gif;
+  }
+
+  void _trimNonBaseClipStart(
+    EditorTimeline timeline,
+    TimelineTrack track,
+    TimelineClip clip,
+    Offset delta,
+  ) {
+    if (track.isLocked) return;
+    final deltaMs = (delta.dx / _pixelsPerSecond * 1000).round();
+    final maximumStart = clip.endTime.inMilliseconds - _minClipDurationMs;
+    final sourceBounded = _usesSourceBounds(clip);
+    final minimumStart = sourceBounded
+        ? math.max(
+            0,
+            clip.startTime.inMilliseconds -
+                (clip.sourceStartTime.inMilliseconds / clip.playbackRate)
+                    .floor(),
+          )
+        : 0;
+    final proposedStart = (clip.startTime.inMilliseconds + deltaMs)
+        .clamp(minimumStart, maximumStart)
+        .toInt();
+    final newStartMs = _snapEdgeMs(
+      timeline,
+      clip,
+      proposedStart,
+    ).clamp(minimumStart, maximumStart).toInt();
+    if (newStartMs == clip.startTime.inMilliseconds) return;
+
+    final sourceDeltaMs =
+        ((newStartMs - clip.startTime.inMilliseconds) * clip.playbackRate)
+            .round();
+    final newDuration = Duration(
+      milliseconds: clip.endTime.inMilliseconds - newStartMs,
+    );
+    final updatedClip = clip.copyWith(
+      startTime: Duration(milliseconds: newStartMs),
+      sourceStartTime: sourceBounded
+          ? clip.sourceStartTime + Duration(milliseconds: sourceDeltaMs)
+          : clip.sourceStartTime,
+      sourceDuration: sourceBounded
+          ? clip.sourceDuration - Duration(milliseconds: sourceDeltaMs)
+          : newDuration,
+    );
+    final nextStart = Duration(milliseconds: newStartMs);
+    final nextTracks = timeline.tracks.map((candidateTrack) {
+      if (candidateTrack.id == track.id) {
+        return candidateTrack.copyWith(
+          clips: candidateTrack.clips
+              .map(
+                (candidate) =>
+                    candidate.id == clip.id ? updatedClip : candidate,
+              )
+              .toList(),
+        );
+      }
+      final nextClips = candidateTrack.clips
+          .where(
+            (candidate) =>
+                candidate.linkedClipId != clip.id ||
+                candidate.endTime > nextStart,
+          )
+          .map((candidate) {
+            if (candidate.linkedClipId != clip.id ||
+                candidate.startTime >= nextStart) {
+              return candidate;
+            }
+            return candidate.copyWith(startTime: nextStart);
+          })
+          .toList();
+      return candidateTrack.copyWith(clips: nextClips);
+    }).toList();
+    _applyTimeline(timeline.copyWith(tracks: nextTracks));
+  }
+
+  void _trimNonBaseClipEnd(
+    EditorTimeline timeline,
+    TimelineTrack track,
+    TimelineClip clip,
+    Offset delta,
+  ) {
+    if (track.isLocked) return;
+    final deltaMs = (delta.dx / _pixelsPerSecond * 1000).round();
+    final sourceBounded = _usesSourceBounds(clip);
+    final compositionEnd = math.max(
+      clip.endTime.inMilliseconds,
+      _compositionDurationMs(timeline),
+    );
+    final assetDurationMs = _assetDurationMs(timeline, clip);
+    final sourceMaximumEnd =
+        clip.endTime.inMilliseconds +
+        ((assetDurationMs -
+                    clip.sourceStartTime.inMilliseconds -
+                    clip.sourceDuration.inMilliseconds) /
+                clip.playbackRate)
+            .floor();
+    final maximumEnd = sourceBounded
+        ? math.min(compositionEnd, sourceMaximumEnd)
+        : compositionEnd;
+    final minimumEnd = clip.startTime.inMilliseconds + _minClipDurationMs;
+    final proposedEnd = (clip.endTime.inMilliseconds + deltaMs)
+        .clamp(minimumEnd, math.max(minimumEnd, maximumEnd))
+        .toInt();
+    final newEndMs = _snapEdgeMs(
+      timeline,
+      clip,
+      proposedEnd,
+    ).clamp(minimumEnd, math.max(minimumEnd, maximumEnd)).toInt();
+    if (newEndMs == clip.endTime.inMilliseconds) return;
+
+    final sourceDeltaMs =
+        ((newEndMs - clip.endTime.inMilliseconds) * clip.playbackRate).round();
+    final newDuration = Duration(
+      milliseconds: newEndMs - clip.startTime.inMilliseconds,
+    );
+    final updatedClip = clip.copyWith(
+      endTime: Duration(milliseconds: newEndMs),
+      sourceDuration: sourceBounded
+          ? clip.sourceDuration + Duration(milliseconds: sourceDeltaMs)
+          : newDuration,
+    );
+    final nextEnd = Duration(milliseconds: newEndMs);
+    final nextTracks = timeline.tracks.map((candidateTrack) {
+      if (candidateTrack.id == track.id) {
+        return candidateTrack.copyWith(
+          clips: candidateTrack.clips
+              .map(
+                (candidate) =>
+                    candidate.id == clip.id ? updatedClip : candidate,
+              )
+              .toList(),
+        );
+      }
+      final nextClips = candidateTrack.clips
+          .where(
+            (candidate) =>
+                candidate.linkedClipId != clip.id ||
+                candidate.startTime < nextEnd,
+          )
+          .map((candidate) {
+            if (candidate.linkedClipId != clip.id ||
+                candidate.endTime <= nextEnd) {
+              return candidate;
+            }
+            return candidate.copyWith(endTime: nextEnd);
+          })
+          .toList();
+      return candidateTrack.copyWith(clips: nextClips);
+    }).toList();
+    _applyTimeline(timeline.copyWith(tracks: nextTracks));
+  }
+
+  void _beginClipTrim(TimelineClip clip) {
+    _activeTrimClipId = clip.id;
+    ref.read(editorProvider.notifier).beginTimelineGestureEdit();
+  }
+
+  void _trimClipStartById(String clipId, Offset delta) {
+    if (_activeTrimClipId != clipId) return;
+    final timeline = ref.read(editorProvider).timeline;
+    final selection = _selectedClipSelection(timeline, clipId);
+    if (selection == null) return;
+    if (selection.$1.section == TimelineTrackSection.baseVideo) {
+      _trimBaseClipStart(timeline, selection.$1, selection.$2, delta);
+    } else {
+      _trimNonBaseClipStart(timeline, selection.$1, selection.$2, delta);
+    }
+  }
+
+  void _trimClipEndById(String clipId, Offset delta) {
+    if (_activeTrimClipId != clipId) return;
+    final timeline = ref.read(editorProvider).timeline;
+    final selection = _selectedClipSelection(timeline, clipId);
+    if (selection == null) return;
+    if (selection.$1.section == TimelineTrackSection.baseVideo) {
+      _trimBaseClipEnd(timeline, selection.$1, selection.$2, delta);
+    } else {
+      _trimNonBaseClipEnd(timeline, selection.$1, selection.$2, delta);
+    }
+  }
+
+  void _endClipTrim() {
+    _activeTrimClipId = null;
+    ref.read(editorProvider.notifier).endTimelineGestureEdit();
+  }
+
   void _splitSelectedBaseClip(EditorTimeline timeline, Duration splitPoint) {
     final editorState = ref.read(editorProvider);
     final selectedClipId = editorState.selectedClipId;
@@ -824,6 +1190,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
     final secondClip = TimelineClip(
       trackId: clip.trackId,
       type: clip.type,
+      effectKind: clip.effectKind,
       label: clip.label,
       assetId: clip.assetId,
       startTime: splitPoint,
@@ -838,6 +1205,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       audioMix: clip.audioMix,
       fitMode: clip.fitMode,
       playbackRate: clip.playbackRate,
+      isReversed: clip.isReversed,
+      crop: clip.crop,
+      blur: clip.blur,
       colorAdjustments: clip.colorAdjustments,
       text: clip.text,
       subtitleStyle: clip.subtitleStyle,
@@ -980,15 +1350,17 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       return;
     }
     final durationMs = clip.duration.inMilliseconds;
-    final timelineEndMs = timeline.videoClips.isEmpty
-        ? clip.endTime.inMilliseconds + durationMs
-        : timeline.videoClips.last.endTime.inMilliseconds;
+    final compositionEndMs = _compositionDurationMs(timeline);
+    final timelineEndMs = compositionEndMs > 0
+        ? compositionEndMs
+        : clip.endTime.inMilliseconds + durationMs;
     final nextStartMs = clip.endTime.inMilliseconds
         .clamp(0, (timelineEndMs - durationMs).clamp(0, timelineEndMs))
         .toInt();
     final duplicate = TimelineClip(
       trackId: track.id,
       type: clip.type,
+      effectKind: clip.effectKind,
       label: clip.label,
       assetId: clip.assetId,
       linkedClipId: clip.linkedClipId,
@@ -1002,6 +1374,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       audioMix: clip.audioMix,
       fitMode: clip.fitMode,
       playbackRate: clip.playbackRate,
+      isReversed: clip.isReversed,
+      crop: clip.crop,
+      blur: clip.blur,
       colorAdjustments: clip.colorAdjustments,
       text: clip.text,
       subtitleStyle: clip.subtitleStyle,
@@ -1051,6 +1426,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
     final secondClip = TimelineClip(
       trackId: track.id,
       type: clip.type,
+      effectKind: clip.effectKind,
       label: clip.label,
       assetId: clip.assetId,
       linkedClipId: clip.linkedClipId,
@@ -1066,6 +1442,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       audioMix: clip.audioMix,
       fitMode: clip.fitMode,
       playbackRate: clip.playbackRate,
+      isReversed: clip.isReversed,
+      crop: clip.crop,
+      blur: clip.blur,
       colorAdjustments: clip.colorAdjustments,
       text: clip.text,
       subtitleStyle: clip.subtitleStyle,
@@ -1161,14 +1540,17 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
 
   @override
   Widget build(BuildContext context) {
-    final playbackState = ref.watch(playbackProvider);
+    final playbackDuration = ref.watch(
+      playbackProvider.select((state) => state.duration),
+    );
     final subtitleState = ref.watch(subtitleProvider);
     final subtitleNotifier = ref.read(subtitleProvider.notifier);
     final editorState = ref.watch(editorProvider);
     final editorNotifier = ref.read(editorProvider.notifier);
-    final timeline = editorState.timeline.mergeSubtitleEntries(
-      subtitles: subtitleState.entries,
-      globalStyle: subtitleState.globalStyle,
+    final timeline = _timelineForBuild(
+      editorState.timeline,
+      subtitleState.entries,
+      subtitleState.globalStyle,
     );
     final fallbackDuration = timeline.tracks
         .expand((track) => track.clips)
@@ -1176,8 +1558,8 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
           Duration.zero,
           (current, clip) => clip.endTime > current ? clip.endTime : current,
         );
-    final totalDuration = playbackState.duration > fallbackDuration
-        ? playbackState.duration
+    final totalDuration = playbackDuration > fallbackDuration
+        ? playbackDuration
         : fallbackDuration;
     final viewportWidth = MediaQuery.of(context).size.width;
     final selectedSelection = _selectedClipSelection(
@@ -1262,8 +1644,10 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                     onPressed:
                         _clipboardClip == null && _clipboardSubtitle == null
                         ? null
-                        : () =>
-                              _pasteSelection(timeline, playbackState.position),
+                        : () => _pasteSelection(
+                            timeline,
+                            ref.read(playbackProvider).position,
+                          ),
                   ),
                   _buildToolbarButton(
                     icon: Icons.control_point_duplicate_rounded,
@@ -1303,7 +1687,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                         ? null
                         : () {
                             if (selectedSubtitle != null) {
-                              final splitPoint = playbackState.position;
+                              final splitPoint = ref
+                                  .read(playbackProvider)
+                                  .position;
                               if (splitPoint <= selectedSubtitle.startTime ||
                                   splitPoint >= selectedSubtitle.endTime) {
                                 SnackBarHelper.showInfo(
@@ -1325,7 +1711,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                                 TimelineTrackSection.baseVideo) {
                               _splitSelectedBaseClip(
                                 timeline,
-                                playbackState.position,
+                                ref.read(playbackProvider).position,
                               );
                               return;
                             }
@@ -1333,7 +1719,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                               timeline,
                               selectedTrack,
                               selectedClip,
-                              playbackState.position,
+                              ref.read(playbackProvider).position,
                             );
                           },
                   ),
@@ -1341,7 +1727,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                     icon: Icons.my_location_rounded,
                     tooltip: 'Center playhead',
                     onPressed: () => _scrollToPlayhead(
-                      playbackState.position,
+                      ref.read(playbackProvider).position,
                       viewportWidth,
                     ),
                   ),
@@ -1360,19 +1746,26 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                     tooltip: 'Previous marker',
                     onPressed: timeline.markers.isEmpty
                         ? null
-                        : () => _seekMarker(-1, playbackState.position),
+                        : () => _seekMarker(
+                            -1,
+                            ref.read(playbackProvider).position,
+                          ),
                   ),
                   _buildToolbarButton(
                     icon: Icons.add_location_alt_rounded,
                     tooltip: 'Add marker at playhead',
-                    onPressed: () => _addMarker(playbackState.position),
+                    onPressed: () =>
+                        _addMarker(ref.read(playbackProvider).position),
                   ),
                   _buildToolbarButton(
                     icon: Icons.keyboard_double_arrow_right_rounded,
                     tooltip: 'Next marker',
                     onPressed: timeline.markers.isEmpty
                         ? null
-                        : () => _seekMarker(1, playbackState.position),
+                        : () => _seekMarker(
+                            1,
+                            ref.read(playbackProvider).position,
+                          ),
                   ),
                   _buildToolbarButton(
                     icon: Icons.compress_rounded,
@@ -1426,389 +1819,299 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                           child: _TimelineLabels(
                             rowLayouts: rowLayouts,
                             onAddTrack: _addTrack,
-                            onRemoveTrack: _removeTrack,
-                            canRemoveTrack: _canRemoveTrack,
-                            onRenameTrack: (track) {
-                              _renameTrack(track);
-                            },
-                            onToggleCollapse: (track) => _updateTrack(
-                              track,
-                              (current) => current.copyWith(
-                                isCollapsed: !current.isCollapsed,
-                              ),
-                            ),
-                            onToggleLock: (track) => _updateTrack(
-                              track,
-                              (current) =>
-                                  current.copyWith(isLocked: !current.isLocked),
-                            ),
-                            onToggleMute: (track) => _updateTrack(
-                              track,
-                              (current) =>
-                                  current.copyWith(isMuted: !current.isMuted),
-                            ),
-                            onToggleHidden: (track) => _updateTrack(
-                              track,
-                              (current) =>
-                                  current.copyWith(isHidden: !current.isHidden),
-                            ),
-                            onToggleSolo: (track) => _updateTrack(
-                              track,
-                              (current) =>
-                                  current.copyWith(isSolo: !current.isSolo),
-                            ),
-                            onMoveTrack: _reorderTrack,
+                            onShowTrackActions: _showTrackActions,
                           ),
                         ),
                         Expanded(
-                          child: GestureDetector(
-                            behavior: HitTestBehavior.translucent,
-                            onScaleStart: (_) {
-                              _scaleStartPixelsPerSecond = _pixelsPerSecond;
-                            },
-                            onScaleUpdate: (details) {
-                              final base = _scaleStartPixelsPerSecond;
-                              if (base == null) return;
-                              setState(() {
-                                _pixelsPerSecond = (base * details.scale)
-                                    .clamp(
-                                      _minPixelsPerSecond,
-                                      _maxPixelsPerSecond,
-                                    )
-                                    .toDouble();
-                              });
-                            },
-                            onScaleEnd: (_) {
-                              _scaleStartPixelsPerSecond = null;
-                            },
-                            child: SingleChildScrollView(
-                              controller: _horizontalScrollController,
-                              scrollDirection: Axis.horizontal,
-                              child: SizedBox(
-                                width: totalWidth,
-                                height: contentHeight,
-                                child: GestureDetector(
-                                  behavior: HitTestBehavior.opaque,
-                                  onTapDown: (details) {
-                                    if (details.localPosition.dy <=
-                                        _rulerHeight) {
-                                      _seekToTimelineX(
-                                        details.localPosition.dx,
-                                        totalDuration,
-                                      );
-                                    } else {
-                                      editorNotifier.selectClip(null);
-                                      editorNotifier.selectTrack(null);
-                                      subtitleNotifier.selectEntry(null);
-                                    }
-                                  },
-                                  child: Stack(
-                                    children: [
-                                      Positioned.fill(
-                                        child: Container(
-                                          color: kSurfaceElevated,
-                                        ),
-                                      ),
-                                      Positioned(
-                                        top: 0,
-                                        left: 0,
-                                        right: 0,
-                                        height: _rulerHeight,
-                                        child: GestureDetector(
-                                          behavior: HitTestBehavior.opaque,
-                                          onTapDown: (details) {
-                                            _seekToTimelineX(
-                                              details.localPosition.dx,
-                                              totalDuration,
-                                            );
-                                          },
-                                          child: CustomPaint(
-                                            painter: _RulerPainter(
-                                              pixelsPerSecond: _pixelsPerSecond,
-                                              totalDuration: totalDuration,
-                                            ),
+                          child: SingleChildScrollView(
+                            controller: _horizontalScrollController,
+                            scrollDirection: Axis.horizontal,
+                            child: SizedBox(
+                              width: totalWidth,
+                              height: contentHeight,
+                              child: GestureDetector(
+                                behavior: HitTestBehavior.opaque,
+                                onTapDown: (details) {
+                                  if (details.localPosition.dy <=
+                                      _rulerHeight) {
+                                    _seekToTimelineX(
+                                      details.localPosition.dx,
+                                      totalDuration,
+                                    );
+                                  } else {
+                                    editorNotifier.selectClip(null);
+                                    editorNotifier.selectTrack(null);
+                                    subtitleNotifier.selectEntry(null);
+                                  }
+                                },
+                                child: Stack(
+                                  children: [
+                                    Positioned.fill(
+                                      child: Container(color: kSurfaceElevated),
+                                    ),
+                                    Positioned(
+                                      top: 0,
+                                      left: 0,
+                                      right: 0,
+                                      height: _rulerHeight,
+                                      child: GestureDetector(
+                                        behavior: HitTestBehavior.opaque,
+                                        onTapDown: (details) {
+                                          _seekToTimelineX(
+                                            details.localPosition.dx,
+                                            totalDuration,
+                                          );
+                                        },
+                                        child: CustomPaint(
+                                          painter: _RulerPainter(
+                                            pixelsPerSecond: _pixelsPerSecond,
+                                            totalDuration: totalDuration,
                                           ),
                                         ),
                                       ),
-                                      for (final row in rowLayouts) ...[
-                                        if (row.sectionTitle != null)
-                                          Positioned(
-                                            top: row.top,
-                                            left: 0,
-                                            right: 0,
-                                            height: _sectionHeaderHeight,
-                                            child: Container(
-                                              padding:
-                                                  const EdgeInsets.symmetric(
-                                                    horizontal: 10,
-                                                  ),
-                                              alignment: Alignment.centerLeft,
-                                              color: kBackground.withValues(
-                                                alpha: 0.18,
+                                    ),
+                                    for (final row in rowLayouts) ...[
+                                      if (row.sectionTitle != null)
+                                        Positioned(
+                                          top: row.top,
+                                          left: 0,
+                                          right: 0,
+                                          height: _sectionHeaderHeight,
+                                          child: Container(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 10,
+                                            ),
+                                            alignment: Alignment.centerLeft,
+                                            color: kBackground.withValues(
+                                              alpha: 0.18,
+                                            ),
+                                            child: Text(
+                                              row.sectionTitle!,
+                                              style: TextStyle(
+                                                color: kTextSecondary,
+                                                fontSize: 11,
+                                                fontWeight: FontWeight.w700,
                                               ),
-                                              child: Text(
-                                                row.sectionTitle!,
-                                                style: TextStyle(
-                                                  color: kTextSecondary,
-                                                  fontSize: 11,
-                                                  fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                        ),
+                                      if (row.track != null)
+                                        Positioned(
+                                          top: row.laneTop,
+                                          left: 0,
+                                          right: 0,
+                                          height: row.laneHeight,
+                                          child: _TimelineLane(
+                                            track: row.track!,
+                                            pixelsPerSecond: _pixelsPerSecond,
+                                            selectedClipId:
+                                                editorState.selectedClipId,
+                                            selectedSubtitleId:
+                                                subtitleState.selectedEntryId,
+                                            onTrackTap: () {
+                                              editorNotifier.selectTrack(
+                                                row.track!.id,
+                                              );
+                                              editorNotifier.selectClip(null);
+                                              subtitleNotifier.selectEntry(
+                                                null,
+                                              );
+                                            },
+                                            onShowTrackActions: (position) =>
+                                                _showTrackActions(
+                                                  row.track!,
+                                                  position,
                                                 ),
-                                              ),
-                                            ),
-                                          ),
-                                        if (row.track != null)
-                                          Positioned(
-                                            top: row.laneTop,
-                                            left: 0,
-                                            right: 0,
-                                            height: row.laneHeight,
-                                            child: _TimelineLane(
-                                              track: row.track!,
-                                              pixelsPerSecond: _pixelsPerSecond,
-                                              selectedClipId:
-                                                  editorState.selectedClipId,
-                                              selectedSubtitleId:
-                                                  subtitleState.selectedEntryId,
-                                              onTrackTap: () {
-                                                editorNotifier.selectTrack(
-                                                  row.track!.id,
+                                            onClipTap: (clip) {
+                                              editorNotifier.selectTrack(
+                                                row.track!.id,
+                                              );
+                                              editorNotifier.selectClip(
+                                                clip.id,
+                                              );
+                                              if (clip.type ==
+                                                  TimelineTrackType.subtitle) {
+                                                subtitleNotifier.selectEntry(
+                                                  clip.id,
                                                 );
-                                                editorNotifier.selectClip(null);
+                                              } else {
                                                 subtitleNotifier.selectEntry(
                                                   null,
                                                 );
-                                              },
-                                              onDoubleTap:
-                                                  row.track!.section ==
-                                                      TimelineTrackSection
-                                                          .overlay
-                                                  ? () => widget
-                                                        .onOverlayAddRequested
-                                                        ?.call(row.track!)
-                                                  : null,
-                                              onClipTap: (clip) {
-                                                editorNotifier.selectTrack(
-                                                  row.track!.id,
+                                              }
+                                            },
+                                            onClipLongPress: (clip) {
+                                              if (clip.type ==
+                                                      TimelineTrackType
+                                                          .subtitle &&
+                                                  widget.onEditRequested !=
+                                                      null) {
+                                                final entry = clip
+                                                    .toSubtitleEntry();
+                                                if (entry != null) {
+                                                  widget.onEditRequested!(
+                                                    entry,
+                                                  );
+                                                }
+                                                return;
+                                              }
+                                              if (clip.type ==
+                                                      TimelineTrackType.text &&
+                                                  widget.onTextClipEditRequested !=
+                                                      null) {
+                                                widget.onTextClipEditRequested!(
+                                                  clip,
                                                 );
-                                                editorNotifier.selectClip(
+                                              }
+                                            },
+                                            onTransitionTap: (clip) {
+                                              editorNotifier.selectTrack(
+                                                row.track!.id,
+                                              );
+                                              editorNotifier.selectClip(
+                                                clip.id,
+                                              );
+                                              widget.onTransitionRequested
+                                                  ?.call(clip);
+                                            },
+                                            onClipMoveStart: _beginClipMove,
+                                            onClipMove: (clip, delta) =>
+                                                _moveClipById(clip.id, delta),
+                                            onClipMoveEnd: (_) =>
+                                                _endClipMove(),
+                                            onClipTrimGestureStart:
+                                                _beginClipTrim,
+                                            onClipTrimGestureEnd: (_) =>
+                                                _endClipTrim(),
+                                            onClipTrimStart: (clip, delta) =>
+                                                _trimClipStartById(
                                                   clip.id,
-                                                );
-                                                if (clip.type ==
-                                                    TimelineTrackType
-                                                        .subtitle) {
-                                                  subtitleNotifier.selectEntry(
-                                                    clip.id,
-                                                  );
-                                                } else {
-                                                  subtitleNotifier.selectEntry(
-                                                    null,
-                                                  );
-                                                }
-                                              },
-                                              onClipLongPress: (clip) {
-                                                if (clip.type ==
-                                                        TimelineTrackType
-                                                            .subtitle &&
-                                                    widget.onEditRequested !=
-                                                        null) {
-                                                  final entry = clip
-                                                      .toSubtitleEntry();
-                                                  if (entry != null) {
-                                                    widget.onEditRequested!(
-                                                      entry,
-                                                    );
-                                                  }
-                                                  return;
-                                                }
-                                                if (clip.type ==
-                                                        TimelineTrackType
-                                                            .text &&
-                                                    widget.onTextClipEditRequested !=
-                                                        null) {
-                                                  widget
-                                                      .onTextClipEditRequested!(
-                                                    clip,
-                                                  );
-                                                }
-                                              },
-                                              onTransitionTap: (clip) {
-                                                editorNotifier.selectTrack(
-                                                  row.track!.id,
-                                                );
-                                                editorNotifier.selectClip(
+                                                  delta,
+                                                ),
+                                            onClipTrimEnd: (clip, delta) =>
+                                                _trimClipEndById(
                                                   clip.id,
-                                                );
-                                                widget.onTransitionRequested
-                                                    ?.call(clip);
-                                              },
-                                              onClipMoveStart: (clip) {
-                                                editorNotifier
-                                                    .beginTimelineGestureEdit();
-                                                editorNotifier.selectTrack(
-                                                  row.track!.id,
-                                                );
-                                                editorNotifier.selectClip(
-                                                  clip.id,
-                                                );
-                                                if (clip.type ==
-                                                    TimelineTrackType
-                                                        .subtitle) {
-                                                  subtitleNotifier.selectEntry(
-                                                    clip.id,
-                                                  );
-                                                } else {
-                                                  subtitleNotifier.selectEntry(
-                                                    null,
-                                                  );
-                                                }
-                                              },
-                                              onClipMove: (clip, delta) =>
-                                                  _moveClip(
-                                                    timeline,
-                                                    row.track!,
-                                                    clip,
-                                                    delta,
-                                                  ),
-                                              onClipMoveEnd: (_) =>
-                                                  editorNotifier
-                                                      .endTimelineGestureEdit(),
-                                              onClipTrimGestureStart: (_) {
-                                                editorNotifier
-                                                    .beginTimelineGestureEdit();
-                                              },
-                                              onClipTrimGestureEnd: (_) {
-                                                editorNotifier
-                                                    .endTimelineGestureEdit();
-                                              },
-                                              onClipTrimStart: (clip, delta) =>
-                                                  _trimBaseClipStart(
-                                                    timeline,
-                                                    row.track!,
-                                                    clip,
-                                                    delta,
-                                                  ),
-                                              onClipTrimEnd: (clip, delta) =>
-                                                  _trimBaseClipEnd(
-                                                    timeline,
-                                                    row.track!,
-                                                    clip,
-                                                    delta,
-                                                  ),
-                                            ),
-                                          ),
-                                      ],
-                                      for (final marker in timeline.markers)
-                                        Positioned(
-                                          left:
-                                              marker.position.inMilliseconds /
-                                                  1000 *
-                                                  _pixelsPerSecond -
-                                              6,
-                                          top: 0,
-                                          bottom: 0,
-                                          width: 12,
-                                          child: Stack(
-                                            alignment: Alignment.topCenter,
-                                            children: [
-                                              Positioned(
-                                                top: 10,
-                                                bottom: 0,
-                                                child: IgnorePointer(
-                                                  child: Container(
-                                                    width: 1,
-                                                    color: marker.color
-                                                        .withValues(
-                                                          alpha: 0.48,
-                                                        ),
-                                                  ),
+                                                  delta,
                                                 ),
-                                              ),
-                                              Tooltip(
-                                                message:
-                                                    '${marker.label}\n'
-                                                    '${SubtitleEntry.formatDisplayTime(marker.position)}'
-                                                    '\nLong-press to remove',
-                                                child: GestureDetector(
-                                                  behavior:
-                                                      HitTestBehavior.opaque,
-                                                  onTap: () => ref
-                                                      .read(
-                                                        playbackProvider
-                                                            .notifier,
-                                                      )
-                                                      .requestSeek(
-                                                        marker.position,
-                                                      ),
-                                                  onLongPress: () =>
-                                                      _removeMarker(marker),
-                                                  child: Icon(
-                                                    marker.type ==
-                                                            TimelineMarkerType
-                                                                .chapter
-                                                        ? Icons.bookmark_rounded
-                                                        : marker.type ==
-                                                              TimelineMarkerType
-                                                                  .beat
-                                                        ? Icons
-                                                              .music_note_rounded
-                                                        : Icons
-                                                              .arrow_drop_down_rounded,
-                                                    color: marker.color,
-                                                    size: 18,
-                                                  ),
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                        ),
-                                      Positioned(
-                                        left:
-                                            playbackState
-                                                    .position
-                                                    .inMilliseconds /
-                                                1000 *
-                                                _pixelsPerSecond -
-                                            1,
-                                        top: 0,
-                                        bottom: 0,
-                                        child: IgnorePointer(
-                                          child: Column(
-                                            children: [
-                                              Container(
-                                                width: 8,
-                                                height: 8,
-                                                decoration: BoxDecoration(
-                                                  color: kAccent,
-                                                  borderRadius:
-                                                      BorderRadius.circular(2),
-                                                ),
-                                              ),
-                                              Expanded(
-                                                child: Container(
-                                                  width: 2,
-                                                  color: kAccent,
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                        ),
-                                      ),
-                                      if (rowLayouts
-                                          .where((row) => row.track != null)
-                                          .isEmpty)
-                                        Positioned(
-                                          top: _rulerHeight + 24,
-                                          left: 16,
-                                          child: Text(
-                                            'Import clips to start editing.',
-                                            style: TextStyle(
-                                              color: kTextSecondary,
-                                              fontSize: 13,
-                                            ),
                                           ),
                                         ),
                                     ],
-                                  ),
+                                    for (final marker in timeline.markers)
+                                      Positioned(
+                                        left:
+                                            marker.position.inMilliseconds /
+                                                1000 *
+                                                _pixelsPerSecond -
+                                            6,
+                                        top: 0,
+                                        bottom: 0,
+                                        width: 12,
+                                        child: Stack(
+                                          alignment: Alignment.topCenter,
+                                          children: [
+                                            Positioned(
+                                              top: 10,
+                                              bottom: 0,
+                                              child: IgnorePointer(
+                                                child: Container(
+                                                  width: 1,
+                                                  color: marker.color
+                                                      .withValues(alpha: 0.48),
+                                                ),
+                                              ),
+                                            ),
+                                            Tooltip(
+                                              message:
+                                                  '${marker.label}\n'
+                                                  '${SubtitleEntry.formatDisplayTime(marker.position)}'
+                                                  '\nLong-press to remove',
+                                              child: GestureDetector(
+                                                behavior:
+                                                    HitTestBehavior.opaque,
+                                                onTap: () => ref
+                                                    .read(
+                                                      playbackProvider.notifier,
+                                                    )
+                                                    .requestSeek(
+                                                      marker.position,
+                                                    ),
+                                                onLongPress: () =>
+                                                    _removeMarker(marker),
+                                                child: Icon(
+                                                  marker.type ==
+                                                          TimelineMarkerType
+                                                              .chapter
+                                                      ? Icons.bookmark_rounded
+                                                      : marker.type ==
+                                                            TimelineMarkerType
+                                                                .beat
+                                                      ? Icons.music_note_rounded
+                                                      : Icons
+                                                            .arrow_drop_down_rounded,
+                                                  color: marker.color,
+                                                  size: 18,
+                                                ),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    Consumer(
+                                      builder: (context, ref, _) {
+                                        final position = ref.watch(
+                                          playbackProvider.select(
+                                            (state) => state.position,
+                                          ),
+                                        );
+                                        return Positioned(
+                                          left:
+                                              position.inMilliseconds /
+                                                  1000 *
+                                                  _pixelsPerSecond -
+                                              1,
+                                          top: 0,
+                                          bottom: 0,
+                                          child: IgnorePointer(
+                                            child: Column(
+                                              children: [
+                                                Container(
+                                                  width: 8,
+                                                  height: 8,
+                                                  decoration: BoxDecoration(
+                                                    color: kAccent,
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                          2,
+                                                        ),
+                                                  ),
+                                                ),
+                                                Expanded(
+                                                  child: Container(
+                                                    width: 2,
+                                                    color: kAccent,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        );
+                                      },
+                                    ),
+                                    if (rowLayouts
+                                        .where((row) => row.track != null)
+                                        .isEmpty)
+                                      Positioned(
+                                        top: _rulerHeight + 24,
+                                        left: 16,
+                                        child: Text(
+                                          'Import clips to start editing.',
+                                          style: TextStyle(
+                                            color: kTextSecondary,
+                                            fontSize: 13,
+                                          ),
+                                        ),
+                                      ),
+                                  ],
                                 ),
                               ),
                             ),
@@ -1851,7 +2154,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
 
       for (final track in tracks) {
         final laneHeight = track.isCollapsed
-            ? 32.0
+            ? 24.0
             : _laneHeightForTrack(track.type);
         layouts.add(
           _TrackRowLayout.track(
@@ -1883,44 +2186,76 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
   double _laneHeightForTrack(TimelineTrackType type) {
     switch (type) {
       case TimelineTrackType.audio:
-        return 44;
+        return 30;
       case TimelineTrackType.subtitle:
       case TimelineTrackType.text:
-        return 54;
+        return 36;
       case TimelineTrackType.video:
       case TimelineTrackType.image:
       case TimelineTrackType.sticker:
       case TimelineTrackType.gif:
-        return 58;
+      case TimelineTrackType.effect:
+        return 40;
     }
+  }
+}
+
+enum _TrackQuickAction { visibility, mute, lock, delete }
+
+class _TrackActionMenuItem extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final Color color;
+
+  const _TrackActionMenuItem({
+    required this.icon,
+    required this.label,
+    this.color = kTextPrimary,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 19, color: color),
+        const SizedBox(width: 10),
+        Text(label, style: TextStyle(color: color)),
+      ],
+    );
+  }
+}
+
+IconData _trackIcon(TimelineTrackType type) {
+  switch (type) {
+    case TimelineTrackType.video:
+      return Icons.movie_outlined;
+    case TimelineTrackType.audio:
+      return Icons.graphic_eq_rounded;
+    case TimelineTrackType.subtitle:
+      return Icons.closed_caption_outlined;
+    case TimelineTrackType.text:
+      return Icons.title_rounded;
+    case TimelineTrackType.image:
+      return Icons.image_outlined;
+    case TimelineTrackType.sticker:
+      return Icons.emoji_emotions_outlined;
+    case TimelineTrackType.gif:
+      return Icons.gif_box_outlined;
+    case TimelineTrackType.effect:
+      return Icons.auto_fix_high_rounded;
   }
 }
 
 class _TimelineLabels extends StatelessWidget {
   final List<_TrackRowLayout> rowLayouts;
   final ValueChanged<TimelineTrackSection> onAddTrack;
-  final ValueChanged<TimelineTrack> onRemoveTrack;
-  final bool Function(TimelineTrack track) canRemoveTrack;
-  final ValueChanged<TimelineTrack> onRenameTrack;
-  final ValueChanged<TimelineTrack> onToggleCollapse;
-  final ValueChanged<TimelineTrack> onToggleLock;
-  final ValueChanged<TimelineTrack> onToggleMute;
-  final ValueChanged<TimelineTrack> onToggleHidden;
-  final ValueChanged<TimelineTrack> onToggleSolo;
-  final void Function(TimelineTrack track, int direction) onMoveTrack;
+  final void Function(TimelineTrack track, Offset position) onShowTrackActions;
 
   const _TimelineLabels({
     required this.rowLayouts,
     required this.onAddTrack,
-    required this.onRemoveTrack,
-    required this.canRemoveTrack,
-    required this.onRenameTrack,
-    required this.onToggleCollapse,
-    required this.onToggleLock,
-    required this.onToggleMute,
-    required this.onToggleHidden,
-    required this.onToggleSolo,
-    required this.onMoveTrack,
+    required this.onShowTrackActions,
   });
 
   @override
@@ -1938,9 +2273,9 @@ class _TimelineLabels extends StatelessWidget {
                 top: row.top,
                 left: 0,
                 right: 0,
-                height: 24,
+                height: row.laneHeight,
                 child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
                   color: kBackground.withValues(alpha: 0.24),
                   child: Row(
                     children: [
@@ -1949,7 +2284,7 @@ class _TimelineLabels extends StatelessWidget {
                           row.sectionTitle!,
                           style: TextStyle(
                             color: kTextSecondary,
-                            fontSize: 11,
+                            fontSize: 9.5,
                             fontWeight: FontWeight.w700,
                           ),
                         ),
@@ -1958,17 +2293,13 @@ class _TimelineLabels extends StatelessWidget {
                         InkWell(
                           borderRadius: BorderRadius.circular(6),
                           onTap: () => onAddTrack(row.section!),
-                          child: Container(
-                            width: 22,
-                            height: 22,
-                            decoration: BoxDecoration(
-                              borderRadius: BorderRadius.circular(6),
-                              border: Border.all(color: kBorder),
-                            ),
-                            child: const Icon(
+                          child: const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: Icon(
                               Icons.add_rounded,
                               color: kTextSecondary,
-                              size: 14,
+                              size: 13,
                             ),
                           ),
                         ),
@@ -1982,167 +2313,14 @@ class _TimelineLabels extends StatelessWidget {
                 left: 0,
                 right: 0,
                 height: row.laneHeight,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10),
-                  alignment: Alignment.centerLeft,
-                  decoration: const BoxDecoration(
-                    border: Border(
-                      bottom: BorderSide(color: kBorder, width: 0.6),
-                    ),
-                  ),
-                  child: Opacity(
-                    opacity: row.track!.isHidden ? 0.48 : 1,
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Row(
-                          children: [
-                            Expanded(
-                              child: Text(
-                                row.track!.name,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  color: kTextPrimary,
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              ),
-                            ),
-                            SizedBox(
-                              width: 22,
-                              height: 22,
-                              child: PopupMenuButton<_TrackMenuAction>(
-                                tooltip: 'Track actions',
-                                padding: EdgeInsets.zero,
-                                icon: const Icon(
-                                  Icons.more_horiz_rounded,
-                                  color: kTextSecondary,
-                                  size: 16,
-                                ),
-                                onSelected: (action) {
-                                  switch (action) {
-                                    case _TrackMenuAction.rename:
-                                      onRenameTrack(row.track!);
-                                      break;
-                                    case _TrackMenuAction.collapse:
-                                      onToggleCollapse(row.track!);
-                                      break;
-                                    case _TrackMenuAction.moveUp:
-                                      onMoveTrack(row.track!, -1);
-                                      break;
-                                    case _TrackMenuAction.moveDown:
-                                      onMoveTrack(row.track!, 1);
-                                      break;
-                                    case _TrackMenuAction.remove:
-                                      onRemoveTrack(row.track!);
-                                      break;
-                                  }
-                                },
-                                itemBuilder: (_) => [
-                                  const PopupMenuItem(
-                                    value: _TrackMenuAction.rename,
-                                    child: Text('Rename'),
-                                  ),
-                                  PopupMenuItem(
-                                    value: _TrackMenuAction.collapse,
-                                    child: Text(
-                                      row.track!.isCollapsed
-                                          ? 'Expand'
-                                          : 'Collapse',
-                                    ),
-                                  ),
-                                  const PopupMenuItem(
-                                    value: _TrackMenuAction.moveUp,
-                                    child: Text('Move up'),
-                                  ),
-                                  const PopupMenuItem(
-                                    value: _TrackMenuAction.moveDown,
-                                    child: Text('Move down'),
-                                  ),
-                                  if (canRemoveTrack(row.track!))
-                                    const PopupMenuItem(
-                                      value: _TrackMenuAction.remove,
-                                      child: Text('Remove track'),
-                                    ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
-                        if (!row.track!.isCollapsed)
-                          Row(
-                            children: [
-                              _miniTrackButton(
-                                tooltip: row.track!.isHidden
-                                    ? 'Show track'
-                                    : 'Hide track',
-                                icon: row.track!.isHidden
-                                    ? Icons.visibility_off_rounded
-                                    : Icons.visibility_rounded,
-                                active: row.track!.isHidden,
-                                onTap: () => onToggleHidden(row.track!),
-                              ),
-                              _miniTrackButton(
-                                tooltip: row.track!.isMuted
-                                    ? 'Unmute track'
-                                    : 'Mute track',
-                                icon: row.track!.isMuted
-                                    ? Icons.volume_off_rounded
-                                    : Icons.volume_up_rounded,
-                                active: row.track!.isMuted,
-                                onTap: () => onToggleMute(row.track!),
-                              ),
-                              _miniTrackButton(
-                                tooltip: row.track!.isLocked
-                                    ? 'Unlock track'
-                                    : 'Lock track',
-                                icon: row.track!.isLocked
-                                    ? Icons.lock_rounded
-                                    : Icons.lock_open_rounded,
-                                active: row.track!.isLocked,
-                                onTap: () => onToggleLock(row.track!),
-                              ),
-                              if (row.track!.type == TimelineTrackType.audio ||
-                                  row.track!.type == TimelineTrackType.video)
-                                _miniTrackButton(
-                                  tooltip: row.track!.isSolo
-                                      ? 'Unsolo track'
-                                      : 'Solo track',
-                                  icon: Icons.surround_sound_rounded,
-                                  active: row.track!.isSolo,
-                                  onTap: () => onToggleSolo(row.track!),
-                                ),
-                            ],
-                          ),
-                      ],
-                    ),
-                  ),
+                child: _CompactTrackLabel(
+                  track: row.track!,
+                  onShowActions: (position) =>
+                      onShowTrackActions(row.track!, position),
                 ),
               ),
           ],
         ],
-      ),
-    );
-  }
-
-  Widget _miniTrackButton({
-    required String tooltip,
-    required IconData icon,
-    required bool active,
-    required VoidCallback onTap,
-  }) {
-    return Tooltip(
-      message: tooltip,
-      child: InkWell(
-        borderRadius: BorderRadius.circular(5),
-        onTap: onTap,
-        child: SizedBox(
-          width: 22,
-          height: 20,
-          child: Icon(icon, size: 12, color: active ? kAccent : kTextSecondary),
-        ),
       ),
     );
   }
@@ -2159,7 +2337,119 @@ class _TimelineLabels extends StatelessWidget {
   }
 }
 
-enum _TrackMenuAction { rename, collapse, moveUp, moveDown, remove }
+class _CompactTrackLabel extends StatefulWidget {
+  final TimelineTrack track;
+  final ValueChanged<Offset> onShowActions;
+
+  const _CompactTrackLabel({required this.track, required this.onShowActions});
+
+  @override
+  State<_CompactTrackLabel> createState() => _CompactTrackLabelState();
+}
+
+class _CompactTrackLabelState extends State<_CompactTrackLabel> {
+  Offset? _lastDoubleTapPosition;
+
+  @override
+  Widget build(BuildContext context) {
+    final track = widget.track;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onDoubleTapDown: (details) {
+        _lastDoubleTapPosition = details.globalPosition;
+      },
+      onDoubleTap: () {
+        final renderBox = context.findRenderObject() as RenderBox?;
+        widget.onShowActions(
+          _lastDoubleTapPosition ??
+              renderBox?.localToGlobal(renderBox.size.center(Offset.zero)) ??
+              Offset.zero,
+        );
+      },
+      child: Opacity(
+        opacity: track.isHidden ? 0.48 : 1,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 7),
+          alignment: Alignment.centerLeft,
+          decoration: const BoxDecoration(
+            border: Border(bottom: BorderSide(color: kBorder, width: 0.6)),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                _trackIcon(track.type),
+                size: 13,
+                color: track.isLocked ? kWarning : kTextSecondary,
+              ),
+              const SizedBox(width: 5),
+              Expanded(
+                child: Text(
+                  track.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: kTextPrimary,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              if (track.isMuted)
+                const Icon(
+                  Icons.volume_off_rounded,
+                  size: 11,
+                  color: kTextSecondary,
+                ),
+              if (track.isLocked) ...[
+                const SizedBox(width: 3),
+                const Icon(Icons.lock_rounded, size: 11, color: kWarning),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _DoubleTapTrackSurface extends StatefulWidget {
+  final VoidCallback onTap;
+  final ValueChanged<Offset> onShowActions;
+  final Widget child;
+
+  const _DoubleTapTrackSurface({
+    required this.onTap,
+    required this.onShowActions,
+    required this.child,
+  });
+
+  @override
+  State<_DoubleTapTrackSurface> createState() => _DoubleTapTrackSurfaceState();
+}
+
+class _DoubleTapTrackSurfaceState extends State<_DoubleTapTrackSurface> {
+  Offset? _lastDoubleTapPosition;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: widget.onTap,
+      onDoubleTapDown: (details) {
+        _lastDoubleTapPosition = details.globalPosition;
+      },
+      onDoubleTap: () {
+        final renderBox = context.findRenderObject() as RenderBox?;
+        widget.onShowActions(
+          _lastDoubleTapPosition ??
+              renderBox?.localToGlobal(renderBox.size.center(Offset.zero)) ??
+              Offset.zero,
+        );
+      },
+      child: widget.child,
+    );
+  }
+}
 
 class _TimelineLane extends StatelessWidget {
   final TimelineTrack track;
@@ -2167,7 +2457,7 @@ class _TimelineLane extends StatelessWidget {
   final String? selectedClipId;
   final String? selectedSubtitleId;
   final VoidCallback onTrackTap;
-  final VoidCallback? onDoubleTap;
+  final ValueChanged<Offset> onShowTrackActions;
   final ValueChanged<TimelineClip> onClipTap;
   final ValueChanged<TimelineClip> onClipLongPress;
   final ValueChanged<TimelineClip> onTransitionTap;
@@ -2185,7 +2475,7 @@ class _TimelineLane extends StatelessWidget {
     required this.selectedClipId,
     required this.selectedSubtitleId,
     required this.onTrackTap,
-    this.onDoubleTap,
+    required this.onShowTrackActions,
     required this.onClipTap,
     required this.onClipLongPress,
     required this.onTransitionTap,
@@ -2203,10 +2493,9 @@ class _TimelineLane extends StatelessWidget {
     final sortedClips = [...track.clips]
       ..sort((a, b) => a.startTime.compareTo(b.startTime));
 
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
+    return _DoubleTapTrackSurface(
       onTap: onTrackTap,
-      onDoubleTap: track.isLocked ? null : onDoubleTap,
+      onShowActions: onShowTrackActions,
       child: Opacity(
         opacity: track.isHidden ? 0.42 : 1,
         child: Container(
@@ -2237,33 +2526,7 @@ class _TimelineLane extends StatelessWidget {
                     ),
                   ),
                 ),
-              for (final clip in sortedClips)
-                Positioned(
-                  left: clip.startTime.inMilliseconds / 1000 * pixelsPerSecond,
-                  top: 4,
-                  width: (clip.duration.inMilliseconds / 1000 * pixelsPerSecond)
-                      .clamp(44.0, double.infinity)
-                      .toDouble(),
-                  bottom: 4,
-                  child: _TimelineClipBlock(
-                    clip: clip,
-                    isSelected:
-                        selectedClipId == clip.id ||
-                        selectedSubtitleId == clip.id,
-                    isEditableBaseClip:
-                        track.section == TimelineTrackSection.baseVideo,
-                    isLocked: track.isLocked,
-                    onMoveStart: () => onClipMoveStart(clip),
-                    onTap: () => onClipTap(clip),
-                    onLongPress: () => onClipLongPress(clip),
-                    onMoveUpdate: (delta) => onClipMove(clip, delta),
-                    onMoveEnd: () => onClipMoveEnd(clip),
-                    onTrimGestureStart: () => onClipTrimGestureStart(clip),
-                    onTrimGestureEnd: () => onClipTrimGestureEnd(clip),
-                    onTrimStartUpdate: (delta) => onClipTrimStart(clip, delta),
-                    onTrimEndUpdate: (delta) => onClipTrimEnd(clip, delta),
-                  ),
-                ),
+              for (final clip in sortedClips) _buildPositionedClip(clip),
               if (track.section == TimelineTrackSection.baseVideo)
                 for (var index = 0; index < sortedClips.length - 1; index++)
                   Positioned(
@@ -2309,10 +2572,44 @@ class _TimelineLane extends StatelessWidget {
     );
   }
 
+  Widget _buildPositionedClip(TimelineClip clip) {
+    final visualWidth = math.max(
+      1.0,
+      clip.duration.inMilliseconds / 1000 * pixelsPerSecond,
+    );
+    final hitWidth = math.max(28.0, visualWidth);
+    final visibleInset = (hitWidth - visualWidth) / 2;
+    final startX = clip.startTime.inMilliseconds / 1000 * pixelsPerSecond;
+    return Positioned(
+      left: startX - visibleInset,
+      top: 3,
+      width: hitWidth,
+      bottom: 3,
+      child: _TimelineClipBlock(
+        clip: clip,
+        visualWidth: visualWidth,
+        isSelected: selectedClipId == clip.id || selectedSubtitleId == clip.id,
+        showTrimHandles: !track.isCollapsed,
+        isLocked: track.isLocked,
+        onMoveStart: () => onClipMoveStart(clip),
+        onTap: () => onClipTap(clip),
+        onLongPress: () => onClipLongPress(clip),
+        onMoveUpdate: (delta) => onClipMove(clip, delta),
+        onMoveEnd: () => onClipMoveEnd(clip),
+        onTrimGestureStart: () => onClipTrimGestureStart(clip),
+        onTrimGestureEnd: () => onClipTrimGestureEnd(clip),
+        onTrimStartUpdate: (delta) => onClipTrimStart(clip, delta),
+        onTrimEndUpdate: (delta) => onClipTrimEnd(clip, delta),
+      ),
+    );
+  }
+
   String _emptyTrackHint(TimelineTrack track) {
     switch (track.section) {
       case TimelineTrackSection.overlay:
-        return 'Add overlay video, image, gif, or sticker';
+        return track.type == TimelineTrackType.effect
+            ? 'Add blur or filter effects'
+            : 'Add overlay video, image, gif, or sticker';
       case TimelineTrackSection.baseVideo:
         return 'Base clips appear here';
       case TimelineTrackSection.textSubtitle:
@@ -2327,8 +2624,9 @@ class _TimelineLane extends StatelessWidget {
 
 class _TimelineClipBlock extends StatelessWidget {
   final TimelineClip clip;
+  final double visualWidth;
   final bool isSelected;
-  final bool isEditableBaseClip;
+  final bool showTrimHandles;
   final bool isLocked;
   final VoidCallback onMoveStart;
   final VoidCallback onTap;
@@ -2342,8 +2640,9 @@ class _TimelineClipBlock extends StatelessWidget {
 
   const _TimelineClipBlock({
     required this.clip,
+    required this.visualWidth,
     required this.isSelected,
-    required this.isEditableBaseClip,
+    required this.showTrimHandles,
     required this.isLocked,
     required this.onMoveStart,
     required this.onTap,
@@ -2359,144 +2658,125 @@ class _TimelineClipBlock extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final colors = _clipColors(clip);
-    const handleWidth = 10.0;
+    const handleHitWidth = 12.0;
 
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: onTap,
-      onLongPress: onLongPress,
-      child: Container(
-        decoration: BoxDecoration(
-          color: colors.$1,
-          borderRadius: BorderRadius.circular(6),
-          border: Border.all(
-            color: isSelected ? kAccent : colors.$2,
-            width: isSelected ? 1.5 : 1,
-          ),
-        ),
-        child: Stack(
-          children: [
-            Positioned.fill(
-              child: LayoutBuilder(
-                builder: (context, constraints) {
-                  final showMeta =
-                      constraints.maxHeight >= 36 && constraints.maxWidth >= 82;
-                  return Padding(
-                    padding: EdgeInsets.symmetric(
-                      horizontal: isEditableBaseClip ? handleWidth + 2 : 8,
-                      vertical: showMeta ? 4 : 2,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final resolvedVisualWidth = visualWidth
+            .clamp(1.0, constraints.maxWidth)
+            .toDouble();
+        final visibleLeft = (constraints.maxWidth - resolvedVisualWidth) / 2;
+        final showMeta =
+            constraints.maxHeight >= 34 && resolvedVisualWidth >= 82;
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: onTap,
+          onLongPress: onLongPress,
+          child: Stack(
+            clipBehavior: Clip.none,
+            children: [
+              Positioned(
+                left: visibleLeft,
+                top: 0,
+                bottom: 0,
+                width: resolvedVisualWidth,
+                child: Container(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: 5,
+                    vertical: showMeta ? 3 : 2,
+                  ),
+                  decoration: BoxDecoration(
+                    color: colors.$1,
+                    borderRadius: BorderRadius.circular(5),
+                    border: Border.all(
+                      color: isSelected ? kAccent : colors.$2,
+                      width: isSelected ? 1.5 : 1,
                     ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Flexible(
+                        child: Text(
+                          clip.text?.trim().isNotEmpty == true
+                              ? clip.text!
+                              : clip.label,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: kTextPrimary,
+                            fontSize: showMeta ? 10.5 : 9.5,
+                            fontWeight: FontWeight.w500,
+                            height: 1,
+                          ),
+                        ),
+                      ),
+                      if (showMeta) const SizedBox(height: 2),
+                      if (showMeta)
                         Flexible(
                           child: Text(
-                            clip.text?.trim().isNotEmpty == true
-                                ? clip.text!
-                                : clip.label,
+                            '${SubtitleEntry.formatDisplayTime(clip.startTime)} • ${clip.duration.inSeconds}s',
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: kTextPrimary,
-                              fontSize: showMeta ? 11 : 10,
-                              fontWeight: FontWeight.w500,
-                              height: 1.0,
+                            style: const TextStyle(
+                              fontFamily: 'monospace',
+                              color: kTextSecondary,
+                              fontSize: 8,
+                              height: 1,
                             ),
                           ),
                         ),
-                        if (showMeta) const SizedBox(height: 2),
-                        if (showMeta)
-                          Flexible(
-                            child: Text(
-                              '${SubtitleEntry.formatDisplayTime(clip.startTime)} • ${clip.duration.inSeconds}s',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontFamily: 'monospace',
-                                color: kTextSecondary,
-                                fontSize: 8.5,
-                                height: 1.0,
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                  );
-                },
-              ),
-            ),
-            Positioned(
-              left: isEditableBaseClip ? handleWidth : 0,
-              right: isEditableBaseClip ? handleWidth : 0,
-              top: 0,
-              bottom: 0,
-              child: GestureDetector(
-                behavior: HitTestBehavior.translucent,
-                onPanStart: isLocked ? null : (_) => onMoveStart(),
-                onPanUpdate: isLocked
-                    ? null
-                    : (details) => onMoveUpdate(details.delta),
-                onPanEnd: isLocked ? null : (_) => onMoveEnd(),
-                onPanCancel: isLocked ? null : onMoveEnd,
-              ),
-            ),
-            if (isEditableBaseClip)
-              Positioned(
-                left: 0,
-                top: 0,
-                bottom: 0,
-                width: handleWidth,
-                child: GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onPanStart: isLocked ? null : (_) => onTrimGestureStart(),
-                  onPanUpdate: isLocked
-                      ? null
-                      : (details) => onTrimStartUpdate(details.delta),
-                  onPanEnd: isLocked ? null : (_) => onTrimGestureEnd(),
-                  onPanCancel: isLocked ? null : onTrimGestureEnd,
-                  child: Container(
-                    decoration: BoxDecoration(
-                      color: isSelected
-                          ? kAccent.withValues(alpha: 0.45)
-                          : Colors.transparent,
-                      borderRadius: const BorderRadius.horizontal(
-                        left: Radius.circular(6),
-                      ),
-                    ),
+                    ],
                   ),
                 ),
               ),
-            if (isEditableBaseClip)
               Positioned(
-                right: 0,
+                left: visibleLeft,
                 top: 0,
                 bottom: 0,
-                width: handleWidth,
+                width: resolvedVisualWidth,
                 child: GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onPanStart: isLocked ? null : (_) => onTrimGestureStart(),
+                  behavior: HitTestBehavior.translucent,
+                  onPanStart: isLocked ? null : (_) => onMoveStart(),
                   onPanUpdate: isLocked
                       ? null
-                      : (details) => onTrimEndUpdate(details.delta),
-                  onPanEnd: isLocked ? null : (_) => onTrimGestureEnd(),
-                  onPanCancel: isLocked ? null : onTrimGestureEnd,
-                  child: Container(
-                    decoration: BoxDecoration(
-                      color: isSelected
-                          ? kAccent.withValues(alpha: 0.45)
-                          : Colors.transparent,
-                      borderRadius: const BorderRadius.horizontal(
-                        right: Radius.circular(6),
-                      ),
-                    ),
-                  ),
+                      : (details) => onMoveUpdate(details.delta),
+                  onPanEnd: isLocked ? null : (_) => onMoveEnd(),
+                  onPanCancel: isLocked ? null : onMoveEnd,
                 ),
               ),
-          ],
-        ),
-      ),
+              if (showTrimHandles && !isLocked)
+                Positioned(
+                  left: visibleLeft - handleHitWidth / 2,
+                  top: 0,
+                  bottom: 0,
+                  width: handleHitWidth,
+                  child: _TrimHandle(
+                    isSelected: isSelected,
+                    onGestureStart: onTrimGestureStart,
+                    onGestureEnd: onTrimGestureEnd,
+                    onUpdate: onTrimStartUpdate,
+                  ),
+                ),
+              if (showTrimHandles && !isLocked)
+                Positioned(
+                  left: visibleLeft + resolvedVisualWidth - handleHitWidth / 2,
+                  top: 0,
+                  bottom: 0,
+                  width: handleHitWidth,
+                  child: _TrimHandle(
+                    isSelected: isSelected,
+                    onGestureStart: onTrimGestureStart,
+                    onGestureEnd: onTrimGestureEnd,
+                    onUpdate: onTrimEndUpdate,
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
     );
   }
 
@@ -2517,7 +2797,41 @@ class _TimelineClipBlock extends StatelessWidget {
       case TimelineTrackType.sticker:
       case TimelineTrackType.gif:
         return (const Color(0xFF233349), const Color(0xFF5CA8FF));
+      case TimelineTrackType.effect:
+        return (const Color(0xFF30253F), const Color(0xFFB784F7));
     }
+  }
+}
+
+class _TrimHandle extends StatelessWidget {
+  final bool isSelected;
+  final VoidCallback onGestureStart;
+  final VoidCallback onGestureEnd;
+  final ValueChanged<Offset> onUpdate;
+
+  const _TrimHandle({
+    required this.isSelected,
+    required this.onGestureStart,
+    required this.onGestureEnd,
+    required this.onUpdate,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onPanStart: (_) => onGestureStart(),
+      onPanUpdate: (details) => onUpdate(details.delta),
+      onPanEnd: (_) => onGestureEnd(),
+      onPanCancel: onGestureEnd,
+      child: Center(
+        child: Container(
+          width: 3,
+          height: double.infinity,
+          color: kAccent.withValues(alpha: isSelected ? 0.9 : 0.35),
+        ),
+      ),
+    );
   }
 }
 
@@ -2594,7 +2908,7 @@ class _TrackRowLayout {
   }) {
     return _TrackRowLayout._(
       top: top,
-      laneHeight: 24,
+      laneHeight: 18,
       sectionTitle: title,
       section: section,
     );
