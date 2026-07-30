@@ -2,17 +2,20 @@
 
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
+import 'package:uuid/uuid.dart';
 import '../../../core/theme/app_theme.dart';
+import '../../../core/utils/editor_change_log_service.dart';
 import '../../../core/utils/ffmpeg_service.dart';
 import '../../../core/utils/firebase_service.dart';
 import '../../../core/utils/giphy_service.dart';
 import '../../../core/utils/subtitle_export_service.dart';
+import '../../../core/utils/subtitle_quality_service.dart';
 import '../../../shared/models/project_model.dart';
 import '../../../shared/widgets/snack_bar_helper.dart';
 import '../../auth/providers/auth_provider.dart';
@@ -23,9 +26,12 @@ import '../../quota/screens/quota_exhausted_screen.dart';
 import '../models/subtitle_entry.dart';
 import '../models/subtitle_style_model.dart';
 import '../models/timeline_models.dart';
+import '../models/export_settings.dart';
+import '../models/word_timing.dart';
 import '../providers/editor_provider.dart';
 import '../providers/playback_provider.dart';
 import '../providers/subtitle_provider.dart';
+import 'creator_lab_screen.dart';
 import 'export_video_screen.dart';
 import '../widgets/export_dialog.dart';
 import '../widgets/subtitle_edit_modal.dart';
@@ -46,26 +52,78 @@ class EditorScreen extends ConsumerStatefulWidget {
 
 enum _CanvasAspectRatio { original, ratio16x9, ratio9x16, ratio1x1, ratio4x5 }
 
-enum _BottomActionCategory { overlay, text, audio, motion }
+enum _BottomActionCategory { add, edit, effects, audio, canvas }
+
+enum _BottomActionSubgroup {
+  addMedia,
+  addText,
+  addTracks,
+  editTiming,
+  editTransform,
+  editArrange,
+  effectsLooks,
+  effectsBlur,
+  effectsMotion,
+  audioMix,
+  audioFades,
+  audioEnhance,
+  canvasFormat,
+  canvasGuides,
+  canvasStudio,
+}
 
 class _EditorScreenState extends ConsumerState<EditorScreen>
     with WidgetsBindingObserver {
   Timer? _saveDebounce;
   bool _isSavingProject = false;
-  bool _queuedProjectSave = false;
+  Project? _queuedProjectSnapshot;
   bool _queuedRemoteSync = false;
+  String? _queuedUserUid;
+  String _queuedChangeType = 'queued_editor_change';
+  Future<void>? _activeProjectSave;
+  DateTime? _lastSavedAt;
+  Object? _localSaveError;
+  bool _remoteSyncPending = false;
+  bool _isClosing = false;
+  bool _editorInitialized = false;
+  bool _isInitializingEditor = true;
+  Object? _editorInitializationError;
+  String? _currentUserUid;
+  late Project _projectSnapshot;
   _CanvasAspectRatio _canvasAspectRatio = _CanvasAspectRatio.original;
   _BottomActionCategory? _activeBottomCategory;
+  _BottomActionSubgroup? _activeBottomSubgroup;
 
   @override
   void initState() {
     super.initState();
+    _projectSnapshot = widget.project;
+    _currentUserUid = ref.read(currentUserProvider)?.uid;
+    _canvasAspectRatio = _canvasAspectRatioFromPreset(
+      widget.project.timeline.canvasSettings.aspectRatioPreset,
+    );
     WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
+      _initializeEditor();
+    });
+  }
+
+  void _initializeEditor() {
+    if (!mounted || _editorInitialized) return;
+
+    try {
       final initialStyle = _normalizedInitialSubtitleStyle(
         widget.project.globalStyle,
       );
+      final didNormalizeLegacyStyle =
+          initialStyle.fontSize != widget.project.globalStyle.fontSize ||
+          initialStyle.maxWidthFactor !=
+              widget.project.globalStyle.maxWidthFactor;
+      final initialTimeline = widget.project.timeline.mergeSubtitleEntries(
+        subtitles: widget.project.subtitles,
+        globalStyle: initialStyle,
+      );
+
       ref
           .read(subtitleProvider.notifier)
           .initializeFromProject(
@@ -78,19 +136,50 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             videoPath: widget.project.videoPath,
             projectId: widget.project.id,
             projectName: widget.project.name,
-            timeline: widget.project.timeline.mergeSubtitleEntries(
-              subtitles: widget.project.subtitles,
-              globalStyle: initialStyle,
-            ),
+            timeline: initialTimeline,
           );
-    });
+      _projectSnapshot = widget.project.copyWith(
+        globalStyle: initialStyle,
+        timeline: initialTimeline,
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _editorInitialized = true;
+        _isInitializingEditor = false;
+        _editorInitializationError = null;
+      });
+      if (didNormalizeLegacyStyle) {
+        _scheduleProjectSave(changeType: 'subtitle_style_migrated');
+      }
+    } catch (error, stackTrace) {
+      debugPrint('Editor initialization failed: $error\n$stackTrace');
+      if (!mounted) return;
+      setState(() {
+        _isInitializingEditor = false;
+        _editorInitializationError = error;
+      });
+    }
   }
 
   @override
   void dispose() {
+    // Riverpod invalidates ConsumerState.ref before State.dispose is invoked.
+    // Provider listeners and PopScope keep this snapshot current while mounted,
+    // so disposal must only use cached values.
+    final finalSnapshot = _projectSnapshot;
+    final userUid = _currentUserUid;
+    _isClosing = true;
     _saveDebounce?.cancel();
     WidgetsBinding.instance.removeObserver(this);
-    unawaited(_saveProjectState(syncRemote: false));
+    unawaited(
+      _saveProjectState(
+        project: finalSnapshot,
+        userUid: userUid,
+        syncRemote: false,
+        changeType: 'editor_disposed',
+      ),
+    );
     super.dispose();
   }
 
@@ -99,7 +188,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
-      unawaited(_flushProjectSave(syncRemote: false));
+      unawaited(
+        _flushProjectSave(
+          syncRemote: false,
+          changeType: 'app_lifecycle_$state',
+        ),
+      );
     }
   }
 
@@ -112,6 +206,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
 
   @override
   Widget build(BuildContext context) {
+    _currentUserUid = ref.watch(currentUserProvider)?.uid;
+    if (!_editorInitialized) {
+      return _buildEditorStartup();
+    }
+
     final editorState = ref.watch(editorProvider);
     final isLandscape =
         MediaQuery.of(context).orientation == Orientation.landscape;
@@ -121,12 +220,14 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       final entriesChanged = prev?.entries != next.entries;
       final styleChanged = prev?.globalStyle != next.globalStyle;
       if (entriesChanged || styleChanged) {
-        _scheduleProjectSave();
+        _scheduleProjectSave(
+          changeType: entriesChanged ? 'subtitles_changed' : 'style_changed',
+        );
       }
     });
     ref.listen(editorProvider.select((state) => state.timeline), (prev, next) {
       if (prev != null && prev != next) {
-        _scheduleProjectSave();
+        _scheduleProjectSave(changeType: 'timeline_changed');
       }
     });
 
@@ -134,30 +235,324 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       canPop: true,
       onPopInvokedWithResult: (didPop, _) {
         if (didPop) {
-          unawaited(_flushProjectSave(syncRemote: false));
+          unawaited(
+            _flushProjectSave(syncRemote: false, changeType: 'editor_popped'),
+          );
         }
       },
       child: Scaffold(
         backgroundColor: kBackground,
-        appBar: AppBar(
-          backgroundColor: kBackground,
-          title: Text(
-            widget.project.name,
-            style: GoogleFonts.inter(fontSize: 16, fontWeight: FontWeight.w600),
-          ),
-          actions: [
-            _buildAspectRatioPicker(),
-            IconButton(
-              tooltip: 'Export / Import',
-              icon: const Icon(Icons.ios_share_rounded, color: kTextPrimary),
-              onPressed: _showExportActions,
-            ),
-            const SizedBox(width: 6),
-          ],
-        ),
+        appBar: _buildEditorToolbar(context, editorState),
         body: isLandscape
             ? _buildLandscape(context, selectedClip)
             : _buildPortrait(context, selectedClip),
+      ),
+    );
+  }
+
+  Widget _buildEditorStartup() {
+    final error = _editorInitializationError;
+    return Scaffold(
+      backgroundColor: kBackground,
+      appBar: AppBar(
+        backgroundColor: kBackground,
+        title: Text(
+          widget.project.name,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+      ),
+      body: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 440),
+          child: Padding(
+            padding: const EdgeInsets.all(28),
+            child: error == null
+                ? const Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      CircularProgressIndicator(),
+                      SizedBox(height: 18),
+                      Text(
+                        'Opening editor…',
+                        style: TextStyle(
+                          color: kTextSecondary,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ],
+                  )
+                : Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(
+                        Icons.error_outline_rounded,
+                        color: kError,
+                        size: 40,
+                      ),
+                      const SizedBox(height: 16),
+                      const Text(
+                        'This project could not be prepared for editing.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: kTextPrimary,
+                          fontSize: 17,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        error.toString().replaceFirst('Exception: ', ''),
+                        maxLines: 4,
+                        overflow: TextOverflow.ellipsis,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: kTextSecondary),
+                      ),
+                      const SizedBox(height: 20),
+                      FilledButton.icon(
+                        onPressed: _isInitializingEditor
+                            ? null
+                            : () {
+                                setState(() {
+                                  _isInitializingEditor = true;
+                                  _editorInitializationError = null;
+                                });
+                                _initializeEditor();
+                              },
+                        icon: const Icon(Icons.refresh_rounded),
+                        label: const Text('Try again'),
+                      ),
+                    ],
+                  ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  PreferredSizeWidget _buildEditorToolbar(
+    BuildContext context,
+    EditorState editorState,
+  ) {
+    final width = MediaQuery.sizeOf(context).width;
+    final compact = width < 560;
+    final phoneToolbar = width < 480;
+    final showAspect = width >= 640;
+
+    return AppBar(
+      toolbarHeight: 62,
+      leadingWidth: 48,
+      titleSpacing: 0,
+      backgroundColor: kBackground,
+      bottom: const PreferredSize(
+        preferredSize: Size.fromHeight(1),
+        child: Divider(height: 1),
+      ),
+      title: Row(
+        children: [
+          if (!phoneToolbar)
+            Container(
+              width: 31,
+              height: 31,
+              margin: const EdgeInsets.only(right: 10),
+              decoration: BoxDecoration(
+                color: kAccent,
+                borderRadius: BorderRadius.circular(9),
+              ),
+              child: const Icon(
+                Icons.content_cut_rounded,
+                color: kOnAccent,
+                size: 17,
+              ),
+            ),
+          Expanded(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  widget.project.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: kTextPrimary,
+                    fontSize: compact ? 13 : 15,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: -0.25,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    AnimatedContainer(
+                      duration: const Duration(milliseconds: 180),
+                      width: 6,
+                      height: 6,
+                      decoration: BoxDecoration(
+                        color: _localSaveError != null
+                            ? kError
+                            : _isSavingProject
+                            ? kWarning
+                            : _remoteSyncPending
+                            ? kInfo
+                            : kSuccess,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 5),
+                    Flexible(
+                      child: Text(
+                        _localSaveError != null
+                            ? 'LOCAL SAVE FAILED'
+                            : _isSavingProject
+                            ? 'SAVING LOCALLY'
+                            : _remoteSyncPending
+                            ? 'LOCAL SAVED · SYNC PENDING'
+                            : _lastSavedAt == null
+                            ? 'AUTOSAVE READY'
+                            : 'SAVED LOCALLY',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: kTextSecondary,
+                          fontSize: 7.5,
+                          fontWeight: FontWeight.w900,
+                          letterSpacing: 0.85,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+      actions: [
+        if (phoneToolbar) ...[
+          _compactToolbarButton(
+            tooltip: 'Undo',
+            icon: Icons.undo_rounded,
+            enabled: editorState.canUndo,
+            onTap: ref.read(editorProvider.notifier).undo,
+          ),
+          _compactToolbarButton(
+            tooltip: 'Redo',
+            icon: Icons.redo_rounded,
+            enabled: editorState.canRedo,
+            onTap: ref.read(editorProvider.notifier).redo,
+          ),
+        ] else
+          Container(
+            height: 34,
+            margin: const EdgeInsets.symmetric(vertical: 14),
+            decoration: BoxDecoration(
+              color: kSurface,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: kBorder),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _toolbarHistoryButton(
+                  tooltip: 'Undo',
+                  icon: Icons.undo_rounded,
+                  enabled: editorState.canUndo,
+                  onTap: ref.read(editorProvider.notifier).undo,
+                ),
+                Container(width: 1, height: 18, color: kBorder),
+                _toolbarHistoryButton(
+                  tooltip: 'Redo',
+                  icon: Icons.redo_rounded,
+                  enabled: editorState.canRedo,
+                  onTap: ref.read(editorProvider.notifier).redo,
+                ),
+              ],
+            ),
+          ),
+        if (showAspect) ...[
+          const SizedBox(width: 8),
+          _buildAspectRatioPicker(),
+        ],
+        if (phoneToolbar)
+          _compactToolbarButton(
+            tooltip: 'Subtitle import and sidecar export',
+            icon: Icons.more_horiz_rounded,
+            onTap: _showExportActions,
+          )
+        else
+          IconButton(
+            tooltip: 'Subtitle import and sidecar export',
+            onPressed: _showExportActions,
+            icon: const Icon(Icons.more_horiz_rounded, size: 21),
+          ),
+        if (phoneToolbar)
+          Padding(
+            padding: const EdgeInsets.only(right: 4),
+            child: _compactToolbarButton(
+              tooltip: 'Export video',
+              icon: Icons.file_upload_outlined,
+              onTap: _showExportDialog,
+            ),
+          )
+        else
+          Padding(
+            padding: EdgeInsets.fromLTRB(0, 10, compact ? 8 : 12, 10),
+            child: FilledButton.icon(
+              onPressed: _showExportDialog,
+              style: FilledButton.styleFrom(
+                padding: EdgeInsets.symmetric(horizontal: compact ? 11 : 15),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10),
+                ),
+              ),
+              icon: const Icon(Icons.file_upload_outlined, size: 17),
+              label: Text(compact ? 'Export' : 'Export master'),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _compactToolbarButton({
+    required String tooltip,
+    required IconData icon,
+    required VoidCallback onTap,
+    bool enabled = true,
+  }) {
+    return IconButton(
+      tooltip: tooltip,
+      onPressed: enabled ? onTap : null,
+      visualDensity: VisualDensity.compact,
+      constraints: const BoxConstraints.tightFor(width: 38, height: 44),
+      padding: EdgeInsets.zero,
+      icon: Icon(icon, size: 19),
+    );
+  }
+
+  Widget _toolbarHistoryButton({
+    required String tooltip,
+    required IconData icon,
+    required bool enabled,
+    required VoidCallback onTap,
+  }) {
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        onTap: enabled ? onTap : null,
+        borderRadius: BorderRadius.circular(9),
+        child: SizedBox(
+          width: 33,
+          height: 33,
+          child: Icon(
+            icon,
+            size: 17,
+            color: enabled
+                ? kTextPrimary
+                : kTextSecondary.withValues(alpha: 0.35),
+          ),
+        ),
       ),
     );
   }
@@ -238,8 +633,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
 
   Future<void> _exportSubtitleFile(String format) async {
     final state = ref.read(subtitleProvider);
+    String? generatedPath;
     try {
-      final generatedPath = format == 'srt'
+      generatedPath = format == 'srt'
           ? await SubtitleExportService.generateSrt(state.entries)
           : await SubtitleExportService.generateVtt(state.entries);
 
@@ -276,6 +672,15 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     } catch (e) {
       if (!mounted) return;
       SnackBarHelper.showError(context, 'Export failed: $e');
+    } finally {
+      if (generatedPath != null) {
+        try {
+          final temporaryFile = File(generatedPath);
+          if (await temporaryFile.exists()) await temporaryFile.delete();
+        } catch (_) {
+          // The delivered subtitle file is independent from its temp source.
+        }
+      }
     }
   }
 
@@ -330,6 +735,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       if (result == null || result.files.isEmpty) return;
       final filePath = result.files.first.path;
       if (filePath == null) return;
+      final subtitleFile = File(filePath);
+      if (!await subtitleFile.exists()) {
+        throw Exception('The selected subtitle file is no longer available.');
+      }
+      if (await subtitleFile.length() > 10 * 1024 * 1024) {
+        throw Exception('Subtitle files must be smaller than 10 MB.');
+      }
 
       final lowerPath = filePath.toLowerCase();
       final entries = lowerPath.endsWith('.vtt')
@@ -343,7 +755,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       }
 
       ref.read(subtitleProvider.notifier).loadSubtitles(entries);
-      _scheduleProjectSave(immediate: true);
+      _scheduleProjectSave(immediate: true, changeType: 'subtitles_imported');
       if (!mounted) return;
       SnackBarHelper.showSuccess(
         context,
@@ -356,40 +768,54 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   void _showExportDialog() {
-    final state = ref.read(subtitleProvider);
-    if (state.entries.isEmpty) {
-      SnackBarHelper.showInfo(context, 'Add subtitles before exporting');
-      return;
-    }
-
     showDialog(
       context: context,
       builder: (_) => ExportDialog(
-        onExport: (quality) {
+        onExport: (settings) {
           Navigator.pop(context);
-          _openExportVideoScreen(quality);
+          unawaited(_openExportVideoScreen(settings));
         },
       ),
     );
   }
 
-  void _openExportVideoScreen(String quality) {
-    final state = ref.read(subtitleProvider);
-    if (state.entries.isEmpty) {
-      SnackBarHelper.showInfo(context, 'Add subtitles before exporting');
-      return;
-    }
-    Navigator.push(
+  Future<void> _openExportVideoScreen(ExportSettings settings) async {
+    final subtitleState = ref.read(subtitleProvider);
+    final editorState = ref.read(editorProvider);
+    final timeline = editorState.timeline.mergeSubtitleEntries(
+      subtitles: subtitleState.entries,
+      globalStyle: subtitleState.globalStyle,
+    );
+    final projectSnapshot = _projectSnapshot.copyWith(
+      subtitles: List<SubtitleEntry>.from(subtitleState.entries),
+      globalStyle: subtitleState.globalStyle,
+      timeline: timeline,
+      lastModifiedAt: DateTime.now(),
+    );
+    final exportedPath = await Navigator.push<String>(
       context,
       MaterialPageRoute(
         builder: (_) => ExportVideoScreen(
-          project: widget.project,
-          quality: quality,
-          entries: List<SubtitleEntry>.from(state.entries),
-          globalStyle: state.globalStyle,
+          project: projectSnapshot,
+          timeline: timeline,
+          settings: settings,
+          entries: List<SubtitleEntry>.from(subtitleState.entries),
+          globalStyle: subtitleState.globalStyle,
         ),
       ),
     );
+    if (!mounted) return;
+    final persistedProject = await ProjectLocalStorage.loadProject(
+      widget.project.id,
+    );
+    if (persistedProject != null) {
+      _projectSnapshot = persistedProject;
+    } else if (exportedPath != null) {
+      _projectSnapshot = projectSnapshot.copyWith(
+        lastExportPath: exportedPath,
+        lastModifiedAt: DateTime.now(),
+      );
+    }
   }
 
   Future<void> _handleGenerateSubtitles() async {
@@ -463,7 +889,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               const SizedBox(height: 14),
               Text(
                 'Choose caption source',
-                style: GoogleFonts.inter(
+                style: TextStyle(
                   color: kTextPrimary,
                   fontSize: 16,
                   fontWeight: FontWeight.w600,
@@ -490,16 +916,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                         clip.label,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: GoogleFonts.inter(color: kTextPrimary),
+                        style: TextStyle(color: kTextPrimary),
                       ),
                       subtitle: Text(
                         '${isAudio ? 'Audio' : 'Video'} • '
                         '${SubtitleEntry.formatDisplayTime(clip.startTime)} - '
                         '${SubtitleEntry.formatDisplayTime(clip.endTime)}',
-                        style: GoogleFonts.inter(
-                          color: kTextSecondary,
-                          fontSize: 12,
-                        ),
+                        style: TextStyle(color: kTextSecondary, fontSize: 12),
                       ),
                       onTap: () => Navigator.pop(context, clip),
                     );
@@ -544,10 +967,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       return;
     }
 
-    final consumed = await ref
-        .read(quotaProvider.notifier)
-        .consumeRun(user.uid);
-    if (!consumed) {
+    if (!ref.read(quotaProvider).canRun) {
       if (!mounted) return;
       await Navigator.push(
         context,
@@ -599,12 +1019,27 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         return;
       }
 
+      // A free run is charged only after transcription produces usable cues.
+      // Failed, cancelled, and silent-media attempts do not consume the quota.
+      final quotaRecorded = await ref
+          .read(quotaProvider.notifier)
+          .consumeRun(user.uid);
+
       final shiftedEntries =
           generatedEntries
               .map(
                 (entry) => entry.copyWith(
                   startTime: entry.startTime + targetClip.startTime,
                   endTime: entry.endTime + targetClip.startTime,
+                  words: entry.words
+                      ?.map(
+                        (word) => WordTiming(
+                          word: word.word,
+                          startTime: word.startTime + targetClip.startTime,
+                          endTime: word.endTime + targetClip.startTime,
+                        ),
+                      )
+                      .toList(),
                 ),
               )
               .toList()
@@ -631,7 +1066,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
 
       ref.read(subtitleProvider.notifier).loadSubtitles(mergedEntries);
       ref.read(editorProvider.notifier).setTimeline(nextTimeline);
-      _scheduleProjectSave(immediate: true);
+      _scheduleProjectSave(immediate: true, changeType: 'subtitles_generated');
 
       if (!processingClosed && mounted && Navigator.of(context).canPop()) {
         Navigator.of(context).pop();
@@ -641,6 +1076,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           context,
           'Generated ${shiftedEntries.length} captions for ${targetClip.label}',
         );
+        if (!quotaRecorded) {
+          SnackBarHelper.showWarning(
+            context,
+            'Captions were created, but usage could not be synced.',
+          );
+        }
       }
     } catch (e) {
       if (!processingClosed && mounted && Navigator.of(context).canPop()) {
@@ -699,75 +1140,169 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     );
   }
 
-  void _scheduleProjectSave({bool immediate = false}) {
+  void _scheduleProjectSave({
+    bool immediate = false,
+    String changeType = 'editor_change',
+  }) {
+    if (!_editorInitialized) return;
     _saveDebounce?.cancel();
+    final userUid = ref.read(currentUserProvider)?.uid;
+    final project = _captureProjectSnapshot(
+      captionsChanged: _changeAffectsCaptions(changeType),
+    );
+    if (userUid != null) {
+      _remoteSyncPending = true;
+    }
+    unawaited(
+      _saveProjectState(
+        project: project,
+        userUid: userUid,
+        syncRemote: immediate,
+        changeType: changeType,
+      ),
+    );
+
     if (immediate) {
-      unawaited(_saveProjectState());
       return;
     }
+
     _saveDebounce = Timer(const Duration(seconds: 2), () {
-      unawaited(_saveProjectState());
+      unawaited(
+        _saveProjectState(
+          project: _projectSnapshot,
+          userUid: userUid,
+          syncRemote: true,
+          changeType: '${changeType}_remote_sync',
+        ),
+      );
     });
   }
 
-  Future<void> _flushProjectSave({bool syncRemote = true}) async {
+  Future<void> _flushProjectSave({
+    bool syncRemote = true,
+    String changeType = 'editor_flush',
+  }) async {
     _saveDebounce?.cancel();
-    await _saveProjectState(syncRemote: syncRemote);
+    final userUid = ref.read(currentUserProvider)?.uid;
+    final project = _captureProjectSnapshot();
+    await _saveProjectState(
+      project: project,
+      userUid: userUid,
+      syncRemote: syncRemote,
+      changeType: changeType,
+    );
   }
 
-  Future<void> _saveProjectState({bool syncRemote = true}) async {
-    if (_isSavingProject) {
-      _queuedProjectSave = true;
-      _queuedRemoteSync = _queuedRemoteSync || syncRemote;
-      return;
+  Project _captureProjectSnapshot({bool captionsChanged = false}) {
+    if (!_editorInitialized) return _projectSnapshot;
+
+    final subtitleState = ref.read(subtitleProvider);
+    final editorState = ref.read(editorProvider);
+    final entries = List<SubtitleEntry>.from(subtitleState.entries);
+    final mergedTimeline = editorState.timeline.mergeSubtitleEntries(
+      subtitles: entries,
+      globalStyle: subtitleState.globalStyle,
+    );
+    final now = DateTime.now();
+    final project = _projectSnapshot.copyWith(
+      subtitles: entries,
+      globalStyle: subtitleState.globalStyle,
+      timeline: mergedTimeline,
+      lastModifiedAt: now,
+      captionsModifiedAt: captionsChanged
+          ? now
+          : _projectSnapshot.captionsModifiedAt,
+    );
+    _projectSnapshot = project;
+    return project;
+  }
+
+  bool _changeAffectsCaptions(String changeType) {
+    return changeType.contains('subtitle') ||
+        changeType.contains('caption') ||
+        changeType.contains('style');
+  }
+
+  Future<void> _saveProjectState({
+    required Project project,
+    required String? userUid,
+    bool syncRemote = true,
+    String changeType = 'editor_change',
+  }) {
+    _queuedProjectSnapshot = project;
+    _queuedRemoteSync = _queuedRemoteSync || (syncRemote && userUid != null);
+    if (userUid != null) {
+      _queuedUserUid = userUid;
+    }
+    _queuedChangeType = changeType;
+
+    final activeSave = _activeProjectSave;
+    if (activeSave != null) return activeSave;
+
+    late final Future<void> saveDrain;
+    saveDrain = _drainProjectSaves().whenComplete(() {
+      if (identical(_activeProjectSave, saveDrain)) {
+        _activeProjectSave = null;
+      }
+    });
+    _activeProjectSave = saveDrain;
+    return saveDrain;
+  }
+
+  Future<void> _drainProjectSaves() async {
+    _isSavingProject = true;
+    if (mounted && !_isClosing) {
+      setState(() {});
     }
 
-    _isSavingProject = true;
-    var shouldSyncRemote = syncRemote;
-
     try {
-      while (true) {
-        _queuedProjectSave = false;
+      while (_queuedProjectSnapshot != null) {
+        final project = _queuedProjectSnapshot!;
+        final shouldSyncRemote = _queuedRemoteSync;
+        final userUid = _queuedUserUid;
+        final changeType = _queuedChangeType;
+
+        _queuedProjectSnapshot = null;
         _queuedRemoteSync = false;
+        _queuedUserUid = null;
+        _queuedChangeType = 'queued_editor_change';
 
-        final subtitleState = ref.read(subtitleProvider);
-        final editorState = ref.read(editorProvider);
-        final mergedTimeline = editorState.timeline.mergeSubtitleEntries(
-          subtitles: subtitleState.entries,
-          globalStyle: subtitleState.globalStyle,
-        );
-        final updatedProject = widget.project.copyWith(
-          subtitles: subtitleState.entries,
-          globalStyle: subtitleState.globalStyle,
-          timeline: mergedTimeline,
-          lastModifiedAt: DateTime.now(),
-        );
+        var savedLocally = false;
+        try {
+          await EditorChangeLogService.saveLocalSnapshot(
+            project: project,
+            changeType: changeType,
+          );
+          savedLocally = true;
+          _lastSavedAt = DateTime.now();
+          _localSaveError = null;
+        } catch (error) {
+          _localSaveError = error;
+        }
 
-        await ProjectLocalStorage.saveProject(updatedProject);
-
-        if (shouldSyncRemote) {
-          final user = ref.read(currentUserProvider);
-          if (user != null) {
+        if (savedLocally && shouldSyncRemote && userUid != null) {
+          if (_queuedProjectSnapshot != null) {
+            _queuedRemoteSync = true;
+            _queuedUserUid ??= userUid;
+          } else {
             try {
               await FirebaseService.saveProject(
-                user.uid,
-                updatedProject.id,
-                updatedProject.toFirestore(),
+                userUid,
+                project.id,
+                project.toFirestore(),
               );
+              _remoteSyncPending = false;
             } catch (_) {
-              // Local persistence remains the fallback when Firestore sync fails.
+              _remoteSyncPending = true;
             }
           }
         }
-
-        if (!_queuedProjectSave) {
-          break;
-        }
-
-        shouldSyncRemote = _queuedRemoteSync;
       }
     } finally {
       _isSavingProject = false;
+      if (mounted && !_isClosing) {
+        setState(() {});
+      }
     }
   }
 
@@ -810,6 +1345,2081 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       }
     }
     return null;
+  }
+
+  void _updateTimelineClip(
+    TimelineClip target,
+    TimelineClip Function(TimelineClip current) mapper, {
+    bool recordHistory = true,
+  }) {
+    final editorState = ref.read(editorProvider);
+    final track = _trackForClip(target, editorState);
+    if (track?.isLocked == true) {
+      SnackBarHelper.showInfo(context, 'Unlock the track to edit this clip.');
+      return;
+    }
+    final nextTracks = editorState.timeline.tracks.map((timelineTrack) {
+      final clips = timelineTrack.clips
+          .map((clip) => clip.id == target.id ? mapper(clip) : clip)
+          .toList();
+      return timelineTrack.copyWith(clips: clips);
+    }).toList();
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(
+          editorState.timeline.copyWith(tracks: nextTracks),
+          recordHistory: recordHistory,
+        );
+  }
+
+  void _updateClipPlaybackRate(
+    TimelineClip target,
+    double playbackRate, {
+    bool recordHistory = true,
+  }) {
+    final editorState = ref.read(editorProvider);
+    final timeline = editorState.timeline;
+    final track = _trackForClip(target, editorState);
+    if (track == null || track.isLocked) {
+      SnackBarHelper.showInfo(context, 'Unlock the track to change speed.');
+      return;
+    }
+    final safeRate = playbackRate.clamp(0.25, 4).toDouble();
+    final sourceDurationMs = target.sourceDuration.inMilliseconds > 0
+        ? target.sourceDuration.inMilliseconds
+        : target.duration.inMilliseconds;
+    final nextDuration = Duration(
+      milliseconds: math.max(100, (sourceDurationMs / safeRate).round()),
+    );
+    final nextEnd = target.startTime + nextDuration;
+    final rippleDelta = nextDuration - target.duration;
+    final isBase = track.section == TimelineTrackSection.baseVideo;
+    final oldEnd = target.endTime;
+
+    final nextTracks = timeline.tracks.map((timelineTrack) {
+      final clips = timelineTrack.clips.map((clip) {
+        if (clip.id == target.id) {
+          return clip.copyWith(playbackRate: safeRate, endTime: nextEnd);
+        }
+        if (clip.linkedClipId == target.id) {
+          final oldDurationMs = math.max(1, target.duration.inMilliseconds);
+          final startRatio =
+              (clip.startTime - target.startTime).inMilliseconds /
+              oldDurationMs;
+          final endRatio =
+              (clip.endTime - target.startTime).inMilliseconds / oldDurationMs;
+          return clip.copyWith(
+            startTime:
+                target.startTime +
+                Duration(
+                  milliseconds: (nextDuration.inMilliseconds * startRatio)
+                      .round(),
+                ),
+            endTime:
+                target.startTime +
+                Duration(
+                  milliseconds: (nextDuration.inMilliseconds * endRatio)
+                      .round(),
+                ),
+          );
+        }
+        if (isBase && clip.startTime >= oldEnd) {
+          return clip.copyWith(
+            startTime: clip.startTime + rippleDelta,
+            endTime: clip.endTime + rippleDelta,
+          );
+        }
+        return clip;
+      }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
+      return timelineTrack.copyWith(clips: clips);
+    }).toList();
+    final markers = timeline.markers.map((marker) {
+      if (isBase && marker.position >= oldEnd) {
+        return marker.copyWith(position: marker.position + rippleDelta);
+      }
+      return marker;
+    }).toList();
+    final nextTimeline = timeline.copyWith(
+      tracks: nextTracks,
+      markers: markers,
+    );
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(nextTimeline, recordHistory: recordHistory);
+    ref
+        .read(subtitleProvider.notifier)
+        .syncFromTimeline(nextTimeline.subtitleEntries);
+  }
+
+  bool _isVisualClip(TimelineClip? clip) {
+    return clip != null &&
+        (clip.type == TimelineTrackType.video ||
+            clip.type == TimelineTrackType.image ||
+            clip.type == TimelineTrackType.gif ||
+            clip.type == TimelineTrackType.sticker);
+  }
+
+  bool _canReverseClip(TimelineClip? clip) {
+    return clip != null &&
+        (clip.type == TimelineTrackType.video ||
+            clip.type == TimelineTrackType.audio ||
+            clip.type == TimelineTrackType.gif);
+  }
+
+  void _toggleClipReverse(TimelineClip clip) {
+    if (!_canReverseClip(clip)) return;
+    _updateTimelineClip(
+      clip,
+      (current) => current.copyWith(isReversed: !current.isReversed),
+    );
+  }
+
+  void _setClipFit(TimelineClip clip, ClipFitMode fitMode) {
+    if (!_isVisualClip(clip)) return;
+    _updateTimelineClip(clip, (current) => current.copyWith(fitMode: fitMode));
+  }
+
+  void _rotateClip(TimelineClip clip, double radians) {
+    if (!_isVisualClip(clip)) return;
+    _updateTimelineClip(
+      clip,
+      (current) => current.copyWith(
+        transform: current.transform.copyWith(
+          rotation: current.transform.rotation + radians,
+        ),
+      ),
+    );
+  }
+
+  void _toggleClipFlip(TimelineClip clip, {required bool horizontal}) {
+    if (!_isVisualClip(clip)) return;
+    _updateTimelineClip(
+      clip,
+      (current) => current.copyWith(
+        transform: horizontal
+            ? current.transform.copyWith(flipX: !current.transform.flipX)
+            : current.transform.copyWith(flipY: !current.transform.flipY),
+      ),
+    );
+  }
+
+  void _changeClipLayer(TimelineClip clip, int delta) {
+    _updateTimelineClip(
+      clip,
+      (current) => current.copyWith(layer: math.max(0, current.layer + delta)),
+    );
+  }
+
+  void _toggleClipEnabled(TimelineClip clip) {
+    _updateTimelineClip(
+      clip,
+      (current) => current.copyWith(enabled: !current.enabled),
+    );
+  }
+
+  void _resetClipTransform(TimelineClip clip) {
+    if (!_isVisualClip(clip)) return;
+    _updateTimelineClip(
+      clip,
+      (current) => current.copyWith(
+        transform: const TimelineTransform(),
+        crop: const ClipCropSettings(),
+        fitMode: current.type == TimelineTrackType.video
+            ? ClipFitMode.cover
+            : ClipFitMode.contain,
+      ),
+    );
+  }
+
+  void _setClipBlurMode(TimelineClip clip, ClipBlurMode mode) {
+    if (!_isVisualClip(clip)) return;
+    _updateTimelineClip(
+      clip,
+      (current) => current.copyWith(blur: current.blur.copyWith(mode: mode)),
+    );
+  }
+
+  void _resetClipColor(TimelineClip clip) {
+    if (!_isVisualClip(clip)) return;
+    _updateTimelineClip(
+      clip,
+      (current) =>
+          current.copyWith(colorAdjustments: const ClipColorAdjustments()),
+    );
+  }
+
+  void _autoEnhanceClip(TimelineClip clip) {
+    if (!_isVisualClip(clip)) return;
+    _updateTimelineClip(
+      clip,
+      (current) => current.copyWith(
+        colorAdjustments: const ClipColorAdjustments(
+          brightness: 0.025,
+          contrast: 1.08,
+          saturation: 1.12,
+          sharpen: 0.14,
+        ),
+      ),
+    );
+  }
+
+  void _toggleClipMute(TimelineClip clip) {
+    if (clip.type != TimelineTrackType.video &&
+        clip.type != TimelineTrackType.audio) {
+      return;
+    }
+    _updateTimelineClip(
+      clip,
+      (current) => current.copyWith(
+        audioMix: current.audioMix.copyWith(muted: !current.audioMix.muted),
+      ),
+    );
+  }
+
+  void _toggleClipNormalize(TimelineClip clip) {
+    if (clip.type != TimelineTrackType.video &&
+        clip.type != TimelineTrackType.audio) {
+      return;
+    }
+    _updateTimelineClip(
+      clip,
+      (current) => current.copyWith(
+        audioMix: current.audioMix.copyWith(
+          normalize: !current.audioMix.normalize,
+        ),
+      ),
+    );
+  }
+
+  void _toggleQuickFade(TimelineClip clip, {required bool fadeIn}) {
+    if (clip.type != TimelineTrackType.video &&
+        clip.type != TimelineTrackType.audio) {
+      return;
+    }
+    _updateTimelineClip(clip, (current) {
+      final mix = current.audioMix;
+      return current.copyWith(
+        audioMix: fadeIn
+            ? mix.copyWith(fadeInMs: mix.fadeInMs == 0 ? 500 : 0)
+            : mix.copyWith(fadeOutMs: mix.fadeOutMs == 0 ? 500 : 0),
+      );
+    });
+  }
+
+  void _duplicateClip(TimelineClip clip) {
+    final editorState = ref.read(editorProvider);
+    final track = _trackForClip(clip, editorState);
+    if (track == null || track.isLocked) {
+      SnackBarHelper.showInfo(context, 'Unlock the track to duplicate clips.');
+      return;
+    }
+    final timeline = editorState.timeline;
+    final newStart = track.section == TimelineTrackSection.baseVideo
+        ? timeline.duration
+        : clip.endTime;
+    final duplicate = clip.copyWith(
+      id: const Uuid().v4(),
+      startTime: newStart,
+      endTime: newStart + clip.duration,
+      clearLinkedClipId: true,
+    );
+    final nextTracks = timeline.tracks.map((candidate) {
+      if (candidate.id != track.id) return candidate;
+      final clips = [...candidate.clips, duplicate]
+        ..sort((a, b) => a.startTime.compareTo(b.startTime));
+      return candidate.copyWith(clips: clips);
+    }).toList();
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(timeline.copyWith(tracks: nextTracks));
+    ref.read(editorProvider.notifier)
+      ..selectTrack(track.id)
+      ..selectClip(duplicate.id);
+  }
+
+  void _deleteClip(TimelineClip clip) {
+    final editorState = ref.read(editorProvider);
+    final track = _trackForClip(clip, editorState);
+    if (track == null || track.isLocked) {
+      SnackBarHelper.showInfo(context, 'Unlock the track to delete clips.');
+      return;
+    }
+    if (track.section == TimelineTrackSection.baseVideo &&
+        track.clips.where((candidate) => candidate.enabled).length <= 1) {
+      SnackBarHelper.showInfo(
+        context,
+        'Keep at least one base video clip in the timeline.',
+      );
+      return;
+    }
+    final nextTracks = editorState.timeline.tracks.map((candidate) {
+      final clips = candidate.clips
+          .where(
+            (item) =>
+                item.id != clip.id &&
+                (item.linkedClipId == null || item.linkedClipId != clip.id),
+          )
+          .toList();
+      return candidate.copyWith(clips: clips);
+    }).toList();
+    final nextTimeline = editorState.timeline.copyWith(tracks: nextTracks);
+    ref.read(editorProvider.notifier)
+      ..setTimeline(nextTimeline)
+      ..selectClip(null);
+    ref
+        .read(subtitleProvider.notifier)
+        .syncFromTimeline(nextTimeline.subtitleEntries);
+  }
+
+  void _splitClipAtPlayhead(TimelineClip clip) {
+    final editorState = ref.read(editorProvider);
+    final timeline = editorState.timeline;
+    final track = _trackForClip(clip, editorState);
+    if (track == null || track.isLocked) {
+      SnackBarHelper.showInfo(context, 'Unlock the track to split clips.');
+      return;
+    }
+    final splitPoint = ref.read(playbackProvider).position;
+    if (splitPoint <= clip.startTime ||
+        splitPoint >= clip.endTime ||
+        (splitPoint - clip.startTime).inMilliseconds < 100 ||
+        (clip.endTime - splitPoint).inMilliseconds < 100) {
+      SnackBarHelper.showInfo(
+        context,
+        'Move the playhead inside the selected clip to split it.',
+      );
+      return;
+    }
+
+    final rightId = const Uuid().v4();
+    final timelineOffsetMs = (splitPoint - clip.startTime).inMilliseconds;
+    final sourceOffsetMs = (timelineOffsetMs * clip.playbackRate).round();
+    final sourceDurationMs = math.max(
+      sourceOffsetMs + 1,
+      clip.sourceDuration.inMilliseconds,
+    );
+    final leftSourceStart = clip.isReversed
+        ? clip.sourceStartTime +
+              Duration(milliseconds: sourceDurationMs - sourceOffsetMs)
+        : clip.sourceStartTime;
+    final rightSourceStart = clip.isReversed
+        ? clip.sourceStartTime
+        : clip.sourceStartTime + Duration(milliseconds: sourceOffsetMs);
+    final left = clip.copyWith(
+      endTime: splitPoint,
+      sourceStartTime: leftSourceStart,
+      sourceDuration: Duration(milliseconds: sourceOffsetMs),
+    );
+    final right = clip.copyWith(
+      id: rightId,
+      startTime: splitPoint,
+      sourceStartTime: rightSourceStart,
+      sourceDuration: Duration(
+        milliseconds: math.max(1, sourceDurationMs - sourceOffsetMs),
+      ),
+    );
+
+    final nextTracks = <TimelineTrack>[];
+    for (final candidateTrack in timeline.tracks) {
+      if (candidateTrack.id == track.id) {
+        final clips = <TimelineClip>[];
+        for (final candidate in candidateTrack.clips) {
+          if (candidate.id == clip.id) {
+            clips.addAll([left, right]);
+          } else {
+            clips.add(candidate);
+          }
+        }
+        clips.sort((a, b) => a.startTime.compareTo(b.startTime));
+        nextTracks.add(candidateTrack.copyWith(clips: clips));
+        continue;
+      }
+      if (candidateTrack.type != TimelineTrackType.subtitle) {
+        nextTracks.add(candidateTrack);
+        continue;
+      }
+      final captions = <TimelineClip>[];
+      for (final caption in candidateTrack.clips) {
+        if (caption.linkedClipId != clip.id || caption.endTime <= splitPoint) {
+          captions.add(caption);
+        } else if (caption.startTime >= splitPoint) {
+          captions.add(caption.copyWith(linkedClipId: rightId));
+        } else {
+          captions.add(caption.copyWith(endTime: splitPoint));
+          captions.add(
+            caption.copyWith(
+              id: const Uuid().v4(),
+              linkedClipId: rightId,
+              startTime: splitPoint,
+            ),
+          );
+        }
+      }
+      captions.sort((a, b) => a.startTime.compareTo(b.startTime));
+      nextTracks.add(candidateTrack.copyWith(clips: captions));
+    }
+    final nextTimeline = timeline.copyWith(tracks: nextTracks);
+    ref.read(editorProvider.notifier)
+      ..setTimeline(nextTimeline)
+      ..selectClip(rightId);
+    ref
+        .read(subtitleProvider.notifier)
+        .syncFromTimeline(nextTimeline.subtitleEntries);
+  }
+
+  int _assetDurationMs(EditorTimeline timeline, TimelineClip clip) {
+    final asset = timeline.assetForClip(clip);
+    final metadataDuration = (asset?.metadata['durationMs'] as num?)?.toInt();
+    if (metadataDuration != null && metadataDuration > 0) {
+      return metadataDuration;
+    }
+    return math.max(
+      100,
+      clip.sourceStartTime.inMilliseconds +
+          math.max(clip.sourceDuration.inMilliseconds, 100),
+    );
+  }
+
+  void _applySourceTrim(
+    TimelineClip target, {
+    required int sourceStartMs,
+    required int sourceEndMs,
+  }) {
+    final editorState = ref.read(editorProvider);
+    final timeline = editorState.timeline;
+    final track = _trackForClip(target, editorState);
+    if (track == null || track.isLocked) {
+      SnackBarHelper.showInfo(context, 'Unlock the track to trim this clip.');
+      return;
+    }
+    final assetDurationMs = _assetDurationMs(timeline, target);
+    final safeStart = sourceStartMs.clamp(0, assetDurationMs - 100).toInt();
+    final safeEnd = sourceEndMs.clamp(safeStart + 100, assetDurationMs).toInt();
+    final sourceDuration = Duration(milliseconds: safeEnd - safeStart);
+    final nextDuration = Duration(
+      milliseconds: math.max(
+        100,
+        (sourceDuration.inMilliseconds / target.playbackRate).round(),
+      ),
+    );
+    final nextEnd = target.startTime + nextDuration;
+    final oldEnd = target.endTime;
+    final rippleDelta = nextEnd - oldEnd;
+    final isBase = track.section == TimelineTrackSection.baseVideo;
+
+    final nextTracks = timeline.tracks.map((candidateTrack) {
+      final clips = candidateTrack.clips.map((clip) {
+        if (clip.id == target.id) {
+          return clip.copyWith(
+            sourceStartTime: Duration(milliseconds: safeStart),
+            sourceDuration: sourceDuration,
+            endTime: nextEnd,
+          );
+        }
+        if (clip.linkedClipId == target.id) {
+          final oldDurationMs = math.max(1, target.duration.inMilliseconds);
+          final startRatio =
+              (clip.startTime - target.startTime).inMilliseconds /
+              oldDurationMs;
+          final endRatio =
+              (clip.endTime - target.startTime).inMilliseconds / oldDurationMs;
+          return clip.copyWith(
+            startTime:
+                target.startTime +
+                Duration(
+                  milliseconds: (nextDuration.inMilliseconds * startRatio)
+                      .round(),
+                ),
+            endTime:
+                target.startTime +
+                Duration(
+                  milliseconds: (nextDuration.inMilliseconds * endRatio)
+                      .round(),
+                ),
+          );
+        }
+        if (isBase && clip.startTime >= oldEnd) {
+          return clip.copyWith(
+            startTime: clip.startTime + rippleDelta,
+            endTime: clip.endTime + rippleDelta,
+          );
+        }
+        return clip;
+      }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
+      return candidateTrack.copyWith(clips: clips);
+    }).toList();
+    final markers = timeline.markers.map((marker) {
+      if (isBase && marker.position >= oldEnd) {
+        return marker.copyWith(position: marker.position + rippleDelta);
+      }
+      return marker;
+    }).toList();
+    final nextTimeline = timeline.copyWith(
+      tracks: nextTracks,
+      markers: markers,
+    );
+    ref.read(editorProvider.notifier).setTimeline(nextTimeline);
+    ref
+        .read(subtitleProvider.notifier)
+        .syncFromTimeline(nextTimeline.subtitleEntries);
+  }
+
+  void _updateCanvasSettings(
+    CanvasSettings Function(CanvasSettings current) mapper, {
+    bool recordHistory = true,
+  }) {
+    final editorState = ref.read(editorProvider);
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(
+          editorState.timeline.copyWith(
+            canvasSettings: mapper(editorState.timeline.canvasSettings),
+          ),
+          recordHistory: recordHistory,
+        );
+  }
+
+  Future<void> _openClipInspectorSheet(TimelineClip initialClip) async {
+    var clip = initialClip;
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          void refreshClip() {
+            final latest = _clipById(clip.id, ref.read(editorProvider));
+            if (latest != null) {
+              setSheetState(() => clip = latest);
+            }
+          }
+
+          void update(
+            TimelineClip Function(TimelineClip current) mapper, {
+            bool recordHistory = true,
+          }) {
+            _updateTimelineClip(clip, mapper, recordHistory: recordHistory);
+            refreshClip();
+          }
+
+          return _buildEditorSheet(
+            title: 'Clip inspector',
+            subtitle: clip.label,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _sheetSectionTitle('LAYOUT'),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: ClipFitMode.values.map((fit) {
+                    return ChoiceChip(
+                      label: Text(switch (fit) {
+                        ClipFitMode.cover => 'Fill',
+                        ClipFitMode.contain => 'Fit',
+                        ClipFitMode.stretch => 'Stretch',
+                      }),
+                      selected: clip.fitMode == fit,
+                      onSelected: (_) {
+                        update((current) => current.copyWith(fitMode: fit));
+                      },
+                    );
+                  }).toList(),
+                ),
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _sheetActionTile(
+                        icon: Icons.rotate_left_rounded,
+                        label: 'Rotate −90°',
+                        onTap: () => update(
+                          (current) => current.copyWith(
+                            transform: current.transform.copyWith(
+                              rotation:
+                                  current.transform.rotation - math.pi / 2,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: _sheetActionTile(
+                        icon: Icons.rotate_right_rounded,
+                        label: 'Rotate +90°',
+                        onTap: () => update(
+                          (current) => current.copyWith(
+                            transform: current.transform.copyWith(
+                              rotation:
+                                  current.transform.rotation + math.pi / 2,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _sheetActionTile(
+                        icon: Icons.flip_rounded,
+                        label: 'Flip horizontal',
+                        active: clip.transform.flipX,
+                        onTap: () => update(
+                          (current) => current.copyWith(
+                            transform: current.transform.copyWith(
+                              flipX: !current.transform.flipX,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: _sheetActionTile(
+                        icon: Icons.flip_camera_android_rounded,
+                        label: 'Flip vertical',
+                        active: clip.transform.flipY,
+                        onTap: () => update(
+                          (current) => current.copyWith(
+                            transform: current.transform.copyWith(
+                              flipY: !current.transform.flipY,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 18),
+                _sheetSliderHeader(
+                  'Opacity',
+                  '${(clip.transform.opacity * 100).round()}%',
+                ),
+                Slider(
+                  value: clip.transform.opacity.clamp(0.0, 1.0),
+                  onChangeStart: (_) => ref
+                      .read(editorProvider.notifier)
+                      .beginTimelineGestureEdit(),
+                  onChanged: (value) => update(
+                    (current) => current.copyWith(
+                      transform: current.transform.copyWith(opacity: value),
+                    ),
+                    recordHistory: false,
+                  ),
+                  onChangeEnd: (_) => ref
+                      .read(editorProvider.notifier)
+                      .endTimelineGestureEdit(),
+                ),
+                if (clip.type == TimelineTrackType.video ||
+                    clip.type == TimelineTrackType.audio) ...[
+                  const SizedBox(height: 10),
+                  _sheetSectionTitle('SPEED'),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: const [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 4.0]
+                        .map(
+                          (speed) => ChoiceChip(
+                            label: Text('${speed}x'),
+                            selected: (clip.playbackRate - speed).abs() < 0.001,
+                            onSelected: (_) {
+                              _updateClipPlaybackRate(clip, speed);
+                              refreshClip();
+                            },
+                          ),
+                        )
+                        .toList(),
+                  ),
+                ],
+                const SizedBox(height: 18),
+                _sheetSectionTitle('LAYER'),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _sheetActionTile(
+                        icon: Icons.move_down_rounded,
+                        label: 'Send backward',
+                        onTap: () => update(
+                          (current) => current.copyWith(
+                            layer: math.max(0, current.layer - 1),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: _sheetActionTile(
+                        icon: Icons.move_up_rounded,
+                        label: 'Bring forward',
+                        onTap: () => update(
+                          (current) =>
+                              current.copyWith(layer: current.layer + 1),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                SwitchListTile.adaptive(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Clip enabled'),
+                  subtitle: const Text('Disabled clips are skipped in export'),
+                  value: clip.enabled,
+                  onChanged: (value) =>
+                      update((current) => current.copyWith(enabled: value)),
+                ),
+                if (clip.assetId != null)
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.link_rounded),
+                    title: const Text('Relink media'),
+                    subtitle: const Text('Replace a missing or moved source'),
+                    trailing: const Icon(Icons.chevron_right_rounded),
+                    onTap: () async {
+                      await _relinkClipMedia(clip);
+                      refreshClip();
+                    },
+                  ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  onPressed: () => update(
+                    (current) => current.copyWith(
+                      transform: const TimelineTransform(),
+                      fitMode: current.type == TimelineTrackType.video
+                          ? ClipFitMode.cover
+                          : ClipFitMode.contain,
+                    ),
+                  ),
+                  icon: const Icon(Icons.restart_alt_rounded),
+                  label: const Text('Reset transform'),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _openTimingSheet(TimelineClip initialClip) async {
+    var clip = initialClip;
+    final initialTimeline = ref.read(editorProvider).timeline;
+    final initialAssetDurationMs = _assetDurationMs(initialTimeline, clip);
+    var trimRange = RangeValues(
+      clip.sourceStartTime.inMilliseconds
+          .clamp(0, initialAssetDurationMs - 100)
+          .toDouble(),
+      (clip.sourceStartTime.inMilliseconds +
+              math.max(100, clip.sourceDuration.inMilliseconds))
+          .clamp(100, initialAssetDurationMs)
+          .toDouble(),
+    );
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          void refreshClip() {
+            final latest = _clipById(clip.id, ref.read(editorProvider));
+            if (latest == null) return;
+            setSheetState(() {
+              clip = latest;
+              final timeline = ref.read(editorProvider).timeline;
+              final assetDurationMs = _assetDurationMs(timeline, latest);
+              trimRange = RangeValues(
+                latest.sourceStartTime.inMilliseconds
+                    .clamp(0, assetDurationMs - 100)
+                    .toDouble(),
+                (latest.sourceStartTime.inMilliseconds +
+                        math.max(100, latest.sourceDuration.inMilliseconds))
+                    .clamp(100, assetDurationMs)
+                    .toDouble(),
+              );
+            });
+          }
+
+          final timeline = ref.read(editorProvider).timeline;
+          final assetDurationMs = _assetDurationMs(timeline, clip);
+          final canReverse = _canReverseClip(clip);
+          return _buildEditorSheet(
+            title: 'Timing',
+            subtitle: 'Trim, speed, split and reverse',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _sheetSectionTitle('SOURCE TRIM'),
+                const SizedBox(height: 5),
+                Text(
+                  '${_formatEditorDuration(Duration(milliseconds: trimRange.start.round()))}'
+                  '  —  '
+                  '${_formatEditorDuration(Duration(milliseconds: trimRange.end.round()))}',
+                  style: const TextStyle(
+                    color: kTextSecondary,
+                    fontFamily: 'monospace',
+                    fontSize: 11,
+                  ),
+                ),
+                RangeSlider(
+                  values: RangeValues(
+                    trimRange.start.clamp(0, assetDurationMs - 100).toDouble(),
+                    trimRange.end.clamp(100, assetDurationMs).toDouble(),
+                  ),
+                  min: 0,
+                  max: assetDurationMs.toDouble(),
+                  divisions: (assetDurationMs ~/ 100).clamp(1, 1000),
+                  labels: RangeLabels(
+                    _formatEditorDuration(
+                      Duration(milliseconds: trimRange.start.round()),
+                    ),
+                    _formatEditorDuration(
+                      Duration(milliseconds: trimRange.end.round()),
+                    ),
+                  ),
+                  onChanged: (value) {
+                    if (value.end - value.start < 100) return;
+                    setSheetState(() => trimRange = value);
+                  },
+                  onChangeEnd: (value) {
+                    _applySourceTrim(
+                      clip,
+                      sourceStartMs: value.start.round(),
+                      sourceEndMs: value.end.round(),
+                    );
+                    refreshClip();
+                  },
+                ),
+                const SizedBox(height: 14),
+                _sheetSectionTitle('SPEED'),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: const [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 4.0]
+                      .map(
+                        (speed) => ChoiceChip(
+                          label: Text('${speed}x'),
+                          selected: (clip.playbackRate - speed).abs() < 0.001,
+                          onSelected: (_) {
+                            _updateClipPlaybackRate(clip, speed);
+                            refreshClip();
+                          },
+                        ),
+                      )
+                      .toList(),
+                ),
+                const SizedBox(height: 8),
+                _sheetSliderHeader(
+                  'Fine speed',
+                  '${clip.playbackRate.toStringAsFixed(2)}x',
+                ),
+                Slider(
+                  value: clip.playbackRate.clamp(0.25, 4),
+                  min: 0.25,
+                  max: 4,
+                  divisions: 75,
+                  onChangeStart: (_) => ref
+                      .read(editorProvider.notifier)
+                      .beginTimelineGestureEdit(),
+                  onChanged: (value) {
+                    _updateClipPlaybackRate(clip, value, recordHistory: false);
+                    refreshClip();
+                  },
+                  onChangeEnd: (_) => ref
+                      .read(editorProvider.notifier)
+                      .endTimelineGestureEdit(),
+                ),
+                if (canReverse) ...[
+                  const SizedBox(height: 10),
+                  SwitchListTile.adaptive(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Reverse playback'),
+                    subtitle: const Text(
+                      'Preview scrubs backward; export reverses picture and audio',
+                    ),
+                    value: clip.isReversed,
+                    onChanged: (_) {
+                      _toggleClipReverse(clip);
+                      refreshClip();
+                    },
+                  ),
+                ],
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _sheetActionTile(
+                        icon: Icons.content_cut_rounded,
+                        label: 'Split at playhead',
+                        onTap: () {
+                          _splitClipAtPlayhead(clip);
+                          Navigator.pop(context);
+                        },
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: _sheetActionTile(
+                        icon: Icons.restart_alt_rounded,
+                        label: 'Reset speed',
+                        onTap: () {
+                          _updateClipPlaybackRate(clip, 1);
+                          refreshClip();
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  String _formatEditorDuration(Duration duration) {
+    final totalMs = math.max(0, duration.inMilliseconds);
+    final minutes = totalMs ~/ 60000;
+    final seconds = (totalMs % 60000) ~/ 1000;
+    final millis = totalMs % 1000;
+    return '${minutes.toString().padLeft(2, '0')}:'
+        '${seconds.toString().padLeft(2, '0')}.'
+        '${millis.toString().padLeft(3, '0')}';
+  }
+
+  ClipCropSettings _centerCropForAspect(
+    TimelineClip clip,
+    double targetAspect,
+  ) {
+    final timeline = ref.read(editorProvider).timeline;
+    final asset = timeline.assetForClip(clip);
+    var width = (asset?.metadata['width'] as num?)?.toDouble() ?? 0;
+    var height = (asset?.metadata['height'] as num?)?.toDouble() ?? 0;
+    if (width <= 0 || height <= 0) {
+      final canvasAspect = _selectedAspectRatioValue;
+      width = canvasAspect ?? 16 / 9;
+      height = 1;
+    }
+    final sourceAspect = width / height;
+    if ((sourceAspect - targetAspect).abs() < 0.001) {
+      return const ClipCropSettings();
+    }
+    if (sourceAspect > targetAspect) {
+      final visibleWidth = (targetAspect / sourceAspect).clamp(0.05, 1.0);
+      final inset = (1 - visibleWidth) / 2;
+      return ClipCropSettings(left: inset, right: inset);
+    }
+    final visibleHeight = (sourceAspect / targetAspect).clamp(0.05, 1.0);
+    final inset = (1 - visibleHeight) / 2;
+    return ClipCropSettings(top: inset, bottom: inset);
+  }
+
+  Future<void> _openCropSheet(TimelineClip initialClip) async {
+    if (!_isVisualClip(initialClip)) return;
+    var clip = initialClip;
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          void update(ClipCropSettings crop, {bool recordHistory = true}) {
+            _updateTimelineClip(
+              clip,
+              (current) => current.copyWith(crop: crop),
+              recordHistory: recordHistory,
+            );
+            final latest = _clipById(clip.id, ref.read(editorProvider));
+            if (latest != null) setSheetState(() => clip = latest);
+          }
+
+          Widget cropSlider({
+            required String label,
+            required double value,
+            required double opposite,
+            required ClipCropSettings Function(double value) mapper,
+          }) {
+            final max = math.max(0.0, 0.9 - opposite);
+            return Column(
+              children: [
+                _sheetSliderHeader(label, '${(value * 100).round()}%'),
+                Slider(
+                  value: value.clamp(0, max),
+                  min: 0,
+                  max: math.max(0.01, max),
+                  divisions: math.max(1, (max * 100).round()),
+                  onChangeStart: (_) => ref
+                      .read(editorProvider.notifier)
+                      .beginTimelineGestureEdit(),
+                  onChanged: (next) =>
+                      update(mapper(next), recordHistory: false),
+                  onChangeEnd: (_) => ref
+                      .read(editorProvider.notifier)
+                      .endTimelineGestureEdit(),
+                ),
+              ],
+            );
+          }
+
+          final crop = clip.crop;
+          return _buildEditorSheet(
+            title: 'Crop',
+            subtitle: 'Non-destructive and reusable on any visual clip',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _sheetSectionTitle('ASPECT PRESETS'),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    ActionChip(
+                      avatar: const Icon(Icons.restart_alt_rounded, size: 16),
+                      label: const Text('Original'),
+                      onPressed: () => update(const ClipCropSettings()),
+                    ),
+                    for (final preset in const [
+                      (1.0, '1:1'),
+                      (16 / 9, '16:9'),
+                      (9 / 16, '9:16'),
+                      (4 / 5, '4:5'),
+                    ])
+                      ActionChip(
+                        label: Text(preset.$2),
+                        onPressed: () =>
+                            update(_centerCropForAspect(clip, preset.$1)),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 18),
+                _sheetSectionTitle('FREE CROP'),
+                cropSlider(
+                  label: 'Left',
+                  value: crop.safeLeft,
+                  opposite: crop.safeRight,
+                  mapper: (value) => crop.copyWith(left: value),
+                ),
+                cropSlider(
+                  label: 'Right',
+                  value: crop.safeRight,
+                  opposite: crop.safeLeft,
+                  mapper: (value) => crop.copyWith(right: value),
+                ),
+                cropSlider(
+                  label: 'Top',
+                  value: crop.safeTop,
+                  opposite: crop.safeBottom,
+                  mapper: (value) => crop.copyWith(top: value),
+                ),
+                cropSlider(
+                  label: 'Bottom',
+                  value: crop.safeBottom,
+                  opposite: crop.safeTop,
+                  mapper: (value) => crop.copyWith(bottom: value),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Visible area: ${(crop.visibleWidth * 100).round()}% × '
+                  '${(crop.visibleHeight * 100).round()}%',
+                  style: const TextStyle(color: kTextSecondary, fontSize: 11),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _openBlurSheet(TimelineClip initialClip) async {
+    if (!_isVisualClip(initialClip)) return;
+    var clip = initialClip;
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          void update(ClipBlurSettings blur, {bool recordHistory = true}) {
+            _updateTimelineClip(
+              clip,
+              (current) => current.copyWith(blur: blur),
+              recordHistory: recordHistory,
+            );
+            final latest = _clipById(clip.id, ref.read(editorProvider));
+            if (latest != null) setSheetState(() => clip = latest);
+          }
+
+          Widget regionSlider({
+            required String label,
+            required double value,
+            required double max,
+            required ClipBlurSettings Function(double value) mapper,
+          }) {
+            return Column(
+              children: [
+                _sheetSliderHeader(label, '${(value * 100).round()}%'),
+                Slider(
+                  value: value.clamp(0, max),
+                  min: 0,
+                  max: math.max(0.01, max),
+                  divisions: math.max(1, (max * 100).round()),
+                  onChangeStart: (_) => ref
+                      .read(editorProvider.notifier)
+                      .beginTimelineGestureEdit(),
+                  onChanged: (next) =>
+                      update(mapper(next), recordHistory: false),
+                  onChangeEnd: (_) => ref
+                      .read(editorProvider.notifier)
+                      .endTimelineGestureEdit(),
+                ),
+              ],
+            );
+          }
+
+          final blur = clip.blur;
+          return _buildEditorSheet(
+            title: 'Blur & privacy',
+            subtitle: 'One effect for video, images, GIFs and stickers',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _sheetSectionTitle('MODE'),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final option in const [
+                      (ClipBlurMode.none, 'Off', Icons.block_rounded),
+                      (ClipBlurMode.full, 'Whole clip', Icons.blur_on_rounded),
+                      (
+                        ClipBlurMode.region,
+                        'Privacy region',
+                        Icons.center_focus_strong_rounded,
+                      ),
+                    ])
+                      ChoiceChip(
+                        avatar: Icon(option.$3, size: 16),
+                        label: Text(option.$2),
+                        selected: blur.mode == option.$1,
+                        onSelected: (_) =>
+                            update(blur.copyWith(mode: option.$1)),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                _sheetSliderHeader(
+                  'Blur strength',
+                  blur.safeStrength.toStringAsFixed(0),
+                ),
+                Slider(
+                  value: blur.safeStrength,
+                  min: 1,
+                  max: 30,
+                  divisions: 29,
+                  onChangeStart: (_) => ref
+                      .read(editorProvider.notifier)
+                      .beginTimelineGestureEdit(),
+                  onChanged: (value) => update(
+                    blur.copyWith(strength: value),
+                    recordHistory: false,
+                  ),
+                  onChangeEnd: (_) => ref
+                      .read(editorProvider.notifier)
+                      .endTimelineGestureEdit(),
+                ),
+                if (blur.mode == ClipBlurMode.region) ...[
+                  const SizedBox(height: 10),
+                  _sheetSectionTitle('REGION PRESETS'),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      ActionChip(
+                        label: const Text('Face'),
+                        onPressed: () => update(
+                          blur.copyWith(
+                            regionX: 0.25,
+                            regionY: 0.12,
+                            regionWidth: 0.5,
+                            regionHeight: 0.34,
+                          ),
+                        ),
+                      ),
+                      ActionChip(
+                        label: const Text('Center'),
+                        onPressed: () => update(
+                          blur.copyWith(
+                            regionX: 0.2,
+                            regionY: 0.3,
+                            regionWidth: 0.6,
+                            regionHeight: 0.4,
+                          ),
+                        ),
+                      ),
+                      ActionChip(
+                        label: const Text('Lower third'),
+                        onPressed: () => update(
+                          blur.copyWith(
+                            regionX: 0.08,
+                            regionY: 0.7,
+                            regionWidth: 0.84,
+                            regionHeight: 0.2,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  regionSlider(
+                    label: 'Horizontal position',
+                    value: blur.safeRegionX,
+                    max: 1 - blur.safeRegionWidth,
+                    mapper: (value) => blur.copyWith(regionX: value),
+                  ),
+                  regionSlider(
+                    label: 'Vertical position',
+                    value: blur.safeRegionY,
+                    max: 1 - blur.safeRegionHeight,
+                    mapper: (value) => blur.copyWith(regionY: value),
+                  ),
+                  regionSlider(
+                    label: 'Region width',
+                    value: blur.safeRegionWidth,
+                    max: 1,
+                    mapper: (value) =>
+                        blur.copyWith(regionWidth: value.clamp(0.08, 1)),
+                  ),
+                  regionSlider(
+                    label: 'Region height',
+                    value: blur.safeRegionHeight,
+                    max: 1,
+                    mapper: (value) =>
+                        blur.copyWith(regionHeight: value.clamp(0.08, 1)),
+                  ),
+                ],
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _openFilterSheet(TimelineClip initialClip) async {
+    var clip = initialClip;
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          void updateAdjustments(
+            ClipColorAdjustments adjustments, {
+            bool recordHistory = true,
+          }) {
+            _updateTimelineClip(
+              clip,
+              (current) => current.copyWith(colorAdjustments: adjustments),
+              recordHistory: recordHistory,
+            );
+            final latest = _clipById(clip.id, ref.read(editorProvider));
+            if (latest != null) {
+              setSheetState(() => clip = latest);
+            }
+          }
+
+          Widget adjustmentSlider({
+            required String label,
+            required double value,
+            required double min,
+            required double max,
+            required double neutral,
+            required ClipColorAdjustments Function(double value) mapper,
+          }) {
+            return Column(
+              children: [
+                _sheetSliderHeader(
+                  label,
+                  value == neutral
+                      ? '0'
+                      : (value > neutral ? '+' : '') +
+                            ((value - neutral) * 100).round().toString(),
+                ),
+                Slider(
+                  value: value.clamp(min, max),
+                  min: min,
+                  max: max,
+                  onChangeStart: (_) => ref
+                      .read(editorProvider.notifier)
+                      .beginTimelineGestureEdit(),
+                  onChanged: (next) =>
+                      updateAdjustments(mapper(next), recordHistory: false),
+                  onChangeEnd: (_) => ref
+                      .read(editorProvider.notifier)
+                      .endTimelineGestureEdit(),
+                ),
+              ],
+            );
+          }
+
+          final adjustments = clip.colorAdjustments;
+          return _buildEditorSheet(
+            title: 'Color & filters',
+            subtitle: clip.label,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _sheetSectionTitle('LOOKS'),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: ClipFilterPreset.values.map((preset) {
+                    return ActionChip(
+                      avatar: preset == ClipFilterPreset.original
+                          ? const Icon(Icons.block_rounded, size: 16)
+                          : const Icon(Icons.tonality_rounded, size: 16),
+                      label: Text(_filterPresetLabel(preset)),
+                      onPressed: () => updateAdjustments(
+                        ClipColorAdjustments.forPreset(preset),
+                      ),
+                    );
+                  }).toList(),
+                ),
+                const SizedBox(height: 20),
+                _sheetSectionTitle('FINE TUNE'),
+                const SizedBox(height: 8),
+                adjustmentSlider(
+                  label: 'Brightness',
+                  value: adjustments.brightness,
+                  min: -0.5,
+                  max: 0.5,
+                  neutral: 0,
+                  mapper: (value) => adjustments.copyWith(brightness: value),
+                ),
+                adjustmentSlider(
+                  label: 'Contrast',
+                  value: adjustments.contrast,
+                  min: 0.5,
+                  max: 1.5,
+                  neutral: 1,
+                  mapper: (value) => adjustments.copyWith(contrast: value),
+                ),
+                adjustmentSlider(
+                  label: 'Saturation',
+                  value: adjustments.saturation,
+                  min: 0,
+                  max: 2,
+                  neutral: 1,
+                  mapper: (value) => adjustments.copyWith(saturation: value),
+                ),
+                adjustmentSlider(
+                  label: 'Temperature',
+                  value: adjustments.temperature,
+                  min: -1,
+                  max: 1,
+                  neutral: 0,
+                  mapper: (value) => adjustments.copyWith(temperature: value),
+                ),
+                adjustmentSlider(
+                  label: 'Fade',
+                  value: adjustments.fade,
+                  min: 0,
+                  max: 1,
+                  neutral: 0,
+                  mapper: (value) => adjustments.copyWith(fade: value),
+                ),
+                adjustmentSlider(
+                  label: 'Vignette',
+                  value: adjustments.vignette,
+                  min: 0,
+                  max: 1,
+                  neutral: 0,
+                  mapper: (value) => adjustments.copyWith(vignette: value),
+                ),
+                adjustmentSlider(
+                  label: 'Sharpen',
+                  value: adjustments.sharpen,
+                  min: 0,
+                  max: 1,
+                  neutral: 0,
+                  mapper: (value) => adjustments.copyWith(sharpen: value),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  onPressed: () =>
+                      updateAdjustments(const ClipColorAdjustments()),
+                  icon: const Icon(Icons.restart_alt_rounded),
+                  label: const Text('Reset color'),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _openCanvasSettingsSheet() async {
+    var canvas = ref.read(editorProvider).timeline.canvasSettings;
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          void update(CanvasSettings next, {bool recordHistory = true}) {
+            setSheetState(() => canvas = next);
+            _updateCanvasSettings((_) => next, recordHistory: recordHistory);
+          }
+
+          const backgroundColors = [
+            Colors.black,
+            Color(0xFF111512),
+            Color(0xFF202420),
+            Color(0xFFF3F0E7),
+            Color(0xFF17324D),
+            Color(0xFF4A2318),
+          ];
+          return _buildEditorSheet(
+            title: 'Canvas',
+            subtitle: 'Format, background and guides',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _sheetSectionTitle('FORMAT'),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: CanvasAspectRatioPreset.values.map((preset) {
+                    final label = switch (preset) {
+                      CanvasAspectRatioPreset.original => 'Original',
+                      CanvasAspectRatioPreset.ratio16x9 => '16:9',
+                      CanvasAspectRatioPreset.ratio9x16 => '9:16',
+                      CanvasAspectRatioPreset.ratio1x1 => '1:1',
+                      CanvasAspectRatioPreset.ratio4x5 => '4:5',
+                    };
+                    return ChoiceChip(
+                      label: Text(label),
+                      selected: canvas.aspectRatioPreset == preset,
+                      onSelected: (_) {
+                        update(canvas.copyWith(aspectRatioPreset: preset));
+                        setState(() {
+                          _canvasAspectRatio = _canvasAspectRatioFromPreset(
+                            preset,
+                          );
+                        });
+                      },
+                    );
+                  }).toList(),
+                ),
+                const SizedBox(height: 20),
+                _sheetSectionTitle('BACKGROUND'),
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 12,
+                  children: backgroundColors.map((color) {
+                    final selected = canvas.backgroundColor == color;
+                    return InkWell(
+                      borderRadius: BorderRadius.circular(999),
+                      onTap: () =>
+                          update(canvas.copyWith(backgroundColor: color)),
+                      child: Container(
+                        width: 38,
+                        height: 38,
+                        decoration: BoxDecoration(
+                          color: color,
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: selected ? kAccent : kBorder,
+                            width: selected ? 3 : 1,
+                          ),
+                        ),
+                        child: selected
+                            ? Icon(
+                                Icons.check_rounded,
+                                color: color.computeLuminance() > 0.5
+                                    ? Colors.black
+                                    : Colors.white,
+                                size: 18,
+                              )
+                            : null,
+                      ),
+                    );
+                  }).toList(),
+                ),
+                const SizedBox(height: 18),
+                SwitchListTile.adaptive(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Title and action safe areas'),
+                  subtitle: const Text('Preview guides are never exported'),
+                  value: canvas.showSafeAreas,
+                  onChanged: (value) =>
+                      update(canvas.copyWith(showSafeAreas: value)),
+                ),
+                SwitchListTile.adaptive(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Composition grid'),
+                  subtitle: Text(
+                    '${canvas.gridDivisions} × ${canvas.gridDivisions}',
+                  ),
+                  value: canvas.showGrid,
+                  onChanged: (value) =>
+                      update(canvas.copyWith(showGrid: value)),
+                ),
+                if (canvas.showGrid)
+                  Slider(
+                    value: canvas.gridDivisions.toDouble(),
+                    min: 2,
+                    max: 6,
+                    divisions: 4,
+                    label: '${canvas.gridDivisions}',
+                    onChanged: (value) =>
+                        update(canvas.copyWith(gridDivisions: value.round())),
+                  ),
+                SwitchListTile.adaptive(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Snap objects to guides'),
+                  value: canvas.snapToGuides,
+                  onChanged: (value) =>
+                      update(canvas.copyWith(snapToGuides: value)),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _openCreatorLab() async {
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => CreatorLabScreen(projectName: _projectSnapshot.name),
+      ),
+    );
+  }
+
+  Future<void> _openSubtitleToolsSheet() async {
+    var report = SubtitleQualityService.analyze(
+      ref.read(subtitleProvider).entries,
+    );
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          void refreshReport() {
+            setSheetState(() {
+              report = SubtitleQualityService.analyze(
+                ref.read(subtitleProvider).entries,
+              );
+            });
+          }
+
+          return _buildEditorSheet(
+            title: 'Caption workshop',
+            subtitle:
+                '${report.cueCount} cues • '
+                '${report.averageCharactersPerSecond.toStringAsFixed(1)} avg CPS',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: report.isClean
+                        ? kSuccess.withValues(alpha: 0.08)
+                        : kWarning.withValues(alpha: 0.08),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(
+                      color: report.isClean
+                          ? kSuccess.withValues(alpha: 0.28)
+                          : kWarning.withValues(alpha: 0.28),
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        report.isClean
+                            ? Icons.verified_rounded
+                            : Icons.rule_rounded,
+                        color: report.isClean ? kSuccess : kWarning,
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          report.isClean
+                              ? 'Captions pass readability checks'
+                              : '${report.issues.length} readability issues found',
+                          style: TextStyle(
+                            color: kTextPrimary,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                if (!report.isClean) ...[
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: SubtitleIssueType.values
+                        .where((type) => report.countFor(type) > 0)
+                        .map(
+                          (type) => Chip(
+                            label: Text(
+                              '${_subtitleIssueLabel(type)} '
+                              '${report.countFor(type)}',
+                            ),
+                          ),
+                        )
+                        .toList(),
+                  ),
+                ],
+                const SizedBox(height: 18),
+                _sheetSectionTitle('CREATOR LAB'),
+                const SizedBox(height: 8),
+                _sheetListAction(
+                  icon: Icons.auto_awesome_rounded,
+                  title: 'Open Creator Lab',
+                  subtitle:
+                      '23 precision and wow tools for captions, moments, '
+                      'chapters, B-roll, launch copy, and rehearsal',
+                  onTap: () async {
+                    await _openCreatorLab();
+                    refreshReport();
+                  },
+                ),
+                const SizedBox(height: 14),
+                _sheetSectionTitle('EDIT'),
+                const SizedBox(height: 8),
+                _sheetListAction(
+                  icon: Icons.search_rounded,
+                  title: 'Find and replace',
+                  subtitle: 'Change repeated words across every cue',
+                  onTap: () async {
+                    await _showSubtitleFindReplaceDialog();
+                    refreshReport();
+                  },
+                ),
+                _sheetListAction(
+                  icon: Icons.more_time_rounded,
+                  title: 'Shift all timings',
+                  subtitle: 'Move the complete subtitle track earlier or later',
+                  onTap: () async {
+                    await _showSubtitleShiftDialog();
+                    refreshReport();
+                  },
+                ),
+                _sheetListAction(
+                  icon: Icons.auto_fix_high_rounded,
+                  title: 'Normalize spacing',
+                  subtitle: 'Clean repeated spaces and ragged line breaks',
+                  onTap: () {
+                    ref.read(subtitleProvider.notifier).normalizeText();
+                    refreshReport();
+                  },
+                ),
+                _sheetListAction(
+                  icon: Icons.format_line_spacing_rounded,
+                  title: 'Resolve overlaps',
+                  subtitle: 'Insert an 80ms gap where cues collide',
+                  onTap: () {
+                    ref.read(subtitleProvider.notifier).fixOverlaps();
+                    refreshReport();
+                  },
+                ),
+                const SizedBox(height: 14),
+                _sheetSectionTitle('CASE'),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: SubtitleTextCase.values.map((textCase) {
+                    return ActionChip(
+                      label: Text(switch (textCase) {
+                        SubtitleTextCase.sentence => 'Sentence',
+                        SubtitleTextCase.upper => 'UPPER',
+                        SubtitleTextCase.lower => 'lower',
+                        SubtitleTextCase.title => 'Title Case',
+                      }),
+                      onPressed: () {
+                        ref
+                            .read(subtitleProvider.notifier)
+                            .convertCase(textCase);
+                        refreshReport();
+                      },
+                    );
+                  }).toList(),
+                ),
+                const SizedBox(height: 16),
+                FilledButton.icon(
+                  onPressed: () {
+                    final playhead = ref.read(playbackProvider).position;
+                    final duration = ref.read(editorProvider).timeline.duration;
+                    final end = playhead + const Duration(seconds: 2);
+                    ref
+                        .read(subtitleProvider.notifier)
+                        .addEntry(playhead, end > duration ? duration : end);
+                    refreshReport();
+                  },
+                  icon: const Icon(Icons.add_comment_rounded),
+                  label: const Text('Add cue at playhead'),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _showSubtitleFindReplaceDialog() async {
+    final findController = TextEditingController();
+    final replaceController = TextEditingController();
+    var matchCase = false;
+    final shouldReplace = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('Find and replace'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: findController,
+                autofocus: true,
+                decoration: const InputDecoration(labelText: 'Find'),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: replaceController,
+                decoration: const InputDecoration(labelText: 'Replace with'),
+              ),
+              CheckboxListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Match case'),
+                value: matchCase,
+                onChanged: (value) =>
+                    setDialogState(() => matchCase = value ?? false),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Replace all'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (shouldReplace == true) {
+      final count = ref
+          .read(subtitleProvider.notifier)
+          .replaceText(
+            query: findController.text,
+            replacement: replaceController.text,
+            matchCase: matchCase,
+          );
+      if (mounted) {
+        SnackBarHelper.showInfo(context, '$count replacements made');
+      }
+    }
+    findController.dispose();
+    replaceController.dispose();
+  }
+
+  Future<void> _showSubtitleShiftDialog() async {
+    final controller = TextEditingController(text: '0');
+    final result = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Shift subtitle timings'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          keyboardType: const TextInputType.numberWithOptions(signed: true),
+          decoration: const InputDecoration(
+            labelText: 'Milliseconds',
+            helperText: 'Negative moves cues earlier',
+            prefixText: '± ',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, controller.text),
+            child: const Text('Apply'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    final milliseconds = int.tryParse(result?.trim() ?? '');
+    if (milliseconds == null || milliseconds == 0) return;
+    ref
+        .read(subtitleProvider.notifier)
+        .shiftAll(
+          Duration(milliseconds: milliseconds),
+          projectDuration: ref.read(editorProvider).timeline.duration,
+        );
+  }
+
+  Future<void> _relinkClipMedia(TimelineClip clip) async {
+    final fileType = switch (clip.type) {
+      TimelineTrackType.audio => FileType.audio,
+      TimelineTrackType.video => FileType.video,
+      _ => FileType.image,
+    };
+    final result = await FilePicker.platform.pickFiles(
+      type: fileType,
+      allowMultiple: false,
+    );
+    final sourcePath = result?.files.firstOrNull?.path;
+    if (sourcePath == null) return;
+    final editorState = ref.read(editorProvider);
+    final timeline = editorState.timeline;
+    final mediaInfo =
+        clip.type == TimelineTrackType.image ||
+            clip.type == TimelineTrackType.gif ||
+            clip.type == TimelineTrackType.sticker
+        ? <String, dynamic>{}
+        : await FFmpegService.getMediaInfo(sourcePath);
+    final assets = timeline.assets.map((asset) {
+      if (asset.id != clip.assetId) return asset;
+      return asset.copyWith(
+        label: path.basename(sourcePath),
+        sourcePath: sourcePath,
+        clearRemoteUrl: true,
+        isNetworkBacked: false,
+        metadata: {...asset.metadata, ...mediaInfo},
+      );
+    }).toList();
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(timeline.copyWith(assets: assets));
+    if (mounted) {
+      SnackBarHelper.showSuccess(context, 'Media relinked');
+    }
+  }
+
+  Widget _buildEditorSheet({
+    required String title,
+    required String subtitle,
+    required Widget child,
+  }) {
+    return SafeArea(
+      top: false,
+      child: Container(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.of(context).size.height * 0.86,
+        ),
+        decoration: const BoxDecoration(
+          color: kSurface,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        child: Column(
+          children: [
+            const SizedBox(height: 10),
+            Container(
+              width: 42,
+              height: 4,
+              decoration: BoxDecoration(
+                color: kBorder,
+                borderRadius: BorderRadius.circular(999),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 14, 18, 12),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          title,
+                          style: TextStyle(
+                            color: kTextPrimary,
+                            fontSize: 18,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          subtitle,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(color: kTextSecondary, fontSize: 12),
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () => Navigator.pop(context),
+                    icon: const Icon(Icons.close_rounded),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            Expanded(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(18, 18, 18, 28),
+                child: child,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _sheetSectionTitle(String label) {
+    return Text(
+      label,
+      style: TextStyle(
+        color: kTextSecondary,
+        fontSize: 10,
+        fontWeight: FontWeight.w800,
+        letterSpacing: 1.1,
+      ),
+    );
+  }
+
+  Widget _sheetSliderHeader(String label, String value) {
+    return Row(
+      children: [
+        Text(label, style: TextStyle(color: kTextPrimary, fontSize: 13)),
+        const Spacer(),
+        Text(
+          value,
+          style: TextStyle(
+            fontFamily: 'monospace',
+            color: kTextSecondary,
+            fontSize: 11,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _sheetActionTile({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+    bool active = false,
+  }) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
+        decoration: BoxDecoration(
+          color: active ? kAccent.withValues(alpha: 0.12) : kSurfaceElevated,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: active ? kAccent : kBorder),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, color: active ? kAccent : kTextSecondary, size: 17),
+            const SizedBox(width: 7),
+            Flexible(
+              child: Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: active ? kAccent : kTextPrimary,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _sheetListAction({
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required VoidCallback onTap,
+  }) {
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: Container(
+        width: 38,
+        height: 38,
+        decoration: BoxDecoration(
+          color: kSurfaceElevated,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: kBorder),
+        ),
+        child: Icon(icon, color: kTextSecondary, size: 19),
+      ),
+      title: Text(title),
+      subtitle: Text(subtitle),
+      trailing: const Icon(Icons.chevron_right_rounded),
+      onTap: onTap,
+    );
+  }
+
+  String _filterPresetLabel(ClipFilterPreset preset) {
+    return switch (preset) {
+      ClipFilterPreset.original => 'Original',
+      ClipFilterPreset.cinematic => 'Cinema',
+      ClipFilterPreset.warm => 'Warm',
+      ClipFilterPreset.cool => 'Cool',
+      ClipFilterPreset.vivid => 'Vivid',
+      ClipFilterPreset.muted => 'Muted',
+      ClipFilterPreset.monochrome => 'Mono',
+      ClipFilterPreset.vintage => 'Vintage',
+    };
+  }
+
+  String _subtitleIssueLabel(SubtitleIssueType type) {
+    return switch (type) {
+      SubtitleIssueType.overlap => 'Overlap',
+      SubtitleIssueType.tooFast => 'Too fast',
+      SubtitleIssueType.tooLong => 'Too long',
+      SubtitleIssueType.tooShort => 'Too short',
+      SubtitleIssueType.tooManyLines => 'Too many lines',
+      SubtitleIssueType.longLine => 'Long line',
+      SubtitleIssueType.lowConfidence => 'Review',
+      SubtitleIssueType.empty => 'Empty',
+    };
   }
 
   Widget _buildPortrait(BuildContext context, TimelineClip? selectedClip) {
@@ -866,6 +3476,16 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       color: kSurface,
       onSelected: (value) {
         setState(() => _canvasAspectRatio = value);
+        final editorState = ref.read(editorProvider);
+        ref
+            .read(editorProvider.notifier)
+            .setTimeline(
+              editorState.timeline.copyWith(
+                canvasSettings: editorState.timeline.canvasSettings.copyWith(
+                  aspectRatioPreset: _canvasPresetFromRatio(value),
+                ),
+              ),
+            );
       },
       itemBuilder: (_) => [
         _aspectMenuItem(_CanvasAspectRatio.original, 'Original'),
@@ -889,7 +3509,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             const SizedBox(width: 6),
             Text(
               _aspectRatioLabel(_canvasAspectRatio),
-              style: GoogleFonts.inter(
+              style: TextStyle(
                 color: kTextSecondary,
                 fontSize: 12,
                 fontWeight: FontWeight.w500,
@@ -913,7 +3533,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             const Icon(Icons.check_rounded, size: 16, color: kAccent),
             const SizedBox(width: 8),
           ],
-          Text(label, style: GoogleFonts.inter(color: kTextPrimary)),
+          Text(label, style: TextStyle(color: kTextPrimary)),
         ],
       ),
     );
@@ -932,6 +3552,28 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       case _CanvasAspectRatio.ratio4x5:
         return '4:5';
     }
+  }
+
+  _CanvasAspectRatio _canvasAspectRatioFromPreset(
+    CanvasAspectRatioPreset preset,
+  ) {
+    return switch (preset) {
+      CanvasAspectRatioPreset.original => _CanvasAspectRatio.original,
+      CanvasAspectRatioPreset.ratio16x9 => _CanvasAspectRatio.ratio16x9,
+      CanvasAspectRatioPreset.ratio9x16 => _CanvasAspectRatio.ratio9x16,
+      CanvasAspectRatioPreset.ratio1x1 => _CanvasAspectRatio.ratio1x1,
+      CanvasAspectRatioPreset.ratio4x5 => _CanvasAspectRatio.ratio4x5,
+    };
+  }
+
+  CanvasAspectRatioPreset _canvasPresetFromRatio(_CanvasAspectRatio ratio) {
+    return switch (ratio) {
+      _CanvasAspectRatio.original => CanvasAspectRatioPreset.original,
+      _CanvasAspectRatio.ratio16x9 => CanvasAspectRatioPreset.ratio16x9,
+      _CanvasAspectRatio.ratio9x16 => CanvasAspectRatioPreset.ratio9x16,
+      _CanvasAspectRatio.ratio1x1 => CanvasAspectRatioPreset.ratio1x1,
+      _CanvasAspectRatio.ratio4x5 => CanvasAspectRatioPreset.ratio4x5,
+    };
   }
 
   double? get _selectedAspectRatioValue {
@@ -1000,6 +3642,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         'durationMs': mediaInfo['durationMs'],
         'width': mediaInfo['width'],
         'height': mediaInfo['height'],
+        'hasAudio': mediaInfo['hasAudio'],
+        'frameRate': mediaInfo['frameRate'],
       };
     }
 
@@ -1042,7 +3686,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       sourcePath: filePath,
       label: file.name,
       sourceDuration: duration,
-      metadata: {'durationMs': mediaInfo['durationMs']},
+      metadata: {
+        'durationMs': mediaInfo['durationMs'],
+        'hasAudio': mediaInfo['hasAudio'],
+      },
     );
   }
 
@@ -1285,7 +3932,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 const SizedBox(height: 14),
                 Text(
                   initialValue.isEmpty ? 'Add Text Clip' : 'Edit Text Clip',
-                  style: GoogleFonts.inter(
+                  style: TextStyle(
                     color: kTextPrimary,
                     fontSize: 18,
                     fontWeight: FontWeight.w600,
@@ -1298,10 +3945,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   autofocus: true,
                   maxLines: 5,
                   minLines: 3,
-                  style: GoogleFonts.inter(color: kTextPrimary),
+                  style: TextStyle(color: kTextPrimary),
                   decoration: InputDecoration(
                     hintText: 'Type your text',
-                    hintStyle: GoogleFonts.inter(color: kTextSecondary),
+                    hintStyle: TextStyle(color: kTextSecondary),
                     filled: true,
                     fillColor: kSurfaceElevated,
                     border: OutlineInputBorder(
@@ -1400,6 +4047,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     double? volume,
     int? fadeInMs,
     int? fadeOutMs,
+    double? pan,
+    bool? normalize,
   }) {
     final editorState = ref.read(editorProvider);
     final nextTracks = editorState.timeline.tracks.map((track) {
@@ -1412,6 +4061,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                       volume: volume ?? candidate.audioMix.volume,
                       fadeInMs: fadeInMs ?? candidate.audioMix.fadeInMs,
                       fadeOutMs: fadeOutMs ?? candidate.audioMix.fadeOutMs,
+                      pan: pan ?? candidate.audioMix.pan,
+                      normalize: normalize ?? candidate.audioMix.normalize,
                     ),
                   )
                 : candidate,
@@ -1514,8 +4165,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         },
         child: _activeBottomCategory == null
             ? _buildCategoryRow()
+            : _activeBottomSubgroup == null
+            ? _buildSubgroupRow(_activeBottomCategory!)
             : _buildToolRow(
-                category: _activeBottomCategory!,
+                subgroup: _activeBottomSubgroup!,
                 selectedClip: selectedClip,
                 canAdjustAudio: canAdjustAudio,
                 canAnimateClip: canAnimateClip,
@@ -1528,34 +4181,49 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   Widget _buildCategoryRow() {
     final categories = [
       _ActionSpec(
-        label: 'Overlay',
-        tooltip: 'Overlay tools',
-        icon: Icons.layers_rounded,
-        onTap: () => setState(
-          () => _activeBottomCategory = _BottomActionCategory.overlay,
-        ),
+        label: 'Add',
+        tooltip: 'Add media, text and tracks',
+        icon: Icons.add_circle_outline_rounded,
+        onTap: () => setState(() {
+          _activeBottomCategory = _BottomActionCategory.add;
+          _activeBottomSubgroup = null;
+        }),
       ),
       _ActionSpec(
-        label: 'Text',
-        tooltip: 'Text tools',
-        icon: Icons.title_rounded,
-        onTap: () =>
-            setState(() => _activeBottomCategory = _BottomActionCategory.text),
+        label: 'Edit',
+        tooltip: 'Timing, transform and arrange',
+        icon: Icons.content_cut_rounded,
+        onTap: () => setState(() {
+          _activeBottomCategory = _BottomActionCategory.edit;
+          _activeBottomSubgroup = null;
+        }),
+      ),
+      _ActionSpec(
+        label: 'Effects',
+        tooltip: 'Looks, blur and motion',
+        icon: Icons.auto_fix_high_rounded,
+        onTap: () => setState(() {
+          _activeBottomCategory = _BottomActionCategory.effects;
+          _activeBottomSubgroup = null;
+        }),
       ),
       _ActionSpec(
         label: 'Audio',
-        tooltip: 'Audio tools',
+        tooltip: 'Mix, fades and enhancement',
         icon: Icons.graphic_eq_rounded,
-        onTap: () =>
-            setState(() => _activeBottomCategory = _BottomActionCategory.audio),
+        onTap: () => setState(() {
+          _activeBottomCategory = _BottomActionCategory.audio;
+          _activeBottomSubgroup = null;
+        }),
       ),
       _ActionSpec(
-        label: 'Motion',
-        tooltip: 'Motion tools',
-        icon: Icons.auto_awesome_motion_rounded,
-        onTap: () => setState(
-          () => _activeBottomCategory = _BottomActionCategory.motion,
-        ),
+        label: 'Canvas',
+        tooltip: 'Format, guides and studio tools',
+        icon: Icons.aspect_ratio_rounded,
+        onTap: () => setState(() {
+          _activeBottomCategory = _BottomActionCategory.canvas;
+          _activeBottomSubgroup = null;
+        }),
       ),
     ];
     return _buildActionScroller(
@@ -1565,17 +4233,146 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     );
   }
 
+  Widget _buildSubgroupRow(_BottomActionCategory category) {
+    final subgroups = switch (category) {
+      _BottomActionCategory.add => [
+        (
+          _BottomActionSubgroup.addMedia,
+          'Media',
+          'Add visual and audio media',
+          Icons.perm_media_rounded,
+        ),
+        (
+          _BottomActionSubgroup.addText,
+          'Text',
+          'Text and captions',
+          Icons.title_rounded,
+        ),
+        (
+          _BottomActionSubgroup.addTracks,
+          'Tracks',
+          'Add timeline lanes',
+          Icons.view_timeline_outlined,
+        ),
+      ],
+      _BottomActionCategory.edit => [
+        (
+          _BottomActionSubgroup.editTiming,
+          'Timing',
+          'Trim, speed, split and reverse',
+          Icons.av_timer_rounded,
+        ),
+        (
+          _BottomActionSubgroup.editTransform,
+          'Transform',
+          'Crop, fit, rotate and flip',
+          Icons.crop_rotate_rounded,
+        ),
+        (
+          _BottomActionSubgroup.editArrange,
+          'Arrange',
+          'Layer, duplicate and visibility',
+          Icons.layers_rounded,
+        ),
+      ],
+      _BottomActionCategory.effects => [
+        (
+          _BottomActionSubgroup.effectsLooks,
+          'Looks',
+          'Filters and color correction',
+          Icons.tonality_rounded,
+        ),
+        (
+          _BottomActionSubgroup.effectsBlur,
+          'Blur',
+          'Whole and privacy-region blur',
+          Icons.blur_on_rounded,
+        ),
+        (
+          _BottomActionSubgroup.effectsMotion,
+          'Motion',
+          'Animations and transitions',
+          Icons.auto_awesome_motion_rounded,
+        ),
+      ],
+      _BottomActionCategory.audio => [
+        (
+          _BottomActionSubgroup.audioMix,
+          'Mix',
+          'Volume, mute and pan',
+          Icons.tune_rounded,
+        ),
+        (
+          _BottomActionSubgroup.audioFades,
+          'Fades',
+          'Audio fade controls',
+          Icons.multiline_chart_rounded,
+        ),
+        (
+          _BottomActionSubgroup.audioEnhance,
+          'Enhance',
+          'Normalize and reset',
+          Icons.hearing_rounded,
+        ),
+      ],
+      _BottomActionCategory.canvas => [
+        (
+          _BottomActionSubgroup.canvasFormat,
+          'Format',
+          'Aspect and background',
+          Icons.aspect_ratio_rounded,
+        ),
+        (
+          _BottomActionSubgroup.canvasGuides,
+          'Guides',
+          'Grid, safe areas and snapping',
+          Icons.grid_4x4_rounded,
+        ),
+        (
+          _BottomActionSubgroup.canvasStudio,
+          'Studio',
+          'Captions and creator tools',
+          Icons.auto_awesome_rounded,
+        ),
+      ],
+    };
+
+    return _buildActionScroller(
+      key: ValueKey('subgroups_${category.name}'),
+      spread: true,
+      actions: [
+        for (final subgroup in subgroups)
+          _ActionSpec(
+            label: subgroup.$2,
+            tooltip: subgroup.$3,
+            icon: subgroup.$4,
+            onTap: () => setState(() => _activeBottomSubgroup = subgroup.$1),
+          ),
+        _ActionSpec(
+          label: 'Back',
+          tooltip: 'Back to editor groups',
+          icon: Icons.arrow_back_rounded,
+          onTap: () => setState(() {
+            _activeBottomCategory = null;
+            _activeBottomSubgroup = null;
+          }),
+        ),
+      ],
+    );
+  }
+
   Widget _buildToolRow({
-    required _BottomActionCategory category,
+    required _BottomActionSubgroup subgroup,
     required TimelineClip? selectedClip,
     required bool canAdjustAudio,
     required bool canAnimateClip,
     required bool canTransition,
   }) {
-    final actions = switch (category) {
-      _BottomActionCategory.overlay => [
+    final isVisual = _isVisualClip(selectedClip);
+    final actions = switch (subgroup) {
+      _BottomActionSubgroup.addMedia => [
         _ActionSpec(
-          label: 'Media',
+          label: 'Overlay',
           tooltip: 'Add image or video overlay',
           icon: Icons.perm_media_rounded,
           onTap: _pickOverlayMedia,
@@ -1587,15 +4384,15 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           onTap: _openGiphyPickerSheet,
         ),
         _ActionSpec(
-          label: 'Lane',
-          tooltip: 'Add overlay lane',
-          icon: Icons.playlist_add_rounded,
-          onTap: () => _addTimelineTrack(TimelineTrackSection.overlay),
+          label: 'Audio',
+          tooltip: 'Add music or voice audio',
+          icon: Icons.music_note_rounded,
+          onTap: _pickAudioMedia,
         ),
       ],
-      _BottomActionCategory.text => [
+      _BottomActionSubgroup.addText => [
         _ActionSpec(
-          label: 'Add',
+          label: 'Text',
           tooltip: 'Add text',
           icon: Icons.title_rounded,
           onTap: _addTextClipAtPlayhead,
@@ -1614,35 +4411,227 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               : null,
         ),
         _ActionSpec(
-          label: 'Style',
-          tooltip: 'Subtitle style',
-          icon: Icons.palette_outlined,
-          onTap: () => _openStylePanelSheet(context),
-        ),
-        _ActionSpec(
           label: 'Captions',
           tooltip: 'Generate captions',
           icon: Icons.closed_caption_rounded,
           onTap: _handleGenerateSubtitles,
         ),
       ],
-      _BottomActionCategory.audio => [
+      _BottomActionSubgroup.addTracks => [
         _ActionSpec(
-          label: 'Add',
-          tooltip: 'Add audio',
-          icon: Icons.music_note_rounded,
-          onTap: _pickAudioMedia,
+          label: 'Overlay',
+          tooltip: 'Add overlay lane',
+          icon: Icons.layers_rounded,
+          onTap: () => _addTimelineTrack(TimelineTrackSection.overlay),
         ),
         _ActionSpec(
-          label: 'Mix',
-          tooltip: 'Volume and fades',
+          label: 'Text',
+          tooltip: 'Add text lane',
+          icon: Icons.title_rounded,
+          onTap: () => _addTimelineTrack(TimelineTrackSection.textSubtitle),
+        ),
+        _ActionSpec(
+          label: 'Audio',
+          tooltip: 'Add audio lane',
+          icon: Icons.graphic_eq_rounded,
+          onTap: () => _addTimelineTrack(TimelineTrackSection.audio),
+        ),
+      ],
+      _BottomActionSubgroup.editTiming => [
+        _ActionSpec(
+          label: 'Trim/Speed',
+          tooltip: 'Trim source, change speed and reverse',
+          icon: Icons.av_timer_rounded,
+          onTap:
+              selectedClip != null &&
+                  (selectedClip.type == TimelineTrackType.video ||
+                      selectedClip.type == TimelineTrackType.audio ||
+                      selectedClip.type == TimelineTrackType.gif)
+              ? () => _openTimingSheet(selectedClip)
+              : null,
+        ),
+        _ActionSpec(
+          label: 'Split',
+          tooltip: 'Split selected clip at playhead',
+          icon: Icons.content_cut_rounded,
+          onTap: selectedClip == null
+              ? null
+              : () => _splitClipAtPlayhead(selectedClip),
+        ),
+      ],
+      _BottomActionSubgroup.editTransform => [
+        _ActionSpec(
+          label: 'Crop',
+          tooltip: 'Crop with presets or free insets',
+          icon: Icons.crop_rounded,
+          onTap: isVisual ? () => _openCropSheet(selectedClip!) : null,
+        ),
+        _ActionSpec(
+          label: 'Fill',
+          tooltip: 'Fill the frame',
+          icon: Icons.fullscreen_rounded,
+          onTap: isVisual
+              ? () => _setClipFit(selectedClip!, ClipFitMode.cover)
+              : null,
+        ),
+        _ActionSpec(
+          label: 'Fit',
+          tooltip: 'Fit inside the frame',
+          icon: Icons.fit_screen_rounded,
+          onTap: isVisual
+              ? () => _setClipFit(selectedClip!, ClipFitMode.contain)
+              : null,
+        ),
+        _ActionSpec(
+          label: 'Stretch',
+          tooltip: 'Stretch to the frame',
+          icon: Icons.open_in_full_rounded,
+          onTap: isVisual
+              ? () => _setClipFit(selectedClip!, ClipFitMode.stretch)
+              : null,
+        ),
+        _ActionSpec(
+          label: 'Rotate L',
+          tooltip: 'Rotate left 90 degrees',
+          icon: Icons.rotate_left_rounded,
+          onTap: isVisual
+              ? () => _rotateClip(selectedClip!, -math.pi / 2)
+              : null,
+        ),
+        _ActionSpec(
+          label: 'Rotate R',
+          tooltip: 'Rotate right 90 degrees',
+          icon: Icons.rotate_right_rounded,
+          onTap: isVisual
+              ? () => _rotateClip(selectedClip!, math.pi / 2)
+              : null,
+        ),
+        _ActionSpec(
+          label: 'Mirror',
+          tooltip: 'Mirror horizontally',
+          icon: Icons.flip_rounded,
+          onTap: isVisual
+              ? () => _toggleClipFlip(selectedClip!, horizontal: true)
+              : null,
+        ),
+        _ActionSpec(
+          label: 'Flip V',
+          tooltip: 'Flip vertically',
+          icon: Icons.flip_camera_android_rounded,
+          onTap: isVisual
+              ? () => _toggleClipFlip(selectedClip!, horizontal: false)
+              : null,
+        ),
+        _ActionSpec(
+          label: 'Reset',
+          tooltip: 'Reset transform and crop',
+          icon: Icons.restart_alt_rounded,
+          onTap: isVisual ? () => _resetClipTransform(selectedClip!) : null,
+        ),
+      ],
+      _BottomActionSubgroup.editArrange => [
+        _ActionSpec(
+          label: 'Inspector',
+          tooltip: 'Opacity, layer and transform controls',
           icon: Icons.tune_rounded,
-          onTap: canAdjustAudio
-              ? () => _openAudioControlsSheet(selectedClip!)
+          onTap: selectedClip == null
+              ? null
+              : () => _openClipInspectorSheet(selectedClip),
+        ),
+        _ActionSpec(
+          label: 'Forward',
+          tooltip: 'Bring clip forward one layer',
+          icon: Icons.move_up_rounded,
+          onTap: selectedClip == null
+              ? null
+              : () => _changeClipLayer(selectedClip, 1),
+        ),
+        _ActionSpec(
+          label: 'Backward',
+          tooltip: 'Send clip backward one layer',
+          icon: Icons.move_down_rounded,
+          onTap: selectedClip == null
+              ? null
+              : () => _changeClipLayer(selectedClip, -1),
+        ),
+        _ActionSpec(
+          label: 'Duplicate',
+          tooltip: 'Duplicate selected clip',
+          icon: Icons.content_copy_rounded,
+          onTap: selectedClip == null
+              ? null
+              : () => _duplicateClip(selectedClip),
+        ),
+        _ActionSpec(
+          label: selectedClip?.enabled == false ? 'Enable' : 'Disable',
+          tooltip: 'Toggle clip visibility in preview and export',
+          icon: selectedClip?.enabled == false
+              ? Icons.visibility_rounded
+              : Icons.visibility_off_rounded,
+          onTap: selectedClip == null
+              ? null
+              : () => _toggleClipEnabled(selectedClip),
+        ),
+        _ActionSpec(
+          label: 'Delete',
+          tooltip: 'Delete selected clip',
+          icon: Icons.delete_outline_rounded,
+          onTap: selectedClip == null ? null : () => _deleteClip(selectedClip),
+        ),
+      ],
+      _BottomActionSubgroup.effectsLooks => [
+        _ActionSpec(
+          label: 'Filters',
+          tooltip: 'Looks and fine color correction',
+          icon: Icons.tonality_rounded,
+          onTap: isVisual ? () => _openFilterSheet(selectedClip!) : null,
+        ),
+        _ActionSpec(
+          label: 'Enhance',
+          tooltip: 'Apply balanced automatic enhancement',
+          icon: Icons.auto_fix_high_rounded,
+          onTap: isVisual ? () => _autoEnhanceClip(selectedClip!) : null,
+        ),
+        _ActionSpec(
+          label: 'Reset',
+          tooltip: 'Reset color adjustments',
+          icon: Icons.restart_alt_rounded,
+          onTap: isVisual ? () => _resetClipColor(selectedClip!) : null,
+        ),
+      ],
+      _BottomActionSubgroup.effectsBlur => [
+        _ActionSpec(
+          label: 'Controls',
+          tooltip: 'Configure whole or privacy-region blur',
+          icon: Icons.blur_on_rounded,
+          onTap: isVisual ? () => _openBlurSheet(selectedClip!) : null,
+        ),
+        _ActionSpec(
+          label: 'Whole',
+          tooltip: 'Blur the whole selected visual',
+          icon: Icons.blur_circular_rounded,
+          onTap: isVisual
+              ? () => _setClipBlurMode(selectedClip!, ClipBlurMode.full)
+              : null,
+        ),
+        _ActionSpec(
+          label: 'Region',
+          tooltip: 'Blur a movable privacy region',
+          icon: Icons.center_focus_strong_rounded,
+          onTap: isVisual
+              ? () => _setClipBlurMode(selectedClip!, ClipBlurMode.region)
+              : null,
+        ),
+        _ActionSpec(
+          label: 'Clear',
+          tooltip: 'Remove blur',
+          icon: Icons.blur_off_rounded,
+          onTap: isVisual
+              ? () => _setClipBlurMode(selectedClip!, ClipBlurMode.none)
               : null,
         ),
       ],
-      _BottomActionCategory.motion => [
+      _BottomActionSubgroup.effectsMotion => [
         _ActionSpec(
           label: 'Animate',
           tooltip: 'Clip animation',
@@ -1660,17 +4649,212 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               : null,
         ),
       ],
+      _BottomActionSubgroup.audioMix => [
+        _ActionSpec(
+          label: 'Mixer',
+          tooltip: 'Volume, pan, fades and normalize',
+          icon: Icons.tune_rounded,
+          onTap: canAdjustAudio
+              ? () => _openAudioControlsSheet(selectedClip!)
+              : null,
+        ),
+        _ActionSpec(
+          label: selectedClip?.audioMix.muted == true ? 'Unmute' : 'Mute',
+          tooltip: 'Toggle selected clip audio',
+          icon: selectedClip?.audioMix.muted == true
+              ? Icons.volume_up_rounded
+              : Icons.volume_off_rounded,
+          onTap: canAdjustAudio ? () => _toggleClipMute(selectedClip!) : null,
+        ),
+      ],
+      _BottomActionSubgroup.audioFades => [
+        _ActionSpec(
+          label: 'Fade In',
+          tooltip: 'Toggle a 500ms audio fade in',
+          icon: Icons.trending_up_rounded,
+          onTap: canAdjustAudio
+              ? () => _toggleQuickFade(selectedClip!, fadeIn: true)
+              : null,
+        ),
+        _ActionSpec(
+          label: 'Fade Out',
+          tooltip: 'Toggle a 500ms audio fade out',
+          icon: Icons.trending_down_rounded,
+          onTap: canAdjustAudio
+              ? () => _toggleQuickFade(selectedClip!, fadeIn: false)
+              : null,
+        ),
+        _ActionSpec(
+          label: 'Clear',
+          tooltip: 'Clear both audio fades',
+          icon: Icons.restart_alt_rounded,
+          onTap: canAdjustAudio
+              ? () => _updateTimelineClip(
+                  selectedClip!,
+                  (current) => current.copyWith(
+                    audioMix: current.audioMix.copyWith(
+                      fadeInMs: 0,
+                      fadeOutMs: 0,
+                    ),
+                  ),
+                )
+              : null,
+        ),
+      ],
+      _BottomActionSubgroup.audioEnhance => [
+        _ActionSpec(
+          label: selectedClip?.audioMix.normalize == true
+              ? 'Raw level'
+              : 'Normalize',
+          tooltip: 'Toggle loudness normalization',
+          icon: Icons.hearing_rounded,
+          onTap: canAdjustAudio
+              ? () => _toggleClipNormalize(selectedClip!)
+              : null,
+        ),
+        _ActionSpec(
+          label: 'Center Pan',
+          tooltip: 'Center the stereo pan',
+          icon: Icons.swap_horiz_rounded,
+          onTap: canAdjustAudio
+              ? () => _updateTimelineClip(
+                  selectedClip!,
+                  (current) => current.copyWith(
+                    audioMix: current.audioMix.copyWith(pan: 0),
+                  ),
+                )
+              : null,
+        ),
+        _ActionSpec(
+          label: 'Reset Mix',
+          tooltip: 'Reset volume, pan, fades and normalize',
+          icon: Icons.restart_alt_rounded,
+          onTap: canAdjustAudio
+              ? () => _updateTimelineClip(
+                  selectedClip!,
+                  (current) =>
+                      current.copyWith(audioMix: const AudioMixSettings()),
+                )
+              : null,
+        ),
+      ],
+      _BottomActionSubgroup.canvasFormat => [
+        _ActionSpec(
+          label: 'Canvas',
+          tooltip: 'Format and background settings',
+          icon: Icons.aspect_ratio_rounded,
+          onTap: _openCanvasSettingsSheet,
+        ),
+        _ActionSpec(
+          label: '16:9',
+          tooltip: 'Set landscape canvas',
+          icon: Icons.crop_16_9_rounded,
+          onTap: () {
+            _updateCanvasSettings(
+              (canvas) => canvas.copyWith(
+                aspectRatioPreset: CanvasAspectRatioPreset.ratio16x9,
+              ),
+            );
+            setState(() => _canvasAspectRatio = _CanvasAspectRatio.ratio16x9);
+          },
+        ),
+        _ActionSpec(
+          label: '9:16',
+          tooltip: 'Set portrait canvas',
+          icon: Icons.stay_current_portrait_rounded,
+          onTap: () {
+            _updateCanvasSettings(
+              (canvas) => canvas.copyWith(
+                aspectRatioPreset: CanvasAspectRatioPreset.ratio9x16,
+              ),
+            );
+            setState(() => _canvasAspectRatio = _CanvasAspectRatio.ratio9x16);
+          },
+        ),
+        _ActionSpec(
+          label: '1:1',
+          tooltip: 'Set square canvas',
+          icon: Icons.crop_square_rounded,
+          onTap: () {
+            _updateCanvasSettings(
+              (canvas) => canvas.copyWith(
+                aspectRatioPreset: CanvasAspectRatioPreset.ratio1x1,
+              ),
+            );
+            setState(() => _canvasAspectRatio = _CanvasAspectRatio.ratio1x1);
+          },
+        ),
+      ],
+      _BottomActionSubgroup.canvasGuides => [
+        _ActionSpec(
+          label: 'Grid',
+          tooltip: 'Toggle composition grid',
+          icon: Icons.grid_4x4_rounded,
+          onTap: () => _updateCanvasSettings(
+            (canvas) => canvas.copyWith(showGrid: !canvas.showGrid),
+          ),
+        ),
+        _ActionSpec(
+          label: 'Safe Area',
+          tooltip: 'Toggle title and action safe areas',
+          icon: Icons.border_style_rounded,
+          onTap: () => _updateCanvasSettings(
+            (canvas) => canvas.copyWith(showSafeAreas: !canvas.showSafeAreas),
+          ),
+        ),
+        _ActionSpec(
+          label: 'Snap',
+          tooltip: 'Toggle snapping to guides',
+          icon: Icons.grid_goldenratio_rounded,
+          onTap: () => _updateCanvasSettings(
+            (canvas) => canvas.copyWith(snapToGuides: !canvas.snapToGuides),
+          ),
+        ),
+        _ActionSpec(
+          label: 'Grid Size',
+          tooltip: 'Cycle composition grid divisions',
+          icon: Icons.grid_on_rounded,
+          onTap: () => _updateCanvasSettings(
+            (canvas) => canvas.copyWith(
+              showGrid: true,
+              gridDivisions: canvas.gridDivisions >= 6
+                  ? 2
+                  : canvas.gridDivisions + 1,
+            ),
+          ),
+        ),
+      ],
+      _BottomActionSubgroup.canvasStudio => [
+        _ActionSpec(
+          label: 'Style',
+          tooltip: 'Subtitle style',
+          icon: Icons.palette_outlined,
+          onTap: () => _openStylePanelSheet(context),
+        ),
+        _ActionSpec(
+          label: 'Captions',
+          tooltip: 'Find, shift and quality-check captions',
+          icon: Icons.fact_check_outlined,
+          onTap: _openSubtitleToolsSheet,
+        ),
+        _ActionSpec(
+          label: 'Creator Lab',
+          tooltip: 'Open 23 creator tools',
+          icon: Icons.auto_awesome_rounded,
+          onTap: _openCreatorLab,
+        ),
+      ],
     };
 
     return _buildActionScroller(
-      key: ValueKey('tools_${category.name}'),
+      key: ValueKey('tools_${subgroup.name}'),
       actions: [
         ...actions,
         _ActionSpec(
           label: 'Back',
-          tooltip: 'Back to categories',
+          tooltip: 'Back to subgroups',
           icon: Icons.arrow_back_rounded,
-          onTap: () => setState(() => _activeBottomCategory = null),
+          onTap: () => setState(() => _activeBottomSubgroup = null),
         ),
       ],
     );
@@ -1742,6 +4926,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   Future<void> _openAudioControlsSheet(TimelineClip clip) async {
     await showModalBottomSheet(
       context: context,
+      isScrollControlled: true,
       backgroundColor: Colors.transparent,
       builder: (_) => Consumer(
         builder: (context, ref, _) {
@@ -1791,7 +4976,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 label,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: GoogleFonts.inter(
+                style: TextStyle(
                   color: isEnabled
                       ? kTextPrimary
                       : kTextPrimary.withValues(alpha: 0.32),
@@ -1832,7 +5017,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           const SizedBox(height: 14),
           Text(
             isVideoClip ? 'Video Clip Audio' : 'Audio Clip Controls',
-            style: GoogleFonts.inter(
+            style: TextStyle(
               color: kTextPrimary,
               fontSize: 13,
               fontWeight: FontWeight.w600,
@@ -1859,7 +5044,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 clip.audioMix.muted
                     ? 'Muted'
                     : '${(clip.audioMix.volume * 100).round()}%',
-                style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
+                style: TextStyle(color: kTextSecondary, fontSize: 12),
               ),
             ],
           ),
@@ -1875,17 +5060,49 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               min: 0,
               max: 1,
               divisions: 20,
+              onChangeStart: (_) =>
+                  ref.read(editorProvider.notifier).beginTimelineGestureEdit(),
               onChanged: (value) => _updateSelectedClipAudioMix(
                 clip,
                 volume: value,
                 muted: value == 0 ? true : false,
               ),
+              onChangeEnd: (_) =>
+                  ref.read(editorProvider.notifier).endTimelineGestureEdit(),
             ),
+          ),
+          Text(
+            'Stereo Pan',
+            style: TextStyle(color: kTextSecondary, fontSize: 12),
+          ),
+          Slider(
+            value: clip.audioMix.pan.clamp(-1.0, 1.0),
+            min: -1,
+            max: 1,
+            divisions: 20,
+            label: clip.audioMix.pan.abs() < 0.05
+                ? 'Center'
+                : clip.audioMix.pan < 0
+                ? 'L ${(clip.audioMix.pan.abs() * 100).round()}'
+                : 'R ${(clip.audioMix.pan * 100).round()}',
+            onChangeStart: (_) =>
+                ref.read(editorProvider.notifier).beginTimelineGestureEdit(),
+            onChanged: (value) => _updateSelectedClipAudioMix(clip, pan: value),
+            onChangeEnd: (_) =>
+                ref.read(editorProvider.notifier).endTimelineGestureEdit(),
+          ),
+          SwitchListTile.adaptive(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Normalize loudness'),
+            subtitle: const Text('Target a consistent −16 LUFS on export'),
+            value: clip.audioMix.normalize,
+            onChanged: (value) =>
+                _updateSelectedClipAudioMix(clip, normalize: value),
           ),
           const SizedBox(height: 6),
           Text(
             'Fade In',
-            style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
+            style: TextStyle(color: kTextSecondary, fontSize: 12),
           ),
           SliderTheme(
             data: SliderThemeData(
@@ -1900,13 +5117,17 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               max: 1500,
               divisions: 15,
               label: '${clip.audioMix.fadeInMs}ms',
+              onChangeStart: (_) =>
+                  ref.read(editorProvider.notifier).beginTimelineGestureEdit(),
               onChanged: (value) =>
                   _updateSelectedClipAudioMix(clip, fadeInMs: value.round()),
+              onChangeEnd: (_) =>
+                  ref.read(editorProvider.notifier).endTimelineGestureEdit(),
             ),
           ),
           Text(
             'Fade Out',
-            style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
+            style: TextStyle(color: kTextSecondary, fontSize: 12),
           ),
           SliderTheme(
             data: SliderThemeData(
@@ -1921,19 +5142,19 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               max: 1500,
               divisions: 15,
               label: '${clip.audioMix.fadeOutMs}ms',
+              onChangeStart: (_) =>
+                  ref.read(editorProvider.notifier).beginTimelineGestureEdit(),
               onChanged: (value) =>
                   _updateSelectedClipAudioMix(clip, fadeOutMs: value.round()),
+              onChangeEnd: (_) =>
+                  ref.read(editorProvider.notifier).endTimelineGestureEdit(),
             ),
           ),
           Text(
             isVideoClip
                 ? 'Overlay video audio can be faded in and out here.'
                 : 'Audio clips now support volume plus simple fade in and fade out.',
-            style: GoogleFonts.inter(
-              color: kTextSecondary,
-              fontSize: 12,
-              height: 1.35,
-            ),
+            style: TextStyle(color: kTextSecondary, fontSize: 12, height: 1.35),
           ),
         ],
       ),
@@ -2012,7 +5233,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           const SizedBox(height: 14),
           Text(
             'Transition from ${clip.label}',
-            style: GoogleFonts.inter(
+            style: TextStyle(
               color: kTextPrimary,
               fontSize: 13,
               fontWeight: FontWeight.w600,
@@ -2033,7 +5254,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 selectedColor: kAccent.withValues(alpha: 0.18),
                 backgroundColor: kSurfaceElevated,
                 side: BorderSide(color: isSelected ? kAccent : kBorder),
-                labelStyle: GoogleFonts.inter(
+                labelStyle: TextStyle(
                   color: isSelected ? kAccent : kTextSecondary,
                   fontSize: 12,
                 ),
@@ -2052,7 +5273,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           const SizedBox(height: 10),
           Text(
             'Duration',
-            style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
+            style: TextStyle(color: kTextSecondary, fontSize: 12),
           ),
           SliderTheme(
             data: SliderThemeData(
@@ -2124,7 +5345,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           const SizedBox(height: 14),
           Text(
             sheetTitle,
-            style: GoogleFonts.inter(
+            style: TextStyle(
               color: kTextPrimary,
               fontSize: 16,
               fontWeight: FontWeight.w600,
@@ -2134,7 +5355,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           if (!isAudioTrack) ...[
             Text(
               'Animate In',
-              style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
+              style: TextStyle(color: kTextSecondary, fontSize: 12),
             ),
             const SizedBox(height: 8),
             Wrap(
@@ -2148,7 +5369,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   selectedColor: kAccent.withValues(alpha: 0.18),
                   backgroundColor: kSurfaceElevated,
                   side: BorderSide(color: isSelected ? kAccent : kBorder),
-                  labelStyle: GoogleFonts.inter(
+                  labelStyle: TextStyle(
                     color: isSelected ? kAccent : kTextSecondary,
                     fontSize: 12,
                   ),
@@ -2165,7 +5386,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             const SizedBox(height: 12),
             Text(
               'Animate Out',
-              style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
+              style: TextStyle(color: kTextSecondary, fontSize: 12),
             ),
             const SizedBox(height: 8),
             Wrap(
@@ -2179,7 +5400,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   selectedColor: kAccent.withValues(alpha: 0.18),
                   backgroundColor: kSurfaceElevated,
                   side: BorderSide(color: isSelected ? kAccent : kBorder),
-                  labelStyle: GoogleFonts.inter(
+                  labelStyle: TextStyle(
                     color: isSelected ? kAccent : kTextSecondary,
                     fontSize: 12,
                   ),
@@ -2196,7 +5417,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             const SizedBox(height: 12),
             Text(
               'Animation Length',
-              style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
+              style: TextStyle(color: kTextSecondary, fontSize: 12),
             ),
             SliderTheme(
               data: SliderThemeData(
@@ -2239,7 +5460,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           ] else ...[
             Text(
               'Fade In',
-              style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
+              style: TextStyle(color: kTextSecondary, fontSize: 12),
             ),
             SliderTheme(
               data: SliderThemeData(
@@ -2260,7 +5481,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             ),
             Text(
               'Fade Out',
-              style: GoogleFonts.inter(color: kTextSecondary, fontSize: 12),
+              style: TextStyle(color: kTextSecondary, fontSize: 12),
             ),
             SliderTheme(
               data: SliderThemeData(
@@ -2316,7 +5537,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 const SizedBox(height: 8),
                 Text(
                   'Subtitle Style',
-                  style: GoogleFonts.inter(
+                  style: TextStyle(
                     color: kTextPrimary,
                     fontSize: 16,
                     fontWeight: FontWeight.w600,
@@ -2324,7 +5545,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 ),
                 Text(
                   'Keep sheet lower to preview changes on video',
-                  style: GoogleFonts.inter(color: kTextSecondary, fontSize: 11),
+                  style: TextStyle(color: kTextSecondary, fontSize: 11),
                 ),
                 const SizedBox(height: 8),
                 const Expanded(child: SubtitleStylePanel()),
@@ -2455,7 +5676,7 @@ class _GiphyPickerSheetState extends State<_GiphyPickerSheet> {
                       child: TextField(
                         controller: _searchController,
                         onChanged: _onQueryChanged,
-                        style: GoogleFonts.inter(color: kTextPrimary),
+                        style: TextStyle(color: kTextPrimary),
                         decoration: InputDecoration(
                           hintText: 'Search GIFs and stickers',
                           prefixIcon: const Icon(
@@ -2649,7 +5870,7 @@ class _GiphyPickerSheetState extends State<_GiphyPickerSheet> {
       selectedColor: kAccent.withValues(alpha: 0.18),
       backgroundColor: kSurfaceElevated,
       side: BorderSide(color: isSelected ? kAccent : kBorder),
-      labelStyle: GoogleFonts.inter(
+      labelStyle: TextStyle(
         color: isSelected ? kAccent : kTextSecondary,
         fontSize: 12,
         fontWeight: FontWeight.w600,
@@ -2679,7 +5900,7 @@ class _GiphyPickerSheetState extends State<_GiphyPickerSheet> {
             Text(
               message,
               textAlign: TextAlign.center,
-              style: GoogleFonts.inter(
+              style: TextStyle(
                 color: kTextSecondary,
                 fontSize: 12,
                 height: 1.5,

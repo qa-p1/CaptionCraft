@@ -11,12 +11,14 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
   final SubtitleEntry entry;
   final SubtitleStyleModel globalStyle;
   final Duration currentPosition;
+  final double scaleFactor;
 
   const AnimatedSubtitleOverlay({
     super.key,
     required this.entry,
     required this.globalStyle,
     required this.currentPosition,
+    this.scaleFactor = 1,
   });
 
   SubtitleStyleModel get _style {
@@ -262,7 +264,7 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
           final t = (elapsed / 150.0).clamp(0.0, 1.0);
 
           final opacity = t;
-          final offsetY = 12.0 * (1.0 - t);
+          final offsetY = 12.0 * scaleFactor * (1.0 - t);
           final displayWord = style.isAllCaps
               ? word.word.toUpperCase()
               : word.word;
@@ -290,7 +292,7 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
     return _wrapBackground(
       style,
       Transform.translate(
-        offset: Offset(0, 14 * (1 - t)),
+        offset: Offset(0, 14 * scaleFactor * (1 - t)),
         child: Opacity(
           opacity: t,
           child: Text(
@@ -338,7 +340,7 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
   TextStyle _textStyle(SubtitleStyleModel style) {
     return GoogleFonts.getFont(
       style.fontFamily,
-      fontSize: style.fontSize,
+      fontSize: style.fontSize * scaleFactor,
       color: style.textColor,
       fontWeight: style.isBold ? FontWeight.bold : FontWeight.normal,
       fontStyle: style.isItalic ? FontStyle.italic : FontStyle.normal,
@@ -363,10 +365,13 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
     final isBox = style.backgroundType == SubtitleBackground.semiTransparentBox;
     final core = Container(
       width: isBar ? double.infinity : null,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      padding: EdgeInsets.symmetric(
+        horizontal: 16 * scaleFactor,
+        vertical: 8 * scaleFactor,
+      ),
       decoration: BoxDecoration(
         color: isBox || isBar ? backgroundColor : Colors.transparent,
-        borderRadius: BorderRadius.circular(isBar ? 0 : 8),
+        borderRadius: BorderRadius.circular(isBar ? 0 : 8 * scaleFactor),
       ),
       child: child,
     );
@@ -458,7 +463,7 @@ class AnimationPresetCard extends StatelessWidget {
             const SizedBox(height: 6),
             Text(
               _labels[preset] ?? '',
-              style: GoogleFonts.inter(
+              style: TextStyle(
                 color: isSelected ? kAccent : kTextPrimary,
                 fontSize: 11,
                 fontWeight: FontWeight.w600,
@@ -468,7 +473,7 @@ class AnimationPresetCard extends StatelessWidget {
             Text(
               _descriptions[preset] ?? '',
               textAlign: TextAlign.center,
-              style: GoogleFonts.inter(color: kTextSecondary, fontSize: 9),
+              style: TextStyle(color: kTextSecondary, fontSize: 9),
             ),
           ],
         ),

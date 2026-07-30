@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 import '../../core/theme/app_theme.dart';
 
 enum AppButtonVariant { filled, ghost, danger }
@@ -32,10 +31,7 @@ class AppButton extends StatelessWidget {
         layoutBuilder: (currentChild, previousChildren) => Stack(
           alignment: Alignment.center,
           fit: StackFit.expand, // preserves tight constraints
-          children: [
-            ...previousChildren,
-            ?currentChild,
-          ],
+          children: [...previousChildren, ?currentChild],
         ),
         child: _buildButton(),
       ),
@@ -114,11 +110,11 @@ class _FilledButton extends StatelessWidget {
         children: [
           Icon(icon, size: 20),
           const SizedBox(width: 8),
-          Text(label, style: GoogleFonts.inter(fontWeight: FontWeight.w600)),
+          Text(label, style: TextStyle(fontWeight: FontWeight.w600)),
         ],
       );
     }
-    return Text(label, style: GoogleFonts.inter(fontWeight: FontWeight.w600));
+    return Text(label, style: TextStyle(fontWeight: FontWeight.w600));
   }
 }
 
@@ -165,11 +161,11 @@ class _GhostButton extends StatelessWidget {
         children: [
           Icon(icon, size: 20),
           const SizedBox(width: 8),
-          Text(label, style: GoogleFonts.inter(fontWeight: FontWeight.w500)),
+          Text(label, style: TextStyle(fontWeight: FontWeight.w500)),
         ],
       );
     }
-    return Text(label, style: GoogleFonts.inter(fontWeight: FontWeight.w500));
+    return Text(label, style: TextStyle(fontWeight: FontWeight.w500));
   }
 }
 
@@ -204,7 +200,7 @@ class _DangerButton extends StatelessWidget {
                 valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
               ),
             )
-          : Text(label, style: GoogleFonts.inter(fontWeight: FontWeight.w600)),
+          : Text(label, style: TextStyle(fontWeight: FontWeight.w600)),
     );
   }
 }

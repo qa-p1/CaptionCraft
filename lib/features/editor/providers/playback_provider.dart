@@ -49,18 +49,22 @@ class PlaybackNotifier extends StateNotifier<PlaybackState> {
   PlaybackNotifier() : super(const PlaybackState());
 
   void updatePosition(Duration position) {
+    if (state.position == position) return;
     state = state.copyWith(position: position);
   }
 
   void updateDuration(Duration duration) {
+    if (state.duration == duration) return;
     state = state.copyWith(duration: duration);
   }
 
   void setPlaying(bool isPlaying) {
+    if (state.isPlaying == isPlaying) return;
     state = state.copyWith(isPlaying: isPlaying);
   }
 
   void setReady(bool isReady) {
+    if (state.isReady == isReady) return;
     state = state.copyWith(isReady: isReady);
   }
 

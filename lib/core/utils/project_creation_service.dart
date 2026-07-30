@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -8,6 +9,9 @@ import '../../features/editor/models/subtitle_style_model.dart';
 import '../../features/editor/models/timeline_models.dart';
 import '../../shared/models/project_model.dart';
 import 'ffmpeg_service.dart';
+
+typedef ProjectMediaInfoLoader =
+    Future<Map<String, dynamic>> Function(String filePath);
 
 class ImportedVideoSource {
   final String filePath;
@@ -25,6 +29,8 @@ class ProjectCreationService {
   static Future<Project> createProjectFromVideos({
     required List<ImportedVideoSource> sources,
     String? projectName,
+    bool generateThumbnail = true,
+    ProjectMediaInfoLoader? mediaInfoLoader,
   }) async {
     if (sources.isEmpty) {
       throw Exception('Select at least one video to create a project.');
@@ -34,10 +40,16 @@ class ProjectCreationService {
     final clips = <TimelineClip>[];
     var timelineCursor = Duration.zero;
     var totalDurationMs = 0;
+    final loadMediaInfo = mediaInfoLoader ?? FFmpegService.getMediaInfo;
 
     for (var index = 0; index < sources.length; index++) {
       final source = sources[index];
-      final mediaInfo = await FFmpegService.getMediaInfo(source.filePath);
+      final mediaInfo = await loadMediaInfo(source.filePath).timeout(
+        const Duration(seconds: 20),
+        onTimeout: () => throw TimeoutException(
+          'Reading ${source.displayName} took too long. Try importing it again.',
+        ),
+      );
       final durationMs = (mediaInfo['durationMs'] as int?) ?? 0;
       if (durationMs <= 0) {
         throw Exception('Could not read duration for ${source.displayName}.');
@@ -52,6 +64,7 @@ class ProjectCreationService {
           'width': mediaInfo['width'],
           'height': mediaInfo['height'],
           'hasAudio': mediaInfo['hasAudio'],
+          'frameRate': mediaInfo['frameRate'],
         },
       );
       assets.add(asset);
@@ -76,7 +89,9 @@ class ProjectCreationService {
       totalDurationMs += durationMs;
     }
 
-    final thumbnailBase64 = await _buildThumbnailBase64(sources.first.filePath);
+    final thumbnailBase64 = generateThumbnail
+        ? await _buildThumbnailBase64(sources.first.filePath)
+        : null;
     final resolvedProjectName = (projectName?.trim().isNotEmpty == true)
         ? projectName!.trim()
         : path.basenameWithoutExtension(sources.first.displayName);
@@ -136,8 +151,9 @@ class ProjectCreationService {
   }
 
   static Future<String?> _buildThumbnailBase64(String videoPath) async {
+    String? thumbPath;
     try {
-      final thumbPath = await FFmpegService.generateThumbnail(videoPath);
+      thumbPath = await FFmpegService.generateThumbnail(videoPath);
       if (thumbPath.isEmpty) return null;
       final thumbFile = File(thumbPath);
       if (!await thumbFile.exists()) return null;
@@ -146,6 +162,15 @@ class ProjectCreationService {
       return base64Encode(bytes);
     } catch (_) {
       return null;
+    } finally {
+      if (thumbPath != null && thumbPath.isNotEmpty) {
+        try {
+          final thumbFile = File(thumbPath);
+          if (await thumbFile.exists()) await thumbFile.delete();
+        } catch (_) {
+          // Thumbnail cleanup is best-effort.
+        }
+      }
     }
   }
 }

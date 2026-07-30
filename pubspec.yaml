@@ -25,9 +25,6 @@
     # File picking
     file_picker: ^10.3.10
     flutter_dotenv: ^6.0.0
-    # Device identity
-    device_info_plus: ^12.3.0
-
     # Secure local storage
     flutter_secure_storage: ^10.0.0
 

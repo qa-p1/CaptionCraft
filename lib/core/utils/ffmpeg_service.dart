@@ -4,6 +4,7 @@ import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit_config.dart';
 import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:ffmpeg_kit_flutter_new/statistics.dart';
+import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
 import '../constants/groq_constants.dart';
@@ -37,7 +38,11 @@ class FFmpegService {
     void Function(double progress)? onProgress,
   }) async {
     final tempDir = await getTemporaryDirectory();
-    final flacPath = p.join(tempDir.path, 'caption_craft_audio.flac');
+    final operationId = DateTime.now().microsecondsSinceEpoch;
+    final flacPath = p.join(
+      tempDir.path,
+      'caption_craft_audio_$operationId.flac',
+    );
 
     // Get video duration for progress reporting
     final durationMs =
@@ -54,20 +59,28 @@ class FFmpegService {
       });
     }
 
-    final segmentArgs = <String>[
-      if (startTime != null) '-ss ${_formatDurationForFfmpeg(startTime)}',
-      if (clipDuration != null) '-t ${_formatDurationForFfmpeg(clipDuration)}',
-    ].join(' ');
-
     // Try FLAC first (lossless, good compression for speech)
-    final flacCommand =
-        '-i "$videoPath" $segmentArgs -vn -ar ${GroqConstants.targetAudioSampleRate} '
-        '-ac ${GroqConstants.targetAudioChannels} -c:a flac "$flacPath" -y';
-
-    final session = await FFmpegKit.execute(flacCommand);
+    final session = await FFmpegKit.executeWithArguments([
+      '-y',
+      '-i',
+      videoPath,
+      if (startTime != null) ...['-ss', _formatDurationForFfmpeg(startTime)],
+      if (clipDuration != null) ...[
+        '-t',
+        _formatDurationForFfmpeg(clipDuration),
+      ],
+      '-vn',
+      '-ar',
+      '${GroqConstants.targetAudioSampleRate}',
+      '-ac',
+      '${GroqConstants.targetAudioChannels}',
+      '-c:a',
+      'flac',
+      flacPath,
+    ]);
     final returnCode = await session.getReturnCode();
 
-    if (ReturnCode.isSuccess(returnCode)) {
+    if (ReturnCode.isSuccess(returnCode) && await File(flacPath).exists()) {
       // Check file size - if too large, fall back to MP3
       final fileSize = await File(flacPath).length();
       if (fileSize <= GroqConstants.maxChunkBytes) {
@@ -76,16 +89,44 @@ class FFmpegService {
     }
 
     // Fallback to MP3 (smaller but still fine for speech)
-    final mp3Path = p.join(tempDir.path, 'caption_craft_audio.mp3');
-    final mp3Command =
-        '-i "$videoPath" $segmentArgs -vn -ar ${GroqConstants.targetAudioSampleRate} '
-        '-ac ${GroqConstants.targetAudioChannels} -b:a 64k "$mp3Path" -y';
-
-    final mp3Session = await FFmpegKit.execute(mp3Command);
+    try {
+      final flacFile = File(flacPath);
+      if (await flacFile.exists()) await flacFile.delete();
+    } catch (_) {
+      // Best-effort cleanup before using the smaller fallback.
+    }
+    final mp3Path = p.join(
+      tempDir.path,
+      'caption_craft_audio_$operationId.mp3',
+    );
+    final mp3Session = await FFmpegKit.executeWithArguments([
+      '-y',
+      '-i',
+      videoPath,
+      if (startTime != null) ...['-ss', _formatDurationForFfmpeg(startTime)],
+      if (clipDuration != null) ...[
+        '-t',
+        _formatDurationForFfmpeg(clipDuration),
+      ],
+      '-vn',
+      '-ar',
+      '${GroqConstants.targetAudioSampleRate}',
+      '-ac',
+      '${GroqConstants.targetAudioChannels}',
+      '-b:a',
+      '64k',
+      mp3Path,
+    ]);
     final mp3ReturnCode = await mp3Session.getReturnCode();
 
     if (!ReturnCode.isSuccess(mp3ReturnCode)) {
       final logs = await mp3Session.getAllLogsAsString();
+      try {
+        final mp3File = File(mp3Path);
+        if (await mp3File.exists()) await mp3File.delete();
+      } catch (_) {
+        // Preserve the extraction error as the useful failure.
+      }
       throw Exception('Audio extraction failed: $logs');
     }
 
@@ -118,6 +159,7 @@ class FFmpegService {
 
     final tempDir = await getTemporaryDirectory();
     final chunks = <AudioChunk>[];
+    final operationId = DateTime.now().microsecondsSinceEpoch;
     var startSec = 0;
     var index = 0;
 
@@ -127,18 +169,42 @@ class FFmpegService {
       if (durationSec <= 0) {
         break;
       }
-      final chunkPath = p.join(tempDir.path, 'cc_chunk_$index.mp3');
+      final chunkPath = p.join(
+        tempDir.path,
+        'cc_chunk_${operationId}_$index.mp3',
+      );
 
-      final command =
-          '-i "$audioPath" -ss $startSec -t $durationSec '
-          '-ar ${GroqConstants.targetAudioSampleRate} '
-          '-ac ${GroqConstants.targetAudioChannels} -b:a 64k "$chunkPath" -y';
-
-      final session = await FFmpegKit.execute(command);
+      final session = await FFmpegKit.executeWithArguments([
+        '-y',
+        '-i',
+        audioPath,
+        '-ss',
+        '$startSec',
+        '-t',
+        '$durationSec',
+        '-ar',
+        '${GroqConstants.targetAudioSampleRate}',
+        '-ac',
+        '${GroqConstants.targetAudioChannels}',
+        '-b:a',
+        '64k',
+        chunkPath,
+      ]);
       final returnCode = await session.getReturnCode();
 
       if (!ReturnCode.isSuccess(returnCode)) {
         final logs = await session.getAllLogsAsString();
+        for (final createdChunk in [
+          ...chunks.map((chunk) => chunk.filePath),
+          chunkPath,
+        ]) {
+          try {
+            final file = File(createdChunk);
+            if (await file.exists()) await file.delete();
+          } catch (_) {
+            // Preserve the chunking failure as the useful error.
+          }
+        }
         throw Exception('Audio chunking failed at chunk $index: $logs');
       }
 
@@ -173,14 +239,21 @@ class FFmpegService {
     int height = 120,
   }) async {
     final tempDir = await getTemporaryDirectory();
-    final outputPath = p.join(tempDir.path, 'caption_craft_waveform.png');
+    final outputPath = p.join(
+      tempDir.path,
+      'caption_craft_waveform_${DateTime.now().microsecondsSinceEpoch}.png',
+    );
 
-    final command =
-        '-i "$audioPath" '
-        '-filter_complex "showwavespic=s=${width}x$height:colors=white" '
-        '-frames:v 1 "$outputPath" -y';
-
-    final session = await FFmpegKit.execute(command);
+    final session = await FFmpegKit.executeWithArguments([
+      '-y',
+      '-i',
+      audioPath,
+      '-filter_complex',
+      'showwavespic=s=${width}x$height:colors=white',
+      '-frames:v',
+      '1',
+      outputPath,
+    ]);
     final returnCode = await session.getReturnCode();
 
     if (!ReturnCode.isSuccess(returnCode)) {
@@ -233,11 +306,12 @@ class FFmpegService {
       throw Exception('ASS subtitle file contains no dialogue entries.');
     }
 
-    // ignore: avoid_print
-    print(
-      '[FFmpeg] ASS path: $safeAssPath (size: $assSize bytes, '
-      'dialogues: $dialogueCount)',
-    );
+    if (kDebugMode) {
+      debugPrint(
+        '[FFmpeg] ASS path: $safeAssPath (size: $assSize bytes, '
+        'dialogues: $dialogueCount)',
+      );
+    }
 
     String scaleFilter = '';
     switch (quality) {
@@ -276,8 +350,9 @@ class FFmpegService {
 
     if (!ReturnCode.isSuccess(returnCode)) {
       final logs = await session.getAllLogsAsString();
-      // ignore: avoid_print
-      print('[FFmpeg] Burn subtitles FAILED. Logs:\n$logs');
+      if (kDebugMode) {
+        debugPrint('[FFmpeg] Burn subtitles FAILED. Logs:\n$logs');
+      }
       throw Exception('Subtitle burn failed. Check logs for details.');
     }
 
@@ -292,11 +367,12 @@ class FFmpegService {
       throw Exception('Video export failed: output file is empty (0 bytes).');
     }
 
-    // ignore: avoid_print
-    print(
-      '[FFmpeg] Burn subtitles SUCCESS. Output: $outputPath '
-      '(${(outputSize / 1024 / 1024).toStringAsFixed(1)} MB)',
-    );
+    if (kDebugMode) {
+      debugPrint(
+        '[FFmpeg] Burn subtitles SUCCESS. Output: $outputPath '
+        '(${(outputSize / 1024 / 1024).toStringAsFixed(1)} MB)',
+      );
+    }
 
     return outputPath;
   }
@@ -320,12 +396,16 @@ class FFmpegService {
     int width = 0;
     int height = 0;
     bool hasAudio = false;
+    double frameRate = 0;
 
     for (final stream in streams) {
       final type = stream.getType();
       if (type == 'video' && width == 0) {
         width = stream.getWidth() ?? 0;
         height = stream.getHeight() ?? 0;
+        frameRate = _parseFrameRate(
+          stream.getAverageFrameRate() ?? stream.getRealFrameRate(),
+        );
       }
       if (type == 'audio') {
         hasAudio = true;
@@ -338,6 +418,7 @@ class FFmpegService {
       'durationMs': durationMs.round(),
       'width': width,
       'height': height,
+      'frameRate': frameRate,
       'hasAudio': hasAudio,
       'fileSize': int.tryParse(fileSize ?? '0') ?? 0,
     };
@@ -346,13 +427,23 @@ class FFmpegService {
   /// Generate a thumbnail from the video.
   static Future<String> generateThumbnail(String videoPath) async {
     final tempDir = await getTemporaryDirectory();
-    final outputPath = p.join(tempDir.path, 'caption_craft_thumb.jpg');
+    final outputPath = p.join(
+      tempDir.path,
+      'caption_craft_thumb_${DateTime.now().microsecondsSinceEpoch}.jpg',
+    );
 
-    final command =
-        '-i "$videoPath" -vf "thumbnail,scale=320:180" -frames:v 1 '
-        '-q:v 6 "$outputPath" -y';
-
-    final session = await FFmpegKit.execute(command);
+    final session = await FFmpegKit.executeWithArguments([
+      '-y',
+      '-i',
+      videoPath,
+      '-vf',
+      'thumbnail,scale=320:180',
+      '-frames:v',
+      '1',
+      '-q:v',
+      '6',
+      outputPath,
+    ]);
     final returnCode = await session.getReturnCode();
 
     if (!ReturnCode.isSuccess(returnCode)) {
@@ -391,5 +482,16 @@ class FFmpegService {
     final secondsText = seconds.toString().padLeft(2, '0');
     final millisText = milliseconds.toString().padLeft(3, '0');
     return '$hoursText:$minutesText:$secondsText.$millisText';
+  }
+
+  static double _parseFrameRate(String? value) {
+    if (value == null || value.isEmpty) return 0;
+    final parts = value.split('/');
+    if (parts.length == 2) {
+      final numerator = double.tryParse(parts[0]) ?? 0;
+      final denominator = double.tryParse(parts[1]) ?? 0;
+      if (denominator != 0) return numerator / denominator;
+    }
+    return double.tryParse(value) ?? 0;
   }
 }

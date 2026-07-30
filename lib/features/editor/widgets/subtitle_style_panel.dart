@@ -146,7 +146,7 @@ class SubtitleStylePanel extends ConsumerWidget {
                       const SizedBox(height: 6),
                       Text(
                         'Static',
-                        style: GoogleFonts.inter(
+                        style: TextStyle(
                           color: style.animationPreset == null
                               ? kAccent
                               : kTextPrimary,
@@ -158,10 +158,7 @@ class SubtitleStylePanel extends ConsumerWidget {
                       Text(
                         'No animation',
                         textAlign: TextAlign.center,
-                        style: GoogleFonts.inter(
-                          color: kTextSecondary,
-                          fontSize: 9,
-                        ),
+                        style: TextStyle(color: kTextSecondary, fontSize: 9),
                       ),
                     ],
                   ),
@@ -257,7 +254,8 @@ class SubtitleStylePanel extends ConsumerWidget {
             children: [
               Text(
                 '${style.fontSize.round()}px',
-                style: GoogleFonts.spaceMono(
+                style: TextStyle(
+                  fontFamily: 'monospace',
                   color: kTextSecondary,
                   fontSize: 12,
                 ),
@@ -286,7 +284,8 @@ class SubtitleStylePanel extends ConsumerWidget {
                 width: 48,
                 child: Text(
                   '${(style.maxWidthFactor * 100).round()}%',
-                  style: GoogleFonts.spaceMono(
+                  style: TextStyle(
+                    fontFamily: 'monospace',
                     color: kTextSecondary,
                     fontSize: 12,
                   ),
@@ -316,7 +315,7 @@ class SubtitleStylePanel extends ConsumerWidget {
               Expanded(
                 child: Text(
                   'Drag subtitle in preview to reposition/resize',
-                  style: GoogleFonts.inter(color: kTextSecondary, fontSize: 11),
+                  style: TextStyle(color: kTextSecondary, fontSize: 11),
                 ),
               ),
               TextButton(
@@ -391,7 +390,8 @@ class SubtitleStylePanel extends ConsumerWidget {
                 width: 48,
                 child: Text(
                   style.verticalOffset.toStringAsFixed(0),
-                  style: GoogleFonts.spaceMono(
+                  style: TextStyle(
+                    fontFamily: 'monospace',
                     color: kTextSecondary,
                     fontSize: 12,
                   ),
@@ -473,7 +473,7 @@ class SubtitleStylePanel extends ConsumerWidget {
   Widget _sectionHeader(String text) {
     return Text(
       text,
-      style: GoogleFonts.inter(
+      style: TextStyle(
         color: kTextSecondary,
         fontSize: 11,
         fontWeight: FontWeight.w600,
@@ -609,7 +609,7 @@ class SubtitleStylePanel extends ConsumerWidget {
           ),
           title: Text(
             isTextColor ? 'Text Color' : 'Background Color',
-            style: GoogleFonts.inter(color: kTextPrimary),
+            style: TextStyle(color: kTextPrimary),
           ),
           content: SingleChildScrollView(
             child: ColorPicker(
@@ -721,7 +721,7 @@ class _ToggleChip extends StatelessWidget {
             ? Icon(icon, size: 16, color: isActive ? kAccent : kTextSecondary)
             : Text(
                 label,
-                style: GoogleFonts.inter(
+                style: TextStyle(
                   color: isActive ? kAccent : kTextSecondary,
                   fontSize: 12,
                   fontWeight: fontWeight ?? FontWeight.w500,

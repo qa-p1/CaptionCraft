@@ -6,6 +6,9 @@ import 'package:firebase_core/firebase_core.dart';
 class FirebaseService {
   FirebaseService._();
 
+  static final Map<String, Future<void>> _projectWriteQueues = {};
+  static final Map<String, DateTime> _latestQueuedProjectWrite = {};
+
   static bool get isAvailable => Firebase.apps.isNotEmpty;
 
   static FirebaseAuth get _auth {
@@ -53,12 +56,16 @@ class FirebaseService {
 
     // Create user profile document in Firestore
     try {
-      await _firestore.collection('users').doc(credential.user!.uid).set({
-        'email': email.trim(),
-        'displayName': displayName.trim(),
-        'createdAt': FieldValue.serverTimestamp(),
-        'lastLoginAt': FieldValue.serverTimestamp(),
-      }).timeout(const Duration(seconds: 8));
+      await _firestore
+          .collection('users')
+          .doc(credential.user!.uid)
+          .set({
+            'email': email.trim(),
+            'displayName': displayName.trim(),
+            'createdAt': FieldValue.serverTimestamp(),
+            'lastLoginAt': FieldValue.serverTimestamp(),
+          })
+          .timeout(const Duration(seconds: 8));
     } catch (_) {
       // Auth account creation should still succeed even if profile sync is delayed.
     }
@@ -74,23 +81,53 @@ class FirebaseService {
     await _auth.sendPasswordResetEmail(email: email.trim());
   }
 
+  static Future<void> updateDisplayName(String displayName) async {
+    final user = currentUser;
+    if (user == null) {
+      throw StateError('No signed-in account is available.');
+    }
+    final normalizedName = displayName.trim();
+    if (normalizedName.isEmpty) {
+      throw ArgumentError.value(displayName, 'displayName', 'Cannot be empty.');
+    }
+    await user.updateDisplayName(normalizedName);
+    try {
+      await _firestore
+          .collection('users')
+          .doc(user.uid)
+          .set({'displayName': normalizedName}, SetOptions(merge: true))
+          .timeout(const Duration(seconds: 8));
+    } catch (_) {
+      // Auth remains the source of truth while profile sync is offline.
+    }
+  }
+
   static Future<void> updateLastLogin() async {
     final uid = currentUser?.uid;
     if (uid == null) return;
-    await _firestore.collection('users').doc(uid).set(
-      {
-        'email': currentUser?.email ?? '',
-        'displayName': currentUser?.displayName ?? currentUser?.email?.split('@').first ?? '',
-        'lastLoginAt': FieldValue.serverTimestamp(),
-      },
-      SetOptions(merge: true),
-    );
+    try {
+      await _firestore
+          .collection('users')
+          .doc(uid)
+          .set({
+            'email': currentUser?.email ?? '',
+            'displayName':
+                currentUser?.displayName ??
+                currentUser?.email?.split('@').first ??
+                '',
+            'lastLoginAt': FieldValue.serverTimestamp(),
+          }, SetOptions(merge: true))
+          .timeout(const Duration(seconds: 8));
+    } catch (_) {
+      // Authentication is successful even when profile telemetry is offline.
+    }
   }
 
   // ─── Projects ───
 
   static CollectionReference<Map<String, dynamic>> _userProjectsRef(
-      String uid) {
+    String uid,
+  ) {
     return _firestore
         .collection('projects')
         .doc(uid)
@@ -102,21 +139,73 @@ class FirebaseService {
     String projectId,
     Map<String, dynamic> data,
   ) async {
-    await _userProjectsRef(uid).doc(projectId).set(
-          data,
-          SetOptions(merge: true),
-        );
+    final queueKey = '$uid::$projectId';
+    final payload = Map<String, dynamic>.from(data);
+    final captions = payload['subtitles'];
+    if (captions is List) {
+      payload['captionCount'] = captions.length;
+    }
+
+    final incomingModifiedAt = _projectModifiedAt(payload['lastModifiedAt']);
+    final latestQueuedAt = _latestQueuedProjectWrite[queueKey];
+    if (incomingModifiedAt != null &&
+        latestQueuedAt != null &&
+        incomingModifiedAt.isBefore(latestQueuedAt)) {
+      return;
+    }
+    if (incomingModifiedAt != null) {
+      _latestQueuedProjectWrite[queueKey] = incomingModifiedAt;
+    }
+
+    final previousWrite = _projectWriteQueues[queueKey] ?? Future<void>.value();
+    final nextWrite = () async {
+      try {
+        await previousWrite;
+      } catch (_) {
+        // A newer snapshot must still be allowed to repair a failed sync.
+      }
+      await _userProjectsRef(uid)
+          .doc(projectId)
+          .set(payload, SetOptions(merge: true))
+          .timeout(const Duration(seconds: 8));
+    }();
+    _projectWriteQueues[queueKey] = nextWrite;
+
+    try {
+      await nextWrite;
+    } finally {
+      if (identical(_projectWriteQueues[queueKey], nextWrite)) {
+        _projectWriteQueues.remove(queueKey);
+      }
+    }
   }
 
   static Future<void> deleteProject(String uid, String projectId) async {
-    await _userProjectsRef(uid).doc(projectId).delete();
+    final queueKey = '$uid::$projectId';
+    final previousWrite = _projectWriteQueues[queueKey] ?? Future<void>.value();
+    final deletion = () async {
+      try {
+        await previousWrite;
+      } catch (_) {
+        // A delete should still proceed after an unsuccessful pending write.
+      }
+      await _userProjectsRef(uid).doc(projectId).delete();
+    }();
+    _projectWriteQueues[queueKey] = deletion;
+    try {
+      await deletion;
+    } finally {
+      if (identical(_projectWriteQueues[queueKey], deletion)) {
+        _projectWriteQueues.remove(queueKey);
+        _latestQueuedProjectWrite.remove(queueKey);
+      }
+    }
   }
 
   static Future<List<Map<String, dynamic>>> loadProjects(String uid) async {
-    final snapshot = await _userProjectsRef(uid)
-        .orderBy('lastModifiedAt', descending: true)
-        .limit(20)
-        .get();
+    final snapshot = await _userProjectsRef(
+      uid,
+    ).orderBy('lastModifiedAt', descending: true).limit(100).get();
 
     return snapshot.docs.map((doc) => {'id': doc.id, ...doc.data()}).toList();
   }
@@ -128,6 +217,16 @@ class FirebaseService {
     final doc = await _userProjectsRef(uid).doc(projectId).get();
     if (!doc.exists) return null;
     return {'id': doc.id, ...doc.data()!};
+  }
+
+  static DateTime? _projectModifiedAt(Object? value) {
+    if (value is Timestamp) return value.toDate();
+    if (value is DateTime) return value;
+    if (value is String) return DateTime.tryParse(value);
+    if (value is num) {
+      return DateTime.fromMillisecondsSinceEpoch(value.toInt());
+    }
+    return null;
   }
 
   // ─── Quota ───
@@ -147,8 +246,9 @@ class FirebaseService {
     String deviceFingerprint,
     String uid,
   ) async {
-    final docRef =
-        _firestore.collection('device_quotas').doc(deviceFingerprint);
+    final docRef = _firestore
+        .collection('device_quotas')
+        .doc(deviceFingerprint);
 
     return _firestore.runTransaction<int>((transaction) async {
       final snapshot = await transaction.get(docRef);

@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:google_fonts/google_fonts.dart';
 import '../../../core/theme/app_theme.dart';
 import '../models/subtitle_entry.dart';
 import '../providers/subtitle_provider.dart';
@@ -26,8 +25,6 @@ class _SubtitleEditModalState extends ConsumerState<SubtitleEditModal> {
 
   @override
   void dispose() {
-    // Auto-save on dismiss
-    _save();
     _textController.dispose();
     super.dispose();
   }
@@ -73,15 +70,18 @@ class _SubtitleEditModalState extends ConsumerState<SubtitleEditModal> {
           // Header
           Row(
             children: [
-              Text(
-                'Edit Subtitle Text',
-                style: GoogleFonts.inter(
-                  color: kTextPrimary,
-                  fontSize: 18,
-                  fontWeight: FontWeight.w600,
+              Expanded(
+                child: Text(
+                  'Edit Subtitle Text',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: kTextPrimary,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
               ),
-              const Spacer(),
               IconButton(
                 icon: const Icon(Icons.delete_rounded, color: kError, size: 20),
                 onPressed: () {
@@ -122,10 +122,7 @@ class _SubtitleEditModalState extends ConsumerState<SubtitleEditModal> {
                 onPressed: () {
                   Navigator.pop(context);
                 },
-                child: Text(
-                  'Cancel',
-                  style: GoogleFonts.inter(color: kTextSecondary),
-                ),
+                child: Text('Cancel', style: TextStyle(color: kTextSecondary)),
               ),
               const SizedBox(width: 16),
               ElevatedButton(
@@ -139,7 +136,7 @@ class _SubtitleEditModalState extends ConsumerState<SubtitleEditModal> {
                 ),
                 child: Text(
                   'Save',
-                  style: GoogleFonts.inter(fontWeight: FontWeight.w600),
+                  style: TextStyle(fontWeight: FontWeight.w600),
                 ),
               ),
             ],

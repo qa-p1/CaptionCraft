@@ -29,7 +29,8 @@ class AuthNotifier extends StateNotifier<AsyncValue<void>> {
   Future<void> _initializeGoogleSignInIfNeeded() async {
     if (_googleInitialized) return;
     await _googleSignIn.initialize(
-      serverClientId: '241322582096-j050snpnngiat8brn22va6ln4fk7a370.apps.googleusercontent.com',
+      serverClientId:
+          '241322582096-j050snpnngiat8brn22va6ln4fk7a370.apps.googleusercontent.com',
     );
     _googleInitialized = true;
   }
@@ -108,8 +109,15 @@ class AuthNotifier extends StateNotifier<AsyncValue<void>> {
   Future<void> signOut() async {
     state = const AsyncLoading();
     try {
-      await _initializeGoogleSignInIfNeeded();
-      await _googleSignIn.signOut();
+      // Firebase sign-out must not depend on the optional Google SDK. Email
+      // accounts and devices without a configured Google provider still need
+      // a reliable way out of the session.
+      try {
+        await _initializeGoogleSignInIfNeeded();
+        await _googleSignIn.signOut();
+      } catch (_) {
+        // Clearing the Firebase session below is the authoritative sign-out.
+      }
       await DeviceQuotaService.clearCurrentUid();
       await FirebaseService.signOut();
       state = const AsyncData(null);

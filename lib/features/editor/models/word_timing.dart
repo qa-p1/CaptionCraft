@@ -19,10 +19,23 @@ class WordTiming {
   }
 
   factory WordTiming.fromJson(Map<String, dynamic> json) {
+    final startMs = _wordTimingInt(json['startTimeMs']);
+    final storedEndMs = _wordTimingInt(
+      json['endTimeMs'],
+      fallback: startMs + 1,
+    );
     return WordTiming(
-      word: json['word'] as String,
-      startTime: Duration(milliseconds: json['startTimeMs'] as int),
-      endTime: Duration(milliseconds: json['endTimeMs'] as int),
+      word: json['word']?.toString() ?? '',
+      startTime: Duration(milliseconds: startMs),
+      endTime: Duration(
+        milliseconds: storedEndMs <= startMs ? startMs + 1 : storedEndMs,
+      ),
     );
   }
+}
+
+int _wordTimingInt(Object? value, {int fallback = 0}) {
+  if (value is num) return value.toInt();
+  if (value is String) return int.tryParse(value) ?? fallback;
+  return fallback;
 }

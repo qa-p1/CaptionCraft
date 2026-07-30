@@ -1,14 +1,12 @@
-import 'dart:io';
 import 'package:crypto/crypto.dart';
 import 'dart:convert';
-import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:uuid/uuid.dart';
 import '../constants/quota_constants.dart';
 import 'firebase_service.dart';
 
 /// Service for device-level quota enforcement.
-/// Each physical device gets exactly 3 free transcription runs,
-/// regardless of accounts.
+/// Each app installation gets a stable allowance shared across its accounts.
 class DeviceQuotaService {
   DeviceQuotaService._();
 
@@ -17,25 +15,15 @@ class DeviceQuotaService {
   /// Get or create a stable device fingerprint.
   static Future<String> getDeviceFingerprint() async {
     // Check if already stored
-    String? fingerprint =
-        await _storage.read(key: QuotaConstants.deviceFingerprintKey);
+    String? fingerprint = await _storage.read(
+      key: QuotaConstants.deviceFingerprintKey,
+    );
     if (fingerprint != null) return fingerprint;
 
-    // Generate from device info
-    final deviceInfo = DeviceInfoPlugin();
-    String rawId;
-
-    if (Platform.isAndroid) {
-      final androidInfo = await deviceInfo.androidInfo;
-      rawId = androidInfo.id; // Android ID
-    } else if (Platform.isIOS) {
-      final iosInfo = await deviceInfo.iosInfo;
-      rawId = iosInfo.identifierForVendor ?? 'unknown_ios';
-    } else {
-      rawId = 'unknown_platform';
-    }
-
-    // Hash with SHA-256
+    // Device build identifiers are not unique and can collide across thousands
+    // of phones. A securely stored random installation id is stable without
+    // collecting hardware identifiers.
+    final rawId = const Uuid().v4();
     fingerprint = sha256.convert(utf8.encode(rawId)).toString();
 
     // Store permanently
@@ -52,15 +40,15 @@ class DeviceQuotaService {
     final fingerprint = await getDeviceFingerprint();
 
     // Local count
-    final localStr =
-        await _storage.read(key: QuotaConstants.runsUsedKey);
+    final localStr = await _storage.read(key: QuotaConstants.runsUsedKey);
     final localCount = int.tryParse(localStr ?? '0') ?? 0;
 
     // Server count
     int serverCount;
     try {
-      serverCount = await FirebaseService.getDeviceRunsUsed(fingerprint)
-          .timeout(const Duration(seconds: 6));
+      serverCount = await FirebaseService.getDeviceRunsUsed(
+        fingerprint,
+      ).timeout(const Duration(seconds: 6));
     } catch (e) {
       // Offline — use local count
       serverCount = 0;
@@ -91,13 +79,13 @@ class DeviceQuotaService {
     // Increment on server (atomic)
     int newCount;
     try {
-      newCount =
-          await FirebaseService.incrementDeviceQuota(fingerprint, uid)
-              .timeout(const Duration(seconds: 8));
+      newCount = await FirebaseService.incrementDeviceQuota(
+        fingerprint,
+        uid,
+      ).timeout(const Duration(seconds: 8));
     } catch (e) {
       // Offline fallback — increment locally
-      final localStr =
-          await _storage.read(key: QuotaConstants.runsUsedKey);
+      final localStr = await _storage.read(key: QuotaConstants.runsUsedKey);
       newCount = (int.tryParse(localStr ?? '0') ?? 0) + 1;
     }
 
@@ -108,13 +96,9 @@ class DeviceQuotaService {
     );
 
     // Bind UID to device if not already
-    final existingUid =
-        await _storage.read(key: QuotaConstants.boundUidKey);
+    final existingUid = await _storage.read(key: QuotaConstants.boundUidKey);
     if (existingUid == null) {
-      await _storage.write(
-        key: QuotaConstants.boundUidKey,
-        value: uid,
-      );
+      await _storage.write(key: QuotaConstants.boundUidKey, value: uid);
     }
 
     return newCount;

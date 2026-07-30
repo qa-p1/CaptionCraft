@@ -35,6 +35,7 @@ class SubtitleEntry {
     bool clearStyleOverride = false,
     double? confidenceScore,
     List<WordTiming>? words,
+    bool clearWords = false,
   }) {
     return SubtitleEntry(
       id: id ?? this.id,
@@ -45,7 +46,7 @@ class SubtitleEntry {
           ? null
           : (styleOverride ?? this.styleOverride),
       confidenceScore: confidenceScore ?? this.confidenceScore,
-      words: words ?? this.words,
+      words: clearWords ? null : (words ?? this.words),
     );
   }
 
@@ -62,20 +63,47 @@ class SubtitleEntry {
   }
 
   factory SubtitleEntry.fromJson(Map<String, dynamic> json) {
+    final startMs = _jsonInt(json['startTimeMs']);
+    final storedEndMs = _jsonInt(json['endTimeMs'], fallback: startMs + 100);
+    final endMs = storedEndMs <= startMs ? startMs + 100 : storedEndMs;
+    SubtitleStyleModel? styleOverride;
+    final styleData = json['styleOverride'];
+    if (styleData is Map) {
+      try {
+        styleOverride = SubtitleStyleModel.fromJson(
+          Map<String, dynamic>.from(styleData),
+        );
+      } catch (_) {
+        styleOverride = null;
+      }
+    }
+
+    List<WordTiming>? words;
+    final wordData = json['words'];
+    if (wordData is List) {
+      final restoredWords = <WordTiming>[];
+      for (final candidate in wordData.whereType<Map>()) {
+        try {
+          restoredWords.add(
+            WordTiming.fromJson(Map<String, dynamic>.from(candidate)),
+          );
+        } catch (_) {
+          // A damaged word timing must not make the whole project unreadable.
+        }
+      }
+      if (restoredWords.isNotEmpty) words = restoredWords;
+    }
+
+    final storedId = json['id'];
     return SubtitleEntry(
-      id: json['id'] as String,
-      startTime: Duration(milliseconds: json['startTimeMs'] as int),
-      endTime: Duration(milliseconds: json['endTimeMs'] as int),
-      text: json['text'] as String,
-      styleOverride: json['styleOverride'] != null
-          ? SubtitleStyleModel.fromJson(
-              json['styleOverride'] as Map<String, dynamic>,
-            )
-          : null,
-      confidenceScore: (json['confidenceScore'] as num?)?.toDouble() ?? 1.0,
-      words: (json['words'] as List<dynamic>?)
-          ?.map((w) => WordTiming.fromJson(w as Map<String, dynamic>))
-          .toList(),
+      id: storedId is String && storedId.isNotEmpty ? storedId : null,
+      startTime: Duration(milliseconds: startMs),
+      endTime: Duration(milliseconds: endMs),
+      text: json['text']?.toString() ?? '',
+      styleOverride: styleOverride,
+      confidenceScore: ((json['confidenceScore'] as num?)?.toDouble() ?? 1)
+          .clamp(0, 1),
+      words: words,
     );
   }
 
@@ -104,4 +132,10 @@ class SubtitleEntry {
     final tenths = ((d.inMilliseconds % 1000) ~/ 100).toString();
     return '$minutes:$seconds.$tenths';
   }
+}
+
+int _jsonInt(Object? value, {int fallback = 0}) {
+  if (value is num) return value.toInt();
+  if (value is String) return int.tryParse(value) ?? fallback;
+  return fallback;
 }

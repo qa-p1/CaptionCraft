@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
+import 'package:dio/dio.dart';
 import 'package:uuid/uuid.dart';
 import 'package:path/path.dart' as p;
 import '../../../core/constants/groq_constants.dart';
@@ -20,6 +21,7 @@ class TranscriptionPipeline {
   Stream<ProcessingProgress> get progressStream => _progressController.stream;
 
   bool _cancelled = false;
+  CancelToken _transcriptionCancelToken = CancelToken();
 
   /// Run the full pipeline. Returns a Project on success.
   Future<Project?> run({
@@ -44,8 +46,9 @@ class TranscriptionPipeline {
       final mediaInfo = await FFmpegService.getMediaInfo(videoPath);
       final durationMs = mediaInfo['durationMs'] as int;
       String? thumbnailBase64;
+      String? thumbPath;
       try {
-        final thumbPath = await FFmpegService.generateThumbnail(videoPath);
+        thumbPath = await FFmpegService.generateThumbnail(videoPath);
         if (thumbPath.isNotEmpty) {
           final thumbFile = File(thumbPath);
           if (await thumbFile.exists()) {
@@ -57,6 +60,15 @@ class TranscriptionPipeline {
         }
       } catch (_) {
         // Non-critical — skip thumbnail
+      } finally {
+        if (thumbPath != null && thumbPath.isNotEmpty) {
+          try {
+            final thumbFile = File(thumbPath);
+            if (await thumbFile.exists()) await thumbFile.delete();
+          } catch (_) {
+            // Thumbnail cleanup is best-effort.
+          }
+        }
       }
 
       _emitProgress(ProcessingStage.done, 1.0, 'Done!');
@@ -87,6 +99,10 @@ class TranscriptionPipeline {
     String language = '',
   }) async {
     _cancelled = false;
+    if (_transcriptionCancelToken.isCancelled) {
+      _transcriptionCancelToken = CancelToken();
+    }
+    final generatedTemporaryPaths = <String>{};
 
     try {
       // ── Step 1: Get media info ──
@@ -130,6 +146,7 @@ class TranscriptionPipeline {
           );
         },
       );
+      generatedTemporaryPaths.add(audioPath);
       if (_cancelled) return null;
 
       // ── Step 3: Chunk audio if needed ──
@@ -140,6 +157,7 @@ class TranscriptionPipeline {
       );
 
       final chunks = await FFmpegService.chunkAudio(audioPath, totalDuration);
+      generatedTemporaryPaths.addAll(chunks.map((chunk) => chunk.filePath));
       if (_cancelled) return null;
 
       _emitProgress(
@@ -171,6 +189,7 @@ class TranscriptionPipeline {
           chunkIndex: chunk.index,
           chunkStartOffset: chunk.startTime,
           language: language,
+          cancelToken: _transcriptionCancelToken,
         );
 
         allWords.addAll(words);
@@ -207,14 +226,27 @@ class TranscriptionPipeline {
 
       return finalEntries;
     } catch (e) {
+      if (_cancelled) return null;
       _emitProgress(ProcessingStage.error, 0, e.toString());
       rethrow;
+    } finally {
+      for (final temporaryPath in generatedTemporaryPaths) {
+        try {
+          final file = File(temporaryPath);
+          if (await file.exists()) await file.delete();
+        } catch (_) {
+          // Temporary media cleanup is best-effort.
+        }
+      }
     }
   }
 
   void cancel() {
     _cancelled = true;
-    FFmpegService.cancelAll();
+    if (!_transcriptionCancelToken.isCancelled) {
+      _transcriptionCancelToken.cancel('Cancelled by user');
+    }
+    unawaited(FFmpegService.cancelAll());
     if (!_progressController.isClosed) {
       _progressController.close();
     }

@@ -2,8 +2,10 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
+import '../theme/app_theme.dart';
 import '../../features/editor/models/subtitle_entry.dart';
 import '../../features/editor/models/subtitle_style_model.dart';
+import '../../features/editor/models/timeline_models.dart';
 
 /// Service for generating subtitle files in SRT, VTT, and ASS formats.
 class SubtitleExportService {
@@ -34,8 +36,11 @@ class SubtitleExportService {
     }
 
     final tempDir = await getTemporaryDirectory();
-    final filePath = p.join(tempDir.path, 'captions.srt');
-    await File(filePath).writeAsString(buffer.toString());
+    final filePath = p.join(
+      tempDir.path,
+      'captions_${DateTime.now().microsecondsSinceEpoch}.srt',
+    );
+    await File(filePath).writeAsString(buffer.toString(), flush: true);
     return filePath;
   }
 
@@ -67,25 +72,70 @@ class SubtitleExportService {
     }
 
     final tempDir = await getTemporaryDirectory();
-    final filePath = p.join(tempDir.path, 'captions.vtt');
-    await File(filePath).writeAsString(buffer.toString());
+    final filePath = p.join(
+      tempDir.path,
+      'captions_${DateTime.now().microsecondsSinceEpoch}.vtt',
+    );
+    await File(filePath).writeAsString(buffer.toString(), flush: true);
     return filePath;
   }
 
   /// Generate an ASS (Advanced SubStation Alpha) file for FFmpeg subtitle burning.
   static Future<String> generateAss(
     List<SubtitleEntry> entries,
-    SubtitleStyleModel globalStyle,
-    {String? fileName}
-  ) async {
+    SubtitleStyleModel globalStyle, {
+    String? fileName,
+    int playResX = 1920,
+    int playResY = 1080,
+  }) async {
+    final document = buildAssDocument(
+      entries,
+      globalStyle,
+      playResX: playResX,
+      playResY: playResY,
+    );
+    final tempDir = await getTemporaryDirectory();
+    final resolvedFileName =
+        (fileName?.trim().isNotEmpty == true
+                ? fileName!.trim()
+                : 'captions.ass')
+            .replaceAll(RegExp(r'[^A-Za-z0-9_.-]'), '_');
+    final filePath = p.join(tempDir.path, resolvedFileName);
+    await File(filePath).writeAsString(document, flush: true);
+    return filePath;
+  }
+
+  /// Builds an ASS document without touching the filesystem.
+  ///
+  /// Export planning and tests use this to verify that preview animation,
+  /// positioning, colors, and background behavior survive delivery.
+  static String buildAssDocument(
+    List<SubtitleEntry> entries,
+    SubtitleStyleModel globalStyle, {
+    int playResX = 1920,
+    int playResY = 1080,
+  }) {
     final buffer = StringBuffer();
+    final sorted = List<SubtitleEntry>.from(entries)
+      ..sort((a, b) => a.startTime.compareTo(b.startTime));
+    final validEntries = sorted
+        .where(
+          (entry) =>
+              entry.endTime > entry.startTime && entry.text.trim().isNotEmpty,
+        )
+        .toList();
+    if (validEntries.isEmpty) {
+      throw Exception('No valid subtitle lines available for ASS export.');
+    }
 
     // Script Info
     buffer.writeln('[Script Info]');
     buffer.writeln('Title: CaptionCraft Export');
     buffer.writeln('ScriptType: v4.00+');
-    buffer.writeln('PlayResX: 1920');
-    buffer.writeln('PlayResY: 1080');
+    buffer.writeln('WrapStyle: 0');
+    buffer.writeln('ScaledBorderAndShadow: yes');
+    buffer.writeln('PlayResX: $playResX');
+    buffer.writeln('PlayResY: $playResY');
     buffer.writeln();
 
     // Styles
@@ -98,8 +148,25 @@ class SubtitleExportService {
     );
 
     // Default style
-    final defaultStyle = _buildAssStyle('Default', globalStyle);
+    final defaultStyle = _buildAssStyle(
+      'Default',
+      globalStyle,
+      playResX: playResX,
+      playResY: playResY,
+    );
     buffer.writeln(defaultStyle);
+    for (var index = 0; index < validEntries.length; index++) {
+      final override = validEntries[index].styleOverride;
+      if (override == null) continue;
+      buffer.writeln(
+        _buildAssStyle(
+          'Cue$index',
+          override,
+          playResX: playResX,
+          playResY: playResY,
+        ),
+      );
+    }
     buffer.writeln();
 
     // Events
@@ -108,55 +175,168 @@ class SubtitleExportService {
       'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
     );
 
-    final sorted = List<SubtitleEntry>.from(entries)
-      ..sort((a, b) => a.startTime.compareTo(b.startTime));
-
-    for (final entry in sorted) {
-      if (entry.endTime <= entry.startTime) continue;
+    for (var index = 0; index < validEntries.length; index++) {
+      final entry = validEntries[index];
       final start = _formatAssTime(entry.startTime);
       final end = _formatAssTime(entry.endTime);
-      final text = _escapeAssText(entry.text);
-      if (text.isEmpty) continue;
-      final styleName = 'Default';
+      final style = entry.styleOverride ?? globalStyle;
+      final content = style.isAllCaps ? entry.text.toUpperCase() : entry.text;
+      final text = _buildAssCueText(
+        entry.copyWith(text: content),
+        style,
+        playResX: playResX,
+        playResY: playResY,
+      );
+      final styleName = entry.styleOverride == null ? 'Default' : 'Cue$index';
 
-      buffer.writeln('Dialogue: 0,$start,$end,$styleName,,0,0,0,,$text');
+      if (style.backgroundType == SubtitleBackground.fullBar) {
+        buffer.writeln(
+          'Dialogue: 0,$start,$end,$styleName,,0,0,0,,'
+          '${_buildFullBarDrawing(style, playResX: playResX, playResY: playResY)}',
+        );
+      }
+      buffer.writeln('Dialogue: 1,$start,$end,$styleName,,0,0,0,,$text');
     }
 
-    final tempDir = await getTemporaryDirectory();
-    final resolvedFileName =
-        (fileName?.trim().isNotEmpty == true ? fileName!.trim() : 'captions.ass')
-            .replaceAll(RegExp(r'[^A-Za-z0-9_.-]'), '_');
-    final filePath = p.join(tempDir.path, resolvedFileName);
-    await File(filePath).writeAsString(buffer.toString());
-    return filePath;
+    return buffer.toString();
   }
 
   /// Escape ASS control characters so user text is rendered literally.
-  static String _escapeAssText(String text) {
+  static String _escapeAssText(String text) => _escapeAssFragment(text).trim();
+
+  static String _escapeAssFragment(String text) {
     return text
         .replaceAll('\\', r'\\')
         .replaceAll('{', r'\{')
         .replaceAll('}', r'\}')
-        .replaceAll('\n', r'\N')
-        .trim();
+        .replaceAll('\n', r'\N');
   }
 
-  static String _buildAssStyle(String name, SubtitleStyleModel style) {
+  static String _buildAssCueText(
+    SubtitleEntry entry,
+    SubtitleStyleModel style, {
+    required int playResX,
+    required int playResY,
+  }) {
+    final x = (playResX / 2 + style.offsetX * (playResX / kTimelineDesignWidth))
+        .clamp(0, playResX)
+        .round();
+    final baseY = switch (style.position) {
+      SubtitlePosition.top => playResY * 0.1,
+      SubtitlePosition.center => playResY * 0.5,
+      SubtitlePosition.bottom => playResY * 0.9,
+    };
+    final y =
+        (baseY +
+                (style.verticalOffset + style.offsetY) *
+                    (playResY / kTimelineDesignHeight))
+            .clamp(0, playResY)
+            .round();
+    final escaped = _escapeAssText(entry.text);
+    final words = entry.words;
+    if (style.animationPreset == SubtitleAnimationPreset.karaokeHighlight &&
+        words != null &&
+        words.isNotEmpty) {
+      final karaoke = StringBuffer('{\\pos($x,$y)}');
+      var cursor = entry.startTime;
+      var emittedWord = false;
+      for (final word in words) {
+        if (word.endTime <= word.startTime || word.word.trim().isEmpty) {
+          continue;
+        }
+        final gapCentiseconds = ((word.startTime - cursor).inMilliseconds / 10)
+            .round()
+            .clamp(0, 9999);
+        if (gapCentiseconds > 0) {
+          karaoke.write('{\\alpha&HFF&\\k$gapCentiseconds}\\h{\\alpha&H00&}');
+        } else if (emittedWord) {
+          karaoke.write(' ');
+        }
+        final durationCentiseconds =
+            ((word.endTime - word.startTime).inMilliseconds / 10).round().clamp(
+              1,
+              9999,
+            );
+        karaoke
+          ..write('{\\k$durationCentiseconds}')
+          ..write(_escapeAssText(word.word));
+        cursor = word.endTime > cursor ? word.endTime : cursor;
+        emittedWord = true;
+      }
+      return karaoke.toString();
+    }
+
+    if (style.animationPreset == SubtitleAnimationPreset.typewriter) {
+      final characters = entry.text.runes
+          .map(String.fromCharCode)
+          .toList(growable: false);
+      if (characters.isNotEmpty) {
+        final durationCentiseconds = (entry.duration.inMilliseconds / 10)
+            .round()
+            .clamp(1, 9999);
+        final characterDuration = (durationCentiseconds / characters.length)
+            .round()
+            .clamp(1, 9999);
+        final typewriter = StringBuffer('{\\pos($x,$y)}');
+        for (final character in characters) {
+          typewriter
+            ..write('{\\k$characterDuration}')
+            ..write(_escapeAssFragment(character));
+        }
+        return typewriter.toString();
+      }
+    }
+
+    final animationOverride = switch (style.animationPreset) {
+      SubtitleAnimationPreset.lineFade => r'\fad(200,0)',
+      SubtitleAnimationPreset.wordPop =>
+        r'\fscx82\fscy82\t(0,160,\fscx100\fscy100)',
+      _ => '',
+    };
+    if (style.animationPreset == SubtitleAnimationPreset.wordSlideUp) {
+      final travel = (12 * (playResY / kTimelineDesignHeight)).round();
+      return '{\\move($x,${y + travel},$x,$y,0,180)}$escaped';
+    }
+    return '{\\pos($x,$y)$animationOverride}$escaped';
+  }
+
+  static String _buildAssStyle(
+    String name,
+    SubtitleStyleModel style, {
+    required int playResX,
+    required int playResY,
+  }) {
     final fontName = style.fontFamily;
-    final fontSize = style.fontSize.round();
-    final primaryColor = _colorToAss(style.textColor);
+    final fontSize = (style.fontSize * (playResY / kTimelineDesignHeight))
+        .clamp(8, playResY * 0.24)
+        .round();
+    final isKaraoke =
+        style.animationPreset == SubtitleAnimationPreset.karaokeHighlight;
+    final isTypewriter =
+        style.animationPreset == SubtitleAnimationPreset.typewriter;
+    final primaryColor = _colorToAss(isKaraoke ? kAccent : style.textColor);
+    final secondaryColor = _colorToAss(
+      isKaraoke
+          ? style.textColor.withValues(alpha: 0.4)
+          : isTypewriter
+          ? style.textColor.withValues(alpha: 0)
+          : style.textColor,
+    );
     final outlineColor = '&H00000000'; // Black outline
-    final backColor = _colorToAss(style.backgroundColor);
+    final backgroundAlpha = (style.backgroundColor.a * style.backgroundOpacity)
+        .clamp(0.0, 1.0);
+    final backColor = _colorToAss(
+      style.backgroundColor.withValues(alpha: backgroundAlpha),
+    );
     final bold = style.isBold ? -1 : 0;
     final italic = style.isItalic ? -1 : 0;
     final borderStyle =
-        style.backgroundType == SubtitleBackground.fullBar ||
-            style.backgroundType == SubtitleBackground.semiTransparentBox
-        ? 3
-        : 1;
-    final outline = style.backgroundType == SubtitleBackground.outlineShadow
-        ? 3
-        : 2;
+        style.backgroundType == SubtitleBackground.semiTransparentBox ? 3 : 1;
+    final outline = switch (style.backgroundType) {
+      SubtitleBackground.outlineShadow => 3,
+      SubtitleBackground.semiTransparentBox => 6,
+      _ => 0,
+    };
     final shadow = style.backgroundType == SubtitleBackground.outlineShadow
         ? 2
         : 0;
@@ -175,17 +355,62 @@ class SubtitleExportService {
         break;
     }
 
-    return 'Style: $name,$fontName,$fontSize,$primaryColor,&H000000FF,'
+    final horizontalMargin =
+        ((1 - style.maxWidthFactor.clamp(0.2, 1.0)) * playResX / 2)
+            .round()
+            .clamp(10, playResX ~/ 2);
+    final verticalMargin = (playResY * 0.05).round().clamp(10, playResY ~/ 3);
+
+    return 'Style: $name,$fontName,$fontSize,$primaryColor,$secondaryColor,'
         '$outlineColor,$backColor,$bold,$italic,0,0,100,100,0,0,'
-        '$borderStyle,$outline,$shadow,$alignment,10,10,10,1';
+        '$borderStyle,$outline,$shadow,$alignment,$horizontalMargin,'
+        '$horizontalMargin,$verticalMargin,1';
+  }
+
+  static String _buildFullBarDrawing(
+    SubtitleStyleModel style, {
+    required int playResX,
+    required int playResY,
+  }) {
+    final baseY = switch (style.position) {
+      SubtitlePosition.top => playResY * 0.1,
+      SubtitlePosition.center => playResY * 0.5,
+      SubtitlePosition.bottom => playResY * 0.9,
+    };
+    final y =
+        (baseY +
+                (style.verticalOffset + style.offsetY) *
+                    (playResY / kTimelineDesignHeight))
+            .clamp(0, playResY)
+            .round();
+    final scaledFontSize = style.fontSize * (playResY / kTimelineDesignHeight);
+    final barHeight = (scaledFontSize + 16 * (playResY / kTimelineDesignHeight))
+        .round()
+        .clamp(18, playResY);
+    final top = (y - barHeight / 2).round().clamp(0, playResY);
+    final bottom = (top + barHeight).clamp(0, playResY);
+    final effectiveAlpha = (style.backgroundColor.a * style.backgroundOpacity)
+        .clamp(0.0, 1.0);
+    final alphaHex = (255 - (effectiveAlpha * 255).round())
+        .clamp(0, 255)
+        .toRadixString(16)
+        .padLeft(2, '0')
+        .toUpperCase();
+    final colorHex = _colorToAss(
+      style.backgroundColor.withValues(alpha: 1),
+    ).substring(4);
+
+    return '{\\an7\\pos(0,0)\\p1\\bord0\\shad0'
+        '\\1c&H$colorHex&\\1a&H$alphaHex&}'
+        'm 0 $top l $playResX $top l $playResX $bottom l 0 $bottom';
   }
 
   /// Convert a Flutter Color to ASS color format (&HAABBGGRR).
   static String _colorToAss(Color color) {
-    final alpha = ((color.a * 255.0).round().clamp(0, 255)) as int;
-    final blue = ((color.b * 255.0).round().clamp(0, 255)) as int;
-    final green = ((color.g * 255.0).round().clamp(0, 255)) as int;
-    final red = ((color.r * 255.0).round().clamp(0, 255)) as int;
+    final alpha = (color.a * 255.0).round().clamp(0, 255);
+    final blue = (color.b * 255.0).round().clamp(0, 255);
+    final green = (color.g * 255.0).round().clamp(0, 255);
+    final red = (color.r * 255.0).round().clamp(0, 255);
     final a = (255 - alpha).toRadixString(16).padLeft(2, '0').toUpperCase();
     final b = blue.toRadixString(16).padLeft(2, '0').toUpperCase();
     final g = green.toRadixString(16).padLeft(2, '0').toUpperCase();
@@ -208,25 +433,28 @@ class SubtitleExportService {
   /// Import subtitles from an SRT file.
   static Future<List<SubtitleEntry>> importSrt(String filePath) async {
     final content = await File(filePath).readAsString();
-    final normalized = content.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+    final normalized = content
+        .replaceFirst('\uFEFF', '')
+        .replaceAll('\r\n', '\n')
+        .replaceAll('\r', '\n');
     final blocks = normalized.trim().split(RegExp(r'\n\s*\n'));
     final entries = <SubtitleEntry>[];
 
     for (final block in blocks) {
       final lines = block.trim().split('\n');
-      if (lines.length < 3) continue;
-
-      // Line 0: index (ignore)
-      // Line 1: timestamps
-      final timeParts = lines[1].split(' --> ');
+      final timestampLineIndex = lines.indexWhere(
+        (line) => line.contains('-->'),
+      );
+      if (timestampLineIndex < 0) continue;
+      final timeParts = lines[timestampLineIndex].split(RegExp(r'\s*-->\s*'));
       if (timeParts.length != 2) continue;
 
       final startTime = _parseSrtTime(timeParts[0].trim());
       final endTime = _parseSrtTime(timeParts[1].trim());
       if (startTime == null || endTime == null) continue;
 
-      // Lines 2+: text
-      final text = lines.sublist(2).join('\n').trim();
+      final text = lines.skip(timestampLineIndex + 1).join('\n').trim();
+      if (text.isEmpty || endTime <= startTime) continue;
 
       entries.add(
         SubtitleEntry(startTime: startTime, endTime: endTime, text: text),
@@ -239,7 +467,10 @@ class SubtitleExportService {
   /// Import subtitles from a VTT file.
   static Future<List<SubtitleEntry>> importVtt(String filePath) async {
     final content = await File(filePath).readAsString();
-    final normalized = content.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+    final normalized = content
+        .replaceFirst('\uFEFF', '')
+        .replaceAll('\r\n', '\n')
+        .replaceAll('\r', '\n');
     final blocks = normalized.trim().split(RegExp(r'\n\s*\n'));
     final entries = <SubtitleEntry>[];
 
@@ -251,6 +482,11 @@ class SubtitleExportService {
           .toList();
       if (lines.isEmpty) continue;
       if (lines.first.trim().toUpperCase() == 'WEBVTT') continue;
+      if (lines.first.trim().startsWith('NOTE') ||
+          lines.first.trim() == 'STYLE' ||
+          lines.first.trim() == 'REGION') {
+        continue;
+      }
 
       var timestampLineIndex = 0;
       if (!lines.first.contains('-->')) {
@@ -258,15 +494,16 @@ class SubtitleExportService {
         timestampLineIndex = 1;
       }
 
-      final timeParts = lines[timestampLineIndex].split(' --> ');
+      final timeParts = lines[timestampLineIndex].split(RegExp(r'\s*-->\s*'));
       if (timeParts.length != 2) continue;
 
       final startTime = _parseVttTime(timeParts[0].trim());
-      final endTime = _parseVttTime(timeParts[1].trim());
+      final endToken = timeParts[1].trim().split(RegExp(r'\s+')).first;
+      final endTime = _parseVttTime(endToken);
       if (startTime == null || endTime == null) continue;
 
       final textLines = lines.skip(timestampLineIndex + 1).toList();
-      if (textLines.isEmpty) continue;
+      if (textLines.isEmpty || endTime <= startTime) continue;
 
       entries.add(
         SubtitleEntry(
@@ -283,30 +520,35 @@ class SubtitleExportService {
   static Duration? _parseSrtTime(String timeStr) {
     // Format: HH:MM:SS,mmm
     final match = RegExp(
-      r'(\d{2}):(\d{2}):(\d{2})[,.](\d{3})',
+      r'(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})',
     ).firstMatch(timeStr);
     if (match == null) return null;
+    final fraction = match.group(4)!.padRight(3, '0').substring(0, 3);
 
     return Duration(
       hours: int.parse(match.group(1)!),
       minutes: int.parse(match.group(2)!),
       seconds: int.parse(match.group(3)!),
-      milliseconds: int.parse(match.group(4)!),
+      milliseconds: int.parse(fraction),
     );
   }
 
   static Duration? _parseVttTime(String timeStr) {
-    // Format: HH:MM:SS.mmm
-    final match = RegExp(
-      r'(\d{2}):(\d{2}):(\d{2})[,.](\d{3})',
-    ).firstMatch(timeStr);
-    if (match == null) return null;
-
+    // Formats: HH:MM:SS.mmm or MM:SS.mmm
+    final parts = timeStr.replaceAll(',', '.').split(':');
+    if (parts.length != 2 && parts.length != 3) return null;
+    final secondParts = parts.last.split('.');
+    if (secondParts.length != 2) return null;
+    final fraction = secondParts[1].padRight(3, '0').substring(0, 3);
+    final seconds = int.tryParse(secondParts[0]);
+    final minutes = int.tryParse(parts[parts.length - 2]);
+    final hours = parts.length == 3 ? int.tryParse(parts[0]) : 0;
+    if (seconds == null || minutes == null || hours == null) return null;
     return Duration(
-      hours: int.parse(match.group(1)!),
-      minutes: int.parse(match.group(2)!),
-      seconds: int.parse(match.group(3)!),
-      milliseconds: int.parse(match.group(4)!),
+      hours: hours,
+      minutes: minutes,
+      seconds: seconds,
+      milliseconds: int.tryParse(fraction) ?? 0,
     );
   }
 }

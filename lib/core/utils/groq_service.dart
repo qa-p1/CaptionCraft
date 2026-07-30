@@ -1,6 +1,9 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
+import 'dart:math';
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import '../constants/groq_constants.dart';
 import '../../features/editor/models/subtitle_entry.dart';
 import '../../features/editor/models/word_timing.dart';
@@ -12,7 +15,6 @@ class GroqService {
   static final Dio _dio = Dio(
     BaseOptions(
       baseUrl: GroqConstants.baseUrl,
-      headers: {'Authorization': 'Bearer ${GroqConstants.apiKey}'},
       connectTimeout: const Duration(seconds: 30),
       sendTimeout: const Duration(seconds: 120),
       receiveTimeout: const Duration(seconds: 120),
@@ -26,7 +28,32 @@ class GroqService {
     required int chunkIndex,
     required Duration chunkStartOffset,
     String language = '',
+    CancelToken? cancelToken,
   }) async {
+    final apiKey = GroqConstants.apiKey;
+    if (apiKey.isEmpty) {
+      throw Exception(
+        'Missing Groq API key. Add GROQ_API_KEY to .env and restart the app.',
+      );
+    }
+
+    if (!await audioChunk.exists()) {
+      throw Exception('Audio chunk ${audioChunk.path} was not created.');
+    }
+
+    final chunkBytes = await audioChunk.length();
+    if (chunkBytes == 0) {
+      throw Exception('Audio chunk ${audioChunk.path} is empty.');
+    }
+    if (chunkBytes > GroqConstants.maxChunkBytes) {
+      throw Exception(
+        'Audio chunk ${(chunkBytes / 1024 / 1024).toStringAsFixed(1)} MB '
+        'exceeds the configured Groq upload limit.',
+      );
+    }
+
+    _dio.options.headers['Authorization'] = 'Bearer $apiKey';
+
     int retries = 0;
     const maxRetries = 3;
 
@@ -44,12 +71,30 @@ class GroqService {
           if (language.isNotEmpty) 'language': language,
         });
 
+        if (kDebugMode) {
+          debugPrint(
+            '[Groq] POST ${GroqConstants.transcriptionsEndpoint} '
+            'chunk=$chunkIndex size=${(chunkBytes / 1024 / 1024).toStringAsFixed(2)}MB',
+          );
+        }
+
         final response = await _dio
-            .post(GroqConstants.transcriptionsEndpoint, data: formData)
+            .post(
+              GroqConstants.transcriptionsEndpoint,
+              data: formData,
+              cancelToken: cancelToken,
+            )
             .timeout(const Duration(minutes: 4));
+
+        if (kDebugMode) {
+          debugPrint('[Groq] Transcription response ${response.statusCode}');
+        }
 
         return _parseWords(response.data, chunkStartOffset);
       } on DioException catch (e) {
+        if (CancelToken.isCancel(e)) {
+          throw Exception('Transcription cancelled.');
+        }
         if (e.response?.statusCode == 429) {
           // Rate limited — exponential backoff
           retries++;
@@ -64,7 +109,11 @@ class GroqService {
           await Future.delayed(const Duration(seconds: 2));
           continue;
         }
-        rethrow;
+        throw Exception(_formatDioError(e));
+      } on TimeoutException {
+        throw Exception(
+          'Groq transcription timed out for chunk ${chunkIndex + 1}.',
+        );
       }
     }
 
@@ -227,26 +276,116 @@ class GroqService {
   static List<WordTiming> deduplicateWordOverlaps(List<WordTiming> allWords) {
     if (allWords.length <= 1) return allWords;
 
-    allWords.sort((a, b) => a.startTime.compareTo(b.startTime));
+    final sorted = List<WordTiming>.from(allWords)
+      ..sort((a, b) => a.startTime.compareTo(b.startTime));
+    final deduplicated = <WordTiming>[];
 
-    final deduplicated = <WordTiming>[allWords.first];
-    for (var i = 1; i < allWords.length; i++) {
-      final prev = deduplicated.last;
-      final current = allWords[i];
-
-      // Skip if this word overlaps with the previous one
-      if (current.startTime.inMilliseconds < prev.endTime.inMilliseconds) {
+    for (final current in sorted) {
+      if (current.endTime <= current.startTime || current.word.trim().isEmpty) {
         continue;
       }
 
+      final normalizedCurrent = _normalizedWord(current.word);
+      var isDuplicate = false;
+      for (final previous in deduplicated.reversed) {
+        final distanceMs =
+            current.startTime.inMilliseconds - previous.endTime.inMilliseconds;
+        if (distanceMs > 1500) break;
+        if (_normalizedWord(previous.word) != normalizedCurrent) continue;
+
+        final overlapStart = current.startTime > previous.startTime
+            ? current.startTime
+            : previous.startTime;
+        final overlapEnd = current.endTime < previous.endTime
+            ? current.endTime
+            : previous.endTime;
+        final overlapMs = (overlapEnd - overlapStart).inMilliseconds.clamp(
+          0,
+          1 << 30,
+        );
+        final shorterMs = min(
+          (current.endTime - current.startTime).inMilliseconds,
+          (previous.endTime - previous.startTime).inMilliseconds,
+        ).clamp(1, 1 << 30);
+        final startsNearlyMatch =
+            (current.startTime.inMilliseconds -
+                    previous.startTime.inMilliseconds)
+                .abs() <=
+            140;
+        final endsNearlyMatch =
+            (current.endTime.inMilliseconds - previous.endTime.inMilliseconds)
+                .abs() <=
+            260;
+
+        if (overlapMs / shorterMs >= 0.45 ||
+            (startsNearlyMatch && endsNearlyMatch)) {
+          isDuplicate = true;
+          break;
+        }
+      }
+      if (isDuplicate) continue;
+
+      // Different words may legitimately have slightly overlapping timestamps
+      // (rapid speech or multiple speakers), so keep them instead of silently
+      // dropping dialogue at an audio-chunk boundary.
       deduplicated.add(current);
     }
 
     return deduplicated;
   }
 
+  static String _normalizedWord(String word) => word.toLowerCase().replaceAll(
+    RegExp(r'[^\p{L}\p{N}]+', unicode: true),
+    '',
+  );
+
   static String _extension(String path) {
     final dotIndex = path.lastIndexOf('.');
     return dotIndex != -1 ? path.substring(dotIndex) : '';
+  }
+
+  static String _formatDioError(DioException error) {
+    final statusCode = error.response?.statusCode;
+    final responseData = error.response?.data;
+    final message = _responseMessage(responseData) ?? error.message;
+
+    if (statusCode == 401) {
+      return 'Groq authentication failed. Check GROQ_API_KEY in .env.';
+    }
+
+    if (statusCode == 413) {
+      return 'Groq rejected the audio upload because the chunk is too large.';
+    }
+
+    if (statusCode != null) {
+      return 'Groq transcription failed with HTTP $statusCode'
+          '${message == null || message.isEmpty ? '' : ': $message'}';
+    }
+
+    return 'Could not reach Groq transcription API'
+        '${message == null || message.isEmpty ? '' : ': $message'}';
+  }
+
+  static String? _responseMessage(dynamic responseData) {
+    if (responseData is Map) {
+      final error = responseData['error'];
+      if (error is Map) {
+        final message = error['message'];
+        if (message is String && message.trim().isNotEmpty) {
+          return message.trim();
+        }
+      }
+
+      final message = responseData['message'];
+      if (message is String && message.trim().isNotEmpty) {
+        return message.trim();
+      }
+    }
+
+    if (responseData is String && responseData.trim().isNotEmpty) {
+      return responseData.trim();
+    }
+
+    return null;
   }
 }
