@@ -737,14 +737,8 @@ class TimelineExportService {
         final clip = input.clip;
         final clipDurationSeconds = clip.duration.inMilliseconds / 1000;
         final mix = clip.audioMix;
-        final fadeInSeconds = math.min(
-          mix.fadeInMs / 1000,
-          clipDurationSeconds / 2,
-        );
-        final fadeOutSeconds = math.min(
-          mix.fadeOutMs / 1000,
-          clipDurationSeconds / 2,
-        );
+        final fadeInSeconds = clip.effectiveAudioFadeInMs / 1000;
+        final fadeOutSeconds = clip.effectiveAudioFadeOutMs / 1000;
         final audioChain = <String>[
           if (clip.isReversed) 'areverse',
           'asetpts=PTS-STARTPTS',
@@ -942,14 +936,8 @@ class TimelineExportService {
   static List<String> _transitionAlphaFilters(TimelineClip clip) {
     final filters = <String>[];
     final durationSeconds = clip.duration.inMilliseconds / 1000;
-    final introSeconds = math.min(
-      clip.introTransition.durationMs / 1000,
-      durationSeconds / 2,
-    );
-    final outroSeconds = math.min(
-      clip.outroTransition.durationMs / 1000,
-      durationSeconds / 2,
-    );
+    final introSeconds = clip.effectiveIntroTransitionMs / 1000;
+    final outroSeconds = clip.effectiveOutroTransitionMs / 1000;
     if (_transitionUsesAlpha(clip.introTransition.type) && introSeconds > 0) {
       filters.add('fade=t=in:st=0:d=${_number(introSeconds)}:alpha=1');
     }
@@ -983,8 +971,8 @@ class TimelineExportService {
     final outro = clip.outroTransition;
     final start = clip.startTime.inMilliseconds / 1000;
     final end = clip.endTime.inMilliseconds / 1000;
-    final introDuration = intro.durationMs / 1000;
-    final outroDuration = outro.durationMs / 1000;
+    final introDuration = clip.effectiveIntroTransitionMs / 1000;
+    final outroDuration = clip.effectiveOutroTransitionMs / 1000;
 
     String x = baseX;
     String y = baseY;

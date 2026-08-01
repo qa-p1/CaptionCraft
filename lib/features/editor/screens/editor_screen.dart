@@ -28,7 +28,6 @@ import '../models/subtitle_entry.dart';
 import '../models/subtitle_style_model.dart';
 import '../models/timeline_models.dart';
 import '../models/export_settings.dart';
-import '../models/word_timing.dart';
 import '../providers/editor_provider.dart';
 import '../providers/playback_provider.dart';
 import '../providers/subtitle_provider.dart';
@@ -704,7 +703,17 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         return;
       }
 
-      ref.read(subtitleProvider.notifier).loadSubtitles(entries);
+      final imported = ref
+          .read(editorProvider.notifier)
+          .replaceSubtitleEntries(entries);
+      if (!imported) {
+        if (!mounted) return;
+        SnackBarHelper.showInfo(
+          context,
+          'Unlock the subtitle track before importing captions.',
+        );
+        return;
+      }
       _scheduleProjectSave(immediate: true, changeType: 'subtitles_imported');
       if (!mounted) return;
       SnackBarHelper.showSuccess(
@@ -792,11 +801,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final captionSources =
         timeline.tracks
             .expand((track) => track.clips)
-            .where(
-              (clip) =>
-                  clip.type == TimelineTrackType.video ||
-                  clip.type == TimelineTrackType.audio,
-            )
+            .where((clip) => timeline.clipHasAudio(clip))
             .toList()
           ..sort((a, b) {
             final startCompare = a.startTime.compareTo(b.startTime);
@@ -891,6 +896,33 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     TimelineClip targetClip,
     EditorTimeline timeline,
   ) async {
+    final existingSubtitleTrack = _resolveInsertionTrack(
+      timeline,
+      TimelineTrackSection.textSubtitle,
+      TimelineTrackType.subtitle,
+    );
+    final hasExistingSubtitleTrack = timeline.tracks.any(
+      (track) => track.type == TimelineTrackType.subtitle,
+    );
+    final subtitleTrack =
+        existingSubtitleTrack ??
+        (hasExistingSubtitleTrack
+            ? null
+            : _createOptionalTrack(
+                timeline,
+                TimelineTrackSection.textSubtitle,
+                TimelineTrackType.subtitle,
+              ));
+    if (subtitleTrack == null ||
+        subtitleTrack.isLocked ||
+        !subtitleTrack.acceptsClipType(TimelineTrackType.subtitle)) {
+      SnackBarHelper.showInfo(
+        context,
+        'Add or unlock a subtitle track before generating captions.',
+      );
+      return;
+    }
+
     final user = ref.read(currentUserProvider);
     if (user == null) {
       SnackBarHelper.showError(context, 'Sign in to generate subtitles.');
@@ -975,28 +1007,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           .read(quotaProvider.notifier)
           .consumeRun(user.uid);
 
-      final shiftedEntries =
-          generatedEntries
-              .map(
-                (entry) => entry.copyWith(
-                  startTime: entry.startTime + targetClip.startTime,
-                  endTime: entry.endTime + targetClip.startTime,
-                  words: entry.words
-                      ?.map(
-                        (word) => WordTiming(
-                          word: word.word,
-                          startTime: word.startTime + targetClip.startTime,
-                          endTime: word.endTime + targetClip.startTime,
-                        ),
-                      )
-                      .toList(),
-                ),
-              )
-              .toList()
-            ..sort((a, b) => a.startTime.compareTo(b.startTime));
+      final shiftedEntries = targetClip.mapSourceSubtitlesToTimeline(
+        generatedEntries,
+      );
 
-      final existingLinkedSubtitleIds = timeline
-          .subtitleClipsForLinkedClip(targetClip.id)
+      final existingLinkedSubtitleIds = subtitleTrack.clips
+          .where((clip) => clip.linkedClipId == targetClip.id)
           .map((clip) => clip.id)
           .toSet();
 
@@ -1011,11 +1027,16 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       final nextTimeline = _timelineWithGeneratedSubtitles(
         timeline: timeline,
         targetClip: targetClip,
+        subtitleTrack: subtitleTrack,
         generatedEntries: shiftedEntries,
       );
 
-      ref.read(subtitleProvider.notifier).loadSubtitles(mergedEntries);
-      ref.read(editorProvider.notifier).setTimeline(nextTimeline);
+      ref
+          .read(editorProvider.notifier)
+          .replaceTimelineAndSubtitleEntries(
+            timeline: nextTimeline,
+            entries: mergedEntries,
+          );
       _scheduleProjectSave(immediate: true, changeType: 'subtitles_generated');
 
       if (!processingClosed && mounted && Navigator.of(context).canPop()) {
@@ -1051,13 +1072,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   EditorTimeline _timelineWithGeneratedSubtitles({
     required EditorTimeline timeline,
     required TimelineClip targetClip,
+    required TimelineTrack subtitleTrack,
     required List<SubtitleEntry> generatedEntries,
   }) {
-    final subtitleTrack = timeline.primarySubtitleTrack;
-    final subtitleTrackId = subtitleTrack?.id ?? 'track_subtitles';
-    final existingSubtitleClips = timeline.tracks
-        .where((track) => track.type == TimelineTrackType.subtitle)
-        .expand((track) => track.clips)
+    final subtitleTrackId = subtitleTrack.id;
+    final existingSubtitleClips = subtitleTrack.clips
         .where((clip) => clip.linkedClipId != targetClip.id)
         .toList();
 
@@ -1071,22 +1090,25 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         )
         .toList();
 
-    final mergedTrack = TimelineTrack(
-      id: subtitleTrackId,
-      name: subtitleTrack?.name ?? 'Subtitles',
+    final mergedTrack = subtitleTrack.copyWith(
       type: TimelineTrackType.subtitle,
       section: TimelineTrackSection.textSubtitle,
       clips: [...existingSubtitleClips, ...generatedSubtitleClips]
         ..sort((a, b) => a.startTime.compareTo(b.startTime)),
     );
 
+    final trackExists = timeline.tracks.any(
+      (track) => track.id == subtitleTrackId,
+    );
+
     return timeline.copyWith(
-      tracks: [
-        ...timeline.tracks.where(
-          (track) => track.type != TimelineTrackType.subtitle,
-        ),
-        mergedTrack,
-      ],
+      tracks: trackExists
+          ? timeline.tracks
+                .map(
+                  (track) => track.id == subtitleTrackId ? mergedTrack : track,
+                )
+                .toList()
+          : [...timeline.tracks, mergedTrack],
     );
   }
 
@@ -1318,7 +1340,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }) {
     final editorState = ref.read(editorProvider);
     final track = _trackForClip(target, editorState);
-    if (track?.isLocked == true) {
+    if (track == null || track.isLocked) {
       SnackBarHelper.showInfo(context, 'Unlock the track to edit this clip.');
       return;
     }
@@ -1363,6 +1385,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final oldDurationMs = math.max(1, liveTarget.duration.inMilliseconds);
 
     final retimedTracks = timeline.tracks.map((timelineTrack) {
+      if (timelineTrack.id != track.id && timelineTrack.isLocked) {
+        return timelineTrack;
+      }
       final clips = timelineTrack.clips.map((clip) {
         if (clip.id == liveTarget.id) {
           return clip.copyWith(playbackRate: safeRate, endTime: nextEnd);
@@ -1421,7 +1446,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     }).toList();
     final nextTracks = retimedTracks
         .map(
-          (timelineTrack) => timelineTrack.type == TimelineTrackType.subtitle
+          (timelineTrack) =>
+              timelineTrack.type == TimelineTrackType.subtitle &&
+                  !timelineTrack.isLocked
               ? timelineTrack.copyWith(
                   clips: _removeSubtitleTimingCollisions(timelineTrack.clips),
                 )
@@ -1464,18 +1491,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   bool _isVisualClip(TimelineClip? clip) {
-    return clip != null &&
-        (clip.type == TimelineTrackType.video ||
-            clip.type == TimelineTrackType.image ||
-            clip.type == TimelineTrackType.gif ||
-            clip.type == TimelineTrackType.sticker);
+    return clip?.supportsVisualEffects ?? false;
   }
 
   bool _canReverseClip(TimelineClip? clip) {
-    return clip != null &&
-        (clip.type == TimelineTrackType.video ||
-            clip.type == TimelineTrackType.audio ||
-            clip.type == TimelineTrackType.gif);
+    return clip?.supportsReversePlayback ?? false;
   }
 
   void _toggleClipReverse(TimelineClip clip) {
@@ -1487,12 +1507,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   void _setClipFit(TimelineClip clip, ClipFitMode fitMode) {
-    if (!_isVisualClip(clip)) return;
+    if (!clip.supportsVisualEffects) return;
     _updateTimelineClip(clip, (current) => current.copyWith(fitMode: fitMode));
   }
 
   void _rotateClip(TimelineClip clip, double radians) {
-    if (!_isVisualClip(clip)) return;
+    if (!clip.supportsVisualEffects) return;
     _updateTimelineClip(
       clip,
       (current) => current.copyWith(
@@ -1504,7 +1524,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   void _toggleClipFlip(TimelineClip clip, {required bool horizontal}) {
-    if (!_isVisualClip(clip)) return;
+    if (!clip.supportsVisualEffects) return;
     _updateTimelineClip(
       clip,
       (current) => current.copyWith(
@@ -1516,6 +1536,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   void _changeClipLayer(TimelineClip clip, int delta) {
+    final editorState = ref.read(editorProvider);
+    final track = _trackForClip(clip, editorState);
+    final supportsLayering =
+        track != null &&
+        !track.isLocked &&
+        track.section == TimelineTrackSection.overlay;
+    if (!supportsLayering) return;
     _updateTimelineClip(
       clip,
       (current) => current.copyWith(layer: math.max(0, current.layer + delta)),
@@ -1530,7 +1557,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   void _resetClipTransform(TimelineClip clip) {
-    if (!_isVisualClip(clip)) return;
+    if (!clip.supportsVisualEffects) return;
     _updateTimelineClip(
       clip,
       (current) => current.copyWith(
@@ -1550,27 +1577,42 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     ClipBlurSettings blur = const ClipBlurSettings(),
     ClipColorAdjustments colorAdjustments = const ClipColorAdjustments(),
   }) {
-    if (!_isVisualClip(anchor)) return;
     final editorState = ref.read(editorProvider);
-    final timeline = editorState.timeline;
-    TimelineTrack? effectTrack;
-    for (final track in timeline.tracks) {
-      if (track.type == TimelineTrackType.effect) {
-        effectTrack = track;
-        break;
-      }
+    final liveAnchor = _clipById(anchor.id, editorState);
+    final anchorTrack = _trackForClip(liveAnchor, editorState);
+    if (liveAnchor == null ||
+        anchorTrack == null ||
+        anchorTrack.isLocked ||
+        !liveAnchor.supportsVisualEffects) {
+      return;
     }
-    effectTrack ??= TimelineTrack(
-      name: 'Effects 1',
-      type: TimelineTrackType.effect,
-      section: TimelineTrackSection.overlay,
+    final timeline = editorState.timeline;
+    final existingEffectTrack = _resolveInsertionTrack(
+      timeline,
+      TimelineTrackSection.overlay,
+      TimelineTrackType.effect,
     );
+    final effectTrack =
+        existingEffectTrack ??
+        _createOptionalTrack(
+          timeline,
+          TimelineTrackSection.overlay,
+          TimelineTrackType.effect,
+        );
+    if (effectTrack == null ||
+        !effectTrack.acceptsClipType(TimelineTrackType.effect)) {
+      SnackBarHelper.showInfo(
+        context,
+        'Add or unlock an effects track before applying this effect.',
+      );
+      return;
+    }
     final effectClip = TimelineClip.effect(
       trackId: effectTrack.id,
       effectKind: kind,
       label: label,
-      startTime: anchor.startTime,
-      endTime: anchor.endTime,
+      startTime: liveAnchor.startTime,
+      endTime: liveAnchor.endTime,
       blur: blur,
       colorAdjustments: colorAdjustments,
       layer: effectTrack.clips.length,
@@ -1578,14 +1620,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final updatedEffectTrack = effectTrack.copyWith(
       clips: [...effectTrack.clips, effectClip],
     );
-    final hasEffectTrack = timeline.tracks.any(
-      (track) => track.id == effectTrack!.id,
-    );
-    final nextTracks = hasEffectTrack
+    final nextTracks = existingEffectTrack != null
         ? timeline.tracks
               .map(
                 (track) =>
-                    track.id == effectTrack!.id ? updatedEffectTrack : track,
+                    track.id == effectTrack.id ? updatedEffectTrack : track,
               )
               .toList()
         : [...timeline.tracks, updatedEffectTrack];
@@ -1617,10 +1656,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   void _toggleClipMute(TimelineClip clip) {
-    if (clip.type != TimelineTrackType.video &&
-        clip.type != TimelineTrackType.audio) {
-      return;
-    }
+    final timeline = ref.read(editorProvider).timeline;
+    if (!timeline.clipHasAudio(clip)) return;
     _updateTimelineClip(
       clip,
       (current) => current.copyWith(
@@ -1630,10 +1667,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   void _toggleClipNormalize(TimelineClip clip) {
-    if (clip.type != TimelineTrackType.video &&
-        clip.type != TimelineTrackType.audio) {
-      return;
-    }
+    final timeline = ref.read(editorProvider).timeline;
+    if (!timeline.clipHasAudio(clip)) return;
     _updateTimelineClip(
       clip,
       (current) => current.copyWith(
@@ -1645,10 +1680,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   void _toggleQuickFade(TimelineClip clip, {required bool fadeIn}) {
-    if (clip.type != TimelineTrackType.video &&
-        clip.type != TimelineTrackType.audio) {
-      return;
-    }
+    final timeline = ref.read(editorProvider).timeline;
+    if (!timeline.clipHasAudio(clip)) return;
     _updateTimelineClip(clip, (current) {
       final mix = current.audioMix;
       return current.copyWith(
@@ -1706,6 +1739,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       return;
     }
     final nextTracks = editorState.timeline.tracks.map((candidate) {
+      if (candidate.id != track.id && candidate.isLocked) return candidate;
       final clips = candidate.clips
           .where(
             (item) =>
@@ -1791,6 +1825,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         nextTracks.add(candidateTrack);
         continue;
       }
+      if (candidateTrack.isLocked) {
+        nextTracks.add(candidateTrack);
+        continue;
+      }
       final captions = <TimelineClip>[];
       for (final caption in candidateTrack.clips) {
         if (caption.linkedClipId != clip.id || caption.endTime <= splitPoint) {
@@ -1861,6 +1899,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final isBase = track.section == TimelineTrackSection.baseVideo;
 
     final nextTracks = timeline.tracks.map((candidateTrack) {
+      if (candidateTrack.id != track.id && candidateTrack.isLocked) {
+        return candidateTrack;
+      }
       final clips = candidateTrack.clips.map((clip) {
         if (clip.id == target.id) {
           return clip.copyWith(
@@ -1933,6 +1974,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   Future<void> _openClipInspectorSheet(TimelineClip initialClip) async {
+    final initialState = ref.read(editorProvider);
+    final initialTrack = _trackForClip(initialClip, initialState);
+    if (!initialClip.supportsVisualEffects ||
+        initialTrack == null ||
+        initialTrack.isLocked) {
+      return;
+    }
     var clip = initialClip;
     await showModalBottomSheet<void>(
       context: context,
@@ -2162,6 +2210,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   Future<void> _openTimingSheet(TimelineClip initialClip) async {
+    final initialState = ref.read(editorProvider);
+    final initialTrack = _trackForClip(initialClip, initialState);
+    if (!initialClip.supportsSourceTiming ||
+        initialTrack == null ||
+        initialTrack.isLocked) {
+      return;
+    }
     var clip = initialClip;
     final initialTimeline = ref.read(editorProvider).timeline;
     final initialAssetDurationMs = _assetDurationMs(initialTimeline, clip);
@@ -2205,7 +2260,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           final canReverse = _canReverseClip(clip);
           return _buildEditorSheet(
             title: 'Timing',
-            subtitle: 'Trim, speed, split and reverse',
+            subtitle: canReverse
+                ? 'Trim, speed, split and reverse'
+                : 'Trim, speed and split',
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -2377,7 +2434,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   Future<void> _openCropSheet(TimelineClip initialClip) async {
-    if (!_isVisualClip(initialClip)) return;
+    final editorState = ref.read(editorProvider);
+    final track = _trackForClip(initialClip, editorState);
+    if (!_isVisualClip(initialClip) || track == null || track.isLocked) return;
     var clip = initialClip;
     await showModalBottomSheet<void>(
       context: context,
@@ -2498,6 +2557,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final isExistingFilter =
         initialClip.type == TimelineTrackType.effect &&
         initialClip.effectKind == TimelineEffectKind.filter;
+    final editorState = ref.read(editorProvider);
+    final track = _trackForClip(initialClip, editorState);
+    if (track == null ||
+        track.isLocked ||
+        (!isExistingFilter && !initialClip.supportsVisualEffects)) {
+      return;
+    }
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -2702,6 +2768,20 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   Future<void> _openSubtitleToolsSheet() async {
+    final hasLockedSubtitleLane = ref
+        .read(editorProvider)
+        .timeline
+        .tracks
+        .any(
+          (track) => track.type == TimelineTrackType.subtitle && track.isLocked,
+        );
+    if (hasLockedSubtitleLane) {
+      SnackBarHelper.showInfo(
+        context,
+        'Unlock the subtitle track before editing captions.',
+      );
+      return;
+    }
     var report = SubtitleQualityService.analyze(
       ref.read(subtitleProvider).entries,
     );
@@ -3195,54 +3275,100 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   Widget _buildPortrait(BuildContext context, TimelineClip? selectedClip) {
-    return Column(
-      children: [
-        SizedBox(
-          height: MediaQuery.of(context).size.height * 0.35,
-          child: VideoPreviewPanel(
-            key: _previewKey,
-            videoPath: widget.project.videoPath,
-            targetAspectRatio: _selectedAspectRatioValue,
-            onFullscreenToggle: () => _setPreviewFullscreen(true),
-          ),
-        ),
-        Expanded(
-          flex: 2,
-          child: TimelinePanel(
-            onEditRequested: _openSubtitleTextEditor,
-            onTextClipEditRequested: _editTextClip,
-            onTransitionRequested: _openTransitionSheet,
-            onOverlayAddRequested: _pickOverlayMediaForTrack,
-          ),
-        ),
-        _buildBottomQuickActions(context, selectedClip),
-      ],
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        const actionBarHeight = 64.0;
+        final workspaceHeight = math.max(
+          0.0,
+          constraints.maxHeight - actionBarHeight,
+        );
+        final minimumTimelineHeight = math.min(230.0, workspaceHeight * 0.55);
+        final availablePreviewHeight = math.max(
+          0.0,
+          workspaceHeight - minimumTimelineHeight,
+        );
+        final minimumPreviewHeight = math.min(190.0, availablePreviewHeight);
+        final maximumPreviewHeight = math.min(420.0, availablePreviewHeight);
+        final previewHeight = (workspaceHeight * 0.43)
+            .clamp(minimumPreviewHeight, maximumPreviewHeight)
+            .toDouble();
+
+        return Column(
+          children: [
+            SizedBox(height: previewHeight, child: _buildVideoPreview()),
+            Expanded(child: _buildTimelinePanel()),
+            _buildBottomQuickActions(context, selectedClip),
+          ],
+        );
+      },
     );
   }
 
   Widget _buildLandscape(BuildContext context, TimelineClip? selectedClip) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        const actionBarHeight = 64.0;
+        final workspaceHeight = math.max(
+          0.0,
+          constraints.maxHeight - actionBarHeight,
+        );
+        final useSideBySideWorkspace = constraints.maxHeight < 560;
+
+        final workspace = useSideBySideWorkspace
+            ? Row(
+                children: [
+                  Expanded(flex: 5, child: _buildVideoPreview()),
+                  const VerticalDivider(width: 1, thickness: 1, color: kBorder),
+                  Expanded(flex: 6, child: _buildTimelinePanel()),
+                ],
+              )
+            : _buildTallLandscapeWorkspace(workspaceHeight);
+
+        return Column(
+          children: [
+            Expanded(child: workspace),
+            _buildBottomQuickActions(context, selectedClip),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildTallLandscapeWorkspace(double workspaceHeight) {
+    final minimumTimelineHeight = math.min(300.0, workspaceHeight * 0.48);
+    final availablePreviewHeight = math.max(
+      0.0,
+      workspaceHeight - minimumTimelineHeight,
+    );
+    final minimumPreviewHeight = math.min(230.0, availablePreviewHeight);
+    final maximumPreviewHeight = math.min(420.0, availablePreviewHeight);
+    final previewHeight = (workspaceHeight * 0.48)
+        .clamp(minimumPreviewHeight, maximumPreviewHeight)
+        .toDouble();
+
     return Column(
       children: [
-        Expanded(
-          flex: 3,
-          child: VideoPreviewPanel(
-            key: _previewKey,
-            videoPath: widget.project.videoPath,
-            targetAspectRatio: _selectedAspectRatioValue,
-            onFullscreenToggle: () => _setPreviewFullscreen(true),
-          ),
-        ),
-        Expanded(
-          flex: 2,
-          child: TimelinePanel(
-            onEditRequested: _openSubtitleTextEditor,
-            onTextClipEditRequested: _editTextClip,
-            onTransitionRequested: _openTransitionSheet,
-            onOverlayAddRequested: _pickOverlayMediaForTrack,
-          ),
-        ),
-        _buildBottomQuickActions(context, selectedClip),
+        SizedBox(height: previewHeight, child: _buildVideoPreview()),
+        Expanded(child: _buildTimelinePanel()),
       ],
+    );
+  }
+
+  Widget _buildVideoPreview() {
+    return VideoPreviewPanel(
+      key: _previewKey,
+      videoPath: widget.project.videoPath,
+      targetAspectRatio: _selectedAspectRatioValue,
+      onFullscreenToggle: () => _setPreviewFullscreen(true),
+    );
+  }
+
+  Widget _buildTimelinePanel() {
+    return TimelinePanel(
+      onEditRequested: _openSubtitleTextEditor,
+      onTextClipEditRequested: _editTextClip,
+      onTransitionRequested: _openTransitionSheet,
+      onOverlayAddRequested: _pickOverlayMediaForTrack,
     );
   }
 
@@ -3393,6 +3519,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   Future<void> _openSubtitleTextEditor(SubtitleEntry entry) async {
+    final editorState = ref.read(editorProvider);
+    final clip = _clipById(entry.id, editorState);
+    final track = clip == null ? null : _trackForClip(clip, editorState);
+    if (track?.isLocked == true) return;
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -3507,10 +3637,17 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }) {
     final editorState = ref.read(editorProvider);
     final timeline = editorState.timeline;
-    final existingTrack = _resolveInsertionTrack(timeline, section);
+    final existingTrack = _resolveInsertionTrack(timeline, section, clipType);
     final targetTrack =
-        existingTrack ?? _createOptionalTrack(timeline, section);
+        existingTrack ?? _createOptionalTrack(timeline, section, clipType);
     if (targetTrack == null) return;
+    if (!targetTrack.acceptsClipType(clipType)) {
+      SnackBarHelper.showInfo(
+        context,
+        'Add or unlock a compatible track before inserting this clip.',
+      );
+      return;
+    }
     final workingTracks = existingTrack == null
         ? [...timeline.tracks, targetTrack]
         : timeline.tracks;
@@ -3620,11 +3757,23 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final existingTrack = _resolveInsertionTrack(
       timeline,
       TimelineTrackSection.textSubtitle,
+      TimelineTrackType.text,
     );
     final targetTrack =
         existingTrack ??
-        _createOptionalTrack(timeline, TimelineTrackSection.textSubtitle);
+        _createOptionalTrack(
+          timeline,
+          TimelineTrackSection.textSubtitle,
+          TimelineTrackType.text,
+        );
     if (targetTrack == null) return;
+    if (!targetTrack.acceptsClipType(TimelineTrackType.text)) {
+      SnackBarHelper.showInfo(
+        context,
+        'Add or unlock a text track before inserting text.',
+      );
+      return;
+    }
     final workingTracks = existingTrack == null
         ? [...timeline.tracks, targetTrack]
         : timeline.tracks;
@@ -3671,36 +3820,31 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   Future<void> _editTextClip(TimelineClip clip) async {
+    if (clip.type != TimelineTrackType.text) return;
+    final currentState = ref.read(editorProvider);
+    final currentTrack = _trackForClip(clip, currentState);
+    if (currentTrack == null || currentTrack.isLocked) return;
     final enteredText = await _showTextClipDialog(
       initialValue: clip.text ?? '',
     );
     if (enteredText == null || enteredText.trim().isEmpty) return;
 
     final editorState = ref.read(editorProvider);
-    final nextTracks = editorState.timeline.tracks.map((track) {
-      final nextClips = track.clips
-          .map(
-            (candidate) => candidate.id == clip.id
-                ? candidate.copyWith(
-                    label: enteredText.trim(),
-                    text: enteredText.trim(),
-                  )
-                : candidate,
-          )
-          .toList();
-      return track.copyWith(clips: nextClips);
-    }).toList();
-
-    ref
-        .read(editorProvider.notifier)
-        .setTimeline(editorState.timeline.copyWith(tracks: nextTracks));
+    final liveClip = _clipById(clip.id, editorState);
+    final liveTrack = _trackForClip(liveClip, editorState);
+    if (liveClip == null || liveTrack == null || liveTrack.isLocked) return;
+    _updateTimelineClip(
+      liveClip,
+      (current) =>
+          current.copyWith(label: enteredText.trim(), text: enteredText.trim()),
+    );
     SnackBarHelper.showSuccess(context, 'Text updated');
   }
 
   Future<void> _openClipAnimationSheetForSelection(TimelineClip clip) async {
     final editorState = ref.read(editorProvider);
     final track = _trackForClip(clip, editorState);
-    if (track == null) return;
+    if (track == null || track.isLocked || !clip.supportsClipAnimation) return;
     await _openClipAnimationSheet(clip, track);
   }
 
@@ -3817,37 +3961,31 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     int? durationMs,
   }) {
     final editorState = ref.read(editorProvider);
-    final nextTracks = editorState.timeline.tracks.map((track) {
-      final nextClips = track.clips
-          .map(
-            (candidate) => candidate.id == clip.id
-                ? candidate.copyWith(
-                    introTransition: updateIntro
-                        ? candidate.introTransition.copyWith(
-                            type: type ?? candidate.introTransition.type,
-                            durationMs:
-                                durationMs ??
-                                candidate.introTransition.durationMs,
-                          )
-                        : candidate.introTransition,
-                    outroTransition: updateOutro
-                        ? candidate.outroTransition.copyWith(
-                            type: type ?? candidate.outroTransition.type,
-                            durationMs:
-                                durationMs ??
-                                candidate.outroTransition.durationMs,
-                          )
-                        : candidate.outroTransition,
-                  )
-                : candidate,
-          )
-          .toList();
-      return track.copyWith(clips: nextClips);
-    }).toList();
-
-    ref
-        .read(editorProvider.notifier)
-        .setTimeline(editorState.timeline.copyWith(tracks: nextTracks));
+    final liveClip = _clipById(clip.id, editorState);
+    final track = _trackForClip(liveClip, editorState);
+    if (liveClip == null ||
+        track == null ||
+        track.isLocked ||
+        !liveClip.supportsClipAnimation) {
+      return;
+    }
+    _updateTimelineClip(
+      liveClip,
+      (current) => current.copyWith(
+        introTransition: updateIntro
+            ? current.introTransition.copyWith(
+                type: type ?? current.introTransition.type,
+                durationMs: durationMs ?? current.introTransition.durationMs,
+              )
+            : current.introTransition,
+        outroTransition: updateOutro
+            ? current.outroTransition.copyWith(
+                type: type ?? current.outroTransition.type,
+                durationMs: durationMs ?? current.outroTransition.durationMs,
+              )
+            : current.outroTransition,
+      ),
+    );
   }
 
   void _updateSelectedClipAudioMix(
@@ -3860,6 +3998,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     bool? normalize,
   }) {
     final editorState = ref.read(editorProvider);
+    final track = _trackForClip(clip, editorState);
+    if (track == null ||
+        track.isLocked ||
+        !editorState.timeline.clipHasAudio(clip)) {
+      return;
+    }
     final nextTracks = editorState.timeline.tracks.map((track) {
       final nextClips = track.clips
           .map(
@@ -3888,68 +4032,122 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   TimelineTrack? _resolveInsertionTrack(
     EditorTimeline timeline,
     TimelineTrackSection section,
+    TimelineTrackType clipType,
   ) {
     final editorState = ref.read(editorProvider);
-    if (editorState.selectedTrackId != null) {
-      for (final track in timeline.tracks) {
-        if (track.id == editorState.selectedTrackId &&
-            track.section == section) {
-          return track;
-        }
-      }
-    }
-
-    final sectionTracks = timeline.tracksForSection(section);
-    if (section == TimelineTrackSection.overlay) {
-      for (final track in sectionTracks) {
-        if (track.name == 'Overlay 1') {
-          return track;
-        }
-      }
-    }
-    if (section == TimelineTrackSection.audio) {
-      for (final track in sectionTracks) {
-        if (track.name == 'Audio 1') {
-          return track;
-        }
-      }
-    }
-    if (section == TimelineTrackSection.textSubtitle) {
-      for (final track in sectionTracks) {
-        if (track.type == TimelineTrackType.text && track.name == 'Text 1') {
-          return track;
-        }
-      }
-      for (final track in sectionTracks) {
-        if (track.type == TimelineTrackType.text) {
-          return track;
-        }
-      }
-    }
-    return sectionTracks.isEmpty ? null : sectionTracks.first;
+    return timeline.insertionTrackFor(
+      section: section,
+      clipType: clipType,
+      preferredTrackId: editorState.selectedTrackId,
+    );
   }
 
   TimelineTrack? _createOptionalTrack(
     EditorTimeline timeline,
     TimelineTrackSection section,
+    TimelineTrackType clipType,
   ) {
-    return switch (section) {
-      TimelineTrackSection.overlay => TimelineTrack(
-        name: timeline.nextTrackNameForSection(section),
-        type: TimelineTrackType.video,
-        section: section,
-      ),
-      TimelineTrackSection.textSubtitle => TimelineTrack(
-        name: timeline.nextTrackNameForSection(section),
-        type: TimelineTrackType.text,
-        section: section,
-      ),
-      TimelineTrackSection.audio => TimelineTrack(
-        name: timeline.nextTrackNameForSection(section),
-        type: TimelineTrackType.audio,
-        section: section,
-      ),
-      TimelineTrackSection.baseVideo => null,
+    final isCompatibleType = switch (section) {
+      TimelineTrackSection.overlay =>
+        clipType.isVisualMedia || clipType == TimelineTrackType.effect,
+      TimelineTrackSection.textSubtitle =>
+        clipType == TimelineTrackType.text ||
+            clipType == TimelineTrackType.subtitle,
+      TimelineTrackSection.audio => clipType == TimelineTrackType.audio,
+      TimelineTrackSection.baseVideo => false,
+    };
+    if (!isCompatibleType) return null;
+
+    final name = switch (clipType) {
+      TimelineTrackType.effect =>
+        'Effects ${timeline.tracks.where((track) => track.type == clipType).length + 1}',
+      TimelineTrackType.subtitle =>
+        'Subtitles ${timeline.tracks.where((track) => track.type == clipType).length + 1}',
+      _ => timeline.nextTrackNameForSection(section),
+    };
+    return TimelineTrack(name: name, type: clipType, section: section);
+  }
+
+  _SelectionCapabilities _selectionCapabilitiesFor(
+    EditorState editorState,
+    TimelineClip? selectedClip,
+  ) {
+    final selectedTrack = _trackForClip(selectedClip, editorState);
+    final canEdit =
+        selectedClip != null &&
+        selectedTrack != null &&
+        !selectedTrack.isLocked;
+    final canVisualEffects = canEdit && selectedClip.supportsVisualEffects;
+    final canTransform = canEdit && selectedClip.supportsVisualEffects;
+    final canAnimate = canEdit && selectedClip.supportsClipAnimation;
+    final canTransition =
+        canEdit &&
+        selectedTrack.section == TimelineTrackSection.baseVideo &&
+        selectedClip.type == TimelineTrackType.video;
+    final canAdjustAudio =
+        canEdit && editorState.timeline.clipHasAudio(selectedClip);
+    final canChangeLayer =
+        canEdit && selectedTrack.section == TimelineTrackSection.overlay;
+    final canArrange =
+        canEdit && selectedClip.type != TimelineTrackType.subtitle;
+    final isFilterEffect =
+        canEdit &&
+        selectedClip.type == TimelineTrackType.effect &&
+        selectedClip.effectKind == TimelineEffectKind.filter;
+    final isBlurEffect =
+        canEdit &&
+        selectedClip.type == TimelineTrackType.effect &&
+        selectedClip.effectKind == TimelineEffectKind.blur;
+
+    return _SelectionCapabilities(
+      hasSelection: selectedClip != null,
+      canEdit: canEdit,
+      canAdjustAudio: canAdjustAudio,
+      canVisualEffects: canVisualEffects,
+      canTransform: canTransform,
+      canAnimate: canAnimate,
+      canTransition: canTransition,
+      canArrange: canArrange,
+      canChangeLayer: canChangeLayer,
+      isFilterEffect: isFilterEffect,
+      isBlurEffect: isBlurEffect,
+    );
+  }
+
+  bool _isCategoryAvailable(
+    _BottomActionCategory category,
+    _SelectionCapabilities capabilities,
+  ) {
+    if (!capabilities.hasSelection) return true;
+    return switch (category) {
+      _BottomActionCategory.add || _BottomActionCategory.canvas => true,
+      _BottomActionCategory.edit => capabilities.canEdit,
+      _BottomActionCategory.effects => capabilities.canUseEffects,
+      _BottomActionCategory.audio => capabilities.canAdjustAudio,
+    };
+  }
+
+  bool _isSubgroupAvailable(
+    _BottomActionSubgroup subgroup,
+    _SelectionCapabilities capabilities,
+  ) {
+    if (!capabilities.hasSelection) return true;
+    return switch (subgroup) {
+      _BottomActionSubgroup.addMedia ||
+      _BottomActionSubgroup.addText ||
+      _BottomActionSubgroup.addTracks ||
+      _BottomActionSubgroup.canvasFormat ||
+      _BottomActionSubgroup.canvasGuides ||
+      _BottomActionSubgroup.canvasStudio => true,
+      _BottomActionSubgroup.editTiming => capabilities.canEdit,
+      _BottomActionSubgroup.editTransform => capabilities.canVisualEffects,
+      _BottomActionSubgroup.editArrange => capabilities.canArrange,
+      _BottomActionSubgroup.effectsLooks => capabilities.canUseLooks,
+      _BottomActionSubgroup.effectsBlur => capabilities.canUseBlur,
+      _BottomActionSubgroup.effectsMotion => capabilities.canUseMotion,
+      _BottomActionSubgroup.audioMix ||
+      _BottomActionSubgroup.audioFades ||
+      _BottomActionSubgroup.audioEnhance => capabilities.canAdjustAudio,
     };
   }
 
@@ -3958,19 +4156,20 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     TimelineClip? selectedClip,
   ) {
     final editorState = ref.read(editorProvider);
-    final selectedTrack = _trackForClip(selectedClip, editorState);
-    final canAdjustAudio =
-        selectedClip != null &&
-        (selectedClip.type == TimelineTrackType.audio ||
-            selectedClip.type == TimelineTrackType.video);
-    final canAnimateClip =
-        selectedClip != null &&
-        selectedTrack != null &&
-        (selectedTrack.section == TimelineTrackSection.overlay ||
-            selectedTrack.section == TimelineTrackSection.baseVideo);
-    final canTransition =
-        selectedClip != null &&
-        selectedTrack?.section == TimelineTrackSection.baseVideo;
+    final capabilities = _selectionCapabilitiesFor(editorState, selectedClip);
+    final requestedCategory = _activeBottomCategory;
+    final activeCategory =
+        requestedCategory != null &&
+            _isCategoryAvailable(requestedCategory, capabilities)
+        ? requestedCategory
+        : null;
+    final requestedSubgroup = _activeBottomSubgroup;
+    final activeSubgroup =
+        activeCategory != null &&
+            requestedSubgroup != null &&
+            _isSubgroupAvailable(requestedSubgroup, capabilities)
+        ? requestedSubgroup
+        : null;
 
     return Container(
       height: 64,
@@ -3996,22 +4195,20 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             child: SlideTransition(position: offset, child: child),
           );
         },
-        child: _activeBottomCategory == null
-            ? _buildCategoryRow()
-            : _activeBottomSubgroup == null
-            ? _buildSubgroupRow(_activeBottomCategory!)
+        child: activeCategory == null
+            ? _buildCategoryRow(capabilities)
+            : activeSubgroup == null
+            ? _buildSubgroupRow(activeCategory, capabilities)
             : _buildToolRow(
-                subgroup: _activeBottomSubgroup!,
+                subgroup: activeSubgroup,
                 selectedClip: selectedClip,
-                canAdjustAudio: canAdjustAudio,
-                canAnimateClip: canAnimateClip,
-                canTransition: canTransition,
+                capabilities: capabilities,
               ),
       ),
     );
   }
 
-  Widget _buildCategoryRow() {
+  Widget _buildCategoryRow(_SelectionCapabilities capabilities) {
     final categories = [
       _ActionSpec(
         label: 'Add',
@@ -4026,28 +4223,34 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         label: 'Edit',
         tooltip: 'Timing, transform and arrange',
         icon: Icons.content_cut_rounded,
-        onTap: () => setState(() {
-          _activeBottomCategory = _BottomActionCategory.edit;
-          _activeBottomSubgroup = null;
-        }),
+        onTap: _isCategoryAvailable(_BottomActionCategory.edit, capabilities)
+            ? () => setState(() {
+                _activeBottomCategory = _BottomActionCategory.edit;
+                _activeBottomSubgroup = null;
+              })
+            : null,
       ),
       _ActionSpec(
         label: 'Effects',
         tooltip: 'Looks, blur and motion',
         icon: Icons.auto_fix_high_rounded,
-        onTap: () => setState(() {
-          _activeBottomCategory = _BottomActionCategory.effects;
-          _activeBottomSubgroup = null;
-        }),
+        onTap: _isCategoryAvailable(_BottomActionCategory.effects, capabilities)
+            ? () => setState(() {
+                _activeBottomCategory = _BottomActionCategory.effects;
+                _activeBottomSubgroup = null;
+              })
+            : null,
       ),
       _ActionSpec(
         label: 'Audio',
         tooltip: 'Mix, fades and enhancement',
         icon: Icons.graphic_eq_rounded,
-        onTap: () => setState(() {
-          _activeBottomCategory = _BottomActionCategory.audio;
-          _activeBottomSubgroup = null;
-        }),
+        onTap: _isCategoryAvailable(_BottomActionCategory.audio, capabilities)
+            ? () => setState(() {
+                _activeBottomCategory = _BottomActionCategory.audio;
+                _activeBottomSubgroup = null;
+              })
+            : null,
       ),
       _ActionSpec(
         label: 'Canvas',
@@ -4066,7 +4269,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     );
   }
 
-  Widget _buildSubgroupRow(_BottomActionCategory category) {
+  Widget _buildSubgroupRow(
+    _BottomActionCategory category,
+    _SelectionCapabilities capabilities,
+  ) {
     final subgroups = switch (category) {
       _BottomActionCategory.add => [
         (
@@ -4179,7 +4385,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             label: subgroup.$2,
             tooltip: subgroup.$3,
             icon: subgroup.$4,
-            onTap: () => setState(() => _activeBottomSubgroup = subgroup.$1),
+            onTap: _isSubgroupAvailable(subgroup.$1, capabilities)
+                ? () => setState(() => _activeBottomSubgroup = subgroup.$1)
+                : null,
           ),
         _ActionSpec(
           label: 'Back',
@@ -4197,17 +4405,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   Widget _buildToolRow({
     required _BottomActionSubgroup subgroup,
     required TimelineClip? selectedClip,
-    required bool canAdjustAudio,
-    required bool canAnimateClip,
-    required bool canTransition,
+    required _SelectionCapabilities capabilities,
   }) {
-    final isVisual = _isVisualClip(selectedClip);
-    final isFilterEffect =
-        selectedClip?.type == TimelineTrackType.effect &&
-        selectedClip?.effectKind == TimelineEffectKind.filter;
-    final isBlurEffect =
-        selectedClip?.type == TimelineTrackType.effect &&
-        selectedClip?.effectKind == TimelineEffectKind.blur;
+    final isVisual = capabilities.canVisualEffects;
+    final isFilterEffect = capabilities.isFilterEffect;
+    final isBlurEffect = capabilities.isBlurEffect;
     final actions = switch (subgroup) {
       _BottomActionSubgroup.addMedia => [
         _ActionSpec(
@@ -4240,9 +4442,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           label: 'Edit',
           tooltip: 'Edit selected text',
           icon: Icons.edit_rounded,
-          onTap: selectedClip?.type == TimelineTrackType.text
+          onTap:
+              capabilities.canEdit &&
+                  selectedClip?.type == TimelineTrackType.text
               ? () => _editTextClip(selectedClip!)
-              : selectedClip?.type == TimelineTrackType.subtitle
+              : capabilities.canEdit &&
+                    selectedClip?.type == TimelineTrackType.subtitle
               ? () {
                   final entry = selectedClip!.toSubtitleEntry();
                   if (entry != null) _openSubtitleTextEditor(entry);
@@ -4253,7 +4458,15 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           label: 'Captions',
           tooltip: 'Generate captions',
           icon: Icons.closed_caption_rounded,
-          onTap: _handleGenerateSubtitles,
+          onTap:
+              ref
+                  .read(editorProvider)
+                  .timeline
+                  .tracks
+                  .expand((track) => track.clips)
+                  .any(ref.read(editorProvider).timeline.clipHasAudio)
+              ? _handleGenerateSubtitles
+              : null,
         ),
       ],
       _BottomActionSubgroup.addTracks => [
@@ -4261,31 +4474,50 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           label: 'Overlay',
           tooltip: 'Add overlay lane',
           icon: Icons.layers_rounded,
-          onTap: () => _addTimelineTrack(TimelineTrackSection.overlay),
+          onTap: () => _addTimelineTrack(
+            TimelineTrackSection.overlay,
+            TimelineTrackType.video,
+          ),
         ),
         _ActionSpec(
           label: 'Text',
           tooltip: 'Add text lane',
           icon: Icons.title_rounded,
-          onTap: () => _addTimelineTrack(TimelineTrackSection.textSubtitle),
+          onTap: () => _addTimelineTrack(
+            TimelineTrackSection.textSubtitle,
+            TimelineTrackType.text,
+          ),
         ),
         _ActionSpec(
           label: 'Audio',
           tooltip: 'Add audio lane',
           icon: Icons.graphic_eq_rounded,
-          onTap: () => _addTimelineTrack(TimelineTrackSection.audio),
+          onTap: () => _addTimelineTrack(
+            TimelineTrackSection.audio,
+            TimelineTrackType.audio,
+          ),
+        ),
+        _ActionSpec(
+          label: 'Effects',
+          tooltip: 'Add effects lane',
+          icon: Icons.auto_fix_high_rounded,
+          onTap: () => _addTimelineTrack(
+            TimelineTrackSection.overlay,
+            TimelineTrackType.effect,
+          ),
         ),
       ],
       _BottomActionSubgroup.editTiming => [
         _ActionSpec(
           label: 'Trim/Speed',
-          tooltip: 'Trim source, change speed and reverse',
+          tooltip: selectedClip?.supportsReversePlayback == true
+              ? 'Trim source, change speed and reverse'
+              : 'Trim source and change speed',
           icon: Icons.av_timer_rounded,
           onTap:
               selectedClip != null &&
-                  (selectedClip.type == TimelineTrackType.video ||
-                      selectedClip.type == TimelineTrackType.audio ||
-                      selectedClip.type == TimelineTrackType.gif)
+                  capabilities.canEdit &&
+                  selectedClip.supportsSourceTiming
               ? () => _openTimingSheet(selectedClip)
               : null,
         ),
@@ -4293,7 +4525,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           label: 'Split',
           tooltip: 'Split selected clip at playhead',
           icon: Icons.content_cut_rounded,
-          onTap: selectedClip == null
+          onTap: selectedClip == null || !capabilities.canEdit
               ? null
               : () => _splitClipAtPlayhead(selectedClip),
         ),
@@ -4373,7 +4605,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           label: 'Inspector',
           tooltip: 'Opacity, layer and transform controls',
           icon: Icons.tune_rounded,
-          onTap: selectedClip == null
+          onTap: selectedClip == null || !capabilities.canTransform
               ? null
               : () => _openClipInspectorSheet(selectedClip),
         ),
@@ -4381,7 +4613,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           label: 'Forward',
           tooltip: 'Bring clip forward one layer',
           icon: Icons.move_up_rounded,
-          onTap: selectedClip == null
+          onTap: selectedClip == null || !capabilities.canChangeLayer
               ? null
               : () => _changeClipLayer(selectedClip, 1),
         ),
@@ -4389,7 +4621,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           label: 'Backward',
           tooltip: 'Send clip backward one layer',
           icon: Icons.move_down_rounded,
-          onTap: selectedClip == null
+          onTap: selectedClip == null || !capabilities.canChangeLayer
               ? null
               : () => _changeClipLayer(selectedClip, -1),
         ),
@@ -4397,7 +4629,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           label: 'Duplicate',
           tooltip: 'Duplicate selected clip',
           icon: Icons.content_copy_rounded,
-          onTap: selectedClip == null
+          onTap: selectedClip == null || !capabilities.canArrange
               ? null
               : () => _duplicateClip(selectedClip),
         ),
@@ -4407,7 +4639,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           icon: selectedClip?.enabled == false
               ? Icons.visibility_rounded
               : Icons.visibility_off_rounded,
-          onTap: selectedClip == null
+          onTap: selectedClip == null || !capabilities.canArrange
               ? null
               : () => _toggleClipEnabled(selectedClip),
         ),
@@ -4415,7 +4647,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           label: 'Delete',
           tooltip: 'Delete selected clip',
           icon: Icons.delete_outline_rounded,
-          onTap: selectedClip == null ? null : () => _deleteClip(selectedClip),
+          onTap: selectedClip == null || !capabilities.canEdit
+              ? null
+              : () => _deleteClip(selectedClip),
         ),
       ],
       _BottomActionSubgroup.effectsLooks => [
@@ -4479,7 +4713,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           label: 'Animate',
           tooltip: 'Clip animation',
           icon: Icons.auto_awesome_motion_rounded,
-          onTap: canAnimateClip
+          onTap: capabilities.canAnimate
               ? () => _openClipAnimationSheetForSelection(selectedClip!)
               : null,
         ),
@@ -4487,7 +4721,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           label: 'Transition',
           tooltip: 'Base clip transition',
           icon: Icons.join_inner_rounded,
-          onTap: canTransition
+          onTap: capabilities.canTransition
               ? () => _openTransitionSheet(selectedClip!)
               : null,
         ),
@@ -4497,7 +4731,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           label: 'Mixer',
           tooltip: 'Volume, pan, fades and normalize',
           icon: Icons.tune_rounded,
-          onTap: canAdjustAudio
+          onTap: capabilities.canAdjustAudio
               ? () => _openAudioControlsSheet(selectedClip!)
               : null,
         ),
@@ -4507,7 +4741,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           icon: selectedClip?.audioMix.muted == true
               ? Icons.volume_up_rounded
               : Icons.volume_off_rounded,
-          onTap: canAdjustAudio ? () => _toggleClipMute(selectedClip!) : null,
+          onTap: capabilities.canAdjustAudio
+              ? () => _toggleClipMute(selectedClip!)
+              : null,
         ),
       ],
       _BottomActionSubgroup.audioFades => [
@@ -4515,7 +4751,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           label: 'Fade In',
           tooltip: 'Toggle a 500ms audio fade in',
           icon: Icons.trending_up_rounded,
-          onTap: canAdjustAudio
+          onTap: capabilities.canAdjustAudio
               ? () => _toggleQuickFade(selectedClip!, fadeIn: true)
               : null,
         ),
@@ -4523,7 +4759,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           label: 'Fade Out',
           tooltip: 'Toggle a 500ms audio fade out',
           icon: Icons.trending_down_rounded,
-          onTap: canAdjustAudio
+          onTap: capabilities.canAdjustAudio
               ? () => _toggleQuickFade(selectedClip!, fadeIn: false)
               : null,
         ),
@@ -4531,7 +4767,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           label: 'Clear',
           tooltip: 'Clear both audio fades',
           icon: Icons.restart_alt_rounded,
-          onTap: canAdjustAudio
+          onTap: capabilities.canAdjustAudio
               ? () => _updateTimelineClip(
                   selectedClip!,
                   (current) => current.copyWith(
@@ -4551,7 +4787,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               : 'Normalize',
           tooltip: 'Toggle loudness normalization',
           icon: Icons.hearing_rounded,
-          onTap: canAdjustAudio
+          onTap: capabilities.canAdjustAudio
               ? () => _toggleClipNormalize(selectedClip!)
               : null,
         ),
@@ -4559,7 +4795,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           label: 'Center Pan',
           tooltip: 'Center the stereo pan',
           icon: Icons.swap_horiz_rounded,
-          onTap: canAdjustAudio
+          onTap: capabilities.canAdjustAudio
               ? () => _updateTimelineClip(
                   selectedClip!,
                   (current) => current.copyWith(
@@ -4572,7 +4808,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           label: 'Reset Mix',
           tooltip: 'Reset volume, pan, fades and normalize',
           icon: Icons.restart_alt_rounded,
-          onTap: canAdjustAudio
+          onTap: capabilities.canAdjustAudio
               ? () => _updateTimelineClip(
                   selectedClip!,
                   (current) =>
@@ -4749,9 +4985,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     );
   }
 
-  void _addTimelineTrack(TimelineTrackSection section) {
+  void _addTimelineTrack(
+    TimelineTrackSection section,
+    TimelineTrackType trackType,
+  ) {
     final timeline = ref.read(editorProvider).timeline;
-    final nextTrack = _createOptionalTrack(timeline, section);
+    final nextTrack = _createOptionalTrack(timeline, section, trackType);
     if (nextTrack == null) return;
     ref
         .read(editorProvider.notifier)
@@ -4762,6 +5001,14 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   Future<void> _openAudioControlsSheet(TimelineClip clip) async {
+    final editorState = ref.read(editorProvider);
+    final liveClip = _clipById(clip.id, editorState) ?? clip;
+    final track = _trackForClip(liveClip, editorState);
+    if (track == null ||
+        track.isLocked ||
+        !editorState.timeline.clipHasAudio(liveClip)) {
+      return;
+    }
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -5003,6 +5250,14 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   Future<void> _openTransitionSheet(TimelineClip clip) async {
+    final editorState = ref.read(editorProvider);
+    final track = _trackForClip(clip, editorState);
+    if (track == null ||
+        track.isLocked ||
+        track.section != TimelineTrackSection.baseVideo ||
+        clip.type != TimelineTrackType.video) {
+      return;
+    }
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -5025,6 +5280,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     TimelineClip clip,
     TimelineTrack track,
   ) async {
+    if (track.isLocked || !clip.supportsClipAnimation) return;
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -5405,6 +5661,39 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       ),
     );
   }
+}
+
+class _SelectionCapabilities {
+  final bool hasSelection;
+  final bool canEdit;
+  final bool canAdjustAudio;
+  final bool canVisualEffects;
+  final bool canTransform;
+  final bool canAnimate;
+  final bool canTransition;
+  final bool canArrange;
+  final bool canChangeLayer;
+  final bool isFilterEffect;
+  final bool isBlurEffect;
+
+  const _SelectionCapabilities({
+    required this.hasSelection,
+    required this.canEdit,
+    required this.canAdjustAudio,
+    required this.canVisualEffects,
+    required this.canTransform,
+    required this.canAnimate,
+    required this.canTransition,
+    required this.canArrange,
+    required this.canChangeLayer,
+    required this.isFilterEffect,
+    required this.isBlurEffect,
+  });
+
+  bool get canUseLooks => canVisualEffects || isFilterEffect;
+  bool get canUseBlur => canVisualEffects || isBlurEffect;
+  bool get canUseMotion => canAnimate || canTransition;
+  bool get canUseEffects => canUseLooks || canUseBlur || canUseMotion;
 }
 
 class _ActionSpec {

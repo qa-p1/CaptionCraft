@@ -5,6 +5,7 @@ import 'package:uuid/uuid.dart';
 
 import 'subtitle_entry.dart';
 import 'subtitle_style_model.dart';
+import 'word_timing.dart';
 
 /// Stable editor-space coordinates used by preview gestures and export.
 ///
@@ -66,6 +67,50 @@ enum TransitionType {
 }
 
 enum TimelineMarkerType { marker, chapter, beat }
+
+/// Capability flags shared by the editor, timeline and render paths.
+///
+/// Keeping these rules beside the timeline model prevents a selected track from
+/// accidentally accepting an unrelated clip (for example, text on a subtitle
+/// lane or an image on an effect lane).
+extension TimelineTrackTypeCapabilities on TimelineTrackType {
+  bool get isVisualMedia {
+    return this == TimelineTrackType.video ||
+        this == TimelineTrackType.image ||
+        this == TimelineTrackType.gif ||
+        this == TimelineTrackType.sticker;
+  }
+
+  bool get isTextContent {
+    return this == TimelineTrackType.text || this == TimelineTrackType.subtitle;
+  }
+
+  bool get supportsSourceTiming {
+    return this == TimelineTrackType.video ||
+        this == TimelineTrackType.audio ||
+        this == TimelineTrackType.gif;
+  }
+
+  /// Reverse preview needs a visual stream because the current media backend
+  /// cannot play audio backward in real time.
+  bool get supportsReversePlayback {
+    return this == TimelineTrackType.video || this == TimelineTrackType.gif;
+  }
+
+  bool get supportsVisualEffects => isVisualMedia;
+
+  bool get supportsTransform {
+    return isVisualMedia || this == TimelineTrackType.text;
+  }
+
+  /// Generic clip transitions are rendered by the visual-media pipeline.
+  /// Text uses its dedicated subtitle/text animation presets instead.
+  bool get supportsClipAnimation => isVisualMedia;
+
+  bool get canCarryAudio {
+    return this == TimelineTrackType.video || this == TimelineTrackType.audio;
+  }
+}
 
 /// A non-destructive crop stored as normalized source-space insets.
 ///
@@ -349,6 +394,15 @@ class TimelineTransform {
     this.flipY = false,
   });
 
+  bool get isIdentity =>
+      offsetX.abs() < 0.0001 &&
+      offsetY.abs() < 0.0001 &&
+      (scale - 1).abs() < 0.0001 &&
+      rotation.abs() < 0.0001 &&
+      (opacity - 1).abs() < 0.0001 &&
+      !flipX &&
+      !flipY;
+
   TimelineTransform copyWith({
     double? offsetX,
     double? offsetY,
@@ -410,6 +464,14 @@ class AudioMixSettings {
     this.pan = 0,
     this.normalize = false,
   });
+
+  bool get hasMixAdjustment =>
+      (volume - 1).abs() > 0.0001 ||
+      pan.abs() > 0.0001 ||
+      normalize ||
+      muted ||
+      fadeInMs > 0 ||
+      fadeOutMs > 0;
 
   AudioMixSettings copyWith({
     double? volume,
@@ -892,6 +954,134 @@ class TimelineClip {
   }
 }
 
+extension TimelineClipCapabilities on TimelineClip {
+  bool get supportsVisualEffects => type.supportsVisualEffects;
+  bool get supportsTransform => type.supportsTransform;
+  bool get supportsClipAnimation => type.supportsClipAnimation;
+  bool get supportsSourceTiming => type.supportsSourceTiming;
+  bool get supportsReversePlayback => type.supportsReversePlayback;
+  bool get canCarryAudio => type.canCarryAudio;
+
+  bool get hasRenderableTransformAdjustment {
+    if (type == TimelineTrackType.text) {
+      return transform.offsetX.abs() > 0.0001 ||
+          transform.offsetY.abs() > 0.0001 ||
+          (transform.scale - 1).abs() > 0.0001;
+    }
+    return supportsTransform && !transform.isIdentity;
+  }
+
+  int get effectiveIntroTransitionMs => math.min(
+    introTransition.durationMs.clamp(0, duration.inMilliseconds).toInt(),
+    duration.inMilliseconds ~/ 2,
+  );
+
+  int get effectiveOutroTransitionMs => math.min(
+    outroTransition.durationMs.clamp(0, duration.inMilliseconds).toInt(),
+    duration.inMilliseconds ~/ 2,
+  );
+
+  int get effectiveAudioFadeInMs => math.min(
+    audioMix.fadeInMs.clamp(0, duration.inMilliseconds).toInt(),
+    duration.inMilliseconds ~/ 2,
+  );
+
+  int get effectiveAudioFadeOutMs => math.min(
+    audioMix.fadeOutMs.clamp(0, duration.inMilliseconds).toInt(),
+    duration.inMilliseconds ~/ 2,
+  );
+
+  /// Maps source-relative transcription cues into this clip's timeline span.
+  ///
+  /// Transcription runs against the selected source range, so its timestamps
+  /// start at zero and do not account for timeline speed or reverse playback.
+  List<SubtitleEntry> mapSourceSubtitlesToTimeline(
+    Iterable<SubtitleEntry> sourceEntries,
+  ) {
+    final timelineSpanMs = math.max(0, duration.inMilliseconds);
+    if (timelineSpanMs == 0) return const [];
+    final safeRate = playbackRate.clamp(0.25, 4).toDouble();
+    final sourceSpanMs = sourceDuration.inMilliseconds > 0
+        ? sourceDuration.inMilliseconds
+        : math.max(1, (timelineSpanMs * safeRate).round());
+
+    ({int start, int end})? mapInterval(Duration start, Duration end) {
+      final clippedSourceStart = start.inMilliseconds
+          .clamp(0, sourceSpanMs)
+          .toInt();
+      final clippedSourceEnd = end.inMilliseconds
+          .clamp(0, sourceSpanMs)
+          .toInt();
+      if (clippedSourceEnd <= clippedSourceStart) return null;
+
+      final timelineStart = isReversed
+          ? ((sourceSpanMs - clippedSourceEnd) / safeRate).round()
+          : (clippedSourceStart / safeRate).round();
+      final timelineEnd = isReversed
+          ? ((sourceSpanMs - clippedSourceStart) / safeRate).round()
+          : (clippedSourceEnd / safeRate).round();
+      if (timelineEnd <= 0 || timelineStart >= timelineSpanMs) return null;
+      var boundedStart = timelineStart.clamp(0, timelineSpanMs).toInt();
+      var boundedEnd = timelineEnd.clamp(0, timelineSpanMs).toInt();
+      if (boundedEnd <= boundedStart) {
+        if (boundedStart < timelineSpanMs) {
+          boundedEnd = boundedStart + 1;
+        } else if (boundedEnd > 0) {
+          boundedStart = boundedEnd - 1;
+        } else {
+          return null;
+        }
+      }
+      return (start: boundedStart, end: boundedEnd);
+    }
+
+    final mappedEntries = <SubtitleEntry>[];
+    for (final entry in sourceEntries) {
+      final interval = mapInterval(entry.startTime, entry.endTime);
+      if (interval == null) continue;
+      final entryStart = startTime + Duration(milliseconds: interval.start);
+      final entryEnd = startTime + Duration(milliseconds: interval.end);
+      final mappedWords = <WordTiming>[];
+      for (final word in entry.words ?? const <WordTiming>[]) {
+        final wordInterval = mapInterval(word.startTime, word.endTime);
+        if (wordInterval == null) continue;
+        var wordStartMs = wordInterval.start
+            .clamp(interval.start, interval.end)
+            .toInt();
+        var wordEndMs = wordInterval.end
+            .clamp(interval.start, interval.end)
+            .toInt();
+        if (wordEndMs <= wordStartMs) {
+          if (wordStartMs < interval.end) {
+            wordEndMs = wordStartMs + 1;
+          } else if (wordEndMs > interval.start) {
+            wordStartMs = wordEndMs - 1;
+          } else {
+            continue;
+          }
+        }
+        mappedWords.add(
+          WordTiming(
+            word: word.word,
+            startTime: startTime + Duration(milliseconds: wordStartMs),
+            endTime: startTime + Duration(milliseconds: wordEndMs),
+          ),
+        );
+      }
+      mappedEntries.add(
+        entry.copyWith(
+          startTime: entryStart,
+          endTime: entryEnd,
+          words: mappedWords.isEmpty ? null : mappedWords,
+          clearWords: entry.words != null && mappedWords.isEmpty,
+        ),
+      );
+    }
+    mappedEntries.sort((a, b) => a.startTime.compareTo(b.startTime));
+    return mappedEntries;
+  }
+}
+
 class TimelineTrack {
   final String id;
   final String name;
@@ -983,6 +1173,33 @@ class TimelineTrack {
           const [],
     );
   }
+}
+
+extension TimelineTrackCompatibility on TimelineTrack {
+  /// Whether this lane can safely contain [clipType].
+  ///
+  /// Visual overlay lanes are intentionally media-agnostic so an image, GIF,
+  /// sticker or overlay video can share a lane. Text, subtitle, audio and effect
+  /// lanes stay strict because their preview/export paths are type-specific.
+  bool acceptsClipType(TimelineTrackType clipType) {
+    switch (section) {
+      case TimelineTrackSection.baseVideo:
+        return type == TimelineTrackType.video &&
+            clipType == TimelineTrackType.video;
+      case TimelineTrackSection.overlay:
+        if (type == TimelineTrackType.effect) {
+          return clipType == TimelineTrackType.effect;
+        }
+        return type.isVisualMedia && clipType.isVisualMedia;
+      case TimelineTrackSection.textSubtitle:
+        return type == clipType && clipType.isTextContent;
+      case TimelineTrackSection.audio:
+        return type == TimelineTrackType.audio &&
+            clipType == TimelineTrackType.audio;
+    }
+  }
+
+  bool acceptsClip(TimelineClip clip) => acceptsClipType(clip.type);
 }
 
 class CanvasSettings {
@@ -1088,6 +1305,34 @@ class EditorTimeline {
     return tracks.where((track) => track.section == section).toList();
   }
 
+  TimelineTrack? insertionTrackFor({
+    required TimelineTrackSection section,
+    required TimelineTrackType clipType,
+    String? preferredTrackId,
+  }) {
+    // Captions are one system-managed lane. Legacy projects can contain
+    // duplicates, but persistence coalesces them, including their lock state;
+    // never route an edit around a locked duplicate only to relock it on save.
+    if (clipType == TimelineTrackType.subtitle &&
+        tracks.any(
+          (track) => track.type == TimelineTrackType.subtitle && track.isLocked,
+        )) {
+      return null;
+    }
+    final candidates = tracks.where(
+      (track) =>
+          track.section == section &&
+          !track.isLocked &&
+          track.acceptsClipType(clipType),
+    );
+    if (preferredTrackId != null) {
+      for (final track in candidates) {
+        if (track.id == preferredTrackId) return track;
+      }
+    }
+    return candidates.firstOrNull;
+  }
+
   String nextTrackNameForSection(TimelineTrackSection section) {
     final sectionTracks = tracksForSection(section);
     switch (section) {
@@ -1149,6 +1394,15 @@ class EditorTimeline {
       if (asset.id == assetId) return asset;
     }
     return null;
+  }
+
+  /// Audio controls are valid only when the selected media actually has audio.
+  /// Unknown video metadata remains editable for backwards-compatible projects.
+  bool clipHasAudio(TimelineClip clip) {
+    if (clip.type == TimelineTrackType.audio) return true;
+    if (clip.type != TimelineTrackType.video) return false;
+    final hasAudio = assetForClip(clip)?.metadata['hasAudio'];
+    return hasAudio is bool ? hasAudio : true;
   }
 
   List<TimelineClip> subtitleClipsForLinkedClip(String clipId) {

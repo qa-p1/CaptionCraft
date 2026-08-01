@@ -181,7 +181,12 @@ void main() {
 
       editor.undo();
       expect(
-        container.read(editorProvider).timeline.tracks.single.name,
+        container
+            .read(editorProvider)
+            .timeline
+            .tracks
+            .firstWhere((track) => track.id == 'track')
+            .name,
         'Video 1',
       );
       // The timeline edit snapshot captures the subtitle state that existed
@@ -190,7 +195,12 @@ void main() {
 
       editor.redo();
       expect(
-        container.read(editorProvider).timeline.tracks.single.name,
+        container
+            .read(editorProvider)
+            .timeline
+            .tracks
+            .firstWhere((track) => track.id == 'track')
+            .name,
         'Renamed video',
       );
     });

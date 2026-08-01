@@ -1365,7 +1365,16 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
       SnackBarHelper.showInfo(context, 'Everything already looks good.');
       return;
     }
-    ref.read(editorProvider.notifier).replaceSubtitleEntries(result.entries);
+    final applied = ref
+        .read(editorProvider.notifier)
+        .replaceSubtitleEntries(result.entries);
+    if (!applied) {
+      SnackBarHelper.showInfo(
+        context,
+        'Unlock the subtitle track before changing captions.',
+      );
+      return;
+    }
     SnackBarHelper.showSuccess(
       context,
       '${result.changedCount} item'

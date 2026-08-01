@@ -229,6 +229,7 @@ void main() {
           fadeInMs: 100,
           fadeOutMs: 180,
           pan: -0.12,
+          normalize: true,
         ),
         outroTransition: const ClipTransition(
           type: TransitionType.dissolve,
@@ -370,6 +371,10 @@ void main() {
       expect(filterGraph, contains('timelineEffect'));
       expect(filterGraph, contains('between(t,0.100000,0.400000)'));
       expect(filterGraph, contains('between(t,2.600000,2.900000)'));
+      expect(filterGraph, contains('loudnorm=I=-16:LRA=11:TP=-1.5'));
+      expect(filterGraph, contains('afade=t=in:st=0:d=0.1'));
+      expect(filterGraph, contains('afade=t=out:st=1.42:d=0.18'));
+      expect(filterGraph, contains('pan=stereo'));
 
       final render = await Process.run('ffmpeg', arguments);
       expect(render.exitCode, 0, reason: '${render.stdout}\n${render.stderr}');

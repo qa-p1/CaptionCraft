@@ -1,14 +1,23 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter/foundation.dart';
 import '../models/subtitle_entry.dart';
 import '../models/subtitle_style_model.dart';
 import '../models/word_timing.dart';
+import 'editor_history_clock.dart';
 
 /// Undo/redo action for the subtitle state.
 class SubtitleAction {
   final List<SubtitleEntry> subtitles;
   final SubtitleStyleModel globalStyle;
+  final int sequence;
+  final int branch;
 
-  SubtitleAction({required this.subtitles, required this.globalStyle});
+  SubtitleAction({
+    required this.subtitles,
+    required this.globalStyle,
+    required this.sequence,
+    required this.branch,
+  });
 }
 
 /// State for all subtitle data.
@@ -49,8 +58,11 @@ class SubtitleState {
 }
 
 class SubtitleNotifier extends StateNotifier<SubtitleState> {
-  SubtitleNotifier() : super(const SubtitleState());
+  SubtitleNotifier([EditorHistoryClock? historyClock])
+    : _historyClock = historyClock ?? EditorHistoryClock(),
+      super(const SubtitleState());
 
+  final EditorHistoryClock _historyClock;
   final List<SubtitleAction> _undoStack = [];
   final List<SubtitleAction> _redoStack = [];
   static const int _maxStackDepth = 50;
@@ -58,13 +70,19 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
   bool _isStyleGestureEditing = false;
 
   bool get canUndo => _undoStack.isNotEmpty;
-  bool get canRedo => _redoStack.isNotEmpty;
+  bool get canRedo =>
+      _redoStack.isNotEmpty && _redoStack.last.branch == _historyClock.branch;
+  int? get latestUndoSequence => canUndo ? _undoStack.last.sequence : null;
+  int? get latestRedoSequence => canRedo ? _redoStack.last.sequence : null;
 
   void _pushUndo() {
+    final sequence = _historyClock.recordAction();
     _undoStack.add(
       SubtitleAction(
         subtitles: List.from(state.entries),
         globalStyle: state.globalStyle,
+        sequence: sequence,
+        branch: _historyClock.branch,
       ),
     );
     if (_undoStack.length > _maxStackDepth) {
@@ -75,13 +93,15 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
 
   void undo() {
     if (!canUndo) return;
+    final action = _undoStack.removeLast();
     _redoStack.add(
       SubtitleAction(
         subtitles: List.from(state.entries),
         globalStyle: state.globalStyle,
+        sequence: _historyClock.recordTraversal(),
+        branch: _historyClock.branch,
       ),
     );
-    final action = _undoStack.removeLast();
     state = state.copyWith(
       entries: action.subtitles,
       globalStyle: action.globalStyle,
@@ -90,13 +110,15 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
 
   void redo() {
     if (!canRedo) return;
+    final action = _redoStack.removeLast();
     _undoStack.add(
       SubtitleAction(
         subtitles: List.from(state.entries),
         globalStyle: state.globalStyle,
+        sequence: _historyClock.recordTraversal(),
+        branch: _historyClock.branch,
       ),
     );
-    final action = _redoStack.removeLast();
     state = state.copyWith(
       entries: action.subtitles,
       globalStyle: action.globalStyle,
@@ -114,6 +136,20 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
   /// Sync subtitle entries from timeline edits without creating a new undo step.
   void syncFromTimeline(List<SubtitleEntry> entries) {
     final existingById = {for (final entry in state.entries) entry.id: entry};
+    final isUnchanged =
+        entries.length == state.entries.length &&
+        entries.every((entry) {
+          final existing = existingById[entry.id];
+          return existing != null &&
+              existing.startTime == entry.startTime &&
+              existing.endTime == entry.endTime &&
+              existing.text == entry.text &&
+              mapEquals(
+                existing.styleOverride?.toJson(),
+                entry.styleOverride?.toJson(),
+              );
+        });
+    if (isUnchanged) return;
     final mergedEntries = entries.map((entry) {
       final existing = existingById[entry.id];
       if (existing == null) return entry;
@@ -185,6 +221,7 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
 
   /// Select a subtitle entry.
   void selectEntry(String? id) {
+    if (state.selectedEntryId == id) return;
     state = state.copyWith(selectedEntryId: id, clearSelection: id == null);
   }
 
@@ -530,6 +567,6 @@ enum SubtitleTextCase { sentence, upper, lower, title }
 
 final subtitleProvider = StateNotifierProvider<SubtitleNotifier, SubtitleState>(
   (ref) {
-    return SubtitleNotifier();
+    return SubtitleNotifier(ref.read(editorHistoryClockProvider));
   },
 );
