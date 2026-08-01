@@ -96,6 +96,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   _BottomActionSubgroup? _activeBottomSubgroup;
   final GlobalKey _previewKey = GlobalKey(debugLabel: 'editor-video-preview');
   bool _isPreviewFullscreen = false;
+  TimelineClip? _clipAttributeClipboard;
 
   @override
   void initState() {
@@ -458,6 +459,18 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             onPressed: _showExportActions,
             icon: const Icon(Icons.more_horiz_rounded, size: 21),
           ),
+        if (!phoneToolbar)
+          IconButton(
+            tooltip: 'Editor tools',
+            onPressed: _showEditorToolsSheet,
+            icon: const Icon(Icons.auto_awesome_mosaic_outlined, size: 20),
+          ),
+        if (phoneToolbar)
+          _compactToolbarButton(
+            tooltip: 'Editor tools',
+            icon: Icons.auto_awesome_mosaic_outlined,
+            onTap: _showEditorToolsSheet,
+          ),
         if (phoneToolbar)
           Padding(
             padding: const EdgeInsets.only(right: 4),
@@ -578,6 +591,835 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         );
       },
     );
+  }
+
+  Future<void> _showEditorToolsSheet() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: kSurface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (sheetContext) {
+        return SafeArea(
+          child: FractionallySizedBox(
+            heightFactor: 0.88,
+            child: ListView(
+              padding: const EdgeInsets.fromLTRB(14, 12, 14, 24),
+              children: [
+                Center(
+                  child: Container(
+                    width: 42,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: kBorder,
+                      borderRadius: BorderRadius.circular(99),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                const Text(
+                  'Editor tools',
+                  style: TextStyle(
+                    color: kTextPrimary,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  'Non-destructive tools for animation, finishing, and a faster timeline workflow.',
+                  style: TextStyle(color: kTextSecondary, fontSize: 12),
+                ),
+                _toolSectionTitle('New editing features'),
+                _toolTile(
+                  sheetContext,
+                  Icons.key_rounded,
+                  'Keyframe opacity',
+                  'Animate clip opacity at the playhead',
+                  () => _addSelectedKeyframe(TimelineKeyframeProperty.opacity),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.zoom_in_rounded,
+                  'Keyframe scale',
+                  'Animate zooms and punch-ins',
+                  () => _addSelectedKeyframe(TimelineKeyframeProperty.scale),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.open_with_rounded,
+                  'Keyframe position',
+                  'Animate X/Y movement from the preview',
+                  () =>
+                      _addSelectedKeyframe(TimelineKeyframeProperty.positionX),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.rotate_right_rounded,
+                  'Keyframe rotation',
+                  'Animate rotation over time',
+                  () => _addSelectedKeyframe(TimelineKeyframeProperty.rotation),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.volume_up_rounded,
+                  'Keyframe volume',
+                  'Create a volume automation point',
+                  () => _addSelectedKeyframe(TimelineKeyframeProperty.volume),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.delete_sweep_rounded,
+                  'Clear clip keyframes',
+                  'Remove all animation points from the selected clip',
+                  _clearSelectedKeyframes,
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.pause_circle_outline_rounded,
+                  'Toggle freeze frame',
+                  'Hold the selected visual clip on its current frame',
+                  () => _toggleSelectedClipFlag(
+                    (clip) => clip.copyWith(freezeFrame: !clip.freezeFrame),
+                  ),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.vibration_rounded,
+                  'Toggle stabilisation',
+                  'Mark a visual clip for stabilised finishing',
+                  () => _toggleSelectedClipFlag(
+                    (clip) => clip.copyWith(stabilize: !clip.stabilize),
+                  ),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.noise_aware_rounded,
+                  'Toggle noise reduction',
+                  'Mark a clip for dialogue cleanup during export',
+                  () => _toggleSelectedClipFlag(
+                    (clip) => clip.copyWith(denoise: !clip.denoise),
+                  ),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.colorize_rounded,
+                  'Toggle chroma key',
+                  'Enable green-screen removal on a visual clip',
+                  () => _toggleSelectedClipFlag(
+                    (clip) =>
+                        clip.copyWith(chromaKeyEnabled: !clip.chromaKeyEnabled),
+                  ),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.record_voice_over_rounded,
+                  'Toggle auto ducking',
+                  'Lower music under captions and voice clips',
+                  () => _toggleSelectedClipFlag(
+                    (clip) => clip.copyWith(autoDuck: !clip.autoDuck),
+                  ),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.sticky_note_2_outlined,
+                  'Add clip note',
+                  'Keep an edit note attached to the clip',
+                  _setSelectedClipNote,
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.palette_outlined,
+                  'Cycle clip colour',
+                  'Colour-code clips for fast scanning',
+                  _cycleSelectedClipColor,
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.copy_all_rounded,
+                  'Copy clip attributes',
+                  'Copy transform, timing, audio, and effect settings',
+                  _copyClipAttributes,
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.content_paste_go_rounded,
+                  'Paste clip attributes',
+                  'Apply copied settings to the selected clips',
+                  _pasteClipAttributes,
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.call_split_rounded,
+                  'Split every track',
+                  'Cut all clips crossing the playhead together',
+                  _splitEveryTrackAtPlayhead,
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.music_note_rounded,
+                  'Generate beat markers',
+                  'Add a half-second beat grid across the composition',
+                  _generateBeatMarkers,
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.bookmark_add_outlined,
+                  'Add chapter marker',
+                  'Mark the current playhead as a chapter',
+                  _addChapterMarker,
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.tune_rounded,
+                  'Set project frame rate',
+                  'Choose 24, 25, 30, 50, or 60 fps snapping',
+                  _chooseProjectFrameRate,
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.clear_all_rounded,
+                  'Clear all markers',
+                  'Remove marker, beat, and chapter guides',
+                  _clearAllMarkers,
+                ),
+                _toolSectionTitle('Editor workflow improvements'),
+                _toolTile(
+                  sheetContext,
+                  Icons.select_all_rounded,
+                  'Select all clips',
+                  'Select every clip for batch actions',
+                  _selectAllClips,
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.deselect_rounded,
+                  'Clear multi-selection',
+                  'Return to a single-clip selection',
+                  () => ref.read(editorProvider.notifier).clearClipSelection(),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.keyboard_double_arrow_left_rounded,
+                  'Nudge selection one frame left',
+                  'Precision alignment without dragging',
+                  () => _nudgeSelectedClips(-1),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.keyboard_double_arrow_right_rounded,
+                  'Nudge selection one frame right',
+                  'Precision alignment without dragging',
+                  () => _nudgeSelectedClips(1),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.edit_outlined,
+                  'Rename selected track',
+                  'Give a lane a useful production name',
+                  _renameSelectedTrack,
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.library_add_outlined,
+                  'Duplicate selected track',
+                  'Clone a lane and all of its clip settings',
+                  _duplicateSelectedTrack,
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.arrow_upward_rounded,
+                  'Move selected track up',
+                  'Reorder the layer stack one row',
+                  () => _moveSelectedTrack(-1),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.arrow_downward_rounded,
+                  'Move selected track down',
+                  'Reorder the layer stack one row',
+                  () => _moveSelectedTrack(1),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.unfold_less_rounded,
+                  'Collapse all tracks',
+                  'Make dense projects easier to scan',
+                  () => ref
+                      .read(editorProvider.notifier)
+                      .setAllTracks(collapsed: true),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.unfold_more_rounded,
+                  'Expand all tracks',
+                  'Restore full-height lanes',
+                  () => ref
+                      .read(editorProvider.notifier)
+                      .setAllTracks(collapsed: false),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.lock_rounded,
+                  'Lock all tracks',
+                  'Protect the current layout before polishing',
+                  () => ref
+                      .read(editorProvider.notifier)
+                      .setAllTracks(locked: true),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.lock_open_rounded,
+                  'Unlock all tracks',
+                  'Resume editing every lane',
+                  () => ref
+                      .read(editorProvider.notifier)
+                      .setAllTracks(locked: false),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.volume_off_rounded,
+                  'Mute all tracks',
+                  'Silence every audio-capable lane',
+                  () => ref
+                      .read(editorProvider.notifier)
+                      .setAllTracks(muted: true),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.volume_up_rounded,
+                  'Unmute all tracks',
+                  'Restore every lane’s monitor audio',
+                  () => ref
+                      .read(editorProvider.notifier)
+                      .setAllTracks(muted: false),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.access_time_rounded,
+                  'Toggle timecode ruler',
+                  'Switch between frame-aware and seconds labels',
+                  () => _toggleWorkspace(
+                    (settings) =>
+                        settings.copyWith(showTimecode: !settings.showTimecode),
+                  ),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.photo_library_outlined,
+                  'Toggle thumbnails',
+                  'Reduce visual noise on compact timelines',
+                  () => _toggleWorkspace(
+                    (settings) => settings.copyWith(
+                      showThumbnails: !settings.showThumbnails,
+                    ),
+                  ),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.graphic_eq_rounded,
+                  'Toggle waveforms',
+                  'Show or hide audio amplitude guides',
+                  () => _toggleWorkspace(
+                    (settings) => settings.copyWith(
+                      showWaveforms: !settings.showWaveforms,
+                    ),
+                  ),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.key_rounded,
+                  'Toggle keyframe guides',
+                  'Show or hide animation diamonds in clips',
+                  () => _toggleWorkspace(
+                    (settings) => settings.copyWith(
+                      showKeyframes: !settings.showKeyframes,
+                    ),
+                  ),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.follow_the_signs_rounded,
+                  'Toggle playhead follow',
+                  'Keep the timeline centered during playback',
+                  () => _toggleWorkspace(
+                    (settings) => settings.copyWith(
+                      autoFollowPlayhead: !settings.autoFollowPlayhead,
+                    ),
+                  ),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.text_fields_rounded,
+                  'Toggle clip labels',
+                  'Use a clean icon-and-envelope timeline view',
+                  () => _toggleWorkspace(
+                    (settings) => settings.copyWith(
+                      showClipLabels: !settings.showClipLabels,
+                    ),
+                  ),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.grid_4x4_rounded,
+                  'Toggle canvas grid',
+                  'Use guides for consistent framing',
+                  () => _updateCanvasSettings(
+                    (settings) =>
+                        settings.copyWith(showGrid: !settings.showGrid),
+                  ),
+                ),
+                _toolTile(
+                  sheetContext,
+                  Icons.crop_free_rounded,
+                  'Toggle safe areas',
+                  'Preview social-platform title-safe margins',
+                  () => _updateCanvasSettings(
+                    (settings) => settings.copyWith(
+                      showSafeAreas: !settings.showSafeAreas,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _toolSectionTitle(String title) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(4, 18, 4, 4),
+      child: Text(
+        title.toUpperCase(),
+        style: const TextStyle(
+          color: kAccent,
+          fontSize: 10,
+          fontWeight: FontWeight.w900,
+          letterSpacing: 1.1,
+        ),
+      ),
+    );
+  }
+
+  Widget _toolTile(
+    BuildContext sheetContext,
+    IconData icon,
+    String title,
+    String subtitle,
+    VoidCallback onTap,
+  ) {
+    return ListTile(
+      dense: true,
+      contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+      leading: Container(
+        width: 34,
+        height: 34,
+        decoration: BoxDecoration(
+          color: kAccent.withValues(alpha: 0.11),
+          borderRadius: BorderRadius.circular(9),
+        ),
+        child: Icon(icon, color: kAccent, size: 18),
+      ),
+      title: Text(
+        title,
+        style: const TextStyle(
+          color: kTextPrimary,
+          fontSize: 13,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+      subtitle: Text(
+        subtitle,
+        style: const TextStyle(color: kTextSecondary, fontSize: 11),
+      ),
+      onTap: () {
+        Navigator.pop(sheetContext);
+        onTap();
+      },
+    );
+  }
+
+  TimelineClip? _toolSelectedClip() {
+    return _selectedClipFromState(ref.read(editorProvider));
+  }
+
+  bool _toggleSelectedClipFlag(TimelineClip Function(TimelineClip) mapper) {
+    final clip = _toolSelectedClip();
+    if (clip == null) {
+      SnackBarHelper.showInfo(context, 'Select a clip first.');
+      return false;
+    }
+    final changed = ref
+        .read(editorProvider.notifier)
+        .updateClip(clip.id, mapper);
+    if (!changed) {
+      SnackBarHelper.showInfo(context, 'Unlock the selected track first.');
+    }
+    return changed;
+  }
+
+  void _addSelectedKeyframe(TimelineKeyframeProperty property) {
+    final clip = _toolSelectedClip();
+    if (clip == null ||
+        !clip.supportsTransform &&
+            property != TimelineKeyframeProperty.volume) {
+      SnackBarHelper.showInfo(context, 'Select a visual or audio clip first.');
+      return;
+    }
+    final position = ref.read(playbackProvider).position;
+    if (position < clip.startTime || position > clip.endTime) {
+      SnackBarHelper.showInfo(
+        context,
+        'Move the playhead inside the selected clip.',
+      );
+      return;
+    }
+    final transform = clip.transformAt(position);
+    final value = switch (property) {
+      TimelineKeyframeProperty.opacity => transform.opacity,
+      TimelineKeyframeProperty.scale => transform.scale,
+      TimelineKeyframeProperty.rotation => transform.rotation,
+      TimelineKeyframeProperty.positionX => transform.offsetX,
+      TimelineKeyframeProperty.positionY => transform.offsetY,
+      TimelineKeyframeProperty.volume => clip.volumeAt(position),
+      TimelineKeyframeProperty.blurStrength => clip.blur.safeStrength,
+    };
+    final ok = ref
+        .read(editorProvider.notifier)
+        .upsertKeyframe(
+          clipId: clip.id,
+          property: property,
+          time: position - clip.startTime,
+          value: value,
+        );
+    if (ok) {
+      SnackBarHelper.showSuccess(context, '${property.name} keyframe added.');
+    } else {
+      SnackBarHelper.showInfo(context, 'Unlock the selected track first.');
+    }
+  }
+
+  void _clearSelectedKeyframes() {
+    final clip = _toolSelectedClip();
+    if (clip == null) return;
+    ref.read(editorProvider.notifier).removeKeyframes(clip.id);
+  }
+
+  Future<void> _setSelectedClipNote() async {
+    final clip = _toolSelectedClip();
+    if (clip == null) return;
+    final controller = TextEditingController(text: clip.notes ?? '');
+    final note = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Clip note'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLines: 4,
+          decoration: const InputDecoration(
+            hintText: 'What should you remember about this clip?',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, controller.text),
+            child: const Text('Save note'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (!mounted || note == null) return;
+    ref
+        .read(editorProvider.notifier)
+        .updateClip(
+          clip.id,
+          (current) => note.trim().isEmpty
+              ? current.copyWith(clearNotes: true)
+              : current.copyWith(notes: note.trim()),
+        );
+  }
+
+  void _cycleSelectedClipColor() {
+    final clip = _toolSelectedClip();
+    if (clip == null) return;
+    const colors = [
+      Color(0x00000000),
+      Color(0xFF4F8CFF),
+      Color(0xFF9B6DFF),
+      Color(0xFFEF7187),
+      Color(0xFFF4B942),
+      Color(0xFF44C38A),
+    ];
+    final current = colors.indexWhere(
+      (color) => color.toARGB32() == clip.timelineColor.toARGB32(),
+    );
+    final next = colors[(current + 1) % colors.length];
+    ref
+        .read(editorProvider.notifier)
+        .updateClip(
+          clip.id,
+          (currentClip) => currentClip.copyWith(timelineColor: next),
+        );
+  }
+
+  void _copyClipAttributes() {
+    final clip = _toolSelectedClip();
+    if (clip == null) return;
+    setState(() => _clipAttributeClipboard = clip);
+    SnackBarHelper.showInfo(context, 'Clip attributes copied.');
+  }
+
+  void _pasteClipAttributes() {
+    final source = _clipAttributeClipboard;
+    final editorState = ref.read(editorProvider);
+    if (source == null || editorState.selectedClipIds.isEmpty) {
+      SnackBarHelper.showInfo(
+        context,
+        'Copy clip attributes first, then select clips.',
+      );
+      return;
+    }
+    final selected = editorState.selectedClipIds;
+    final tracks = editorState.timeline.tracks.map((track) {
+      if (track.isLocked) return track;
+      return track.copyWith(
+        clips: track.clips.map((clip) {
+          if (!selected.contains(clip.id)) return clip;
+          return clip.copyWith(
+            transform: source.transform,
+            audioMix: source.audioMix,
+            fitMode: source.fitMode,
+            playbackRate: source.playbackRate,
+            isReversed: source.isReversed,
+            crop: source.crop,
+            blur: source.blur,
+            colorAdjustments: source.colorAdjustments,
+            introTransition: source.introTransition,
+            outroTransition: source.outroTransition,
+            keyframes: source.keyframes,
+            freezeFrame: source.freezeFrame,
+            stabilize: source.stabilize,
+            denoise: source.denoise,
+            chromaKeyEnabled: source.chromaKeyEnabled,
+            chromaKeyColor: source.chromaKeyColor,
+            chromaKeySimilarity: source.chromaKeySimilarity,
+            timelineColor: source.timelineColor,
+            autoDuck: source.autoDuck,
+            duckAmount: source.duckAmount,
+          );
+        }).toList(),
+      );
+    }).toList();
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(editorState.timeline.copyWith(tracks: tracks));
+  }
+
+  void _splitEveryTrackAtPlayhead() {
+    final position = ref.read(playbackProvider).position;
+    final ids = ref
+        .read(editorProvider)
+        .timeline
+        .tracks
+        .expand((track) => track.clips)
+        .where((clip) => clip.startTime < position && clip.endTime > position)
+        .map((clip) => clip.id)
+        .toList();
+    for (final id in ids) {
+      final live = _clipById(id, ref.read(editorProvider));
+      if (live != null) _splitClipAtPlayhead(live);
+    }
+    if (ids.isEmpty) {
+      SnackBarHelper.showInfo(context, 'No clips cross the playhead.');
+    }
+  }
+
+  void _generateBeatMarkers() {
+    final timeline = ref.read(editorProvider).timeline;
+    final duration = timeline.duration;
+    if (duration <= Duration.zero) return;
+    final markers = [...timeline.markers];
+    for (var ms = 0; ms <= duration.inMilliseconds; ms += 500) {
+      if (markers.any(
+        (marker) =>
+            marker.type == TimelineMarkerType.beat &&
+            (marker.position.inMilliseconds - ms).abs() < 40,
+      )) {
+        continue;
+      }
+      markers.add(
+        TimelineMarker(
+          position: Duration(milliseconds: ms),
+          label: 'Beat ${ms ~/ 500 + 1}',
+          type: TimelineMarkerType.beat,
+          color: const Color(0xFF67E8F9),
+        ),
+      );
+    }
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(
+          timeline.copyWith(
+            markers: markers..sort((a, b) => a.position.compareTo(b.position)),
+          ),
+        );
+  }
+
+  void _addChapterMarker() {
+    final timeline = ref.read(editorProvider).timeline;
+    final position = ref.read(playbackProvider).position;
+    final marker = TimelineMarker(
+      position: position,
+      label:
+          'Chapter ${timeline.markers.where((marker) => marker.type == TimelineMarkerType.chapter).length + 1}',
+      type: TimelineMarkerType.chapter,
+      color: const Color(0xFFF59E0B),
+    );
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(timeline.copyWith(markers: [...timeline.markers, marker]));
+  }
+
+  void _clearAllMarkers() {
+    final timeline = ref.read(editorProvider).timeline;
+    if (timeline.markers.isEmpty) return;
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(timeline.copyWith(markers: const []));
+  }
+
+  Future<void> _chooseProjectFrameRate() async {
+    final current = ref
+        .read(editorProvider)
+        .timeline
+        .workspaceSettings
+        .frameRate;
+    final selected = await showDialog<int>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Project frame rate'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final rate in const [24, 25, 30, 50, 60])
+              ListTile(
+                leading: Icon(
+                  rate == current
+                      ? Icons.radio_button_checked
+                      : Icons.radio_button_off,
+                  color: rate == current ? kAccent : kTextSecondary,
+                ),
+                title: Text('$rate fps'),
+                onTap: () => Navigator.pop(dialogContext, rate),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted || selected == null) return;
+    _toggleWorkspace((settings) => settings.copyWith(frameRate: selected));
+  }
+
+  void _selectAllClips() {
+    final ids = ref
+        .read(editorProvider)
+        .timeline
+        .tracks
+        .expand((track) => track.clips)
+        .map((clip) => clip.id);
+    ref.read(editorProvider.notifier).selectClipIds(ids);
+  }
+
+  void _nudgeSelectedClips(int direction) {
+    final editorState = ref.read(editorProvider);
+    final selected = editorState.selectedClipIds;
+    if (selected.isEmpty) return;
+    final frameMs = math.max(
+      1,
+      (1000 / editorState.timeline.workspaceSettings.frameRate).round(),
+    );
+    final delta = Duration(milliseconds: frameMs * direction);
+    final nextTracks = editorState.timeline.tracks.map((track) {
+      if (track.isLocked) return track;
+      return track.copyWith(
+        clips: track.clips.map((clip) {
+          if (!selected.contains(clip.id)) return clip;
+          final start = math.max(
+            0,
+            clip.startTime.inMilliseconds + delta.inMilliseconds,
+          );
+          return clip.copyWith(
+            startTime: Duration(milliseconds: start),
+            endTime: Duration(
+              milliseconds: start + clip.duration.inMilliseconds,
+            ),
+          );
+        }).toList(),
+      );
+    }).toList();
+    final nextTimeline = editorState.timeline.copyWith(tracks: nextTracks);
+    ref.read(editorProvider.notifier).setTimeline(nextTimeline);
+    ref
+        .read(subtitleProvider.notifier)
+        .syncFromTimeline(nextTimeline.subtitleEntries);
+  }
+
+  Future<void> _renameSelectedTrack() async {
+    final editorState = ref.read(editorProvider);
+    final track = editorState.timeline.tracks
+        .where((candidate) => candidate.id == editorState.selectedTrackId)
+        .firstOrNull;
+    if (track == null) return;
+    final controller = TextEditingController(text: track.name);
+    final name = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Rename track'),
+        content: TextField(controller: controller, autofocus: true),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, controller.text),
+            child: const Text('Rename'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (!mounted || name == null) return;
+    ref.read(editorProvider.notifier).renameTrack(track.id, name);
+  }
+
+  void _duplicateSelectedTrack() {
+    final trackId = ref.read(editorProvider).selectedTrackId;
+    if (trackId == null) return;
+    ref.read(editorProvider.notifier).duplicateTrack(trackId);
+  }
+
+  void _moveSelectedTrack(int direction) {
+    final trackId = ref.read(editorProvider).selectedTrackId;
+    if (trackId == null) return;
+    ref.read(editorProvider.notifier).reorderTrack(trackId, direction);
+  }
+
+  void _toggleWorkspace(
+    TimelineWorkspaceSettings Function(TimelineWorkspaceSettings current)
+    mapper,
+  ) {
+    ref.read(editorProvider.notifier).setWorkspaceSettings(mapper);
   }
 
   Future<void> _exportSubtitleFile(String format) async {

@@ -68,6 +68,171 @@ enum TransitionType {
 
 enum TimelineMarkerType { marker, chapter, beat }
 
+enum TimelineKeyframeProperty {
+  opacity,
+  scale,
+  rotation,
+  positionX,
+  positionY,
+  volume,
+  blurStrength,
+}
+
+/// A non-destructive value change stored relative to the start of a clip.
+/// Keyframes are deliberately small and serializable so they remain safe for
+/// older projects and can be interpolated by both preview and export paths.
+class TimelineKeyframe {
+  final String id;
+  final Duration time;
+  final TimelineKeyframeProperty property;
+  final double value;
+
+  TimelineKeyframe({
+    String? id,
+    required this.time,
+    required this.property,
+    required this.value,
+  }) : id = id ?? const Uuid().v4();
+
+  TimelineKeyframe copyWith({
+    Duration? time,
+    TimelineKeyframeProperty? property,
+    double? value,
+  }) {
+    return TimelineKeyframe(
+      id: id,
+      time: time ?? this.time,
+      property: property ?? this.property,
+      value: value ?? this.value,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'timeMs': time.inMilliseconds,
+      'property': property.name,
+      'value': value,
+    };
+  }
+
+  factory TimelineKeyframe.fromJson(Map<String, dynamic> json) {
+    return TimelineKeyframe(
+      id: json['id'] as String?,
+      time: Duration(milliseconds: (json['timeMs'] as num?)?.toInt() ?? 0),
+      property: TimelineKeyframeProperty.values.firstWhere(
+        (candidate) => candidate.name == json['property'],
+        orElse: () => TimelineKeyframeProperty.opacity,
+      ),
+      value: (json['value'] as num?)?.toDouble() ?? 0,
+    );
+  }
+}
+
+class TimelineWorkspaceSettings {
+  final int frameRate;
+  final bool loopPlayback;
+  final bool showWaveforms;
+  final bool showThumbnails;
+  final bool showTimecode;
+  final bool showKeyframes;
+  final bool autoFollowPlayhead;
+  final bool showClipLabels;
+  final Duration? workAreaStart;
+  final Duration? workAreaEnd;
+
+  const TimelineWorkspaceSettings({
+    this.frameRate = 30,
+    this.loopPlayback = false,
+    this.showWaveforms = true,
+    this.showThumbnails = true,
+    this.showTimecode = true,
+    this.showKeyframes = true,
+    this.autoFollowPlayhead = false,
+    this.showClipLabels = true,
+    this.workAreaStart,
+    this.workAreaEnd,
+  });
+
+  TimelineWorkspaceSettings copyWith({
+    int? frameRate,
+    bool? loopPlayback,
+    bool? showWaveforms,
+    bool? showThumbnails,
+    bool? showTimecode,
+    bool? showKeyframes,
+    bool? autoFollowPlayhead,
+    bool? showClipLabels,
+    Duration? workAreaStart,
+    Duration? workAreaEnd,
+    bool clearWorkAreaStart = false,
+    bool clearWorkAreaEnd = false,
+  }) {
+    return TimelineWorkspaceSettings(
+      frameRate: (frameRate ?? this.frameRate).clamp(1, 120),
+      loopPlayback: loopPlayback ?? this.loopPlayback,
+      showWaveforms: showWaveforms ?? this.showWaveforms,
+      showThumbnails: showThumbnails ?? this.showThumbnails,
+      showTimecode: showTimecode ?? this.showTimecode,
+      showKeyframes: showKeyframes ?? this.showKeyframes,
+      autoFollowPlayhead: autoFollowPlayhead ?? this.autoFollowPlayhead,
+      showClipLabels: showClipLabels ?? this.showClipLabels,
+      workAreaStart: clearWorkAreaStart
+          ? null
+          : (workAreaStart ?? this.workAreaStart),
+      workAreaEnd: clearWorkAreaEnd ? null : (workAreaEnd ?? this.workAreaEnd),
+    );
+  }
+
+  Duration? get normalizedWorkAreaStart {
+    final start = workAreaStart;
+    final end = workAreaEnd;
+    if (start == null || end == null || end <= start) return null;
+    return start;
+  }
+
+  Duration? get normalizedWorkAreaEnd {
+    final start = workAreaStart;
+    final end = workAreaEnd;
+    if (start == null || end == null || end <= start) return null;
+    return end;
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'frameRate': frameRate,
+      'loopPlayback': loopPlayback,
+      'showWaveforms': showWaveforms,
+      'showThumbnails': showThumbnails,
+      'showTimecode': showTimecode,
+      'showKeyframes': showKeyframes,
+      'autoFollowPlayhead': autoFollowPlayhead,
+      'showClipLabels': showClipLabels,
+      'workAreaStartMs': normalizedWorkAreaStart?.inMilliseconds,
+      'workAreaEndMs': normalizedWorkAreaEnd?.inMilliseconds,
+    };
+  }
+
+  factory TimelineWorkspaceSettings.fromJson(Map<String, dynamic> json) {
+    return TimelineWorkspaceSettings(
+      frameRate: (json['frameRate'] as num?)?.toInt() ?? 30,
+      loopPlayback: json['loopPlayback'] as bool? ?? false,
+      showWaveforms: json['showWaveforms'] as bool? ?? true,
+      showThumbnails: json['showThumbnails'] as bool? ?? true,
+      showTimecode: json['showTimecode'] as bool? ?? true,
+      showKeyframes: json['showKeyframes'] as bool? ?? true,
+      autoFollowPlayhead: json['autoFollowPlayhead'] as bool? ?? false,
+      showClipLabels: json['showClipLabels'] as bool? ?? true,
+      workAreaStart: (json['workAreaStartMs'] as num?) == null
+          ? null
+          : Duration(milliseconds: (json['workAreaStartMs'] as num).toInt()),
+      workAreaEnd: (json['workAreaEndMs'] as num?) == null
+          ? null
+          : Duration(milliseconds: (json['workAreaEndMs'] as num).toInt()),
+    );
+  }
+}
+
 /// Capability flags shared by the editor, timeline and render paths.
 ///
 /// Keeping these rules beside the timeline model prevents a selected track from
@@ -693,6 +858,17 @@ class TimelineClip {
   final SubtitleStyleModel? subtitleStyle;
   final ClipTransition introTransition;
   final ClipTransition outroTransition;
+  final List<TimelineKeyframe> keyframes;
+  final bool freezeFrame;
+  final bool stabilize;
+  final bool denoise;
+  final bool chromaKeyEnabled;
+  final Color chromaKeyColor;
+  final double chromaKeySimilarity;
+  final Color timelineColor;
+  final String? notes;
+  final bool autoDuck;
+  final double duckAmount;
 
   TimelineClip({
     String? id,
@@ -720,9 +896,21 @@ class TimelineClip {
     this.subtitleStyle,
     this.introTransition = const ClipTransition(),
     this.outroTransition = const ClipTransition(),
+    List<TimelineKeyframe>? keyframes,
+    this.freezeFrame = false,
+    this.stabilize = false,
+    this.denoise = false,
+    this.chromaKeyEnabled = false,
+    this.chromaKeyColor = const Color(0xFF00FF00),
+    this.chromaKeySimilarity = 0.25,
+    this.timelineColor = const Color(0x00000000),
+    this.notes,
+    this.autoDuck = false,
+    this.duckAmount = 0.35,
   }) : id = id ?? const Uuid().v4(),
        sourceStartTime = sourceStartTime ?? Duration.zero,
-       sourceDuration = sourceDuration ?? (endTime - startTime);
+       sourceDuration = sourceDuration ?? (endTime - startTime),
+       keyframes = List.unmodifiable(keyframes ?? const []);
 
   Duration get duration => endTime - startTime;
   bool get isEffect => type == TimelineTrackType.effect && effectKind != null;
@@ -786,6 +974,18 @@ class TimelineClip {
     bool clearSubtitleStyle = false,
     ClipTransition? introTransition,
     ClipTransition? outroTransition,
+    List<TimelineKeyframe>? keyframes,
+    bool? freezeFrame,
+    bool? stabilize,
+    bool? denoise,
+    bool? chromaKeyEnabled,
+    Color? chromaKeyColor,
+    double? chromaKeySimilarity,
+    Color? timelineColor,
+    String? notes,
+    bool clearNotes = false,
+    bool? autoDuck,
+    double? duckAmount,
   }) {
     return TimelineClip(
       id: id ?? this.id,
@@ -817,6 +1017,17 @@ class TimelineClip {
           : (subtitleStyle ?? this.subtitleStyle),
       introTransition: introTransition ?? this.introTransition,
       outroTransition: outroTransition ?? this.outroTransition,
+      keyframes: keyframes ?? this.keyframes,
+      freezeFrame: freezeFrame ?? this.freezeFrame,
+      stabilize: stabilize ?? this.stabilize,
+      denoise: denoise ?? this.denoise,
+      chromaKeyEnabled: chromaKeyEnabled ?? this.chromaKeyEnabled,
+      chromaKeyColor: chromaKeyColor ?? this.chromaKeyColor,
+      chromaKeySimilarity: chromaKeySimilarity ?? this.chromaKeySimilarity,
+      timelineColor: timelineColor ?? this.timelineColor,
+      notes: clearNotes ? null : (notes ?? this.notes),
+      autoDuck: autoDuck ?? this.autoDuck,
+      duckAmount: duckAmount ?? this.duckAmount,
     );
   }
 
@@ -847,6 +1058,17 @@ class TimelineClip {
       'subtitleStyle': subtitleStyle?.toJson(),
       'introTransition': introTransition.toJson(),
       'outroTransition': outroTransition.toJson(),
+      'keyframes': keyframes.map((keyframe) => keyframe.toJson()).toList(),
+      'freezeFrame': freezeFrame,
+      'stabilize': stabilize,
+      'denoise': denoise,
+      'chromaKeyEnabled': chromaKeyEnabled,
+      'chromaKeyColor': _colorToInt(chromaKeyColor),
+      'chromaKeySimilarity': chromaKeySimilarity.clamp(0.01, 1.0),
+      'timelineColor': _colorToInt(timelineColor),
+      'notes': notes,
+      'autoDuck': autoDuck,
+      'duckAmount': duckAmount.clamp(0.0, 1.0),
     };
   }
 
@@ -921,6 +1143,27 @@ class TimelineClip {
               json['outroTransition'] as Map<String, dynamic>,
             )
           : const ClipTransition(),
+      keyframes:
+          (json['keyframes'] as List<dynamic>?)
+              ?.whereType<Map>()
+              .map(
+                (keyframe) => TimelineKeyframe.fromJson(
+                  Map<String, dynamic>.from(keyframe),
+                ),
+              )
+              .toList() ??
+          const [],
+      freezeFrame: json['freezeFrame'] as bool? ?? false,
+      stabilize: json['stabilize'] as bool? ?? false,
+      denoise: json['denoise'] as bool? ?? false,
+      chromaKeyEnabled: json['chromaKeyEnabled'] as bool? ?? false,
+      chromaKeyColor: Color(json['chromaKeyColor'] as int? ?? 0xFF00FF00),
+      chromaKeySimilarity:
+          (json['chromaKeySimilarity'] as num?)?.toDouble() ?? 0.25,
+      timelineColor: Color(json['timelineColor'] as int? ?? 0),
+      notes: json['notes'] as String?,
+      autoDuck: json['autoDuck'] as bool? ?? false,
+      duckAmount: (json['duckAmount'] as num?)?.toDouble() ?? 0.35,
     );
   }
 
@@ -961,6 +1204,85 @@ extension TimelineClipCapabilities on TimelineClip {
   bool get supportsSourceTiming => type.supportsSourceTiming;
   bool get supportsReversePlayback => type.supportsReversePlayback;
   bool get canCarryAudio => type.canCarryAudio;
+
+  bool get hasKeyframes => keyframes.isNotEmpty;
+
+  bool get hasAdvancedProcessing =>
+      freezeFrame ||
+      stabilize ||
+      denoise ||
+      chromaKeyEnabled ||
+      autoDuck ||
+      notes?.trim().isNotEmpty == true;
+
+  /// Resolve a keyframed value at an absolute timeline position. Keyframes
+  /// are stored clip-relative, which makes trim, split, duplicate and move
+  /// operations preserve the animation without rewriting every keyframe.
+  double keyframedValue(
+    TimelineKeyframeProperty property,
+    Duration absolutePosition, {
+    double fallback = 0,
+  }) {
+    final frames =
+        keyframes.where((keyframe) => keyframe.property == property).toList()
+          ..sort((a, b) => a.time.compareTo(b.time));
+    if (frames.isEmpty) return fallback;
+    final relative = (absolutePosition - startTime).inMilliseconds;
+    if (relative <= frames.first.time.inMilliseconds) return frames.first.value;
+    if (relative >= frames.last.time.inMilliseconds) return frames.last.value;
+    for (var index = 1; index < frames.length; index++) {
+      final previous = frames[index - 1];
+      final next = frames[index];
+      if (relative <= next.time.inMilliseconds) {
+        final span = math.max(
+          1,
+          next.time.inMilliseconds - previous.time.inMilliseconds,
+        );
+        final progress = ((relative - previous.time.inMilliseconds) / span)
+            .clamp(0.0, 1.0);
+        return previous.value + (next.value - previous.value) * progress;
+      }
+    }
+    return frames.last.value;
+  }
+
+  TimelineTransform transformAt(Duration position) {
+    return transform.copyWith(
+      offsetX: keyframedValue(
+        TimelineKeyframeProperty.positionX,
+        position,
+        fallback: transform.offsetX,
+      ),
+      offsetY: keyframedValue(
+        TimelineKeyframeProperty.positionY,
+        position,
+        fallback: transform.offsetY,
+      ),
+      scale: keyframedValue(
+        TimelineKeyframeProperty.scale,
+        position,
+        fallback: transform.scale,
+      ),
+      rotation: keyframedValue(
+        TimelineKeyframeProperty.rotation,
+        position,
+        fallback: transform.rotation,
+      ),
+      opacity: keyframedValue(
+        TimelineKeyframeProperty.opacity,
+        position,
+        fallback: transform.opacity,
+      ),
+    );
+  }
+
+  double volumeAt(Duration position) {
+    return keyframedValue(
+      TimelineKeyframeProperty.volume,
+      position,
+      fallback: audioMix.volume,
+    ).clamp(0.0, 2.0);
+  }
 
   bool get hasRenderableTransformAdjustment {
     if (type == TimelineTrackType.text) {
@@ -1278,6 +1600,7 @@ class CanvasSettings {
 class EditorTimeline {
   final int schemaVersion;
   final CanvasSettings canvasSettings;
+  final TimelineWorkspaceSettings workspaceSettings;
   final SubtitleStyleModel subtitleStyle;
   final List<EditorAssetReference> assets;
   final List<TimelineTrack> tracks;
@@ -1286,6 +1609,7 @@ class EditorTimeline {
   const EditorTimeline({
     this.schemaVersion = 4,
     this.canvasSettings = const CanvasSettings(),
+    this.workspaceSettings = const TimelineWorkspaceSettings(),
     this.subtitleStyle = const SubtitleStyleModel(),
     this.assets = const [],
     this.tracks = const [],
@@ -1417,6 +1741,7 @@ class EditorTimeline {
   EditorTimeline copyWith({
     int? schemaVersion,
     CanvasSettings? canvasSettings,
+    TimelineWorkspaceSettings? workspaceSettings,
     SubtitleStyleModel? subtitleStyle,
     List<EditorAssetReference>? assets,
     List<TimelineTrack>? tracks,
@@ -1425,6 +1750,7 @@ class EditorTimeline {
     return EditorTimeline(
       schemaVersion: schemaVersion ?? this.schemaVersion,
       canvasSettings: canvasSettings ?? this.canvasSettings,
+      workspaceSettings: workspaceSettings ?? this.workspaceSettings,
       subtitleStyle: subtitleStyle ?? this.subtitleStyle,
       assets: assets ?? this.assets,
       tracks: tracks ?? this.tracks,
@@ -1556,6 +1882,7 @@ class EditorTimeline {
     return {
       'schemaVersion': schemaVersion,
       'canvasSettings': canvasSettings.toJson(),
+      'workspaceSettings': workspaceSettings.toJson(),
       'subtitleStyle': subtitleStyle.toJson(),
       'assets': assets.map((asset) => asset.toJson()).toList(),
       'tracks': tracks.map((track) => track.toJson()).toList(),
@@ -1571,6 +1898,11 @@ class EditorTimeline {
               json['canvasSettings'] as Map<String, dynamic>,
             )
           : const CanvasSettings(),
+      workspaceSettings: json['workspaceSettings'] is Map<String, dynamic>
+          ? TimelineWorkspaceSettings.fromJson(
+              json['workspaceSettings'] as Map<String, dynamic>,
+            )
+          : const TimelineWorkspaceSettings(),
       subtitleStyle: json['subtitleStyle'] is Map<String, dynamic>
           ? SubtitleStyleModel.fromJson(
               json['subtitleStyle'] as Map<String, dynamic>,

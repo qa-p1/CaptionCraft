@@ -619,6 +619,11 @@ class TimelineExportService {
         'trim=duration=${_seconds(clipDuration)}',
         ..._cropFilters(clip.crop),
         ..._colorFilters(clip.colorAdjustments),
+        if (clip.stabilize) 'deshake=rx=16:ry=16:edge=mirror',
+        if (clip.denoise) 'hqdn3d=1.5:1.5:6:6',
+        if (clip.chromaKeyEnabled)
+          'colorkey=${_ffmpegColor(clip.chromaKeyColor)}:'
+              '${_number(clip.chromaKeySimilarity.clamp(0.01, 1.0))}:0.08',
         ..._fitFilters(clip, canvasSize: canvasSize, isBase: isBase),
         if (clip.transform.flipX) 'hflip',
         if (clip.transform.flipY) 'vflip',
@@ -746,7 +751,7 @@ class TimelineExportService {
           'atrim=duration=${_seconds(clip.duration)}',
           'aformat=sample_rates=48000:channel_layouts=stereo',
           if (mix.normalize) 'loudnorm=I=-16:LRA=11:TP=-1.5',
-          'volume=${_number(mix.volume.clamp(0, 2))}',
+          'volume=${_number((clip.volumeAt(clip.startTime) * (clip.autoDuck ? 1 - clip.duckAmount : 1)).clamp(0, 2))}',
           if (mix.pan.abs() > 0.001)
             _panFilter(mix.pan.clamp(-1, 1).toDouble()),
           if (fadeInSeconds > 0) 'afade=t=in:st=0:d=${_number(fadeInSeconds)}',

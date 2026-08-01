@@ -46,6 +46,19 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
   _ClipMoveSession? _clipMoveSession;
   _ClipTrimSession? _clipTrimSession;
 
+  @override
+  void initState() {
+    super.initState();
+    ref.listenManual<Duration>(
+      playbackProvider.select((state) => state.position),
+      (_, next) {
+        if (!mounted) return;
+        final workspace = ref.read(editorProvider).timeline.workspaceSettings;
+        if (workspace.autoFollowPlayhead) _scrollToPlayhead(next);
+      },
+    );
+  }
+
   static const double _minPixelsPerSecond = 10;
   static const double _maxPixelsPerSecond = 150;
   static const double _toolbarHeight = 48;
@@ -694,6 +707,17 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       subtitleStyle: sourceClip.subtitleStyle,
       introTransition: sourceClip.introTransition,
       outroTransition: sourceClip.outroTransition,
+      keyframes: sourceClip.keyframes,
+      freezeFrame: sourceClip.freezeFrame,
+      stabilize: sourceClip.stabilize,
+      denoise: sourceClip.denoise,
+      chromaKeyEnabled: sourceClip.chromaKeyEnabled,
+      chromaKeyColor: sourceClip.chromaKeyColor,
+      chromaKeySimilarity: sourceClip.chromaKeySimilarity,
+      timelineColor: sourceClip.timelineColor,
+      notes: sourceClip.notes,
+      autoDuck: sourceClip.autoDuck,
+      duckAmount: sourceClip.duckAmount,
     );
     final nextTracks = timeline.tracks.map((track) {
       if (track.id != sourceTrack.id) return track;
@@ -1601,6 +1625,17 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       subtitleStyle: clip.subtitleStyle,
       introTransition: const ClipTransition(),
       outroTransition: clip.outroTransition,
+      keyframes: clip.keyframes,
+      freezeFrame: clip.freezeFrame,
+      stabilize: clip.stabilize,
+      denoise: clip.denoise,
+      chromaKeyEnabled: clip.chromaKeyEnabled,
+      chromaKeyColor: clip.chromaKeyColor,
+      chromaKeySimilarity: clip.chromaKeySimilarity,
+      timelineColor: clip.timelineColor,
+      notes: clip.notes,
+      autoDuck: clip.autoDuck,
+      duckAmount: clip.duckAmount,
     );
 
     final subtitleTrack = timeline.primarySubtitleTrack;
@@ -1773,6 +1808,17 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       subtitleStyle: clip.subtitleStyle,
       introTransition: clip.introTransition,
       outroTransition: clip.outroTransition,
+      keyframes: clip.keyframes,
+      freezeFrame: clip.freezeFrame,
+      stabilize: clip.stabilize,
+      denoise: clip.denoise,
+      chromaKeyEnabled: clip.chromaKeyEnabled,
+      chromaKeyColor: clip.chromaKeyColor,
+      chromaKeySimilarity: clip.chromaKeySimilarity,
+      timelineColor: clip.timelineColor,
+      notes: clip.notes,
+      autoDuck: clip.autoDuck,
+      duckAmount: clip.duckAmount,
     );
 
     final nextTracks = timeline.tracks.map((candidateTrack) {
@@ -1851,6 +1897,17 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       subtitleStyle: clip.subtitleStyle,
       introTransition: const ClipTransition(),
       outroTransition: clip.outroTransition,
+      keyframes: clip.keyframes,
+      freezeFrame: clip.freezeFrame,
+      stabilize: clip.stabilize,
+      denoise: clip.denoise,
+      chromaKeyEnabled: clip.chromaKeyEnabled,
+      chromaKeyColor: clip.chromaKeyColor,
+      chromaKeySimilarity: clip.chromaKeySimilarity,
+      timelineColor: clip.timelineColor,
+      notes: clip.notes,
+      autoDuck: clip.autoDuck,
+      duckAmount: clip.duckAmount,
     );
 
     final nextTracks = timeline.tracks.map((candidateTrack) {
@@ -1942,6 +1999,53 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
     );
   }
 
+  void _updateWorkspace(
+    TimelineWorkspaceSettings Function(TimelineWorkspaceSettings current)
+    mapper,
+  ) {
+    ref.read(editorProvider.notifier).setWorkspaceSettings(mapper);
+  }
+
+  void _setWorkAreaIn(Duration position) {
+    final timeline = ref.read(editorProvider).timeline;
+    final end = timeline.workspaceSettings.workAreaEnd;
+    _updateWorkspace(
+      (settings) => settings.copyWith(
+        workAreaStart: end != null && position >= end ? null : position,
+        clearWorkAreaStart: end != null && position >= end,
+      ),
+    );
+  }
+
+  void _setWorkAreaOut(Duration position) {
+    final timeline = ref.read(editorProvider).timeline;
+    final start = timeline.workspaceSettings.workAreaStart;
+    _updateWorkspace(
+      (settings) => settings.copyWith(
+        workAreaEnd: start != null && position <= start ? null : position,
+        clearWorkAreaEnd: start != null && position <= start,
+      ),
+    );
+  }
+
+  void _clearWorkArea() {
+    _updateWorkspace(
+      (settings) =>
+          settings.copyWith(clearWorkAreaStart: true, clearWorkAreaEnd: true),
+    );
+  }
+
+  void _nudgePlayhead(int direction) {
+    final workspace = ref.read(editorProvider).timeline.workspaceSettings;
+    final frameMs = math.max(1, (1000 / workspace.frameRate).round());
+    final playback = ref.read(playbackProvider);
+    ref
+        .read(playbackProvider.notifier)
+        .requestSeek(
+          playback.position + Duration(milliseconds: direction * frameMs),
+        );
+  }
+
   @override
   Widget build(BuildContext context) {
     final playbackDuration = ref.watch(
@@ -1956,6 +2060,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       subtitleState.entries,
       subtitleState.globalStyle,
     );
+    final workspace = timeline.workspaceSettings;
     final fallbackDuration = timeline.tracks
         .expand((track) => track.clips)
         .fold<Duration>(
@@ -2164,6 +2269,97 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                     isActive: editorState.isSnappingEnabled,
                   ),
                   _buildToolbarButton(
+                    icon: Icons.keyboard_arrow_left_rounded,
+                    tooltip: 'Previous frame',
+                    onPressed: () => _nudgePlayhead(-1),
+                  ),
+                  _buildToolbarButton(
+                    icon: Icons.keyboard_arrow_right_rounded,
+                    tooltip: 'Next frame',
+                    onPressed: () => _nudgePlayhead(1),
+                  ),
+                  _buildToolbarButton(
+                    icon: Icons.repeat_rounded,
+                    tooltip: workspace.loopPlayback
+                        ? 'Turn loop playback off'
+                        : 'Loop work area',
+                    onPressed: () => _updateWorkspace(
+                      (settings) => settings.copyWith(
+                        loopPlayback: !settings.loopPlayback,
+                      ),
+                    ),
+                    isActive: workspace.loopPlayback,
+                  ),
+                  _buildToolbarButton(
+                    icon: Icons.first_page_rounded,
+                    tooltip: 'Set work area in',
+                    onPressed: () =>
+                        _setWorkAreaIn(ref.read(playbackProvider).position),
+                    isActive: workspace.normalizedWorkAreaStart != null,
+                  ),
+                  _buildToolbarButton(
+                    icon: Icons.last_page_rounded,
+                    tooltip: 'Set work area out',
+                    onPressed: () =>
+                        _setWorkAreaOut(ref.read(playbackProvider).position),
+                    isActive: workspace.normalizedWorkAreaEnd != null,
+                  ),
+                  _buildToolbarButton(
+                    icon: Icons.clear_all_rounded,
+                    tooltip: 'Clear work area',
+                    onPressed: workspace.normalizedWorkAreaStart == null
+                        ? null
+                        : _clearWorkArea,
+                  ),
+                  _buildToolbarButton(
+                    icon: Icons.graphic_eq_rounded,
+                    tooltip: workspace.showWaveforms
+                        ? 'Hide audio waveforms'
+                        : 'Show audio waveforms',
+                    onPressed: () => _updateWorkspace(
+                      (settings) => settings.copyWith(
+                        showWaveforms: !settings.showWaveforms,
+                      ),
+                    ),
+                    isActive: workspace.showWaveforms,
+                  ),
+                  _buildToolbarButton(
+                    icon: Icons.photo_library_outlined,
+                    tooltip: workspace.showThumbnails
+                        ? 'Hide clip thumbnails'
+                        : 'Show clip thumbnails',
+                    onPressed: () => _updateWorkspace(
+                      (settings) => settings.copyWith(
+                        showThumbnails: !settings.showThumbnails,
+                      ),
+                    ),
+                    isActive: workspace.showThumbnails,
+                  ),
+                  _buildToolbarButton(
+                    icon: Icons.key_rounded,
+                    tooltip: workspace.showKeyframes
+                        ? 'Hide keyframes'
+                        : 'Show keyframes',
+                    onPressed: () => _updateWorkspace(
+                      (settings) => settings.copyWith(
+                        showKeyframes: !settings.showKeyframes,
+                      ),
+                    ),
+                    isActive: workspace.showKeyframes,
+                  ),
+                  _buildToolbarButton(
+                    icon: Icons.follow_the_signs_rounded,
+                    tooltip: workspace.autoFollowPlayhead
+                        ? 'Stop following playhead'
+                        : 'Follow playhead while playing',
+                    onPressed: () => _updateWorkspace(
+                      (settings) => settings.copyWith(
+                        autoFollowPlayhead: !settings.autoFollowPlayhead,
+                      ),
+                    ),
+                    isActive: workspace.autoFollowPlayhead,
+                  ),
+                  _buildToolbarButton(
                     icon: Icons.keyboard_double_arrow_left_rounded,
                     tooltip: 'Previous marker',
                     onPressed: timeline.markers.isEmpty
@@ -2308,10 +2504,52 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                                             painter: _RulerPainter(
                                               pixelsPerSecond: _pixelsPerSecond,
                                               totalDuration: totalDuration,
+                                              frameRate: workspace.frameRate,
+                                              showTimecode:
+                                                  workspace.showTimecode,
                                             ),
                                           ),
                                         ),
                                       ),
+                                      if (workspace.normalizedWorkAreaStart !=
+                                              null &&
+                                          workspace.normalizedWorkAreaEnd !=
+                                              null)
+                                        Positioned(
+                                          left:
+                                              workspace
+                                                  .normalizedWorkAreaStart!
+                                                  .inMilliseconds /
+                                              1000 *
+                                              _pixelsPerSecond,
+                                          top: 0,
+                                          bottom: 0,
+                                          width:
+                                              (workspace
+                                                      .normalizedWorkAreaEnd!
+                                                      .inMilliseconds -
+                                                  workspace
+                                                      .normalizedWorkAreaStart!
+                                                      .inMilliseconds) /
+                                              1000 *
+                                              _pixelsPerSecond,
+                                          child: IgnorePointer(
+                                            child: DecoratedBox(
+                                              decoration: BoxDecoration(
+                                                color: kAccent.withValues(
+                                                  alpha: 0.045,
+                                                ),
+                                                border: Border.symmetric(
+                                                  vertical: BorderSide(
+                                                    color: kAccent.withValues(
+                                                      alpha: 0.35,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
                                       for (final row in rowLayouts) ...[
                                         if (row.sectionTitle != null)
                                           Positioned(
@@ -2345,8 +2583,12 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                                               pixelsPerSecond: _pixelsPerSecond,
                                               selectedClipId:
                                                   editorState.selectedClipId,
+                                              selectedClipIds:
+                                                  editorState.selectedClipIds,
                                               selectedSubtitleId:
                                                   subtitleState.selectedEntryId,
+                                              workspaceSettings:
+                                                  timeline.workspaceSettings,
                                               onTrackTap: () {
                                                 editorNotifier.selectTrack(
                                                   row.track!.id,
@@ -2946,7 +3188,9 @@ class _TimelineLane extends StatelessWidget {
   final TimelineTrack track;
   final double pixelsPerSecond;
   final String? selectedClipId;
+  final Set<String> selectedClipIds;
   final String? selectedSubtitleId;
+  final TimelineWorkspaceSettings workspaceSettings;
   final VoidCallback onTrackTap;
   final ValueChanged<Offset> onShowTrackActions;
   final ValueChanged<TimelineClip> onClipTap;
@@ -2965,7 +3209,9 @@ class _TimelineLane extends StatelessWidget {
     required this.track,
     required this.pixelsPerSecond,
     required this.selectedClipId,
+    required this.selectedClipIds,
     required this.selectedSubtitleId,
+    required this.workspaceSettings,
     required this.onTrackTap,
     required this.onShowTrackActions,
     required this.onClipTap,
@@ -3075,6 +3321,7 @@ class _TimelineLane extends StatelessWidget {
     final startX = clip.startTime.inMilliseconds / 1000 * pixelsPerSecond;
     final isSelected =
         selectedClipId == clip.id || selectedSubtitleId == clip.id;
+    final isMultiSelected = selectedClipIds.contains(clip.id);
     return Positioned(
       left: startX - visibleInset,
       top: 3,
@@ -3084,7 +3331,12 @@ class _TimelineLane extends StatelessWidget {
         key: ValueKey('timeline_clip_${clip.id}'),
         clip: clip,
         visualWidth: visualWidth,
-        isSelected: isSelected,
+        isSelected: isSelected || isMultiSelected,
+        showWaveform: workspaceSettings.showWaveforms,
+        showThumbnail: workspaceSettings.showThumbnails,
+        showTimecode: workspaceSettings.showTimecode,
+        showKeyframes: workspaceSettings.showKeyframes,
+        showClipLabel: workspaceSettings.showClipLabels,
         showTrimHandles: isSelected && !track.isCollapsed,
         isLocked: track.isLocked,
         canMove:
@@ -3235,6 +3487,11 @@ class _TimelineClipBlock extends StatelessWidget {
   final TimelineClip clip;
   final double visualWidth;
   final bool isSelected;
+  final bool showWaveform;
+  final bool showThumbnail;
+  final bool showTimecode;
+  final bool showKeyframes;
+  final bool showClipLabel;
   final bool showTrimHandles;
   final bool isLocked;
   final bool canMove;
@@ -3254,6 +3511,11 @@ class _TimelineClipBlock extends StatelessWidget {
     required this.clip,
     required this.visualWidth,
     required this.isSelected,
+    required this.showWaveform,
+    required this.showThumbnail,
+    required this.showTimecode,
+    required this.showKeyframes,
+    required this.showClipLabel,
     required this.showTrimHandles,
     required this.isLocked,
     required this.canMove,
@@ -3328,6 +3590,28 @@ class _TimelineClipBlock extends StatelessWidget {
                     child: Stack(
                       fit: StackFit.expand,
                       children: [
+                        if (showThumbnail && clip.type.isVisualMedia)
+                          IgnorePointer(
+                            child: Align(
+                              alignment: Alignment.centerRight,
+                              child: Icon(
+                                Icons.photo_size_select_actual_outlined,
+                                color: colors.$2.withValues(alpha: 0.28),
+                                size: math.min(28, resolvedVisualWidth * 0.45),
+                              ),
+                            ),
+                          ),
+                        if (showWaveform &&
+                            (clip.type == TimelineTrackType.audio ||
+                                clip.canCarryAudio))
+                          IgnorePointer(
+                            child: CustomPaint(
+                              painter: _WaveformPainter(
+                                seed: clip.id.hashCode,
+                                color: colors.$2.withValues(alpha: 0.35),
+                              ),
+                            ),
+                          ),
                         IgnorePointer(
                           child: CustomPaint(
                             key: ValueKey('timeline_clip_envelope_${clip.id}'),
@@ -3353,9 +3637,12 @@ class _TimelineClipBlock extends StatelessWidget {
                                     right: visibleBadgeCount * 13.0,
                                   ),
                                   child: Text(
-                                    clip.text?.trim().isNotEmpty == true
+                                    showClipLabel &&
+                                            clip.text?.trim().isNotEmpty == true
                                         ? clip.text!
-                                        : clip.label,
+                                        : showClipLabel
+                                        ? clip.label
+                                        : '',
                                     maxLines: 1,
                                     overflow: TextOverflow.ellipsis,
                                     style: TextStyle(
@@ -3374,7 +3661,7 @@ class _TimelineClipBlock extends StatelessWidget {
                                 ),
                               ),
                               if (showMeta) const SizedBox(height: 2),
-                              if (showMeta)
+                              if (showMeta && showTimecode)
                                 Flexible(
                                   child: Text(
                                     '${SubtitleEntry.formatDisplayTime(clip.startTime)} • ${clip.duration.inSeconds}s',
@@ -3397,6 +3684,18 @@ class _TimelineClipBlock extends StatelessWidget {
                             ],
                           ),
                         ),
+                        if (showKeyframes && clip.hasKeyframes)
+                          Positioned.fill(
+                            child: IgnorePointer(
+                              child: CustomPaint(
+                                painter: _KeyframePainter(
+                                  keyframes: clip.keyframes,
+                                  duration: clip.duration,
+                                  color: kWarning,
+                                ),
+                              ),
+                            ),
+                          ),
                         if (visibleBadgeCount > 0)
                           Positioned(
                             right: 3,
@@ -3514,6 +3813,28 @@ class _TimelineClipBlock extends StatelessWidget {
         (Icons.replay_rounded, 'Reversed', const Color(0xFFFDE68A)),
       if ((clip.playbackRate - 1).abs() > 0.001)
         (Icons.speed_rounded, 'Speed changed', const Color(0xFFFDE68A)),
+      if (clip.hasKeyframes)
+        (Icons.key_rounded, 'Keyframed', const Color(0xFFFFD166)),
+      if (clip.freezeFrame)
+        (
+          Icons.pause_circle_outline_rounded,
+          'Freeze frame',
+          const Color(0xFFFFD166),
+        ),
+      if (clip.stabilize)
+        (Icons.vibration_rounded, 'Stabilized', const Color(0xFF67E8F9)),
+      if (clip.denoise)
+        (Icons.noise_aware_rounded, 'Noise reduced', const Color(0xFF67E8F9)),
+      if (clip.chromaKeyEnabled)
+        (Icons.colorize_rounded, 'Chroma key', const Color(0xFF86EFAC)),
+      if (clip.autoDuck)
+        (
+          Icons.record_voice_over_rounded,
+          'Auto ducking',
+          const Color(0xFF86EFAC),
+        ),
+      if (clip.notes?.trim().isNotEmpty == true)
+        (Icons.sticky_note_2_outlined, 'Has notes', const Color(0xFFF9A8D4)),
     ];
   }
 
@@ -3530,6 +3851,10 @@ class _TimelineClipBlock extends StatelessWidget {
   }
 
   (Color, Color) _clipColors(TimelineClip clip) {
+    final custom = clip.timelineColor;
+    if (custom.a > 0.01) {
+      return (custom.withValues(alpha: 0.22), custom.withValues(alpha: 0.78));
+    }
     switch (clip.type) {
       case TimelineTrackType.video:
         return (
@@ -3681,6 +4006,80 @@ class _ClipEnvelopePainter extends CustomPainter {
   }
 }
 
+class _WaveformPainter extends CustomPainter {
+  final int seed;
+  final Color color;
+
+  const _WaveformPainter({required this.seed, required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.width <= 4 || size.height <= 4) return;
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = 1;
+    var value = seed.abs() + 17;
+    final step = math.max(3.0, size.width / 28);
+    for (var x = 1.0; x < size.width - 1; x += step) {
+      value = (value * 1103515245 + 12345) & 0x7fffffff;
+      final amplitude = 0.18 + (value % 78) / 100;
+      final center = size.height * 0.68;
+      final half = size.height * 0.28 * amplitude;
+      canvas.drawLine(
+        Offset(x, center - half),
+        Offset(x, center + half),
+        paint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _WaveformPainter oldDelegate) {
+    return oldDelegate.seed != seed || oldDelegate.color != color;
+  }
+}
+
+class _KeyframePainter extends CustomPainter {
+  final List<TimelineKeyframe> keyframes;
+  final Duration duration;
+  final Color color;
+
+  const _KeyframePainter({
+    required this.keyframes,
+    required this.duration,
+    required this.color,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.width <= 4 || duration.inMilliseconds <= 0) return;
+    final paint = Paint()..color = color;
+    final seen = <int>{};
+    for (final keyframe in keyframes) {
+      final x =
+          (keyframe.time.inMilliseconds / duration.inMilliseconds * size.width)
+              .clamp(2.0, size.width - 2)
+              .toDouble();
+      final bucket = x.round();
+      if (!seen.add(bucket)) continue;
+      final path = Path()
+        ..moveTo(x, 3)
+        ..lineTo(x + 3.5, size.height / 2)
+        ..lineTo(x, size.height - 3)
+        ..lineTo(x - 3.5, size.height / 2)
+        ..close();
+      canvas.drawPath(path, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _KeyframePainter oldDelegate) {
+    return oldDelegate.keyframes != keyframes ||
+        oldDelegate.duration != duration ||
+        oldDelegate.color != color;
+  }
+}
+
 class _TrimHandle extends StatelessWidget {
   final bool isSelected;
   final VoidCallback onGestureStart;
@@ -3716,8 +4115,15 @@ class _TrimHandle extends StatelessWidget {
 class _RulerPainter extends CustomPainter {
   final double pixelsPerSecond;
   final Duration totalDuration;
+  final int frameRate;
+  final bool showTimecode;
 
-  _RulerPainter({required this.pixelsPerSecond, required this.totalDuration});
+  _RulerPainter({
+    required this.pixelsPerSecond,
+    required this.totalDuration,
+    this.frameRate = 30,
+    this.showTimecode = true,
+  });
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -3749,8 +4155,11 @@ class _RulerPainter extends CustomPainter {
         paint,
       );
 
+      final label = showTimecode
+          ? _timecode(Duration(seconds: sec), frameRate)
+          : '$sec';
       final textPainter = TextPainter(
-        text: TextSpan(text: '$sec', style: textStyle),
+        text: TextSpan(text: label, style: textStyle),
         textDirection: TextDirection.ltr,
       )..layout();
       textPainter.paint(canvas, Offset(x + 2, 4));
@@ -3760,7 +4169,20 @@ class _RulerPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _RulerPainter oldDelegate) {
     return oldDelegate.pixelsPerSecond != pixelsPerSecond ||
-        oldDelegate.totalDuration != totalDuration;
+        oldDelegate.totalDuration != totalDuration ||
+        oldDelegate.frameRate != frameRate ||
+        oldDelegate.showTimecode != showTimecode;
+  }
+
+  String _timecode(Duration duration, int rate) {
+    final totalSeconds = duration.inSeconds;
+    final minutes = (totalSeconds ~/ 60).toString().padLeft(2, '0');
+    final seconds = (totalSeconds % 60).toString().padLeft(2, '0');
+    final frame = ((duration.inMilliseconds % 1000) * rate / 1000)
+        .floor()
+        .toString()
+        .padLeft(2, '0');
+    return '$minutes:$seconds:$frame';
   }
 }
 

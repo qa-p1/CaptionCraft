@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/subtitle_entry.dart';
@@ -21,6 +23,7 @@ class EditorState {
   final bool canUndo;
   final bool canRedo;
   final int editRevision;
+  final Set<String> selectedClipIds;
 
   const EditorState({
     this.videoPath,
@@ -36,6 +39,7 @@ class EditorState {
     this.canUndo = false,
     this.canRedo = false,
     this.editRevision = 0,
+    this.selectedClipIds = const <String>{},
   });
 
   EditorState copyWith({
@@ -52,6 +56,7 @@ class EditorState {
     bool? canUndo,
     bool? canRedo,
     int? editRevision,
+    Set<String>? selectedClipIds,
     bool clearTrackSelection = false,
     bool clearClipSelection = false,
   }) {
@@ -73,6 +78,7 @@ class EditorState {
       canUndo: canUndo ?? this.canUndo,
       canRedo: canRedo ?? this.canRedo,
       editRevision: editRevision ?? this.editRevision,
+      selectedClipIds: selectedClipIds ?? this.selectedClipIds,
     );
   }
 }
@@ -93,6 +99,7 @@ class _EditorHistorySnapshot {
   final SubtitleStyleModel subtitleStyle;
   final String? selectedTrackId;
   final String? selectedClipId;
+  final Set<String> selectedClipIds;
   final String? selectedSubtitleId;
   final int sequence;
   final int branch;
@@ -103,6 +110,7 @@ class _EditorHistorySnapshot {
     required this.subtitleStyle,
     required this.selectedTrackId,
     required this.selectedClipId,
+    required this.selectedClipIds,
     required this.selectedSubtitleId,
     required this.sequence,
     required this.branch,
@@ -154,6 +162,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
       editRevision: 0,
       clearTrackSelection: true,
       clearClipSelection: true,
+      selectedClipIds: const <String>{},
     );
   }
 
@@ -324,6 +333,9 @@ class EditorNotifier extends StateNotifier<EditorState> {
       clearTrackSelection: trackId == null,
       clearClipSelection:
           state.selectedClipId != null && !selectedClipBelongsToTrack,
+      selectedClipIds: selectedClipBelongsToTrack
+          ? state.selectedClipIds
+          : const <String>{},
     );
   }
 
@@ -351,6 +363,201 @@ class EditorNotifier extends StateNotifier<EditorState> {
     state = state.copyWith(
       selectedClipId: clipId,
       clearClipSelection: clipId == null,
+      selectedClipIds: clipId == null ? const <String>{} : {clipId},
+    );
+  }
+
+  void toggleClipSelection(String clipId) {
+    final selection = {...state.selectedClipIds};
+    if (selection.contains(clipId)) {
+      selection.remove(clipId);
+    } else {
+      selection.add(clipId);
+    }
+    final nextPrimary = selection.isEmpty ? null : selection.last;
+    state = state.copyWith(
+      selectedClipIds: selection,
+      selectedClipId: nextPrimary,
+      clearClipSelection: nextPrimary == null,
+    );
+  }
+
+  void selectClipIds(Iterable<String> clipIds) {
+    final selection = clipIds.toSet();
+    final primary = selection.isEmpty ? null : selection.last;
+    state = state.copyWith(
+      selectedClipIds: selection,
+      selectedClipId: primary,
+      clearClipSelection: primary == null,
+    );
+  }
+
+  void clearClipSelection() {
+    state = state.copyWith(
+      selectedClipIds: const <String>{},
+      clearClipSelection: true,
+    );
+  }
+
+  void setWorkspaceSettings(
+    TimelineWorkspaceSettings Function(TimelineWorkspaceSettings current)
+    mapper, {
+    bool recordHistory = true,
+  }) {
+    setTimeline(
+      state.timeline.copyWith(
+        workspaceSettings: mapper(state.timeline.workspaceSettings),
+      ),
+      recordHistory: recordHistory,
+    );
+  }
+
+  bool updateClip(
+    String clipId,
+    TimelineClip Function(TimelineClip clip) mapper, {
+    bool recordHistory = true,
+  }) {
+    final track = state.timeline.tracks
+        .where((candidate) => candidate.clips.any((clip) => clip.id == clipId))
+        .firstOrNull;
+    if (track == null || track.isLocked) return false;
+    final tracks = state.timeline.tracks
+        .map(
+          (candidate) => candidate.id == track.id
+              ? candidate.copyWith(
+                  clips: candidate.clips
+                      .map((clip) => clip.id == clipId ? mapper(clip) : clip)
+                      .toList(),
+                )
+              : candidate,
+        )
+        .toList();
+    setTimeline(
+      state.timeline.copyWith(tracks: tracks),
+      recordHistory: recordHistory,
+    );
+    return true;
+  }
+
+  bool upsertKeyframe({
+    required String clipId,
+    required TimelineKeyframeProperty property,
+    required Duration time,
+    required double value,
+  }) {
+    return updateClip(clipId, (clip) {
+      final relativeMs = time.inMilliseconds
+          .clamp(0, math.max(0, clip.duration.inMilliseconds))
+          .toInt();
+      final next = [...clip.keyframes]
+        ..removeWhere(
+          (keyframe) =>
+              keyframe.property == property &&
+              keyframe.time.inMilliseconds == relativeMs,
+        )
+        ..add(
+          TimelineKeyframe(
+            time: Duration(milliseconds: relativeMs),
+            property: property,
+            value: value,
+          ),
+        )
+        ..sort((a, b) => a.time.compareTo(b.time));
+      return clip.copyWith(keyframes: next);
+    });
+  }
+
+  bool removeKeyframes(String clipId, {TimelineKeyframeProperty? property}) {
+    return updateClip(clipId, (clip) {
+      final next = property == null
+          ? const <TimelineKeyframe>[]
+          : clip.keyframes
+                .where((keyframe) => keyframe.property != property)
+                .toList();
+      return clip.copyWith(keyframes: next);
+    });
+  }
+
+  bool renameTrack(String trackId, String name) {
+    final cleaned = name.trim();
+    if (cleaned.isEmpty) return false;
+    final track = state.timeline.tracks
+        .where((candidate) => candidate.id == trackId)
+        .firstOrNull;
+    if (track == null || track.isLocked) return false;
+    setTimeline(
+      state.timeline.copyWith(
+        tracks: state.timeline.tracks
+            .map(
+              (candidate) => candidate.id == trackId
+                  ? candidate.copyWith(name: cleaned)
+                  : candidate,
+            )
+            .toList(),
+      ),
+    );
+    return true;
+  }
+
+  bool duplicateTrack(String trackId) {
+    final source = state.timeline.tracks
+        .where((candidate) => candidate.id == trackId)
+        .firstOrNull;
+    if (source == null || source.isLocked) return false;
+    final duplicateId = 'track_${DateTime.now().microsecondsSinceEpoch}';
+    final duplicate = TimelineTrack(
+      id: duplicateId,
+      name: '${source.name} copy',
+      type: source.type,
+      section: source.section,
+      clips: source.clips
+          .map(
+            (clip) => clip.copyWith(
+              id: '${clip.id}_copy_$duplicateId',
+              trackId: duplicateId,
+            ),
+          )
+          .toList(),
+    );
+    final index = state.timeline.tracks.indexOf(source);
+    final tracks = [...state.timeline.tracks]..insert(index + 1, duplicate);
+    setTimeline(state.timeline.copyWith(tracks: tracks));
+    selectTrack(duplicate.id);
+    return true;
+  }
+
+  bool reorderTrack(String trackId, int direction) {
+    if (direction == 0) return false;
+    final tracks = [...state.timeline.tracks];
+    final index = tracks.indexWhere((track) => track.id == trackId);
+    if (index < 0) return false;
+    final target = index + direction.sign;
+    if (target < 0 || target >= tracks.length) return false;
+    final moved = tracks.removeAt(index);
+    tracks.insert(target, moved);
+    setTimeline(state.timeline.copyWith(tracks: tracks));
+    return true;
+  }
+
+  void setAllTracks({
+    bool? locked,
+    bool? muted,
+    bool? hidden,
+    bool? collapsed,
+  }) {
+    setTimeline(
+      state.timeline.copyWith(
+        tracks: state.timeline.tracks
+            .map(
+              (track) => track.copyWith(
+                isLocked: locked ?? track.isLocked,
+                isMuted: muted ?? track.isMuted,
+                isHidden: hidden ?? track.isHidden,
+                isCollapsed: collapsed ?? track.isCollapsed,
+              ),
+            )
+            .toList(),
+      ),
     );
   }
 
@@ -388,6 +595,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
       subtitleStyle: subtitleState.globalStyle,
       selectedTrackId: state.selectedTrackId,
       selectedClipId: state.selectedClipId,
+      selectedClipIds: state.selectedClipIds,
       selectedSubtitleId: subtitleState.selectedEntryId,
       sequence: sequence,
       branch: branch,
@@ -406,6 +614,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
       timeline: snapshot.timeline,
       selectedTrackId: snapshot.selectedTrackId,
       selectedClipId: snapshot.selectedClipId,
+      selectedClipIds: snapshot.selectedClipIds,
       clearTrackSelection: snapshot.selectedTrackId == null,
       clearClipSelection: snapshot.selectedClipId == null,
       canUndo: canUndo,
@@ -470,7 +679,8 @@ class EditorNotifier extends StateNotifier<EditorState> {
         ? null
         : state.selectedClipId;
     final selectionChanged =
-        nextTrackId != state.selectedTrackId || nextClipId != state.selectedClipId;
+        nextTrackId != state.selectedTrackId ||
+        nextClipId != state.selectedClipId;
     if (matchesTimeline &&
         !selectionChanged &&
         state.canUndo == canUndo &&
@@ -481,6 +691,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
       timeline: nextTimeline,
       selectedTrackId: nextTrackId,
       selectedClipId: nextClipId,
+      selectedClipIds: nextClipId == null ? const <String>{} : {nextClipId},
       clearClipSelection: nextClipId == null,
       canUndo: canUndo,
       canRedo: canRedo,

@@ -25,7 +25,10 @@ double _previewAudioVolume({
 
   // Loudness normalization needs analysis of the complete source and remains
   // an export-time operation. Preview only the deterministic mix envelope.
-  var volume = mix.volume.clamp(0.0, 1.0).toDouble();
+  var volume = clip.volumeAt(position).clamp(0.0, 1.0).toDouble();
+  if (clip.autoDuck) {
+    volume *= (1 - clip.duckAmount.clamp(0.0, 1.0));
+  }
 
   final durationMs = math.max(0, clip.duration.inMilliseconds);
   final fadeInMs = clip.effectiveAudioFadeInMs;
@@ -75,7 +78,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
   bool _isSwitchingClip = false;
   bool _isAdvancingClip = false;
   bool _playRequested = false;
-  bool _loopPlayback = false;
   Duration? _queuedSeekPosition;
   bool? _queuedSeekAutoplay;
   bool _queuedSeekForce = false;
@@ -545,10 +547,13 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     try {
       final timeline = ref.read(editorProvider).timeline;
       final nextPosition = completedClip.endTime;
-      if (nextPosition >= timeline.duration) {
-        if (_loopPlayback) {
+      final workEnd = timeline.workspaceSettings.normalizedWorkAreaEnd;
+      final workStart = timeline.workspaceSettings.normalizedWorkAreaStart;
+      final loopEnd = workEnd ?? timeline.duration;
+      if (nextPosition >= loopEnd) {
+        if (timeline.workspaceSettings.loopPlayback) {
           await _seekTimelinePosition(
-            Duration.zero,
+            workStart ?? Duration.zero,
             autoplay: true,
             forceSeek: true,
           );
@@ -1021,6 +1026,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
       constraints,
       playbackState.position,
     );
+    final transform = item.clip.transformAt(playbackState.position);
     Widget child = switch (item.asset.type) {
       EditorAssetType.image || EditorAssetType.gif => ClipRRect(
         borderRadius: BorderRadius.circular(10),
@@ -1105,8 +1111,8 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     child = Transform(
       alignment: Alignment.center,
       transform: Matrix4.diagonal3Values(
-        item.clip.transform.flipX ? -1 : 1,
-        item.clip.transform.flipY ? -1 : 1,
+        transform.flipX ? -1 : 1,
+        transform.flipY ? -1 : 1,
         1,
       ),
       child: child,
@@ -1115,17 +1121,11 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     return Transform.translate(
       offset: animation.offset,
       child: Opacity(
-        opacity: (animation.opacity * item.clip.transform.opacity).clamp(
-          0.0,
-          1.0,
-        ),
+        opacity: (animation.opacity * transform.opacity).clamp(0.0, 1.0),
         child: Transform.rotate(
-          angle: item.clip.transform.rotation,
+          angle: transform.rotation,
           child: Transform.scale(
-            scale: (animation.scale * item.clip.transform.scale).clamp(
-              0.2,
-              4.0,
-            ),
+            scale: (animation.scale * transform.scale).clamp(0.2, 4.0),
             child: child,
           ),
         ),
@@ -1239,7 +1239,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     final videoSize = controller.value.size;
     final sourceWidth = videoSize.width <= 0 ? 16.0 : videoSize.width;
     final sourceHeight = videoSize.height <= 0 ? 9.0 : videoSize.height;
-    final transform = clip.transform;
+    final transform = clip.transformAt(playbackPosition);
     final crop = clip.crop;
 
     Widget source = SizedBox(
@@ -1620,6 +1620,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     final playbackState = ref.watch(playbackProvider);
     final subtitleState = ref.watch(subtitleProvider);
     final editorState = ref.watch(editorProvider);
+    final workspaceLoop = editorState.timeline.workspaceSettings.loopPlayback;
     final activeOverlayItems = _activeOverlayItems(
       editorState.timeline,
       playbackState.position,
@@ -1794,7 +1795,9 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                                       final isSelected =
                                           editorState.selectedClipId ==
                                           item.clip.id;
-                                      final transform = item.clip.transform;
+                                      final transform = item.clip.transformAt(
+                                        playbackState.position,
+                                      );
                                       return Align(
                                         child: Transform.translate(
                                           offset: Offset(
@@ -1932,7 +1935,9 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                                             position: SubtitlePosition.center,
                                             fontSize: 32,
                                           );
-                                      final transform = item.clip.transform;
+                                      final transform = item.clip.transformAt(
+                                        playbackState.position,
+                                      );
                                       Widget textPreview = ConstrainedBox(
                                         constraints: BoxConstraints(
                                           maxWidth:
@@ -1968,13 +1973,13 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                                       return Align(
                                         child: Transform.translate(
                                           offset: Offset(
-                                            item.clip.transform.offsetX.clamp(
+                                            transform.offsetX.clamp(
                                                   -maxX,
                                                   maxX,
                                                 ) *
                                                 constraints.maxWidth /
                                                 kTimelineDesignWidth,
-                                            item.clip.transform.offsetY.clamp(
+                                            transform.offsetY.clamp(
                                                   -maxY,
                                                   maxY,
                                                 ) *
@@ -2435,21 +2440,29 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                                         ),
                                       ),
                                       IconButton(
-                                        tooltip: _loopPlayback
+                                        tooltip: workspaceLoop
                                             ? 'Turn looping off'
                                             : 'Loop timeline',
                                         icon: Icon(
                                           Icons.repeat_rounded,
-                                          color: _loopPlayback
+                                          color: workspaceLoop
                                               ? kAccent
                                               : kTextSecondary,
                                           size: 20,
                                         ),
                                         onPressed: () {
-                                          setState(
-                                            () =>
-                                                _loopPlayback = !_loopPlayback,
-                                          );
+                                          final current = ref
+                                              .read(editorProvider)
+                                              .timeline
+                                              .workspaceSettings
+                                              .loopPlayback;
+                                          ref
+                                              .read(editorProvider.notifier)
+                                              .setWorkspaceSettings(
+                                                (settings) => settings.copyWith(
+                                                  loopPlayback: !current,
+                                                ),
+                                              );
                                         },
                                       ),
                                       if (widget.onFullscreenToggle != null)
