@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
@@ -23,6 +24,34 @@ class AssSubtitlePreflight {
 /// Service for generating subtitle files in SRT, VTT, and ASS formats.
 class SubtitleExportService {
   SubtitleExportService._();
+
+  /// Keeps imported cues inside the playable composition. Subtitle files can
+  /// legally contain hours-long timestamps; accepting those unchanged would
+  /// extend an otherwise short project and export a long blank tail.
+  static List<SubtitleEntry> clampEntriesToDuration(
+    Iterable<SubtitleEntry> entries,
+    Duration duration,
+  ) {
+    if (duration <= Duration.zero) return const [];
+    final bounded = <SubtitleEntry>[];
+    for (final entry in entries) {
+      if (entry.endTime <= Duration.zero || entry.startTime >= duration) {
+        continue;
+      }
+      final start = entry.startTime < Duration.zero
+          ? Duration.zero
+          : entry.startTime;
+      final end = entry.endTime > duration ? duration : entry.endTime;
+      if (end <= start) continue;
+      bounded.add(
+        start == entry.startTime && end == entry.endTime
+            ? entry
+            : entry.copyWith(startTime: start, endTime: end),
+      );
+    }
+    bounded.sort((a, b) => a.startTime.compareTo(b.startTime));
+    return bounded;
+  }
 
   /// Resolves the caption list that both preview and export should render.
   ///
@@ -350,9 +379,16 @@ class SubtitleExportService {
     required int playResX,
     required int playResY,
   }) {
-    final x = (playResX / 2 + style.offsetX * (playResX / kTimelineDesignWidth))
-        .clamp(0, playResX)
-        .round();
+    final horizontalAlignment = _assHorizontalAlignment(style.textAlignment);
+    final boxCenterX =
+        playResX / 2 + style.offsetX * (playResX / kTimelineDesignWidth);
+    final boxHalfWidth = playResX * style.maxWidthFactor.clamp(0.25, 1.0) / 2;
+    final anchorX = switch (horizontalAlignment) {
+      1 => boxCenterX - boxHalfWidth,
+      3 => boxCenterX + boxHalfWidth,
+      _ => boxCenterX,
+    };
+    final x = anchorX.clamp(0, playResX).round();
     final baseY = switch (style.position) {
       SubtitlePosition.top => playResY * 0.1,
       SubtitlePosition.center => playResY * 0.5,
@@ -365,35 +401,62 @@ class SubtitleExportService {
             .clamp(0, playResY)
             .round();
     final escaped = _escapeAssText(entry.text);
-    final words = entry.words;
-    if (style.animationPreset == SubtitleAnimationPreset.karaokeHighlight &&
-        words != null &&
-        words.isNotEmpty) {
-      final karaoke = StringBuffer('{\\pos($x,$y)}');
-      var cursor = entry.startTime;
-      var emittedWord = false;
-      for (final word in words) {
-        if (word.endTime <= word.startTime || word.word.trim().isEmpty) {
-          continue;
+    if (style.animationPreset == SubtitleAnimationPreset.wordPop) {
+      final fragments = _resolveWordAnimationFragments(entry);
+      if (fragments.isNotEmpty) {
+        final primaryAlpha = _assAlpha(style.textColor.a);
+        final secondaryAlpha = primaryAlpha;
+        final outlineAlpha = '00';
+        final backgroundAlpha = _assAlpha(
+          style.backgroundColor.a * style.backgroundOpacity,
+        );
+        final pop = StringBuffer('{\\pos($x,$y)}');
+        for (final fragment in fragments) {
+          final startMs = fragment.startOffset.inMilliseconds;
+          final endMs = (startMs + _wordPopDuration.inMilliseconds).clamp(
+            startMs,
+            entry.duration.inMilliseconds,
+          );
+          pop
+            ..write(
+              '{\\alpha&HFF&\\fscx60\\fscy60'
+              '\\t($startMs,$endMs,'
+              '\\1a&H$primaryAlpha&\\2a&H$secondaryAlpha&'
+              '\\3a&H$outlineAlpha&\\4a&H$backgroundAlpha&'
+              '\\fscx100\\fscy100)}',
+            )
+            ..write(_escapeAssFragment(fragment.text));
         }
-        final gapCentiseconds = ((word.startTime - cursor).inMilliseconds / 10)
+        return pop.toString();
+      }
+    }
+    if (style.animationPreset == SubtitleAnimationPreset.karaokeHighlight) {
+      final fragments = _resolveKaraokeAnimationFragments(entry);
+      if (fragments.isEmpty) {
+        final durationCentiseconds = (entry.duration.inMilliseconds / 10)
             .round()
-            .clamp(0, 9999);
-        if (gapCentiseconds > 0) {
-          karaoke.write('{\\alpha&HFF&\\k$gapCentiseconds}\\h{\\alpha&H00&}');
-        } else if (emittedWord) {
-          karaoke.write(' ');
-        }
-        final durationCentiseconds =
-            ((word.endTime - word.startTime).inMilliseconds / 10).round().clamp(
-              1,
+            .clamp(1, 9999);
+        return '{\\pos($x,$y)\\kf$durationCentiseconds}$escaped';
+      }
+      final karaoke = StringBuffer('{\\pos($x,$y)}');
+      var cursor = Duration.zero;
+      for (final fragment in fragments) {
+        final gapCentiseconds =
+            ((fragment.startOffset - cursor).inMilliseconds / 10).round().clamp(
+              0,
               9999,
             );
+        if (gapCentiseconds > 0) {
+          karaoke.write('{\\alpha&HFF&\\k$gapCentiseconds}\\h{\\alpha&H00&}');
+        }
+        final durationCentiseconds =
+            ((fragment.endOffset - fragment.startOffset).inMilliseconds / 10)
+                .round()
+                .clamp(1, 9999);
         karaoke
           ..write('{\\k$durationCentiseconds}')
-          ..write(_escapeAssText(word.word));
-        cursor = word.endTime > cursor ? word.endTime : cursor;
-        emittedWord = true;
+          ..write(_escapeAssFragment(fragment.text));
+        cursor = fragment.endOffset > cursor ? fragment.endOffset : cursor;
       }
       return karaoke.toString();
     }
@@ -421,15 +484,101 @@ class SubtitleExportService {
 
     final animationOverride = switch (style.animationPreset) {
       SubtitleAnimationPreset.lineFade => r'\fad(200,0)',
-      SubtitleAnimationPreset.wordPop =>
-        r'\fscx82\fscy82\t(0,160,\fscx100\fscy100)',
       _ => '',
     };
     if (style.animationPreset == SubtitleAnimationPreset.wordSlideUp) {
       final travel = (12 * (playResY / kTimelineDesignHeight)).round();
-      return '{\\move($x,${y + travel},$x,$y,0,180)}$escaped';
+      return '{\\move($x,${y + travel},$x,$y,0,180)\\fad(180,0)}$escaped';
     }
     return '{\\pos($x,$y)$animationOverride}$escaped';
+  }
+
+  static const _wordPopDuration = Duration(milliseconds: 120);
+  static const _fallbackWordStagger = Duration(milliseconds: 160);
+
+  /// Resolves the visible caption into text-preserving word fragments.
+  ///
+  /// Provider word timestamps are used when every visible word has a valid
+  /// timing. Edited/imported captions commonly have no word data (or stale
+  /// data), so those cues use a deterministic stagger that is shared with the
+  /// editor preview. Keeping all fragments inside one ASS event preserves the
+  /// cue's wrapping, alignment, background, and style without duplicate text.
+  static List<_AssWordAnimationFragment> _resolveWordAnimationFragments(
+    SubtitleEntry entry,
+  ) {
+    final matches = RegExp(
+      r'\S+',
+    ).allMatches(entry.text).toList(growable: false);
+    if (matches.isEmpty) return const [];
+
+    final validWords = entry.words
+        ?.where(
+          (word) =>
+              word.word.trim().isNotEmpty && word.endTime > word.startTime,
+        )
+        .toList(growable: false);
+    final useProviderTiming = validWords?.length == matches.length;
+    final durationMs = entry.duration.inMilliseconds;
+    final fallbackAvailableMs = (durationMs - _wordPopDuration.inMilliseconds)
+        .clamp(0, durationMs);
+    final fallbackStaggerMs = matches.length <= 1
+        ? 0
+        : (fallbackAvailableMs ~/ (matches.length - 1)).clamp(
+            0,
+            _fallbackWordStagger.inMilliseconds,
+          );
+
+    return List.generate(matches.length, (index) {
+      final start = index == 0 ? 0 : matches[index].start;
+      final end = index + 1 < matches.length
+          ? matches[index + 1].start
+          : entry.text.length;
+      final rawStartMs = useProviderTiming
+          ? validWords![index].startTime.inMilliseconds -
+                entry.startTime.inMilliseconds
+          : index * fallbackStaggerMs;
+      return _AssWordAnimationFragment(
+        text: entry.text.substring(start, end),
+        startOffset: Duration(milliseconds: rawStartMs.clamp(0, durationMs)),
+      );
+    }, growable: false);
+  }
+
+  static List<_AssKaraokeAnimationFragment> _resolveKaraokeAnimationFragments(
+    SubtitleEntry entry,
+  ) {
+    final matches = RegExp(
+      r'\S+',
+    ).allMatches(entry.text).toList(growable: false);
+    final validWords = entry.words
+        ?.where(
+          (word) =>
+              word.word.trim().isNotEmpty && word.endTime > word.startTime,
+        )
+        .toList(growable: false);
+    if (matches.isEmpty || validWords?.length != matches.length) {
+      return const [];
+    }
+    final durationMs = entry.duration.inMilliseconds;
+    return List.generate(matches.length, (index) {
+      final start = index == 0 ? 0 : matches[index].start;
+      final end = index + 1 < matches.length
+          ? matches[index + 1].start
+          : entry.text.length;
+      final startOffsetMs =
+          (validWords![index].startTime - entry.startTime).inMilliseconds;
+      final endOffsetMs =
+          (validWords[index].endTime - entry.startTime).inMilliseconds;
+      final safeStartMs = startOffsetMs.clamp(0, durationMs).toInt();
+      final safeEndMs = endOffsetMs
+          .clamp(safeStartMs + 1, math.max(safeStartMs + 1, durationMs))
+          .toInt();
+      return _AssKaraokeAnimationFragment(
+        text: entry.text.substring(start, end),
+        startOffset: Duration(milliseconds: safeStartMs),
+        endOffset: Duration(milliseconds: safeEndMs),
+      );
+    }, growable: false);
   }
 
   static String _buildAssStyle(
@@ -473,22 +622,19 @@ class SubtitleExportService {
         ? 2
         : 0;
 
-    // ASS alignment: 2 = bottom center (default)
-    int alignment;
-    switch (style.position) {
-      case SubtitlePosition.top:
-        alignment = 8; // top center
-        break;
-      case SubtitlePosition.center:
-        alignment = 5; // middle center
-        break;
-      case SubtitlePosition.bottom:
-        alignment = 2; // bottom center
-        break;
-    }
+    // ASS uses numpad alignment: 1/2/3 bottom, 4/5/6 middle,
+    // and 7/8/9 top. The matching horizontal anchor is positioned at the
+    // left edge, center, or right edge of the same centered max-width box that
+    // the editor preview lays out.
+    final horizontalAlignment = _assHorizontalAlignment(style.textAlignment);
+    final alignment = switch (style.position) {
+      SubtitlePosition.top => horizontalAlignment + 6,
+      SubtitlePosition.center => horizontalAlignment + 3,
+      SubtitlePosition.bottom => horizontalAlignment,
+    };
 
     final horizontalMargin =
-        ((1 - style.maxWidthFactor.clamp(0.2, 1.0)) * playResX / 2)
+        ((1 - style.maxWidthFactor.clamp(0.25, 1.0)) * playResX / 2)
             .round()
             .clamp(10, playResX ~/ 2);
     final verticalMargin = (playResY * 0.05).round().clamp(10, playResY ~/ 3);
@@ -497,6 +643,20 @@ class SubtitleExportService {
         '$outlineColor,$backColor,$bold,$italic,0,0,100,100,0,0,'
         '$borderStyle,$outline,$shadow,$alignment,$horizontalMargin,'
         '$horizontalMargin,$verticalMargin,1';
+  }
+
+  static int _assHorizontalAlignment(TextAlign textAlignment) {
+    switch (textAlignment) {
+      case TextAlign.left:
+      case TextAlign.start:
+        return 1;
+      case TextAlign.right:
+      case TextAlign.end:
+        return 3;
+      case TextAlign.center:
+      case TextAlign.justify:
+        return 2;
+    }
   }
 
   static String _buildFullBarDrawing(
@@ -548,6 +708,14 @@ class SubtitleExportService {
     final g = green.toRadixString(16).padLeft(2, '0').toUpperCase();
     final r = red.toRadixString(16).padLeft(2, '0').toUpperCase();
     return '&H$a$b$g$r';
+  }
+
+  static String _assAlpha(double opacity) {
+    return (255 - (opacity.clamp(0.0, 1.0) * 255).round())
+        .clamp(0, 255)
+        .toRadixString(16)
+        .padLeft(2, '0')
+        .toUpperCase();
   }
 
   /// Format Duration as ASS time (H:MM:SS.cc — centiseconds).
@@ -683,4 +851,26 @@ class SubtitleExportService {
       milliseconds: int.tryParse(fraction) ?? 0,
     );
   }
+}
+
+class _AssWordAnimationFragment {
+  final String text;
+  final Duration startOffset;
+
+  const _AssWordAnimationFragment({
+    required this.text,
+    required this.startOffset,
+  });
+}
+
+class _AssKaraokeAnimationFragment {
+  final String text;
+  final Duration startOffset;
+  final Duration endOffset;
+
+  const _AssKaraokeAnimationFragment({
+    required this.text,
+    required this.startOffset,
+    required this.endOffset,
+  });
 }

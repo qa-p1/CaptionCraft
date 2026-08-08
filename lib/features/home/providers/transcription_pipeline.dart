@@ -80,6 +80,7 @@ class TranscriptionPipeline {
 
       return Project(
         id: projectId,
+        ownerUid: uid,
         name: videoName,
         videoPath: videoPath,
         thumbnailBase64: thumbnailBase64,
@@ -105,6 +106,8 @@ class TranscriptionPipeline {
     final generatedTemporaryPaths = <String>{};
 
     try {
+      GroqService.ensureConfigured();
+
       // ── Step 1: Get media info ──
       _emitProgress(ProcessingStage.extractingAudio, 0.0, 'Analyzing video...');
 

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:crypto/crypto.dart';
 import 'dart:convert';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -11,9 +12,25 @@ class DeviceQuotaService {
   DeviceQuotaService._();
 
   static const _storage = FlutterSecureStorage();
+  static Future<String>? _fingerprintFuture;
+  static Future<void> _quotaOperationTail = Future<void>.value();
 
   /// Get or create a stable device fingerprint.
-  static Future<String> getDeviceFingerprint() async {
+  static Future<String> getDeviceFingerprint() {
+    final pending = _fingerprintFuture;
+    if (pending != null) return pending;
+    final operation = _loadOrCreateDeviceFingerprint();
+    _fingerprintFuture = operation;
+    operation.catchError((Object _) {
+      if (identical(_fingerprintFuture, operation)) {
+        _fingerprintFuture = null;
+      }
+      return '';
+    });
+    return operation;
+  }
+
+  static Future<String> _loadOrCreateDeviceFingerprint() async {
     // Check if already stored
     String? fingerprint = await _storage.read(
       key: QuotaConstants.deviceFingerprintKey,
@@ -36,12 +53,13 @@ class DeviceQuotaService {
   }
 
   /// Get the current number of runs used (max of local and server).
-  static Future<int> getRunsUsed() async {
+  static Future<int> getRunsUsed() => _serializeQuotaOperation(_getRunsUsed);
+
+  static Future<int> _getRunsUsed() async {
     final fingerprint = await getDeviceFingerprint();
 
     // Local count
-    final localStr = await _storage.read(key: QuotaConstants.runsUsedKey);
-    final localCount = int.tryParse(localStr ?? '0') ?? 0;
+    final localCount = await _readLocalRunsUsed();
 
     // Server count
     int serverCount;
@@ -51,11 +69,17 @@ class DeviceQuotaService {
       ).timeout(const Duration(seconds: 6));
     } catch (e) {
       // Offline — use local count
-      serverCount = 0;
+      serverCount = localCount;
     }
 
     // Use the higher value to prevent bypass via local storage clearing
-    return localCount > serverCount ? localCount : serverCount;
+    final resolvedCount = _boundedRunsUsed(
+      localCount > serverCount ? localCount : serverCount,
+    );
+    if (resolvedCount != localCount) {
+      await _writeLocalRunsUsed(resolvedCount);
+    }
+    return resolvedCount;
   }
 
   /// Check if a transcription run is allowed.
@@ -73,8 +97,15 @@ class DeviceQuotaService {
   }
 
   /// Consume one transcription run. Returns the new total used count.
-  static Future<int> consumeRun(String uid) async {
+  static Future<int> consumeRun(String uid) =>
+      _serializeQuotaOperation(() => _consumeRun(uid));
+
+  static Future<int> _consumeRun(String uid) async {
     final fingerprint = await getDeviceFingerprint();
+    final localCount = await _readLocalRunsUsed();
+    if (localCount >= QuotaConstants.maxFreeRuns) {
+      throw QuotaLimitReachedException(QuotaConstants.maxFreeRuns);
+    }
 
     // Increment on server (atomic)
     int newCount;
@@ -82,18 +113,20 @@ class DeviceQuotaService {
       newCount = await FirebaseService.incrementDeviceQuota(
         fingerprint,
         uid,
+        minimumRunsUsed: localCount,
+        maxRuns: QuotaConstants.maxFreeRuns,
       ).timeout(const Duration(seconds: 8));
-    } catch (e) {
+    } on QuotaLimitReachedException {
+      await _writeLocalRunsUsed(QuotaConstants.maxFreeRuns);
+      rethrow;
+    } catch (_) {
       // Offline fallback — increment locally
-      final localStr = await _storage.read(key: QuotaConstants.runsUsedKey);
-      newCount = (int.tryParse(localStr ?? '0') ?? 0) + 1;
+      newCount = localCount + 1;
     }
 
-    // Update local count
-    await _storage.write(
-      key: QuotaConstants.runsUsedKey,
-      value: newCount.toString(),
-    );
+    // A stale server response can never lower the monotonic local count.
+    newCount = _boundedRunsUsed(newCount < localCount ? localCount : newCount);
+    await _writeLocalRunsUsed(newCount);
 
     // Bind UID to device if not already
     final existingUid = await _storage.read(key: QuotaConstants.boundUidKey);
@@ -102,6 +135,36 @@ class DeviceQuotaService {
     }
 
     return newCount;
+  }
+
+  static Future<int> _readLocalRunsUsed() async {
+    final localValue = await _storage.read(key: QuotaConstants.runsUsedKey);
+    return _boundedRunsUsed(int.tryParse(localValue ?? '0') ?? 0);
+  }
+
+  static Future<void> _writeLocalRunsUsed(int count) {
+    return _storage.write(
+      key: QuotaConstants.runsUsedKey,
+      value: _boundedRunsUsed(count).toString(),
+    );
+  }
+
+  static int _boundedRunsUsed(int count) {
+    return count.clamp(0, QuotaConstants.maxFreeRuns).toInt();
+  }
+
+  static Future<T> _serializeQuotaOperation<T>(Future<T> Function() operation) {
+    final completer = Completer<T>();
+    _quotaOperationTail = _quotaOperationTail.catchError((Object _) {}).then((
+      _,
+    ) async {
+      try {
+        completer.complete(await operation());
+      } catch (error, stackTrace) {
+        completer.completeError(error, stackTrace);
+      }
+    });
+    return completer.future;
   }
 
   /// Store the current user UID in secure storage.

@@ -15,6 +15,7 @@ import '../../../core/theme/text_styles.dart';
 import '../../../core/utils/device_quota_service.dart';
 import '../../../core/utils/ffmpeg_service.dart';
 import '../../../core/utils/firebase_service.dart';
+import '../../../core/utils/media_import_service.dart';
 import '../../../core/utils/project_creation_service.dart';
 import '../../../shared/models/project_model.dart';
 import '../../../shared/widgets/app_button.dart';
@@ -29,7 +30,15 @@ enum _ProjectSort { recent, name, duration }
 
 enum _ProjectView { grid, list }
 
-enum _ProjectAction { favorite, rename, duplicate, relink, openExport, delete }
+enum _ProjectAction {
+  favorite,
+  rename,
+  duplicate,
+  relink,
+  openEditor,
+  openExport,
+  delete,
+}
 
 class HomeScreen extends ConsumerStatefulWidget {
   final List<Project>? initialProjects;
@@ -53,6 +62,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   _ProjectSort _sort = _ProjectSort.recent;
   _ProjectView _view = _ProjectView.grid;
   int _loadRequestId = 0;
+  final Set<String> _busyProjectIds = {};
 
   @override
   void initState() {
@@ -108,14 +118,28 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     final user = ref.read(currentUserProvider);
     unawaited(_refreshQuotaAndDeviceNotice(user, requestId));
 
-    final localProjects = await _loadLocalProjects(requestId);
-    if (user == null) return;
+    if (user == null) {
+      if (mounted && requestId == _loadRequestId) {
+        setState(() {
+          _projects = [];
+          _isLoadingProjects = false;
+        });
+      }
+      return;
+    }
+    final localProjects = await _loadLocalProjects(requestId, user.uid);
     unawaited(_syncCloudProjects(user.uid, localProjects, requestId));
   }
 
-  Future<List<Project>> _loadLocalProjects(int requestId) async {
+  Future<List<Project>> _loadLocalProjects(
+    int requestId,
+    String ownerUid,
+  ) async {
     try {
-      final localProjects = await ProjectLocalStorage.loadProjects();
+      final localProjects = await ProjectLocalStorage.loadProjects(
+        ownerUid: ownerUid,
+        claimUnowned: true,
+      );
       await _cacheVideoAvailability(localProjects);
 
       if (!mounted || requestId != _loadRequestId) return localProjects;
@@ -143,13 +167,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     int requestId,
   ) async {
     try {
-      final firestoreData = await FirebaseService.loadProjects(
-        uid,
-      ).timeout(const Duration(seconds: 4));
+      final firestoreData = await FirebaseService.loadProjects(uid);
       final pendingDeletionIds =
           await ProjectLocalStorage.loadDeletedProjectIds(uid);
       final cloudProjects = firestoreData
-          .map((data) => Project.fromFirestore(data))
+          .map((data) => Project.fromFirestore(data, fallbackOwnerUid: uid))
+          .where((project) => project.ownerUid == uid)
           .where((project) => !pendingDeletionIds.contains(project.id))
           .toList();
       await _cacheVideoAvailability(cloudProjects);
@@ -167,7 +190,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       }
 
       if (!mounted || requestId != _loadRequestId) return;
-      final mergedProjects = _mergeProjects(localProjects, cloudProjects);
+      final currentLocalProjects = _projects
+          .where((project) => project.ownerUid == uid)
+          .toList();
+      final mergedProjects = _mergeProjects(
+        currentLocalProjects,
+        cloudProjects,
+      );
       setState(() {
         _projects = mergedProjects;
         _loadWarning = null;
@@ -175,7 +204,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       unawaited(
         _reconcileProjectCopies(
           uid: uid,
-          localProjects: localProjects,
+          localProjects: currentLocalProjects,
           cloudProjects: cloudProjects,
           mergedProjects: mergedProjects,
         ),
@@ -215,14 +244,20 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   Future<void> _cacheVideoAvailability(List<Project> projects) async {
     final availability = await Future.wait(
       projects.map((project) async {
-        for (final mediaPath in project.mediaPaths) {
-          if (await File(mediaPath).exists()) return true;
-        }
-        return false;
+        final paths = project.mediaPaths.toSet();
+        final pathAvailability = <String, bool>{};
+        await Future.wait(
+          paths.map((mediaPath) async {
+            pathAvailability[mediaPath] = await File(mediaPath).exists();
+          }),
+        );
+        return project.evaluateVideoAvailability(
+          pathExists: (mediaPath) => pathAvailability[mediaPath] ?? false,
+        );
       }),
     );
     for (var index = 0; index < projects.length; index++) {
-      projects[index].cacheVideoAvailability(availability[index]);
+      projects[index].cacheVideoAvailabilityDetails(availability[index]);
     }
   }
 
@@ -258,6 +293,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     };
 
     for (final project in mergedProjects) {
+      if (project.ownerUid != uid) continue;
       final local = localById[project.id];
       if (local == null ||
           project.lastModifiedAt.isAfter(local.lastModifiedAt) ||
@@ -287,6 +323,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   Future<void> _importVideos() async {
+    if (_isCreatingProject) return;
     try {
       final result = await FilePicker.platform.pickFiles(
         type: FileType.video,
@@ -522,9 +559,25 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     setState(() => _isCreatingProject = true);
     final user = ref.read(currentUserProvider);
     try {
-      SnackBarHelper.showInfo(context, 'Building your local timeline…');
+      SnackBarHelper.showInfo(context, 'Securing media and building timeline…');
+      final durableSources = <ImportedVideoSource>[];
+      for (final source in sources) {
+        final durablePath = await MediaImportService.persistFile(
+          source.filePath,
+          originalFileName: source.displayName,
+        );
+        durableSources.add(
+          ImportedVideoSource(
+            filePath: durablePath,
+            displayName: source.displayName,
+          ),
+        );
+      }
       final result = await ProjectCreationService.createProjectFromVideos(
-        sources: sources,
+        sources: durableSources,
+        ownerUid:
+            user?.uid ??
+            (throw StateError('Sign in before creating a project.')),
         projectName: projectName,
         generateThumbnail: false,
       );
@@ -548,6 +601,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   Future<void> _syncProjectToCloud(String uid, Project project) async {
+    if (project.ownerUid != uid) return;
     try {
       await FirebaseService.saveProject(
         uid,
@@ -564,7 +618,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     _isOpeningEditor = true;
     try {
       var projectToOpen = project;
-      if (!project.isVideoAvailable) {
+      if (!project.videoAvailability.primarySourceAvailable) {
         final relinked = await _pickAndRelinkProject(project);
         if (relinked == null || !mounted) {
           if (mounted) {
@@ -582,7 +636,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         context,
         MaterialPageRoute(builder: (_) => EditorScreen(project: projectToOpen)),
       );
-      if (mounted) await _loadData();
+      if (mounted && ref.read(currentUserProvider) != null) {
+        await _loadData();
+      }
     } catch (error) {
       if (mounted) {
         SnackBarHelper.showError(context, 'Could not open editor: $error');
@@ -593,27 +649,34 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   Future<void> _persistProject(Project project) async {
-    await ProjectLocalStorage.saveProject(project);
     final user = ref.read(currentUserProvider);
-    if (user != null) {
-      try {
-        await FirebaseService.saveProject(
-          user.uid,
-          project.id,
-          project.toFirestore(),
-        );
-      } catch (_) {
-        // Local changes remain available and will win on the next sync.
-      }
+    if (user == null) {
+      throw StateError('Sign in before saving a project.');
+    }
+    if (project.ownerUid != null && project.ownerUid != user.uid) {
+      throw StateError('This project belongs to another account.');
+    }
+    final ownedProject = project.ownerUid == null
+        ? project.copyWith(ownerUid: user.uid)
+        : project;
+    await ProjectLocalStorage.saveProject(ownedProject);
+    try {
+      await FirebaseService.saveProject(
+        user.uid,
+        ownedProject.id,
+        ownedProject.toFirestore(),
+      );
+    } catch (_) {
+      // Local changes remain available and will win on the next sync.
     }
     if (!mounted) return;
     setState(() {
-      final index = _projects.indexWhere((item) => item.id == project.id);
+      final index = _projects.indexWhere((item) => item.id == ownedProject.id);
       if (index == -1) {
-        _projects = [project, ..._projects];
+        _projects = [ownedProject, ..._projects];
       } else {
         final updated = [..._projects];
-        updated[index] = project;
+        updated[index] = ownedProject;
         _projects = updated;
       }
     });
@@ -670,6 +733,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     final now = DateTime.now();
     final duplicate = Project(
       id: const Uuid().v4(),
+      ownerUid: project.ownerUid,
+      projectSchemaVersion: project.projectSchemaVersion,
       name: '${project.name} copy',
       videoPath: project.videoPath,
       thumbnailBase64: project.thumbnailBase64,
@@ -682,7 +747,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       createdAt: now,
       lastModifiedAt: now,
     );
-    duplicate.cacheVideoAvailability(project.isVideoAvailable);
+    duplicate.cacheVideoAvailabilityDetails(project.videoAvailability);
     await _persistProject(duplicate);
     if (mounted) {
       SnackBarHelper.showInfo(context, 'Project duplicated');
@@ -695,10 +760,15 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   Future<Project?> _pickAndRelinkProject(Project project) async {
     final picked = await FilePicker.platform.pickFiles(type: FileType.video);
-    final nextPath = picked?.files.single.path;
-    if (nextPath == null) return null;
+    final pickedFile = picked?.files.single;
+    final selectedPath = pickedFile?.path;
+    if (selectedPath == null) return null;
 
     try {
+      final nextPath = await MediaImportService.persistFile(
+        selectedPath,
+        originalFileName: pickedFile!.name,
+      );
       final info = await FFmpegService.getMediaInfo(nextPath);
       final oldPath = project.videoPath;
       var replacedAsset = false;
@@ -729,7 +799,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         timeline: project.timeline.copyWith(assets: assets),
         lastModifiedAt: DateTime.now(),
       );
-      updated.cacheVideoAvailability(true);
+      await _cacheVideoAvailability([updated]);
       await _persistProject(updated);
       if (mounted) {
         SnackBarHelper.showInfo(context, 'Media relinked successfully');
@@ -800,20 +870,31 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     SnackBarHelper.showInfo(context, 'Project deleted');
   }
 
-  void _handleProjectAction(Project project, _ProjectAction action) {
-    switch (action) {
-      case _ProjectAction.favorite:
-        unawaited(_toggleFavorite(project));
-      case _ProjectAction.rename:
-        unawaited(_renameProject(project));
-      case _ProjectAction.duplicate:
-        unawaited(_duplicateProject(project));
-      case _ProjectAction.relink:
-        unawaited(_relinkProject(project));
-      case _ProjectAction.openExport:
-        unawaited(_openLastExport(project));
-      case _ProjectAction.delete:
-        unawaited(_confirmDelete(project));
+  Future<void> _handleProjectAction(
+    Project project,
+    _ProjectAction action,
+  ) async {
+    if (_busyProjectIds.contains(project.id)) return;
+    if (mounted) setState(() => _busyProjectIds.add(project.id));
+    try {
+      await switch (action) {
+        _ProjectAction.favorite => _toggleFavorite(project),
+        _ProjectAction.rename => _renameProject(project),
+        _ProjectAction.duplicate => _duplicateProject(project),
+        _ProjectAction.relink => _relinkProject(project),
+        _ProjectAction.openEditor => _openEditor(project),
+        _ProjectAction.openExport => _openLastExport(project),
+        _ProjectAction.delete => _confirmDelete(project),
+      };
+    } catch (error) {
+      if (mounted) {
+        SnackBarHelper.showError(
+          context,
+          'Project action failed: ${error.toString().replaceFirst('Exception: ', '')}',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _busyProjectIds.remove(project.id));
     }
   }
 
@@ -854,6 +935,23 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                           child: Column(
                             children: [
                               _buildTopBar(user),
+                              if (_isCreatingProject) ...[
+                                const SizedBox(height: 12),
+                                const _NoticeBanner(
+                                  icon: Icons.video_settings_rounded,
+                                  color: kAccentSecondary,
+                                  message:
+                                      'Securing imported media and building the timeline…',
+                                  action: SizedBox(
+                                    width: 16,
+                                    height: 16,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: kAccentSecondary,
+                                    ),
+                                  ),
+                                ),
+                              ],
                               const SizedBox(height: 20),
                               _buildStudioHero(constraints.maxWidth),
                               if (_showDeviceQuotaNotice) ...[
@@ -901,7 +999,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       floatingActionButton: _projects.isEmpty
           ? null
           : FloatingActionButton.extended(
-              onPressed: _importVideos,
+              onPressed: _isCreatingProject ? null : _importVideos,
               backgroundColor: kAccent,
               foregroundColor: kOnAccent,
               elevation: 4,
@@ -985,6 +1083,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     final missing = _projects
         .where((project) => !project.isVideoAvailable)
         .length;
+    final latestVisibleProject = Project.mostRecentlyModified(_visibleProjects);
 
     return Container(
       width: double.infinity,
@@ -1074,14 +1173,14 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                   runSpacing: 10,
                   children: [
                     FilledButton.icon(
-                      onPressed: _importVideos,
+                      onPressed: _isCreatingProject ? null : _importVideos,
                       icon: const Icon(Icons.add_rounded, size: 19),
                       label: const Text('Start new edit'),
                     ),
                     OutlinedButton.icon(
-                      onPressed: _projects.isEmpty
+                      onPressed: latestVisibleProject == null
                           ? null
-                          : () => _openEditor(_visibleProjects.first),
+                          : () => _openEditor(latestVisibleProject),
                       icon: const Icon(Icons.play_arrow_rounded, size: 19),
                       label: const Text('Resume latest'),
                     ),
@@ -1345,6 +1444,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   Widget _buildProjectCard(Project project, {required bool isList}) {
     final isVideoMissing = !project.isVideoAvailable;
+    final needsPrimaryRelink =
+        !project.videoAvailability.primarySourceAvailable;
+    final isBusy = _busyProjectIds.contains(project.id);
     final thumbnailBytes = project.thumbnailBytes;
     final hasExport = project.lastExportPath != null;
 
@@ -1386,15 +1488,24 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               color: kBackground.withValues(alpha: 0.84),
               child: Center(
                 child: OutlinedButton.icon(
-                  onPressed: () => _relinkProject(project),
+                  onPressed: isBusy
+                      ? null
+                      : () => unawaited(
+                          _handleProjectAction(
+                            project,
+                            needsPrimaryRelink
+                                ? _ProjectAction.relink
+                                : _ProjectAction.openEditor,
+                          ),
+                        ),
                   icon: const Icon(
                     Icons.link_off_rounded,
                     color: kWarning,
                     size: 17,
                   ),
-                  label: const Text(
-                    'Relink media',
-                    style: TextStyle(color: kWarning),
+                  label: Text(
+                    needsPrimaryRelink ? 'Relink media' : 'Open to relink',
+                    style: const TextStyle(color: kWarning),
                   ),
                 ),
               ),
@@ -1488,7 +1599,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         side: const BorderSide(color: kBorder),
       ),
       child: InkWell(
-        onTap: () => _openEditor(project),
+        onTap: isBusy ? null : () => _openEditor(project),
         child: Stack(
           children: [
             if (isList)
@@ -1510,7 +1621,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               right: 8,
               child: PopupMenuButton<_ProjectAction>(
                 tooltip: 'Project actions',
-                onSelected: (action) => _handleProjectAction(project, action),
+                enabled: !isBusy,
+                onSelected: (action) =>
+                    unawaited(_handleProjectAction(project, action)),
                 itemBuilder: (_) => [
                   PopupMenuItem(
                     value: _ProjectAction.favorite,
@@ -1622,7 +1735,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               AppButton(
                 label: 'Import your footage',
                 icon: Icons.add_rounded,
-                onPressed: _importVideos,
+                onPressed: _isCreatingProject ? null : _importVideos,
+                isLoading: _isCreatingProject,
                 width: 220,
               ),
             ],

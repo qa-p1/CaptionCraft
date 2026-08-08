@@ -25,6 +25,7 @@ class _ProcessingScreenState extends ConsumerState<ProcessingScreen>
   late final AnimationController _signalController;
   StreamSubscription<ProcessingProgress>? _progressSubscription;
   ProcessingProgress _currentProgress = ProcessingProgress.initial();
+  bool _cancelDialogOpen = false;
 
   @override
   void initState() {
@@ -67,6 +68,9 @@ class _ProcessingScreenState extends ConsumerState<ProcessingScreen>
 
     return PopScope(
       canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) unawaited(_confirmCancel());
+      },
       child: Scaffold(
         backgroundColor: kBackground,
         body: SafeArea(
@@ -393,33 +397,39 @@ class _ProcessingScreenState extends ConsumerState<ProcessingScreen>
   }
 
   Future<void> _confirmCancel() async {
+    if (_cancelDialogOpen) return;
     if (_currentProgress.stage == ProcessingStage.error) {
       widget.onCancel();
       return;
     }
-    final shouldCancel = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Stop transcription?'),
-        content: const Text(
-          'The current analysis will stop. Your video and existing timeline '
-          'edits are not affected.',
-          style: TextStyle(color: kTextSecondary, height: 1.45),
+    _cancelDialogOpen = true;
+    try {
+      final shouldCancel = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('Stop transcription?'),
+          content: const Text(
+            'The current analysis will stop. Your video and existing timeline '
+            'edits are not affected.',
+            style: TextStyle(color: kTextSecondary, height: 1.45),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Keep processing'),
+            ),
+            FilledButton(
+              style: FilledButton.styleFrom(backgroundColor: kError),
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Stop'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext, false),
-            child: const Text('Keep processing'),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: kError),
-            onPressed: () => Navigator.pop(dialogContext, true),
-            child: const Text('Stop'),
-          ),
-        ],
-      ),
-    );
-    if (shouldCancel == true) widget.onCancel();
+      );
+      if (shouldCancel == true) widget.onCancel();
+    } finally {
+      _cancelDialogOpen = false;
+    }
   }
 }
 

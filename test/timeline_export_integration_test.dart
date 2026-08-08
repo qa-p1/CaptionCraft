@@ -369,8 +369,8 @@ void main() {
       expect(filterGraph, contains('crop=w=trunc(iw*'));
       expect(filterGraph, contains('blurRegion'));
       expect(filterGraph, contains('timelineEffect'));
-      expect(filterGraph, contains('between(t,0.100000,0.400000)'));
-      expect(filterGraph, contains('between(t,2.600000,2.900000)'));
+      expect(filterGraph, contains('gte(t,0.100000)*lt(t,0.400000)'));
+      expect(filterGraph, contains('gte(t,2.600000)*lt(t,2.900000)'));
       expect(filterGraph, contains('loudnorm=I=-16:LRA=11:TP=-1.5'));
       expect(filterGraph, contains('afade=t=in:st=0:d=0.1'));
       expect(filterGraph, contains('afade=t=out:st=1.42:d=0.18'));

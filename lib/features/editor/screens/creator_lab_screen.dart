@@ -846,7 +846,7 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
       context: context,
       builder: (dialogContext) => SimpleDialog(
         title: const Text('Snap to frame rate'),
-        children: [24.0, 25.0, 30.0, 60.0]
+        children: [24.0, 25.0, 30.0, 50.0, 60.0]
             .map(
               (fps) => SimpleDialogOption(
                 onPressed: () => Navigator.pop(dialogContext, fps),

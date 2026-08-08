@@ -12,6 +12,19 @@ import '../../features/editor/models/word_timing.dart';
 class GroqService {
   GroqService._();
 
+  static bool get isConfigured => GroqConstants.apiKey.isNotEmpty;
+
+  /// Fail before media analysis or transcoding when transcription has not
+  /// been configured for this build.
+  static void ensureConfigured() {
+    if (!isConfigured) {
+      throw Exception(
+        'Missing Groq API key. Run with '
+        '`--dart-define-from-file=.env` after adding GROQ_API_KEY.',
+      );
+    }
+  }
+
   static final Dio _dio = Dio(
     BaseOptions(
       baseUrl: GroqConstants.baseUrl,
@@ -30,12 +43,8 @@ class GroqService {
     String language = '',
     CancelToken? cancelToken,
   }) async {
+    ensureConfigured();
     final apiKey = GroqConstants.apiKey;
-    if (apiKey.isEmpty) {
-      throw Exception(
-        'Missing Groq API key. Add GROQ_API_KEY to .env and restart the app.',
-      );
-    }
 
     if (!await audioChunk.exists()) {
       throw Exception('Audio chunk ${audioChunk.path} was not created.');
@@ -90,7 +99,7 @@ class GroqService {
           debugPrint('[Groq] Transcription response ${response.statusCode}');
         }
 
-        return _parseWords(response.data, chunkStartOffset);
+        return parseWordsResponse(response.data, chunkStartOffset);
       } on DioException catch (e) {
         if (CancelToken.isCancel(e)) {
           throw Exception('Transcription cancelled.');
@@ -122,34 +131,47 @@ class GroqService {
     );
   }
 
-  /// Parse Groq's verbose_json response words array into WordTiming list.
-  static List<WordTiming> _parseWords(dynamic responseData, Duration offset) {
-    final data = responseData is String
-        ? jsonDecode(responseData) as Map<String, dynamic>
-        : responseData as Map<String, dynamic>;
+  /// Parse Groq's verbose_json response into validated word timings.
+  static List<WordTiming> parseWordsResponse(
+    dynamic responseData,
+    Duration offset,
+  ) {
+    final dynamic decoded = responseData is String
+        ? jsonDecode(responseData)
+        : responseData;
+    if (decoded is! Map) {
+      throw const FormatException('Groq returned an invalid response body.');
+    }
+    final data = Map<String, dynamic>.from(decoded);
     final words = _extractWordItems(data);
     final timings = <WordTiming>[];
 
     for (final word in words) {
-      final text = ((word['word'] ?? word['text']) as String? ?? '').trim();
+      final textValue = word['word'] ?? word['text'];
+      final text = textValue is String ? textValue.trim() : '';
       final startValue = word['start'];
       final endValue = word['end'];
 
       if (text.isEmpty || startValue is! num || endValue is! num) continue;
 
+      final startSeconds = startValue.toDouble();
+      final endSeconds = endValue.toDouble();
+      if (!startSeconds.isFinite || !endSeconds.isFinite) continue;
+
+      final startMs = (max(0.0, startSeconds) * 1000).round();
+      final endMs = (max(0.0, endSeconds) * 1000).round();
+      if (endMs <= startMs) continue;
+
       timings.add(
         WordTiming(
           word: text,
-          startTime:
-              Duration(milliseconds: (startValue.toDouble() * 1000).round()) +
-              offset,
-          endTime:
-              Duration(milliseconds: (endValue.toDouble() * 1000).round()) +
-              offset,
+          startTime: Duration(milliseconds: startMs) + offset,
+          endTime: Duration(milliseconds: endMs) + offset,
         ),
       );
     }
 
+    timings.sort((a, b) => a.startTime.compareTo(b.startTime));
     return timings;
   }
 

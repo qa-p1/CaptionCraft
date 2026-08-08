@@ -29,12 +29,21 @@ class _SubtitleEditModalState extends ConsumerState<SubtitleEditModal> {
     super.dispose();
   }
 
-  void _save() {
+  bool _save() {
     final notifier = ref.read(subtitleProvider.notifier);
     final text = _textController.text.trim();
-    if (text.isNotEmpty && text != widget.entry.text) {
+    if (text.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Subtitle text cannot be empty. Use delete instead.'),
+        ),
+      );
+      return false;
+    }
+    if (text != widget.entry.text) {
       notifier.updateText(widget.entry.id, text);
     }
+    return true;
   }
 
   @override
@@ -135,8 +144,7 @@ class _SubtitleEditModalState extends ConsumerState<SubtitleEditModal> {
                 const SizedBox(width: 16),
                 ElevatedButton(
                   onPressed: () {
-                    _save();
-                    Navigator.pop(context);
+                    if (_save()) Navigator.pop(context);
                   },
                   style: ElevatedButton.styleFrom(
                     backgroundColor: kAccent,

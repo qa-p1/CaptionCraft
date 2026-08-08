@@ -1,0 +1,68 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function owns(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function isCurrentServerTimestamp(value) {
+      return value is timestamp && value == request.time;
+    }
+
+    match /users/{uid} {
+      allow read, create, update, delete: if owns(uid);
+    }
+
+    match /projects/{uid}/user_projects/{projectId} {
+      allow read, delete: if owns(uid);
+      allow create, update: if owns(uid)
+        && request.resource.data.ownerUid is string
+        && request.resource.data.ownerUid == uid
+        && request.resource.data.id is string
+        && request.resource.data.id == projectId;
+    }
+
+    match /device_quotas/{fingerprint} {
+      allow get: if signedIn();
+      allow list: if false;
+
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly([
+          'runs_used',
+          'bound_uid',
+          'created_at',
+          'last_used_at'
+        ])
+        && request.resource.data.bound_uid == request.auth.uid
+        && request.resource.data.runs_used is int
+        && request.resource.data.runs_used >= 1
+        && request.resource.data.runs_used <= 3
+        && isCurrentServerTimestamp(request.resource.data.created_at)
+        && isCurrentServerTimestamp(request.resource.data.last_used_at);
+
+      allow update: if signedIn()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'runs_used',
+          'last_used_at'
+        ])
+        && resource.data.bound_uid is string
+        && request.resource.data.bound_uid == resource.data.bound_uid
+        && resource.data.runs_used is int
+        && request.resource.data.runs_used is int
+        && request.resource.data.runs_used > resource.data.runs_used
+        && request.resource.data.runs_used <= 3
+        && isCurrentServerTimestamp(request.resource.data.last_used_at);
+
+      allow delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

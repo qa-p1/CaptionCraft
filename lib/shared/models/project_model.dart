@@ -10,7 +10,11 @@ import '../../features/editor/models/timeline_models.dart';
 
 /// Project data model — represents a subtitling project.
 class Project {
+  static const int currentSchemaVersion = 3;
+
   final String id;
+  final String? ownerUid;
+  final int projectSchemaVersion;
   final String name;
   final String videoPath;
   final String? thumbnailBase64;
@@ -25,10 +29,12 @@ class Project {
   final DateTime captionsModifiedAt;
   Uint8List? _thumbnailBytesCache;
   bool _thumbnailDecoded = false;
-  bool? _videoAvailableCache;
+  ProjectVideoAvailability? _videoAvailabilityCache;
 
   Project({
     required this.id,
+    this.ownerUid,
+    this.projectSchemaVersion = currentSchemaVersion,
     required this.name,
     required this.videoPath,
     this.thumbnailBase64,
@@ -48,12 +54,18 @@ class Project {
 
   /// Whether the source video file still exists on device.
   bool get isVideoAvailable {
-    final cached = _videoAvailableCache;
+    return videoAvailability.allRequiredSourcesAvailable;
+  }
+
+  ProjectVideoAvailability get videoAvailability {
+    final cached = _videoAvailabilityCache;
     if (cached != null) return cached;
 
-    final exists = mediaPaths.any((mediaPath) => File(mediaPath).existsSync());
-    _videoAvailableCache = exists;
-    return exists;
+    final availability = evaluateVideoAvailability(
+      pathExists: (mediaPath) => File(mediaPath).existsSync(),
+    );
+    _videoAvailabilityCache = availability;
+    return availability;
   }
 
   /// Local video candidates that can make this project editable.
@@ -65,6 +77,7 @@ class Project {
     for (final asset in timeline.assets) {
       final sourcePath = asset.sourcePath;
       if (asset.type == EditorAssetType.video &&
+          !asset.isNetworkBacked &&
           sourcePath != null &&
           sourcePath.isNotEmpty &&
           seen.add(sourcePath)) {
@@ -92,14 +105,105 @@ class Project {
   }
 
   void cacheVideoAvailability(bool isAvailable) {
-    _videoAvailableCache = isAvailable;
+    _videoAvailabilityCache = ProjectVideoAvailability(
+      allRequiredSourcesAvailable: isAvailable,
+      primarySourceAvailable: isAvailable,
+      anySourceAvailable: isAvailable,
+    );
+  }
+
+  void cacheVideoAvailabilityDetails(ProjectVideoAvailability availability) {
+    _videoAvailabilityCache = availability;
+  }
+
+  ProjectVideoAvailability evaluateVideoAvailability({
+    required bool Function(String path) pathExists,
+  }) {
+    final assetsById = {for (final asset in timeline.assets) asset.id: asset};
+    final videoClips = timeline.tracks
+        .expand((track) => track.clips)
+        .where((clip) => clip.type == TimelineTrackType.video)
+        .toList();
+    if (videoClips.isEmpty) {
+      final available = videoPath.isNotEmpty && pathExists(videoPath);
+      return ProjectVideoAvailability(
+        allRequiredSourcesAvailable: available,
+        primarySourceAvailable: available,
+        anySourceAvailable: available,
+      );
+    }
+
+    final primaryCandidates =
+        timeline.tracks
+            .where((track) => track.section == TimelineTrackSection.baseVideo)
+            .expand((track) => track.clips)
+            .where((clip) => clip.type == TimelineTrackType.video)
+            .toList()
+          ..sort((a, b) => a.startTime.compareTo(b.startTime));
+    final primaryClip = primaryCandidates.isNotEmpty
+        ? primaryCandidates.first
+        : (videoClips..sort((a, b) => a.startTime.compareTo(b.startTime)))
+              .first;
+
+    bool sourceIsAvailable(TimelineClip clip) {
+      final asset = assetsById[clip.assetId];
+      if (asset != null) {
+        if (asset.isNetworkBacked) return true;
+        final sourcePath = asset.sourcePath;
+        return sourcePath != null &&
+            sourcePath.isNotEmpty &&
+            pathExists(sourcePath);
+      }
+      if (clip.assetId == null &&
+          identical(clip, primaryClip) &&
+          videoPath.isNotEmpty) {
+        return pathExists(videoPath);
+      }
+      return false;
+    }
+
+    var allAvailable = true;
+    var anyAvailable = false;
+    for (final clip in videoClips) {
+      final available = sourceIsAvailable(clip);
+      allAvailable = allAvailable && available;
+      anyAvailable = anyAvailable || available;
+    }
+    return ProjectVideoAvailability(
+      allRequiredSourcesAvailable: allAvailable,
+      primarySourceAvailable: sourceIsAvailable(primaryClip),
+      anySourceAvailable: anyAvailable,
+    );
   }
 
   Duration get duration => Duration(milliseconds: durationMs);
 
+  static Project? mostRecentlyModified(Iterable<Project> projects) {
+    Project? latest;
+    for (final project in projects) {
+      if (latest == null ||
+          project.lastModifiedAt.isAfter(latest.lastModifiedAt)) {
+        latest = project;
+      }
+    }
+    return latest;
+  }
+
+  /// Applies one-time editor-default migrations only to persisted legacy data.
+  /// A current project may intentionally use the old default values.
+  SubtitleStyleModel get editorGlobalStyle {
+    if (projectSchemaVersion < currentSchemaVersion &&
+        globalStyle.fontSize == 24 &&
+        globalStyle.maxWidthFactor == 0.85) {
+      return globalStyle.copyWith(fontSize: 10, maxWidthFactor: 1);
+    }
+    return globalStyle;
+  }
+
   Map<String, dynamic> toFirestore() {
     return {
       'id': id,
+      'ownerUid': ownerUid,
       'name': name,
       'videoPath': videoPath,
       'thumbnailBase64': thumbnailBase64,
@@ -113,11 +217,14 @@ class Project {
       'lastModifiedAt': Timestamp.fromDate(lastModifiedAt),
       'captionsModifiedAt': Timestamp.fromDate(captionsModifiedAt),
       'captionCount': subtitles.length,
-      'projectSchemaVersion': 2,
+      'projectSchemaVersion': projectSchemaVersion,
     };
   }
 
-  factory Project.fromFirestore(Map<String, dynamic> data) {
+  factory Project.fromFirestore(
+    Map<String, dynamic> data, {
+    String? fallbackOwnerUid,
+  }) {
     final subtitles = _subtitlesFromData(data);
     final globalStyle = _styleFromData(data['globalStyle']);
     final videoPath = data['videoPath'] as String? ?? '';
@@ -126,6 +233,9 @@ class Project {
 
     return Project(
       id: data['id'] as String? ?? '',
+      ownerUid: data['ownerUid'] as String? ?? fallbackOwnerUid,
+      projectSchemaVersion:
+          (data['projectSchemaVersion'] as num?)?.toInt() ?? 1,
       name: data['name'] as String? ?? 'Untitled',
       videoPath: videoPath,
       thumbnailBase64: data['thumbnailBase64'] as String?,
@@ -153,6 +263,7 @@ class Project {
   Map<String, dynamic> toJson() {
     return {
       'id': id,
+      'ownerUid': ownerUid,
       'name': name,
       'videoPath': videoPath,
       'thumbnailBase64': thumbnailBase64,
@@ -165,7 +276,7 @@ class Project {
       'createdAt': createdAt.toIso8601String(),
       'lastModifiedAt': lastModifiedAt.toIso8601String(),
       'captionsModifiedAt': captionsModifiedAt.toIso8601String(),
-      'projectSchemaVersion': 2,
+      'projectSchemaVersion': projectSchemaVersion,
     };
   }
 
@@ -180,6 +291,9 @@ class Project {
 
     return Project(
       id: data['id'] as String,
+      ownerUid: data['ownerUid'] as String?,
+      projectSchemaVersion:
+          (data['projectSchemaVersion'] as num?)?.toInt() ?? 1,
       name: data['name'] as String? ?? 'Untitled',
       videoPath: videoPath,
       thumbnailBase64: data['thumbnailBase64'] as String?,
@@ -206,6 +320,8 @@ class Project {
   }
 
   Project copyWith({
+    String? ownerUid,
+    int? projectSchemaVersion,
     String? name,
     String? videoPath,
     int? durationMs,
@@ -221,6 +337,8 @@ class Project {
   }) {
     return Project(
       id: id,
+      ownerUid: ownerUid ?? this.ownerUid,
+      projectSchemaVersion: projectSchemaVersion ?? this.projectSchemaVersion,
       name: name ?? this.name,
       videoPath: videoPath ?? this.videoPath,
       thumbnailBase64: thumbnailBase64 ?? this.thumbnailBase64,
@@ -244,6 +362,11 @@ class Project {
     required Project local,
     required Project remote,
   }) {
+    if (local.ownerUid != null &&
+        remote.ownerUid != null &&
+        local.ownerUid != remote.ownerUid) {
+      throw StateError('Cannot merge projects owned by different accounts.');
+    }
     final base = remote.lastModifiedAt.isAfter(local.lastModifiedAt)
         ? remote
         : local;
@@ -252,9 +375,20 @@ class Project {
         ? remote
         : local;
 
-    if (identical(base, captionSource)) return base;
+    final resolvedOwnerUid = local.ownerUid ?? remote.ownerUid;
+    // The schema follows the caption/style source because that is the part
+    // whose legacy defaults require migration in the editor.
+    final resolvedSchemaVersion = captionSource.projectSchemaVersion;
+
+    if (identical(base, captionSource) &&
+        base.ownerUid == resolvedOwnerUid &&
+        base.projectSchemaVersion == resolvedSchemaVersion) {
+      return base;
+    }
 
     return base.copyWith(
+      ownerUid: resolvedOwnerUid,
+      projectSchemaVersion: resolvedSchemaVersion,
       subtitles: List<SubtitleEntry>.from(captionSource.subtitles),
       globalStyle: captionSource.globalStyle,
       timeline: base.timeline.mergeSubtitleEntries(
@@ -338,6 +472,21 @@ class Project {
     }
     return fallback ?? DateTime.now();
   }
+}
+
+class ProjectVideoAvailability {
+  final bool allRequiredSourcesAvailable;
+  final bool primarySourceAvailable;
+  final bool anySourceAvailable;
+
+  const ProjectVideoAvailability({
+    required this.allRequiredSourcesAvailable,
+    required this.primarySourceAvailable,
+    required this.anySourceAvailable,
+  });
+
+  bool get isPartiallyAvailable =>
+      anySourceAvailable && !allRequiredSourcesAvailable;
 }
 
 /// Service for local JSON project persistence (offline fallback).
@@ -425,7 +574,10 @@ class ProjectLocalStorage {
   }
 
   /// Load all projects from local JSON.
-  static Future<List<Project>> loadProjects() async {
+  static Future<List<Project>> loadProjects({
+    String? ownerUid,
+    bool claimUnowned = false,
+  }) async {
     final dir = await _projectsDir;
     final directory = Directory(dir);
 
@@ -442,16 +594,46 @@ class ProjectLocalStorage {
       projectPaths.map(_readLatestProject),
     );
 
-    final projects = loadedProjects.whereType<Project>().toList();
+    var projects = loadedProjects.whereType<Project>().toList();
+
+    if (ownerUid != null) {
+      final ownedProjects = <Project>[];
+      final claimedProjects = <Project>[];
+      for (final project in projects) {
+        if (project.ownerUid == ownerUid) {
+          ownedProjects.add(project);
+        } else if (claimUnowned && project.ownerUid == null) {
+          final claimed = project.copyWith(ownerUid: ownerUid);
+          ownedProjects.add(claimed);
+          claimedProjects.add(claimed);
+        }
+      }
+      projects = ownedProjects;
+      if (claimedProjects.isNotEmpty) {
+        await Future.wait(claimedProjects.map(saveProject));
+      }
+    }
 
     projects.sort((a, b) => b.lastModifiedAt.compareTo(a.lastModifiedAt));
     return projects;
   }
 
-  static Future<Project?> loadProject(String projectId) async {
+  static Future<Project?> loadProject(
+    String projectId, {
+    String? ownerUid,
+    bool claimUnowned = false,
+  }) async {
     final dir = await _projectsDir;
     final basePath = p.join(dir, '${_safeFileId(projectId)}.json');
-    return _readLatestProject(basePath);
+    final project = await _readLatestProject(basePath);
+    if (project == null || ownerUid == null) return project;
+    if (project.ownerUid == ownerUid) return project;
+    if (project.ownerUid == null && claimUnowned) {
+      final claimed = project.copyWith(ownerUid: ownerUid);
+      await saveProject(claimed);
+      return claimed;
+    }
+    return null;
   }
 
   /// Delete a project's local JSON file.

@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -52,7 +54,12 @@ class FirebaseService {
       email: email.trim(),
       password: password,
     );
-    await credential.user?.updateDisplayName(displayName.trim());
+    try {
+      await credential.user?.updateDisplayName(displayName.trim());
+    } catch (_) {
+      // Account creation is already committed. Keep registration successful
+      // and let the profile document preserve the requested display name.
+    }
 
     // Create user profile document in Firestore
     try {
@@ -141,6 +148,11 @@ class FirebaseService {
   ) async {
     final queueKey = '$uid::$projectId';
     final payload = Map<String, dynamic>.from(data);
+    final ownerUid = payload['ownerUid'];
+    if (ownerUid != null && ownerUid != uid) {
+      throw StateError('Cannot save a project owned by another account.');
+    }
+    payload['ownerUid'] = uid;
     final captions = payload['subtitles'];
     if (captions is List) {
       payload['captionCount'] = captions.length;
@@ -203,11 +215,25 @@ class FirebaseService {
   }
 
   static Future<List<Map<String, dynamic>>> loadProjects(String uid) async {
-    final snapshot = await _userProjectsRef(
-      uid,
-    ).orderBy('lastModifiedAt', descending: true).limit(100).get();
+    const pageSize = 100;
+    final projects = <Map<String, dynamic>>[];
+    QueryDocumentSnapshot<Map<String, dynamic>>? cursor;
 
-    return snapshot.docs.map((doc) => {'id': doc.id, ...doc.data()}).toList();
+    while (true) {
+      Query<Map<String, dynamic>> query = _userProjectsRef(
+        uid,
+      ).orderBy('lastModifiedAt', descending: true).limit(pageSize);
+      if (cursor != null) query = query.startAfterDocument(cursor);
+
+      final snapshot = await query.get();
+      projects.addAll(
+        snapshot.docs.map((doc) => {...doc.data(), 'id': doc.id}),
+      );
+      if (snapshot.docs.length < pageSize) break;
+      cursor = snapshot.docs.last;
+    }
+
+    return projects;
   }
 
   static Future<Map<String, dynamic>?> loadProject(
@@ -216,7 +242,7 @@ class FirebaseService {
   ) async {
     final doc = await _userProjectsRef(uid).doc(projectId).get();
     if (!doc.exists) return null;
-    return {'id': doc.id, ...doc.data()!};
+    return {...doc.data()!, 'id': doc.id};
   }
 
   static DateTime? _projectModifiedAt(Object? value) {
@@ -238,14 +264,16 @@ class FirebaseService {
         .get();
 
     if (!doc.exists) return 0;
-    return (doc.data()?['runs_used'] as int?) ?? 0;
+    return (doc.data()?['runs_used'] as num?)?.toInt() ?? 0;
   }
 
   /// Atomically increment the device quota. Creates the document if needed.
   static Future<int> incrementDeviceQuota(
     String deviceFingerprint,
-    String uid,
-  ) async {
+    String uid, {
+    required int minimumRunsUsed,
+    required int maxRuns,
+  }) async {
     final docRef = _firestore
         .collection('device_quotas')
         .doc(deviceFingerprint);
@@ -253,19 +281,22 @@ class FirebaseService {
     return _firestore.runTransaction<int>((transaction) async {
       final snapshot = await transaction.get(docRef);
 
+      final storedRuns = (snapshot.data()?['runs_used'] as num?)?.toInt() ?? 0;
+      final currentRuns = math.max(storedRuns, minimumRunsUsed);
+      if (currentRuns >= maxRuns) {
+        throw QuotaLimitReachedException(maxRuns);
+      }
+      final newRuns = currentRuns + 1;
+
       if (!snapshot.exists) {
-        // First run on this device
         transaction.set(docRef, {
-          'runs_used': 1,
+          'runs_used': newRuns,
           'bound_uid': uid,
           'created_at': FieldValue.serverTimestamp(),
           'last_used_at': FieldValue.serverTimestamp(),
         });
-        return 1;
+        return newRuns;
       }
-
-      final currentRuns = (snapshot.data()?['runs_used'] as int?) ?? 0;
-      final newRuns = currentRuns + 1;
 
       transaction.update(docRef, {
         'runs_used': newRuns,
@@ -275,4 +306,13 @@ class FirebaseService {
       return newRuns;
     });
   }
+}
+
+class QuotaLimitReachedException implements Exception {
+  final int maxRuns;
+
+  const QuotaLimitReachedException(this.maxRuns);
+
+  @override
+  String toString() => 'The device quota of $maxRuns runs has been reached.';
 }

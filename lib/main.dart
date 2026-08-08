@@ -8,11 +8,11 @@ import 'firebase_options.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  await dotenv.load(fileName: '.env');
+  // The tracked template keeps clean checkouts buildable. Real credentials are
+  // supplied with `--dart-define-from-file=.env` and are never committed.
+  await dotenv.load(fileName: '.env.example');
 
-  await Firebase.initializeApp(
-    options: DefaultFirebaseOptions.currentPlatform,
-  );
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
 
   runApp(const ProviderScope(child: CaptionCraftApp()));
 }

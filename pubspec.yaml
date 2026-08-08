@@ -1,7 +1,7 @@
   name: caption_craft
   description: "CaptionCraft — AI-powered subtitle editor"
   publish_to: 'none'
-  version: 0.1.0+2004
+  version: 0.1.1+2005
 
   environment:
     sdk: ^3.11.0
@@ -19,16 +19,17 @@
 
     # Subtitle data model & SRT/VTT parsing
     flutter_subtitle: ^0.0.6
-    ffmpeg_kit_flutter_new: ^4.1.0
     # FFmpeg for audio extraction, compression, video export
+    ffmpeg_kit_flutter_new: ^4.1.0
 
-    # File picking
+    # File picking and local configuration
     file_picker: ^10.3.10
     flutter_dotenv: ^6.0.0
+
     # Secure local storage
     flutter_secure_storage: ^10.0.0
 
-      # Firebase
+    # Firebase
     firebase_core: ^4.5.0
     firebase_auth: ^6.2.0
     cloud_firestore: ^6.1.3
@@ -72,7 +73,7 @@
   flutter:
     uses-material-design: true
     assets:
-      - .env
+      - .env.example
       - assets/fonts/licenses/
     fonts:
       - family: Roboto

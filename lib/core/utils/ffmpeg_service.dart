@@ -62,9 +62,9 @@ class FFmpegService {
     // Try FLAC first (lossless, good compression for speech)
     final session = await FFmpegKit.executeWithArguments([
       '-y',
+      if (startTime != null) ...['-ss', _formatDurationForFfmpeg(startTime)],
       '-i',
       videoPath,
-      if (startTime != null) ...['-ss', _formatDurationForFfmpeg(startTime)],
       if (clipDuration != null) ...[
         '-t',
         _formatDurationForFfmpeg(clipDuration),
@@ -80,6 +80,11 @@ class FFmpegService {
     ]);
     final returnCode = await session.getReturnCode();
 
+    if (ReturnCode.isCancel(returnCode)) {
+      await _deleteFileBestEffort(flacPath);
+      throw Exception('Audio extraction cancelled.');
+    }
+
     if (ReturnCode.isSuccess(returnCode) && await File(flacPath).exists()) {
       // Check file size - if too large, fall back to MP3
       final fileSize = await File(flacPath).length();
@@ -89,21 +94,16 @@ class FFmpegService {
     }
 
     // Fallback to MP3 (smaller but still fine for speech)
-    try {
-      final flacFile = File(flacPath);
-      if (await flacFile.exists()) await flacFile.delete();
-    } catch (_) {
-      // Best-effort cleanup before using the smaller fallback.
-    }
+    await _deleteFileBestEffort(flacPath);
     final mp3Path = p.join(
       tempDir.path,
       'caption_craft_audio_$operationId.mp3',
     );
     final mp3Session = await FFmpegKit.executeWithArguments([
       '-y',
+      if (startTime != null) ...['-ss', _formatDurationForFfmpeg(startTime)],
       '-i',
       videoPath,
-      if (startTime != null) ...['-ss', _formatDurationForFfmpeg(startTime)],
       if (clipDuration != null) ...[
         '-t',
         _formatDurationForFfmpeg(clipDuration),
@@ -119,18 +119,27 @@ class FFmpegService {
     ]);
     final mp3ReturnCode = await mp3Session.getReturnCode();
 
+    if (ReturnCode.isCancel(mp3ReturnCode)) {
+      await _deleteFileBestEffort(mp3Path);
+      throw Exception('Audio extraction cancelled.');
+    }
+
     if (!ReturnCode.isSuccess(mp3ReturnCode)) {
       final logs = await mp3Session.getAllLogsAsString();
-      try {
-        final mp3File = File(mp3Path);
-        if (await mp3File.exists()) await mp3File.delete();
-      } catch (_) {
-        // Preserve the extraction error as the useful failure.
-      }
+      await _deleteFileBestEffort(mp3Path);
       throw Exception('Audio extraction failed: $logs');
     }
 
     return mp3Path;
+  }
+
+  static Future<void> _deleteFileBestEffort(String filePath) async {
+    try {
+      final file = File(filePath);
+      if (await file.exists()) await file.delete();
+    } catch (_) {
+      // Preserve the operation result; temporary cleanup is best-effort.
+    }
   }
 
   /// Split audio into chunks for Groq's file size limit.
@@ -176,10 +185,10 @@ class FFmpegService {
 
       final session = await FFmpegKit.executeWithArguments([
         '-y',
-        '-i',
-        audioPath,
         '-ss',
         '$startSec',
+        '-i',
+        audioPath,
         '-t',
         '$durationSec',
         '-ar',
@@ -191,6 +200,16 @@ class FFmpegService {
         chunkPath,
       ]);
       final returnCode = await session.getReturnCode();
+
+      if (ReturnCode.isCancel(returnCode)) {
+        for (final createdChunk in [
+          ...chunks.map((chunk) => chunk.filePath),
+          chunkPath,
+        ]) {
+          await _deleteFileBestEffort(createdChunk);
+        }
+        throw Exception('Audio chunking cancelled.');
+      }
 
       if (!ReturnCode.isSuccess(returnCode)) {
         final logs = await session.getAllLogsAsString();

@@ -3,8 +3,15 @@ import 'package:flutter_dotenv/flutter_dotenv.dart';
 class GroqConstants {
   GroqConstants._();
 
+  static const _definedApiKey = String.fromEnvironment('GROQ_API_KEY');
+  static const _definedLegacyApiKey = String.fromEnvironment('groq_api_key');
+
   static String get apiKey =>
-      _envValue('GROQ_API_KEY') ?? _envValue('groq_api_key') ?? '';
+      _normalizedValue(_definedApiKey) ??
+      _normalizedValue(_definedLegacyApiKey) ??
+      _envValue('GROQ_API_KEY') ??
+      _envValue('groq_api_key') ??
+      '';
 
   static const String baseUrl = 'https://api.groq.com/openai/v1';
   static const String model = 'whisper-large-v3';
@@ -18,7 +25,11 @@ class GroqConstants {
   static const int maxVideoDurationMinutes = 20;
 
   static String? _envValue(String key) {
-    final value = dotenv.env[key]?.trim();
+    return _normalizedValue(dotenv.env[key]);
+  }
+
+  static String? _normalizedValue(String? rawValue) {
+    final value = rawValue?.trim();
     if (value == null || value.isEmpty) return null;
 
     if (value.length >= 2) {

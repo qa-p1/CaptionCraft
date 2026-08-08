@@ -40,7 +40,10 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
   String? _errorText;
   String? _outputPath;
   String? _previewWarningText;
+  String? _galleryWarningText;
+  String? _projectSaveWarningText;
   bool _savedToGallery = false;
+  bool _gallerySaveInProgress = false;
   bool _openInProgress = false;
   bool _isExporting = false;
   bool _isCancelling = false;
@@ -74,7 +77,10 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
       _errorText = null;
       _outputPath = null;
       _previewWarningText = null;
+      _galleryWarningText = null;
+      _projectSaveWarningText = null;
       _savedToGallery = false;
+      _gallerySaveInProgress = false;
       _previewReady = false;
       _exportResult = null;
       _isExporting = true;
@@ -128,24 +134,35 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
       });
 
       var savedToGallery = false;
+      String? galleryWarning;
       if (widget.settings.saveToGallery) {
         try {
           await Gal.putVideo(outputPath);
           savedToGallery = true;
         } catch (_) {
           savedToGallery = false;
+          galleryWarning =
+              'The video was exported, but CaptionCraft could not add it to '
+              'your gallery. Check photo permissions and try again.';
         }
       }
 
-      await ProjectLocalStorage.saveProject(
-        widget.project.copyWith(
-          timeline: widget.timeline,
-          subtitles: widget.entries,
-          globalStyle: widget.globalStyle,
-          lastExportPath: outputPath,
-          lastModifiedAt: DateTime.now(),
-        ),
-      );
+      String? projectSaveWarning;
+      try {
+        await ProjectLocalStorage.saveProject(
+          widget.project.copyWith(
+            timeline: widget.timeline,
+            subtitles: widget.entries,
+            globalStyle: widget.globalStyle,
+            lastExportPath: outputPath,
+            lastModifiedAt: DateTime.now(),
+          ),
+        );
+      } catch (_) {
+        projectSaveWarning =
+            'The video is safe, but its export path could not be added to '
+            'project history.';
+      }
 
       final previewReady = await _initializePreview(outputPath);
       final previewWarning = previewReady
@@ -155,6 +172,8 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
       if (!mounted) return;
       setState(() {
         _savedToGallery = savedToGallery;
+        _galleryWarningText = galleryWarning;
+        _projectSaveWarningText = projectSaveWarning;
         _progress = 1;
         _statusText = previewReady
             ? 'Export complete'
@@ -215,9 +234,11 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
   }
 
   Future<bool> _initializePreview(String videoPath) async {
+    VideoPlayerController? createdController;
     try {
       _previewController?.dispose();
       final controller = VideoPlayerController.file(File(videoPath));
+      createdController = controller;
       await controller.initialize();
       controller.addListener(() {
         if (!mounted) return;
@@ -235,6 +256,14 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
       });
       return true;
     } catch (_) {
+      final controller = createdController;
+      if (controller != null && !identical(controller, _previewController)) {
+        try {
+          await controller.dispose();
+        } catch (_) {
+          // Failed initialization may already have released the native handle.
+        }
+      }
       if (!mounted) return false;
       setState(() {
         _previewController = null;
@@ -255,6 +284,32 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
     }
   }
 
+  Future<void> _retryGallerySave() async {
+    final outputPath = _outputPath;
+    if (outputPath == null || _gallerySaveInProgress) return;
+    setState(() => _gallerySaveInProgress = true);
+    try {
+      await Gal.putVideo(outputPath);
+      if (!mounted) return;
+      setState(() {
+        _savedToGallery = true;
+        _galleryWarningText = null;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Video added to your gallery.')),
+      );
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _galleryWarningText =
+            'CaptionCraft still could not add the video to your gallery. '
+            'Check photo permissions and available storage.';
+      });
+    } finally {
+      if (mounted) setState(() => _gallerySaveInProgress = false);
+    }
+  }
+
   Future<void> _openFileExplorer() async {
     final outputPath = _outputPath;
     if (outputPath == null) return;
@@ -271,6 +326,12 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
       if (result.type != ResultType.done) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Could not open path: ${result.message}')),
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Unable to open the exported video.')),
         );
       }
     } finally {
@@ -547,6 +608,11 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
             child: Column(
               children: [
                 _buildSuccessHeader(),
+                if (_galleryWarningText != null ||
+                    _projectSaveWarningText != null) ...[
+                  const SizedBox(height: 10),
+                  _buildCompletionWarnings(),
+                ],
                 const SizedBox(height: 14),
                 Container(
                   width: double.infinity,
@@ -633,6 +699,60 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
               letterSpacing: 0.9,
             ),
           ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCompletionWarnings() {
+    final warnings = [?_galleryWarningText, ?_projectSaveWarningText];
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(13, 11, 10, 11),
+      decoration: BoxDecoration(
+        color: kWarning.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: kWarning.withValues(alpha: 0.28)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Padding(
+            padding: EdgeInsets.only(top: 2),
+            child: Icon(Icons.warning_amber_rounded, color: kWarning, size: 18),
+          ),
+          const SizedBox(width: 9),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: warnings
+                  .map(
+                    (warning) => Padding(
+                      padding: const EdgeInsets.only(bottom: 3),
+                      child: Text(
+                        warning,
+                        style: const TextStyle(
+                          color: kTextPrimary,
+                          fontSize: 11,
+                          height: 1.4,
+                        ),
+                      ),
+                    ),
+                  )
+                  .toList(growable: false),
+            ),
+          ),
+          if (_galleryWarningText != null)
+            TextButton(
+              onPressed: _gallerySaveInProgress ? null : _retryGallerySave,
+              child: _gallerySaveInProgress
+                  ? const SizedBox(
+                      width: 15,
+                      height: 15,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Text('Retry'),
+            ),
         ],
       ),
     );
@@ -911,8 +1031,7 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               openFiles,
-              const SizedBox(height: 9),
-              gallery,
+              if (_savedToGallery) ...[const SizedBox(height: 9), gallery],
               const SizedBox(height: 5),
               done,
             ],
@@ -921,8 +1040,10 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
         return Row(
           children: [
             Expanded(flex: 2, child: openFiles),
-            const SizedBox(width: 9),
-            Expanded(child: gallery),
+            if (_savedToGallery) ...[
+              const SizedBox(width: 9),
+              Expanded(child: gallery),
+            ],
             const SizedBox(width: 4),
             done,
           ],

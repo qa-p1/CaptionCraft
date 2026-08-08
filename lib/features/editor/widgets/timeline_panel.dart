@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:uuid/uuid.dart';
 
 import '../../../core/theme/app_theme.dart';
 import '../../../shared/widgets/snack_bar_helper.dart';
@@ -423,10 +424,8 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       );
       if (confirmed != true || !mounted) return;
     }
-    final liveTrack = ref
-        .read(editorProvider)
-        .timeline
-        .tracks
+    final timeline = ref.read(editorProvider).timeline;
+    final liveTrack = timeline.tracks
         .where((candidate) => candidate.id == track.id)
         .firstOrNull;
     if (liveTrack != null) _removeTrack(liveTrack);
@@ -440,10 +439,8 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         Overlay.of(context).context.findRenderObject() as RenderBox?;
     if (overlay == null) return;
     final local = overlay.globalToLocal(globalPosition);
-    final liveTrack = ref
-        .read(editorProvider)
-        .timeline
-        .tracks
+    final timeline = ref.read(editorProvider).timeline;
+    final liveTrack = timeline.tracks
         .where((candidate) => candidate.id == track.id)
         .firstOrNull;
     if (liveTrack == null) return;
@@ -451,6 +448,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
     final canMute =
         liveTrack.section == TimelineTrackSection.audio ||
         liveTrack.type == TimelineTrackType.video;
+    final canSolo =
+        liveTrack.isSolo ||
+        liveTrack.clips.any((clip) => timeline.clipHasAudio(clip));
     final action = await showMenu<_TrackQuickAction>(
       context: context,
       color: kSurfaceElevated,
@@ -479,6 +479,16 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                   ? Icons.volume_up_rounded
                   : Icons.volume_off_rounded,
               label: liveTrack.isMuted ? 'Unmute' : 'Mute',
+            ),
+          ),
+        if (canSolo)
+          PopupMenuItem(
+            value: _TrackQuickAction.solo,
+            child: _TrackActionMenuItem(
+              icon: liveTrack.isSolo
+                  ? Icons.hearing_disabled_rounded
+                  : Icons.hearing_rounded,
+              label: liveTrack.isSolo ? 'Unsolo' : 'Solo',
             ),
           ),
         PopupMenuItem(
@@ -520,6 +530,12 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         _updateTrack(
           latest,
           (current) => current.copyWith(isMuted: !current.isMuted),
+        );
+        break;
+      case _TrackQuickAction.solo:
+        _updateTrack(
+          latest,
+          (current) => current.copyWith(isSolo: !current.isSolo),
         );
         break;
       case _TrackQuickAction.lock:
@@ -652,6 +668,16 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         );
         return;
       }
+      final compositionEnd = Duration(
+        milliseconds: _compositionDurationMs(timeline),
+      );
+      if (playhead + subtitle.duration > compositionEnd) {
+        SnackBarHelper.showInfo(
+          context,
+          'Move the playhead earlier to paste this subtitle.',
+        );
+        return;
+      }
       ref
           .read(subtitleProvider.notifier)
           .pasteEntry(subtitle, startTime: playhead);
@@ -682,42 +708,11 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       );
       return;
     }
-    final pasted = TimelineClip(
+    final pasted = sourceClip.copyWith(
+      id: const Uuid().v4(),
       trackId: sourceTrack.id,
-      type: sourceClip.type,
-      effectKind: sourceClip.effectKind,
-      label: sourceClip.label,
-      assetId: sourceClip.assetId,
-      linkedClipId: sourceClip.linkedClipId,
       startTime: playhead,
       endTime: end,
-      sourceStartTime: sourceClip.sourceStartTime,
-      sourceDuration: sourceClip.sourceDuration,
-      layer: sourceClip.layer,
-      enabled: sourceClip.enabled,
-      transform: sourceClip.transform,
-      audioMix: sourceClip.audioMix,
-      fitMode: sourceClip.fitMode,
-      playbackRate: sourceClip.playbackRate,
-      isReversed: sourceClip.isReversed,
-      crop: sourceClip.crop,
-      blur: sourceClip.blur,
-      colorAdjustments: sourceClip.colorAdjustments,
-      text: sourceClip.text,
-      subtitleStyle: sourceClip.subtitleStyle,
-      introTransition: sourceClip.introTransition,
-      outroTransition: sourceClip.outroTransition,
-      keyframes: sourceClip.keyframes,
-      freezeFrame: sourceClip.freezeFrame,
-      stabilize: sourceClip.stabilize,
-      denoise: sourceClip.denoise,
-      chromaKeyEnabled: sourceClip.chromaKeyEnabled,
-      chromaKeyColor: sourceClip.chromaKeyColor,
-      chromaKeySimilarity: sourceClip.chromaKeySimilarity,
-      timelineColor: sourceClip.timelineColor,
-      notes: sourceClip.notes,
-      autoDuck: sourceClip.autoDuck,
-      duckAmount: sourceClip.duckAmount,
     );
     final nextTracks = timeline.tracks.map((track) {
       if (track.id != sourceTrack.id) return track;
@@ -2307,7 +2302,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                   _buildToolbarButton(
                     icon: Icons.clear_all_rounded,
                     tooltip: 'Clear work area',
-                    onPressed: workspace.normalizedWorkAreaStart == null
+                    onPressed:
+                        workspace.workAreaStart == null &&
+                            workspace.workAreaEnd == null
                         ? null
                         : _clearWorkArea,
                   ),
@@ -2898,7 +2895,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
   }
 }
 
-enum _TrackQuickAction { visibility, mute, lock, delete }
+enum _TrackQuickAction { visibility, mute, solo, lock, delete }
 
 class _TrackActionMenuItem extends StatelessWidget {
   final IconData icon;
@@ -3076,6 +3073,7 @@ class _CompactTrackLabelState extends State<_CompactTrackLabel> {
     final status = [
       if (track.isLocked) 'locked',
       if (track.isMuted) 'muted',
+      if (track.isSolo) 'solo',
       if (track.isHidden) 'hidden',
     ];
     final statusLabel = status.isEmpty ? '' : ', ${status.join(', ')}';
@@ -3134,6 +3132,16 @@ class _CompactTrackLabelState extends State<_CompactTrackLabel> {
                       right: 3,
                       top: 2,
                       child: Icon(Icons.lock_rounded, size: 9, color: kWarning),
+                    ),
+                  if (track.isSolo)
+                    const Positioned(
+                      left: 3,
+                      top: 2,
+                      child: Icon(
+                        Icons.hearing_rounded,
+                        size: 9,
+                        color: kAccent,
+                      ),
                     ),
                 ],
               ),

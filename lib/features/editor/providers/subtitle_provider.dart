@@ -153,25 +153,11 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
     final mergedEntries = entries.map((entry) {
       final existing = existingById[entry.id];
       if (existing == null) return entry;
-      final oldDurationMs = existing.duration.inMilliseconds;
-      final newDurationMs = entry.duration.inMilliseconds;
-      final mappedWords = existing.words?.map((word) {
-        if (oldDurationMs <= 0) return word;
-        final startRatio =
-            (word.startTime - existing.startTime).inMilliseconds /
-            oldDurationMs;
-        final endRatio =
-            (word.endTime - existing.startTime).inMilliseconds / oldDurationMs;
-        return WordTiming(
-          word: word.word,
-          startTime:
-              entry.startTime +
-              Duration(milliseconds: (newDurationMs * startRatio).round()),
-          endTime:
-              entry.startTime +
-              Duration(milliseconds: (newDurationMs * endRatio).round()),
-        );
-      }).toList();
+      final mappedWords = _remapWords(
+        existing,
+        newStartTime: entry.startTime,
+        newEndTime: entry.endTime,
+      );
       return entry.copyWith(
         confidenceScore: existing.confidenceScore,
         words: mappedWords,
@@ -253,7 +239,11 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
     }
     final entries = state.entries.map((e) {
       if (e.id == id) {
-        return e.copyWith(startTime: safeStart, endTime: safeEnd);
+        return e.copyWith(
+          startTime: safeStart,
+          endTime: safeEnd,
+          words: _remapWords(e, newStartTime: safeStart, newEndTime: safeEnd),
+        );
       }
       return e;
     }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
@@ -307,13 +297,19 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
   void duplicateEntry(String id) {
     _pushUndo();
     final original = state.entries.firstWhere((e) => e.id == id);
+    final copyStart = original.endTime;
+    final copyEnd = original.endTime + original.duration;
     final copy = SubtitleEntry(
-      startTime: original.endTime,
-      endTime: original.endTime + original.duration,
+      startTime: copyStart,
+      endTime: copyEnd,
       text: original.text,
       styleOverride: original.styleOverride,
       confidenceScore: original.confidenceScore,
-      words: original.words,
+      words: _remapWords(
+        original,
+        newStartTime: copyStart,
+        newEndTime: copyEnd,
+      ),
     );
     state = state.copyWith(
       entries: [...state.entries, copy]
@@ -394,9 +390,16 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
         startMs = (startMs - overshoot).clamp(0, maxMs).toInt();
         endMs = maxMs;
       }
+      final newStartTime = Duration(milliseconds: startMs);
+      final newEndTime = Duration(milliseconds: endMs);
       return entry.copyWith(
-        startTime: Duration(milliseconds: startMs),
-        endTime: Duration(milliseconds: endMs),
+        startTime: newStartTime,
+        endTime: newEndTime,
+        words: _remapWords(
+          entry,
+          newStartTime: newStartTime,
+          newEndTime: newEndTime,
+        ),
       );
     }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
     state = state.copyWith(entries: shifted);
@@ -469,7 +472,16 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
       final latestEnd = next.startTime - minimumGap;
       if (entry.endTime > latestEnd &&
           latestEnd > entry.startTime + const Duration(milliseconds: 100)) {
-        fixed.add(entry.copyWith(endTime: latestEnd));
+        fixed.add(
+          entry.copyWith(
+            endTime: latestEnd,
+            words: _remapWords(
+              entry,
+              newStartTime: entry.startTime,
+              newEndTime: latestEnd,
+            ),
+          ),
+        );
         changed = true;
       } else {
         fixed.add(entry);
@@ -535,6 +547,52 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
 
   void endStyleGestureEdit() {
     _isStyleGestureEditing = false;
+  }
+
+  List<WordTiming>? _remapWords(
+    SubtitleEntry entry, {
+    required Duration newStartTime,
+    required Duration newEndTime,
+  }) {
+    final words = entry.words;
+    if (words == null) return null;
+    if (words.isEmpty) return const [];
+
+    final oldStartMs = entry.startTime.inMilliseconds;
+    final oldDurationMs = entry.duration.inMilliseconds;
+    final newStartMs = newStartTime.inMilliseconds;
+    final newEndMs = newEndTime.inMilliseconds;
+    final newDurationMs = newEndMs - newStartMs;
+    if (newDurationMs <= 0) return const [];
+
+    return words
+        .map((word) {
+          int mappedStartMs;
+          int mappedEndMs;
+          if (oldDurationMs <= 0) {
+            final deltaMs = newStartMs - oldStartMs;
+            mappedStartMs = word.startTime.inMilliseconds + deltaMs;
+            mappedEndMs = word.endTime.inMilliseconds + deltaMs;
+          } else {
+            final startRatio =
+                ((word.startTime.inMilliseconds - oldStartMs) / oldDurationMs)
+                    .clamp(0.0, 1.0);
+            final endRatio =
+                ((word.endTime.inMilliseconds - oldStartMs) / oldDurationMs)
+                    .clamp(0.0, 1.0);
+            mappedStartMs = newStartMs + (newDurationMs * startRatio).round();
+            mappedEndMs = newStartMs + (newDurationMs * endRatio).round();
+          }
+
+          mappedStartMs = mappedStartMs.clamp(newStartMs, newEndMs - 1).toInt();
+          mappedEndMs = mappedEndMs.clamp(mappedStartMs + 1, newEndMs).toInt();
+          return WordTiming(
+            word: word.word,
+            startTime: Duration(milliseconds: mappedStartMs),
+            endTime: Duration(milliseconds: mappedEndMs),
+          );
+        })
+        .toList(growable: false);
   }
 
   (String, String) _splitTextNearRatio(String text, double ratio) {

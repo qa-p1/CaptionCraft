@@ -14,6 +14,66 @@ import 'word_timing.dart';
 const double kTimelineDesignWidth = 390;
 const double kTimelineDesignHeight = 360;
 
+Map<String, dynamic>? _timelineJsonMap(Object? value) {
+  if (value is! Map) return null;
+  try {
+    return Map<String, dynamic>.from(value);
+  } catch (_) {
+    return null;
+  }
+}
+
+T _timelineModelFromJson<T>(
+  Object? value,
+  T Function(Map<String, dynamic>) parser,
+  T fallback,
+) {
+  final map = _timelineJsonMap(value);
+  if (map == null) return fallback;
+  try {
+    return parser(map);
+  } catch (_) {
+    return fallback;
+  }
+}
+
+T? _timelineOptionalModelFromJson<T>(
+  Object? value,
+  T Function(Map<String, dynamic>) parser,
+) {
+  final map = _timelineJsonMap(value);
+  if (map == null) return null;
+  try {
+    return parser(map);
+  } catch (_) {
+    return null;
+  }
+}
+
+List<T> _timelineModelsFromJson<T>(
+  Object? value,
+  T Function(Map<String, dynamic>) parser,
+) {
+  if (value is! List) return const [];
+  final models = <T>[];
+  for (final candidate in value) {
+    final map = _timelineJsonMap(candidate);
+    if (map == null) continue;
+    try {
+      models.add(parser(map));
+    } catch (_) {
+      // Keep the rest of the timeline usable when one nested item is damaged.
+    }
+  }
+  return models;
+}
+
+int _timelineInt(Object? value, {int fallback = 0}) {
+  if (value is num) return value.toInt();
+  if (value is String) return int.tryParse(value) ?? fallback;
+  return fallback;
+}
+
 enum TimelineTrackType {
   video,
   audio,
@@ -771,7 +831,7 @@ class EditorAssetReference {
       sourcePath: json['sourcePath'] as String?,
       remoteUrl: json['remoteUrl'] as String?,
       isNetworkBacked: json['isNetworkBacked'] as bool? ?? false,
-      metadata: (json['metadata'] as Map<String, dynamic>?) ?? const {},
+      metadata: _timelineJsonMap(json['metadata']) ?? const {},
     );
   }
 }
@@ -819,15 +879,13 @@ class TimelineMarker {
   factory TimelineMarker.fromJson(Map<String, dynamic> json) {
     return TimelineMarker(
       id: json['id'] as String?,
-      position: Duration(
-        milliseconds: (json['positionMs'] as num?)?.toInt() ?? 0,
-      ),
+      position: Duration(milliseconds: _timelineInt(json['positionMs'])),
       label: json['label'] as String? ?? 'Marker',
       type: TimelineMarkerType.values.firstWhere(
         (value) => value.name == json['type'],
         orElse: () => TimelineMarkerType.marker,
       ),
-      color: Color(json['color'] as int? ?? 0xFFFF9A62),
+      color: Color(_timelineInt(json['color'], fallback: 0xFFFF9A62)),
     );
   }
 }
@@ -860,6 +918,13 @@ class TimelineClip {
   final ClipTransition outroTransition;
   final List<TimelineKeyframe> keyframes;
   final bool freezeFrame;
+
+  /// Source timestamp held while [freezeFrame] is enabled.
+  ///
+  /// Older projects only persisted the boolean flag. In that case the first
+  /// frame in the selected source range is used so the feature remains
+  /// deterministic instead of becoming a render-only no-op.
+  final Duration? freezeFrameSourceTime;
   final bool stabilize;
   final bool denoise;
   final bool chromaKeyEnabled;
@@ -898,6 +963,7 @@ class TimelineClip {
     this.outroTransition = const ClipTransition(),
     List<TimelineKeyframe>? keyframes,
     this.freezeFrame = false,
+    this.freezeFrameSourceTime,
     this.stabilize = false,
     this.denoise = false,
     this.chromaKeyEnabled = false,
@@ -976,6 +1042,8 @@ class TimelineClip {
     ClipTransition? outroTransition,
     List<TimelineKeyframe>? keyframes,
     bool? freezeFrame,
+    Duration? freezeFrameSourceTime,
+    bool clearFreezeFrameSourceTime = false,
     bool? stabilize,
     bool? denoise,
     bool? chromaKeyEnabled,
@@ -1019,6 +1087,9 @@ class TimelineClip {
       outroTransition: outroTransition ?? this.outroTransition,
       keyframes: keyframes ?? this.keyframes,
       freezeFrame: freezeFrame ?? this.freezeFrame,
+      freezeFrameSourceTime: clearFreezeFrameSourceTime
+          ? null
+          : (freezeFrameSourceTime ?? this.freezeFrameSourceTime),
       stabilize: stabilize ?? this.stabilize,
       denoise: denoise ?? this.denoise,
       chromaKeyEnabled: chromaKeyEnabled ?? this.chromaKeyEnabled,
@@ -1060,6 +1131,7 @@ class TimelineClip {
       'outroTransition': outroTransition.toJson(),
       'keyframes': keyframes.map((keyframe) => keyframe.toJson()).toList(),
       'freezeFrame': freezeFrame,
+      'freezeFrameSourceTimeMs': freezeFrameSourceTime?.inMilliseconds,
       'stabilize': stabilize,
       'denoise': denoise,
       'chromaKeyEnabled': chromaKeyEnabled,
@@ -1073,6 +1145,20 @@ class TimelineClip {
   }
 
   factory TimelineClip.fromJson(Map<String, dynamic> json) {
+    final startTimeMs = _timelineInt(json['startTimeMs']);
+    final endTimeMs = _timelineInt(json['endTimeMs']);
+    if (endTimeMs <= startTimeMs) {
+      throw const FormatException(
+        'Timeline clips must have positive duration.',
+      );
+    }
+    final playbackRate = ((json['playbackRate'] as num?)?.toDouble() ?? 1)
+        .clamp(0.25, 4)
+        .toDouble();
+    final storedSourceDurationMs = _timelineInt(json['sourceDurationMs']);
+    final sourceDurationMs = storedSourceDurationMs > 0
+        ? storedSourceDurationMs
+        : math.max(1, ((endTimeMs - startTimeMs) * playbackRate).round());
     return TimelineClip(
       id: json['id'] as String?,
       trackId: json['trackId'] as String? ?? '',
@@ -1086,81 +1172,79 @@ class TimelineClip {
       label: json['label'] as String? ?? 'Untitled clip',
       assetId: json['assetId'] as String?,
       linkedClipId: json['linkedClipId'] as String?,
-      startTime: Duration(
-        milliseconds: (json['startTimeMs'] as num?)?.toInt() ?? 0,
-      ),
-      endTime: Duration(
-        milliseconds: (json['endTimeMs'] as num?)?.toInt() ?? 0,
-      ),
+      startTime: Duration(milliseconds: startTimeMs),
+      endTime: Duration(milliseconds: endTimeMs),
       sourceStartTime: Duration(
-        milliseconds: (json['sourceStartTimeMs'] as num?)?.toInt() ?? 0,
+        milliseconds: _timelineInt(json['sourceStartTimeMs']),
       ),
-      sourceDuration: Duration(
-        milliseconds: (json['sourceDurationMs'] as num?)?.toInt() ?? 0,
-      ),
+      sourceDuration: Duration(milliseconds: sourceDurationMs),
       layer: (json['layer'] as num?)?.toInt() ?? 0,
       enabled: json['enabled'] as bool? ?? true,
-      transform: json['transform'] is Map<String, dynamic>
-          ? TimelineTransform.fromJson(
-              json['transform'] as Map<String, dynamic>,
-            )
-          : const TimelineTransform(),
-      audioMix: json['audioMix'] is Map<String, dynamic>
-          ? AudioMixSettings.fromJson(json['audioMix'] as Map<String, dynamic>)
-          : const AudioMixSettings(),
+      transform: _timelineModelFromJson(
+        json['transform'],
+        TimelineTransform.fromJson,
+        const TimelineTransform(),
+      ),
+      audioMix: _timelineModelFromJson(
+        json['audioMix'],
+        AudioMixSettings.fromJson,
+        const AudioMixSettings(),
+      ),
       fitMode: ClipFitMode.values.firstWhere(
         (value) => value.name == json['fitMode'],
         orElse: () => ClipFitMode.cover,
       ),
-      playbackRate: ((json['playbackRate'] as num?)?.toDouble() ?? 1)
-          .clamp(0.25, 4)
-          .toDouble(),
+      playbackRate: playbackRate,
       isReversed: json['isReversed'] as bool? ?? false,
-      crop: json['crop'] is Map<String, dynamic>
-          ? ClipCropSettings.fromJson(json['crop'] as Map<String, dynamic>)
-          : const ClipCropSettings(),
-      blur: json['blur'] is Map<String, dynamic>
-          ? ClipBlurSettings.fromJson(json['blur'] as Map<String, dynamic>)
-          : const ClipBlurSettings(),
-      colorAdjustments: json['colorAdjustments'] is Map<String, dynamic>
-          ? ClipColorAdjustments.fromJson(
-              json['colorAdjustments'] as Map<String, dynamic>,
-            )
-          : const ClipColorAdjustments(),
+      crop: _timelineModelFromJson(
+        json['crop'],
+        ClipCropSettings.fromJson,
+        const ClipCropSettings(),
+      ),
+      blur: _timelineModelFromJson(
+        json['blur'],
+        ClipBlurSettings.fromJson,
+        const ClipBlurSettings(),
+      ),
+      colorAdjustments: _timelineModelFromJson(
+        json['colorAdjustments'],
+        ClipColorAdjustments.fromJson,
+        const ClipColorAdjustments(),
+      ),
       text: json['text'] as String?,
-      subtitleStyle: json['subtitleStyle'] is Map<String, dynamic>
-          ? SubtitleStyleModel.fromJson(
-              json['subtitleStyle'] as Map<String, dynamic>,
-            )
-          : null,
-      introTransition: json['introTransition'] is Map<String, dynamic>
-          ? ClipTransition.fromJson(
-              json['introTransition'] as Map<String, dynamic>,
-            )
-          : const ClipTransition(),
-      outroTransition: json['outroTransition'] is Map<String, dynamic>
-          ? ClipTransition.fromJson(
-              json['outroTransition'] as Map<String, dynamic>,
-            )
-          : const ClipTransition(),
-      keyframes:
-          (json['keyframes'] as List<dynamic>?)
-              ?.whereType<Map>()
-              .map(
-                (keyframe) => TimelineKeyframe.fromJson(
-                  Map<String, dynamic>.from(keyframe),
-                ),
-              )
-              .toList() ??
-          const [],
+      subtitleStyle: _timelineOptionalModelFromJson(
+        json['subtitleStyle'],
+        SubtitleStyleModel.fromJson,
+      ),
+      introTransition: _timelineModelFromJson(
+        json['introTransition'],
+        ClipTransition.fromJson,
+        const ClipTransition(),
+      ),
+      outroTransition: _timelineModelFromJson(
+        json['outroTransition'],
+        ClipTransition.fromJson,
+        const ClipTransition(),
+      ),
+      keyframes: _timelineModelsFromJson(
+        json['keyframes'],
+        TimelineKeyframe.fromJson,
+      ),
       freezeFrame: json['freezeFrame'] as bool? ?? false,
+      freezeFrameSourceTime: (json['freezeFrameSourceTimeMs'] as num?) == null
+          ? null
+          : Duration(
+              milliseconds: (json['freezeFrameSourceTimeMs'] as num).toInt(),
+            ),
       stabilize: json['stabilize'] as bool? ?? false,
       denoise: json['denoise'] as bool? ?? false,
       chromaKeyEnabled: json['chromaKeyEnabled'] as bool? ?? false,
-      chromaKeyColor: Color(json['chromaKeyColor'] as int? ?? 0xFF00FF00),
+      chromaKeyColor: Color(
+        _timelineInt(json['chromaKeyColor'], fallback: 0xFF00FF00),
+      ),
       chromaKeySimilarity:
           (json['chromaKeySimilarity'] as num?)?.toDouble() ?? 0.25,
-      timelineColor: Color(json['timelineColor'] as int? ?? 0),
+      timelineColor: Color(_timelineInt(json['timelineColor'])),
       notes: json['notes'] as String?,
       autoDuck: json['autoDuck'] as bool? ?? false,
       duckAmount: (json['duckAmount'] as num?)?.toDouble() ?? 0.35,
@@ -1274,6 +1358,32 @@ extension TimelineClipCapabilities on TimelineClip {
         fallback: transform.opacity,
       ),
     );
+  }
+
+  ClipBlurSettings blurAt(Duration position) {
+    return blur.copyWith(
+      strength: keyframedValue(
+        TimelineKeyframeProperty.blurStrength,
+        position,
+        fallback: blur.safeStrength,
+      ).clamp(0.0, 30.0).toDouble(),
+    );
+  }
+
+  /// An absolute source-file timestamp that is always inside the selected
+  /// source window and can safely be passed to preview and FFmpeg seeks.
+  Duration get effectiveFreezeFrameSourceTime {
+    final startMs = sourceStartTime.inMilliseconds;
+    final declaredSpanMs = sourceDuration.inMilliseconds;
+    final fallbackSpanMs = math.max(
+      1,
+      (duration.inMilliseconds * playbackRate.clamp(0.25, 4)).round(),
+    );
+    final spanMs = declaredSpanMs > 0 ? declaredSpanMs : fallbackSpanMs;
+    final endMs = startMs + math.max(0, spanMs - 1);
+    final requestedMs =
+        (freezeFrameSourceTime ?? sourceStartTime).inMilliseconds;
+    return Duration(milliseconds: requestedMs.clamp(startMs, endMs).toInt());
   }
 
   double volumeAt(Duration position) {
@@ -1486,13 +1596,7 @@ class TimelineTrack {
       isMuted: json['isMuted'] as bool? ?? false,
       isHidden: json['isHidden'] as bool? ?? false,
       isSolo: json['isSolo'] as bool? ?? false,
-      clips:
-          (json['clips'] as List<dynamic>?)
-              ?.map(
-                (clip) => TimelineClip.fromJson(clip as Map<String, dynamic>),
-              )
-              .toList() ??
-          const [],
+      clips: _timelineModelsFromJson(json['clips'], TimelineClip.fromJson),
     );
   }
 }
@@ -1892,50 +1996,31 @@ class EditorTimeline {
 
   factory EditorTimeline.fromJson(Map<String, dynamic> json) {
     final parsed = EditorTimeline(
-      schemaVersion: (json['schemaVersion'] as num?)?.toInt() ?? 2,
-      canvasSettings: json['canvasSettings'] is Map<String, dynamic>
-          ? CanvasSettings.fromJson(
-              json['canvasSettings'] as Map<String, dynamic>,
-            )
-          : const CanvasSettings(),
-      workspaceSettings: json['workspaceSettings'] is Map<String, dynamic>
-          ? TimelineWorkspaceSettings.fromJson(
-              json['workspaceSettings'] as Map<String, dynamic>,
-            )
-          : const TimelineWorkspaceSettings(),
-      subtitleStyle: json['subtitleStyle'] is Map<String, dynamic>
-          ? SubtitleStyleModel.fromJson(
-              json['subtitleStyle'] as Map<String, dynamic>,
-            )
-          : const SubtitleStyleModel(),
-      assets:
-          (json['assets'] as List<dynamic>?)
-              ?.whereType<Map>()
-              .map(
-                (asset) => EditorAssetReference.fromJson(
-                  Map<String, dynamic>.from(asset),
-                ),
-              )
-              .toList() ??
-          const [],
-      tracks:
-          (json['tracks'] as List<dynamic>?)
-              ?.whereType<Map>()
-              .map(
-                (track) =>
-                    TimelineTrack.fromJson(Map<String, dynamic>.from(track)),
-              )
-              .toList() ??
-          const [],
-      markers:
-          (json['markers'] as List<dynamic>?)
-              ?.whereType<Map>()
-              .map(
-                (marker) =>
-                    TimelineMarker.fromJson(Map<String, dynamic>.from(marker)),
-              )
-              .toList() ??
-          const [],
+      schemaVersion: _timelineInt(json['schemaVersion'], fallback: 2),
+      canvasSettings: _timelineModelFromJson(
+        json['canvasSettings'],
+        CanvasSettings.fromJson,
+        const CanvasSettings(),
+      ),
+      workspaceSettings: _timelineModelFromJson(
+        json['workspaceSettings'],
+        TimelineWorkspaceSettings.fromJson,
+        const TimelineWorkspaceSettings(),
+      ),
+      subtitleStyle: _timelineModelFromJson(
+        json['subtitleStyle'],
+        SubtitleStyleModel.fromJson,
+        const SubtitleStyleModel(),
+      ),
+      assets: _timelineModelsFromJson(
+        json['assets'],
+        EditorAssetReference.fromJson,
+      ),
+      tracks: _timelineModelsFromJson(json['tracks'], TimelineTrack.fromJson),
+      markers: _timelineModelsFromJson(
+        json['markers'],
+        TimelineMarker.fromJson,
+      ),
     );
     return parsed.canonicalized();
   }

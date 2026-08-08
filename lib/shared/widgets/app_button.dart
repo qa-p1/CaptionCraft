@@ -191,16 +191,31 @@ class _DangerButton extends StatelessWidget {
         foregroundColor: Colors.white,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       ),
-      child: isLoading
-          ? const SizedBox(
-              width: 20,
-              height: 20,
-              child: CircularProgressIndicator(
-                strokeWidth: 2,
-                valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-              ),
-            )
-          : Text(label, style: TextStyle(fontWeight: FontWeight.w600)),
+      child: _buildContent(),
     );
+  }
+
+  Widget _buildContent() {
+    if (isLoading) {
+      return const SizedBox(
+        width: 20,
+        height: 20,
+        child: CircularProgressIndicator(
+          strokeWidth: 2,
+          valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+        ),
+      );
+    }
+    if (icon != null) {
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 20),
+          const SizedBox(width: 8),
+          Text(label, style: const TextStyle(fontWeight: FontWeight.w600)),
+        ],
+      );
+    }
+    return Text(label, style: const TextStyle(fontWeight: FontWeight.w600));
   }
 }

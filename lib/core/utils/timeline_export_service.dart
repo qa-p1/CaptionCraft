@@ -54,6 +54,8 @@ class TimelineExportResult {
 class TimelineExportService {
   TimelineExportService._();
 
+  static const _freezeFramePreroll = Duration(seconds: 1);
+  static const _maxNetworkAssetBytes = 64 * 1024 * 1024;
   static CancelToken? _activeDownloadCancelToken;
 
   static Future<void> cancelActiveExport() async {
@@ -104,11 +106,7 @@ class TimelineExportService {
     try {
       final sourcePaths = <String, Future<String>>{};
       Future<String> resolveSourcePath(TimelineClip clip) {
-        final sourceKey =
-            clip.assetId ??
-            (clip.type == TimelineTrackType.video
-                ? 'project-video:${project.videoPath}'
-                : 'clip:${clip.id}');
+        final sourceKey = _sourceCacheKey(clip);
         return sourcePaths.putIfAbsent(
           sourceKey,
           () => _sourcePathForClip(
@@ -180,6 +178,7 @@ class TimelineExportService {
               hasAudio:
                   clip.type == TimelineTrackType.audio ||
                   (mediaInfo['hasAudio'] as bool? ?? false),
+              frameRate: (mediaInfo['frameRate'] as num?)?.toDouble(),
             ),
           );
         }
@@ -319,10 +318,17 @@ class TimelineExportService {
     for (final input in inputs) {
       args.addAll(_inputArguments(input));
     }
+    final frozenVisualInputIndices = <int, int>{};
+    var nextInputIndex = inputs.length;
+    for (final input in inputs.where(_usesFrozenVisualInput)) {
+      frozenVisualInputIndices[input.index] = nextInputIndex++;
+      args.addAll(_freezeInputArguments(input));
+    }
 
     final filterGraph = _buildFilterGraph(
       timeline: timeline,
       inputs: inputs,
+      frozenVisualInputIndices: frozenVisualInputIndices,
       settings: settings,
       canvasSize: canvasSize,
       timelineDuration: timelineDuration,
@@ -444,6 +450,34 @@ class TimelineExportService {
     return clips;
   }
 
+  static String _sourceCacheKey(TimelineClip clip) {
+    final normalizedAssetId = clip.assetId?.trim();
+    return normalizedAssetId == null || normalizedAssetId.isEmpty
+        ? 'clip:${clip.id}'
+        : 'asset:$normalizedAssetId';
+  }
+
+  @visibleForTesting
+  static String sourceCacheKeyForTesting(TimelineClip clip) {
+    return _sourceCacheKey(clip);
+  }
+
+  @visibleForTesting
+  static Future<String> resolveSourcePathForTesting({
+    required Project project,
+    required EditorTimeline timeline,
+    required TimelineClip clip,
+    required Directory workingDirectory,
+  }) {
+    return _sourcePathForClip(
+      project: project,
+      timeline: timeline,
+      clip: clip,
+      workingDirectory: workingDirectory,
+      downloadCancelToken: CancelToken(),
+    );
+  }
+
   static Future<String> _sourcePathForClip({
     required Project project,
     required EditorTimeline timeline,
@@ -461,8 +495,17 @@ class TimelineExportService {
     final remoteUrl = asset?.remoteUrl;
     if (remoteUrl != null && remoteUrl.isNotEmpty) {
       final uri = Uri.tryParse(remoteUrl);
-      final rawExtension = uri == null ? '' : p.extension(uri.path);
-      final extension = rawExtension.isEmpty ? '.media' : rawExtension;
+      if (uri == null ||
+          !const {'http', 'https'}.contains(uri.scheme.toLowerCase()) ||
+          uri.host.isEmpty) {
+        throw Exception(
+          'Unsupported media URL for ${asset?.label ?? clip.label}.',
+        );
+      }
+      final rawExtension = p.extension(uri.path);
+      final extension = RegExp(r'^\.[A-Za-z0-9]{1,8}$').hasMatch(rawExtension)
+          ? rawExtension.toLowerCase()
+          : '.media';
       final safeAssetId = asset!.id.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
       final outputPath = p.join(
         workingDirectory.path,
@@ -470,16 +513,46 @@ class TimelineExportService {
       );
       final cachedDownload = File(outputPath);
       if (await cachedDownload.exists() && await cachedDownload.length() > 0) {
-        return outputPath;
+        if (await cachedDownload.length() <= _maxNetworkAssetBytes) {
+          return outputPath;
+        }
+        await cachedDownload.delete();
       }
+      var exceededDownloadLimit = false;
       try {
         await Dio(
           BaseOptions(
             connectTimeout: const Duration(seconds: 25),
             receiveTimeout: const Duration(minutes: 5),
           ),
-        ).download(remoteUrl, outputPath, cancelToken: downloadCancelToken);
+        ).download(
+          remoteUrl,
+          (headers) {
+            final declaredLength = int.tryParse(
+              headers.value(Headers.contentLengthHeader) ?? '',
+            );
+            if (declaredLength != null &&
+                declaredLength > _maxNetworkAssetBytes) {
+              exceededDownloadLimit = true;
+              throw StateError('Network media exceeds the export size limit.');
+            }
+            return outputPath;
+          },
+          cancelToken: downloadCancelToken,
+          onReceiveProgress: (received, total) {
+            if (received > _maxNetworkAssetBytes ||
+                total > _maxNetworkAssetBytes) {
+              exceededDownloadLimit = true;
+              throw StateError('Network media exceeds the export size limit.');
+            }
+          },
+        );
       } on DioException catch (error) {
+        if (exceededDownloadLimit) {
+          throw Exception(
+            '${asset.label} exceeds the 64 MB network-media export limit.',
+          );
+        }
         if (CancelToken.isCancel(error)) {
           throw Exception('Export cancelled.');
         }
@@ -487,15 +560,34 @@ class TimelineExportService {
           'Could not download ${asset.label}: '
           '${error.message ?? 'network error'}.',
         );
+      } catch (_) {
+        if (exceededDownloadLimit) {
+          throw Exception(
+            '${asset.label} exceeds the 64 MB network-media export limit.',
+          );
+        }
+        rethrow;
       }
       final outputFile = File(outputPath);
       if (!await outputFile.exists() || await outputFile.length() == 0) {
         throw Exception('Downloaded media is empty: ${asset.label}.');
       }
+      if (await outputFile.length() > _maxNetworkAssetBytes) {
+        await outputFile.delete();
+        throw Exception(
+          '${asset.label} exceeds the 64 MB network-media export limit.',
+        );
+      }
       return outputPath;
     }
 
+    final baseClips = _visibleBaseClips(timeline);
+    final primaryBaseClip = baseClips.isEmpty ? null : baseClips.first.$2;
+    final hasAssetReference = clip.assetId?.trim().isNotEmpty ?? false;
+    final isLegacyPrimaryClip =
+        !hasAssetReference && primaryBaseClip?.id == clip.id;
     if (clip.type == TimelineTrackType.video &&
+        isLegacyPrimaryClip &&
         project.videoPath.isNotEmpty &&
         await File(project.videoPath).exists()) {
       return project.videoPath;
@@ -534,10 +626,7 @@ class TimelineExportService {
   static List<String> _inputArguments(TimelineRenderInput input) {
     final clipDuration = input.clip.duration;
     final sourceWindow = _sourceWindow(input.clip);
-    final extension = p.extension(input.sourcePath).toLowerCase();
-    final isAnimatedImage =
-        input.asset?.type == EditorAssetType.gif ||
-        (input.asset?.type == EditorAssetType.sticker && extension == '.gif');
+    final isAnimatedImage = _isAnimatedImage(input);
     if (input.asset?.type == EditorAssetType.image ||
         (input.asset?.type == EditorAssetType.sticker && !isAnimatedImage)) {
       return [
@@ -553,6 +642,10 @@ class TimelineExportService {
       return [
         '-stream_loop',
         '-1',
+        if (input.clip.sourceStartTime > Duration.zero) ...[
+          '-ss',
+          _seconds(input.clip.sourceStartTime),
+        ],
         '-t',
         _seconds(sourceWindow),
         '-i',
@@ -569,9 +662,29 @@ class TimelineExportService {
     ];
   }
 
+  static List<String> _freezeInputArguments(TimelineRenderInput input) {
+    final seek = _freezeSeekPlan(input.clip);
+    return [
+      if (_isAnimatedImage(input)) ...['-stream_loop', '-1'],
+      '-ss',
+      _seconds(seek.seekStart),
+      '-t',
+      _seconds(seek.decodeWindow),
+      '-i',
+      input.sourcePath,
+    ];
+  }
+
+  static bool _isAnimatedImage(TimelineRenderInput input) {
+    final extension = p.extension(input.sourcePath).toLowerCase();
+    return input.asset?.type == EditorAssetType.gif ||
+        (input.asset?.type == EditorAssetType.sticker && extension == '.gif');
+  }
+
   static String _buildFilterGraph({
     required EditorTimeline timeline,
     required List<TimelineRenderInput> inputs,
+    required Map<int, int> frozenVisualInputIndices,
     required ExportSettings settings,
     required ExportCanvasSize canvasSize,
     required Duration timelineDuration,
@@ -608,53 +721,92 @@ class TimelineExportService {
       final input = visualInputs[visualIndex];
       final clip = input.clip;
       final clipDuration = clip.duration;
+      final playbackRate = clip.playbackRate.clamp(0.25, 4).toDouble();
       final isBase = input.track.section == TimelineTrackSection.baseVideo;
       final visualLabel = 'visual$visualIndex';
+      final isFrozenVisual = _usesFrozenVisualInput(input);
+      final visualInputIndex = isFrozenVisual
+          ? frozenVisualInputIndices[input.index]!
+          : input.index;
+      final scaleExpression = _visualScaleExpression(clip);
+      final rotationExpression = _keyframedValueExpression(
+        clip,
+        TimelineKeyframeProperty.rotation,
+        fallback: clip.transform.rotation,
+        variable: 't',
+      );
+      final hasScaleAnimation =
+          _hasKeyframes(clip, TimelineKeyframeProperty.scale) ||
+          _hasZoomTransition(clip);
+      final hasRotationAnimation = _hasKeyframes(
+        clip,
+        TimelineKeyframeProperty.rotation,
+      );
+      final hasOpacityAnimation = _hasKeyframes(
+        clip,
+        TimelineKeyframeProperty.opacity,
+      );
+      final needsAlpha =
+          !isBase ||
+          clip.chromaKeyEnabled ||
+          hasOpacityAnimation ||
+          clip.transform.opacity < 0.999 ||
+          hasRotationAnimation ||
+          clip.transform.rotation.abs() > 0.0001 ||
+          _transitionUsesAlpha(clip.introTransition.type) ||
+          _transitionUsesAlpha(clip.outroTransition.type);
+      final hasAlphaEnvelope =
+          hasOpacityAnimation ||
+          clip.transform.opacity < 0.999 ||
+          _transitionUsesAlpha(clip.introTransition.type) ||
+          _transitionUsesAlpha(clip.outroTransition.type);
       final preparation = <String>[
-        if (clip.isReversed &&
-            (clip.type == TimelineTrackType.video ||
-                clip.type == TimelineTrackType.gif))
-          'reverse',
-        'setpts=(PTS-STARTPTS)/${_number(clip.playbackRate)}',
-        'trim=duration=${_seconds(clipDuration)}',
+        if (isFrozenVisual)
+          ..._freezeFrameFilters(input)
+        else ...[
+          if (clip.isReversed &&
+              (clip.type == TimelineTrackType.video ||
+                  clip.type == TimelineTrackType.gif))
+            'reverse',
+          'setpts=(PTS-STARTPTS)/${_number(playbackRate)}',
+          'trim=duration=${_seconds(clipDuration)}',
+        ],
         ..._cropFilters(clip.crop),
         ..._colorFilters(clip.colorAdjustments),
         if (clip.stabilize) 'deshake=rx=16:ry=16:edge=mirror',
         if (clip.denoise) 'hqdn3d=1.5:1.5:6:6',
-        if (clip.chromaKeyEnabled)
+        if (clip.chromaKeyEnabled) ...[
+          'format=rgba',
           'colorkey=${_ffmpegColor(clip.chromaKeyColor)}:'
               '${_number(clip.chromaKeySimilarity.clamp(0.01, 1.0))}:0.08',
+        ],
         ..._fitFilters(clip, canvasSize: canvasSize, isBase: isBase),
+        // Apply alpha while the frame geometry is still stable. Some FFmpeg
+        // pixel-expression filters do not renegotiate dimensions when a
+        // frame-evaluated scale changes size later in the chain.
+        if (needsAlpha) 'format=rgba',
+        if (hasAlphaEnvelope) ..._alphaEnvelopeFilters(clip),
+      ];
+      final finishing = <String>[
         if (clip.transform.flipX) 'hflip',
         if (clip.transform.flipY) 'vflip',
-        if (clip.transform.rotation.abs() > 0.0001)
-          'rotate=${_number(clip.transform.rotation)}:'
-              'ow=rotw(iw):oh=roth(ih):c=none',
-        if (clip.transform.scale != 1)
-          'scale=w=trunc(iw*${_number(clip.transform.scale)}/2)*2:'
-              'h=trunc(ih*${_number(clip.transform.scale)}/2)*2',
-      ];
-      final needsAlpha =
-          !isBase ||
-          clip.transform.opacity < 0.999 ||
-          clip.transform.rotation.abs() > 0.0001 ||
-          _transitionUsesAlpha(clip.introTransition.type) ||
-          _transitionUsesAlpha(clip.outroTransition.type);
-      final finishing = <String>[
-        if (needsAlpha) 'format=rgba',
-        if (clip.transform.opacity < 0.999)
-          'colorchannelmixer=aa=${_number(clip.transform.opacity.clamp(0, 1))}',
-        ..._transitionAlphaFilters(clip),
+        if (hasRotationAnimation || clip.transform.rotation.abs() > 0.0001)
+          "rotate=angle='$rotationExpression':"
+              "ow='ceil(hypot(iw,ih)/2)*2':"
+              "oh='ceil(hypot(iw,ih)/2)*2':c=none",
+        if (hasScaleAnimation || clip.transform.scale != 1)
+          "scale=w='max(2,trunc(iw*($scaleExpression)/2)*2)':"
+              "h='max(2,trunc(ih*($scaleExpression)/2)*2)':eval=frame",
         'setpts=PTS-STARTPTS+${_seconds(clip.startTime)}/TB',
       ];
-      if (clip.blur.mode == ClipBlurMode.region && clip.blur.isEnabled) {
+      if (clip.blur.mode == ClipBlurMode.region && _blurIsEnabled(clip)) {
         final clean = 'clean$visualIndex';
         final blurredSource = 'blurSource$visualIndex';
         final blurredRegion = 'blurRegion$visualIndex';
         final effected = 'effected$visualIndex';
         final blur = clip.blur;
         filters.add(
-          '[${input.index}:v]${preparation.join(',')},'
+          '[$visualInputIndex:v]${preparation.join(',')},'
           'format=rgba,split=2[$clean][$blurredSource]',
         );
         filters.add(
@@ -663,7 +815,7 @@ class TimelineExportService {
           'h=ih*${_number(blur.safeRegionHeight)}:'
           'x=iw*${_number(blur.safeRegionX)}:'
           'y=ih*${_number(blur.safeRegionY)},'
-          'gblur=sigma=${_number(blur.safeStrength)}'
+          '${_blurFilterChain(clip, target: 'clipRegionBlur$visualIndex').join(',')}'
           '[$blurredRegion]',
         );
         filters.add(
@@ -677,19 +829,15 @@ class TimelineExportService {
       } else {
         final chain = <String>[
           ...preparation,
-          if (clip.blur.mode == ClipBlurMode.full && clip.blur.isEnabled)
-            'gblur=sigma=${_number(clip.blur.safeStrength)}',
+          if (clip.blur.mode == ClipBlurMode.full && _blurIsEnabled(clip))
+            ..._blurFilterChain(clip, target: 'clipFullBlur$visualIndex'),
           ...finishing,
         ];
-        filters.add('[${input.index}:v]${chain.join(',')}[$visualLabel]');
+        filters.add('[$visualInputIndex:v]${chain.join(',')}[$visualLabel]');
       }
 
       final nextCanvas = 'canvas${canvasIndex + 1}';
-      final position = _overlayPosition(
-        clip,
-        canvasSize: canvasSize,
-        isBase: isBase,
-      );
+      final position = _overlayPosition(clip, canvasSize: canvasSize);
       filters.add(
         '[canvas$canvasIndex][$visualLabel]'
         "overlay=x='${position.$1}':y='${position.$2}':"
@@ -750,8 +898,14 @@ class TimelineExportService {
           ..._atempoFilters(clip.playbackRate),
           'atrim=duration=${_seconds(clip.duration)}',
           'aformat=sample_rates=48000:channel_layouts=stereo',
+          if (clip.denoise) 'afftdn=nr=12:nf=-45',
           if (mix.normalize) 'loudnorm=I=-16:LRA=11:TP=-1.5',
-          'volume=${_number((clip.volumeAt(clip.startTime) * (clip.autoDuck ? 1 - clip.duckAmount : 1)).clamp(0, 2))}',
+          _audioVolumeFilter(
+            clip,
+            timeline: timeline,
+            inputs: inputs,
+            soloTrackIds: soloTrackIds,
+          ),
           if (mix.pan.abs() > 0.001)
             _panFilter(mix.pan.clamp(-1, 1).toDouble()),
           if (fadeInSeconds > 0) 'afade=t=in:st=0:d=${_number(fadeInSeconds)}',
@@ -814,13 +968,14 @@ class TimelineExportService {
     for (final effectEntry in effectClips) {
       final clip = effectEntry.$2;
       final enableExpression =
-          'between(t,${_seconds(clip.startTime)},${_seconds(clip.endTime)})';
+          'gte(t,${_seconds(clip.startTime)})*'
+          'lt(t,${_seconds(clip.endTime)})';
       final outputLabel = 'timelineEffect$appliedEffectIndex';
 
       switch (clip.effectKind!) {
         case TimelineEffectKind.blur:
           final blur = clip.blur;
-          if (!blur.isEnabled) continue;
+          if (!_blurIsEnabled(clip)) continue;
           if (blur.mode == ClipBlurMode.region) {
             final cleanLabel = 'effectClean$appliedEffectIndex';
             final blurSourceLabel = 'effectBlurSource$appliedEffectIndex';
@@ -834,8 +989,7 @@ class TimelineExportService {
               'h=ih*${_number(blur.safeRegionHeight)}:'
               'x=iw*${_number(blur.safeRegionX)}:'
               'y=ih*${_number(blur.safeRegionY)},'
-              "gblur=sigma=${_number(blur.safeStrength)}:"
-              "enable='$enableExpression'"
+              '${_blurFilterChain(clip, target: 'effectRegionBlur$appliedEffectIndex', timelineOffset: clip.startTime, enableExpression: enableExpression).join(',')}'
               '[$blurredRegionLabel]',
             );
             filters.add(
@@ -849,8 +1003,7 @@ class TimelineExportService {
           } else {
             filters.add(
               '[$currentSource]'
-              "gblur=sigma=${_number(blur.safeStrength)}:"
-              "enable='$enableExpression'"
+              '${_blurFilterChain(clip, target: 'effectFullBlur$appliedEffectIndex', timelineOffset: clip.startTime, enableExpression: enableExpression).join(',')}'
               '[$outputLabel]',
             );
           }
@@ -869,6 +1022,403 @@ class TimelineExportService {
       appliedEffectIndex++;
     }
     return currentSource;
+  }
+
+  static bool _hasKeyframes(
+    TimelineClip clip,
+    TimelineKeyframeProperty property,
+  ) {
+    return clip.keyframes.any((keyframe) => keyframe.property == property);
+  }
+
+  static bool _blurIsEnabled(TimelineClip clip) {
+    if (clip.blur.mode == ClipBlurMode.none) return false;
+    final frames = _keyframesFor(clip, TimelineKeyframeProperty.blurStrength);
+    if (frames.isEmpty) return clip.blur.isEnabled;
+    return frames.any((frame) => frame.value.clamp(0, 30) > 0.01);
+  }
+
+  /// Produces a Gaussian blur whose sigma follows the editor's linear
+  /// keyframe interpolation. `gblur` accepts runtime commands but not a sigma
+  /// expression, so `sendcmd` evaluates the interpolation once per frame and
+  /// updates the named filter instance.
+  static List<String> _blurFilterChain(
+    TimelineClip clip, {
+    required String target,
+    Duration timelineOffset = Duration.zero,
+    String? enableExpression,
+  }) {
+    final frames = _keyframesFor(clip, TimelineKeyframeProperty.blurStrength);
+    final initialStrength = frames.isEmpty
+        ? clip.blur.safeStrength
+        : frames.first.value.clamp(0, 30).toDouble();
+    final commands = <String>[];
+    final offsetSeconds =
+        timelineOffset.inMicroseconds / Duration.microsecondsPerSecond;
+    final maximumSeconds =
+        clip.duration.inMicroseconds / Duration.microsecondsPerSecond;
+    for (var index = 0; index + 1 < frames.length; index++) {
+      final previous = frames[index];
+      final next = frames[index + 1];
+      final localStart =
+          (previous.time.inMicroseconds / Duration.microsecondsPerSecond)
+              .clamp(0.0, maximumSeconds)
+              .toDouble();
+      final localEnd =
+          (next.time.inMicroseconds / Duration.microsecondsPerSecond)
+              .clamp(0.0, maximumSeconds)
+              .toDouble();
+      if (localEnd <= localStart) continue;
+      final start = _number(offsetSeconds + localStart);
+      final end = _number(offsetSeconds + localEnd);
+      final startValue = _number(previous.value.clamp(0, 30));
+      final delta = _number(
+        next.value.clamp(0, 30) - previous.value.clamp(0, 30),
+      );
+      commands.add(
+        '$start-$end [expr] gblur@$target sigma '
+        '$startValue+($delta)*TI',
+      );
+      commands.add(
+        '$end [enter] gblur@$target sigma '
+        '${_number(next.value.clamp(0, 30))}',
+      );
+    }
+    final filterName = commands.isEmpty ? 'gblur' : 'gblur@$target';
+    final blur = StringBuffer('$filterName=sigma=${_number(initialStrength)}');
+    if (enableExpression != null) {
+      blur.write(":enable='$enableExpression'");
+    }
+    return [
+      if (commands.isNotEmpty) "sendcmd=c='${commands.join(';')}'",
+      blur.toString(),
+    ];
+  }
+
+  static List<TimelineKeyframe> _keyframesFor(
+    TimelineClip clip,
+    TimelineKeyframeProperty property,
+  ) {
+    final byTime = <int, TimelineKeyframe>{};
+    for (final keyframe in clip.keyframes) {
+      if (keyframe.property != property) continue;
+      byTime[keyframe.time.inMicroseconds] = keyframe;
+    }
+    final frames = byTime.values.toList()
+      ..sort((a, b) => a.time.compareTo(b.time));
+    return frames;
+  }
+
+  /// Builds a piecewise-linear FFmpeg expression with the same endpoint
+  /// behavior as [TimelineClip.keyframedValue].
+  static String _keyframedValueExpression(
+    TimelineClip clip,
+    TimelineKeyframeProperty property, {
+    required double fallback,
+    required String variable,
+    double? minimum,
+    double? maximum,
+  }) {
+    final frames = _keyframesFor(clip, property);
+    if (frames.isEmpty) {
+      final value = minimum == null || maximum == null
+          ? fallback
+          : fallback.clamp(minimum, maximum).toDouble();
+      return _number(value);
+    }
+
+    var expression = _number(frames.last.value);
+    for (var index = frames.length - 2; index >= 0; index--) {
+      final previous = frames[index];
+      final next = frames[index + 1];
+      final start =
+          previous.time.inMicroseconds / Duration.microsecondsPerSecond;
+      final end = next.time.inMicroseconds / Duration.microsecondsPerSecond;
+      final span = math.max(0.000001, end - start);
+      final startText = _number(start);
+      final endText = _number(end);
+      final previousValue = _number(previous.value);
+      final delta = _number(next.value - previous.value);
+      final interpolated =
+          '$previousValue+($delta)*clip((($variable)-$startText)/'
+          '${_number(span)},0,1)';
+      expression = 'if(lt(($variable),$endText),($interpolated),($expression))';
+    }
+    final firstTime = _number(
+      frames.first.time.inMicroseconds / Duration.microsecondsPerSecond,
+    );
+    expression =
+        'if(lte(($variable),$firstTime),${_number(frames.first.value)},'
+        '($expression))';
+    if (minimum != null && maximum != null) {
+      expression =
+          'clip(($expression),${_number(minimum)},${_number(maximum)})';
+    }
+    return expression;
+  }
+
+  static bool _hasZoomTransition(TimelineClip clip) {
+    return (clip.introTransition.type == TransitionType.zoom &&
+            clip.effectiveIntroTransitionMs > 0) ||
+        (clip.outroTransition.type == TransitionType.zoom &&
+            clip.effectiveOutroTransitionMs > 0);
+  }
+
+  static String _visualScaleExpression(TimelineClip clip) {
+    final baseScale = _keyframedValueExpression(
+      clip,
+      TimelineKeyframeProperty.scale,
+      fallback: clip.transform.scale,
+      variable: 't',
+      minimum: 0.2,
+      maximum: 4,
+    );
+    final factors = <String>[];
+    final introSeconds = clip.effectiveIntroTransitionMs / 1000;
+    if (clip.introTransition.type == TransitionType.zoom && introSeconds > 0) {
+      factors.add('0.85+0.15*clip(t/${_number(introSeconds)},0,1)');
+    }
+    final outroSeconds = clip.effectiveOutroTransitionMs / 1000;
+    if (clip.outroTransition.type == TransitionType.zoom && outroSeconds > 0) {
+      final outroStart = clip.duration.inMilliseconds / 1000 - outroSeconds;
+      factors.add(
+        '1-0.15*clip((t-${_number(outroStart)})/'
+        '${_number(outroSeconds)},0,1)',
+      );
+    }
+    if (factors.isEmpty) return baseScale;
+    return 'clip(($baseScale)*(${factors.join(')*(')}),0.2,4)';
+  }
+
+  static List<String> _alphaEnvelopeFilters(TimelineClip clip) {
+    var alpha = _keyframedValueExpression(
+      clip,
+      TimelineKeyframeProperty.opacity,
+      fallback: clip.transform.opacity,
+      variable: 'T',
+      minimum: 0,
+      maximum: 1,
+    );
+    final introSeconds = clip.effectiveIntroTransitionMs / 1000;
+    if (_transitionUsesAlpha(clip.introTransition.type) && introSeconds > 0) {
+      final progress = 'clip(T/${_number(introSeconds)},0,1)';
+      final envelope = clip.introTransition.type == TransitionType.dissolve
+          ? _smoothstepExpression(progress)
+          : progress;
+      alpha = '($alpha)*($envelope)';
+    }
+    final outroSeconds = clip.effectiveOutroTransitionMs / 1000;
+    if (_transitionUsesAlpha(clip.outroTransition.type) && outroSeconds > 0) {
+      final outroStart =
+          clip.duration.inMicroseconds / Duration.microsecondsPerSecond -
+          outroSeconds;
+      final remaining =
+          '1-clip((T-${_number(outroStart)})/${_number(outroSeconds)},0,1)';
+      final envelope = clip.outroTransition.type == TransitionType.dissolve
+          ? _smoothstepExpression(remaining)
+          : remaining;
+      alpha = '($alpha)*($envelope)';
+    }
+    return [
+      "geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
+          "a='alpha(X,Y)*clip(($alpha),0,1)'",
+    ];
+  }
+
+  static String _smoothstepExpression(String progress) {
+    return "(($progress)*($progress)*(3-2*($progress)))";
+  }
+
+  static List<String> _freezeFrameFilters(TimelineRenderInput input) {
+    final clip = input.clip;
+    final seek = _freezeSeekPlan(clip);
+    // The frozen visual comes from a duplicate input seeked to at most one
+    // second before the requested frame. Reversing this bounded prefix selects
+    // the frame active at the requested presentation time, including VFR GIF
+    // frames, without buffering everything from the beginning of a long clip.
+    final inclusiveEndUs = seek.selectionOffset.inMicroseconds + 1;
+    return [
+      'settb=AVTB',
+      'setpts=PTS-STARTPTS',
+      'trim=end=${_seconds(Duration(microseconds: inclusiveEndUs))}',
+      'reverse',
+      'trim=end_frame=1',
+      'setpts=PTS-STARTPTS',
+      'tpad=stop_mode=clone:stop_duration=${_seconds(clip.duration)}',
+      'trim=duration=${_seconds(clip.duration)}',
+    ];
+  }
+
+  static bool _usesFrozenVisualInput(TimelineRenderInput input) {
+    final clip = input.clip;
+    return clip.freezeFrame &&
+        (clip.type == TimelineTrackType.video ||
+            clip.type == TimelineTrackType.gif ||
+            _isAnimatedImage(input));
+  }
+
+  static ({Duration seekStart, Duration selectionOffset, Duration decodeWindow})
+  _freezeSeekPlan(TimelineClip clip) {
+    // Freeze-frame selection is independent of how much source media normal
+    // playback consumes. The editor permits choosing any frame in the clip's
+    // declared source span, including frames after a shortened timeline range.
+    final playbackSourceWindow = _sourceWindow(clip);
+    final selectableSourceWindow = clip.sourceDuration.inMicroseconds > 0
+        ? clip.sourceDuration
+        : playbackSourceWindow;
+    final requestedOffset =
+        clip.effectiveFreezeFrameSourceTime - clip.sourceStartTime;
+    final maximumOffsetUs = math.max(
+      0,
+      selectableSourceWindow.inMicroseconds - 1,
+    );
+    final selectedOffsetUs = requestedOffset.inMicroseconds
+        .clamp(0, maximumOffsetUs)
+        .toInt();
+    final seekOffsetUs = math.max(
+      0,
+      selectedOffsetUs - _freezeFramePreroll.inMicroseconds,
+    );
+    final selectionOffsetUs = selectedOffsetUs - seekOffsetUs;
+    final decodeSourceWindow =
+        selectedOffsetUs < playbackSourceWindow.inMicroseconds
+        ? playbackSourceWindow
+        : selectableSourceWindow;
+    final remainingWindowUs = decodeSourceWindow.inMicroseconds - seekOffsetUs;
+    final decodeWindowUs = math.min(
+      remainingWindowUs,
+      selectionOffsetUs + _freezeFramePreroll.inMicroseconds,
+    );
+    return (
+      seekStart: clip.sourceStartTime + Duration(microseconds: seekOffsetUs),
+      selectionOffset: Duration(microseconds: selectionOffsetUs),
+      decodeWindow: Duration(microseconds: math.max(1, decodeWindowUs)),
+    );
+  }
+
+  static String _audioVolumeFilter(
+    TimelineClip clip, {
+    required EditorTimeline timeline,
+    required List<TimelineRenderInput> inputs,
+    required Set<String> soloTrackIds,
+  }) {
+    final hasVolumeKeyframes = _hasKeyframes(
+      clip,
+      TimelineKeyframeProperty.volume,
+    );
+    var expression = _keyframedValueExpression(
+      clip,
+      TimelineKeyframeProperty.volume,
+      fallback: clip.audioMix.volume,
+      variable: 't',
+      minimum: 0,
+      maximum: 2,
+    );
+    final duckingFactor = clip.autoDuck && clip.duckAmount > 0.001
+        ? _duckingVolumeExpression(
+            clip,
+            timeline: timeline,
+            inputs: inputs,
+            soloTrackIds: soloTrackIds,
+          )
+        : null;
+    if (duckingFactor != null) {
+      expression = 'clip(($expression)*($duckingFactor),0,2)';
+    }
+    if (!hasVolumeKeyframes && duckingFactor == null) {
+      return 'volume=${_number(clip.audioMix.volume.clamp(0, 2))}';
+    }
+    return "volume='$expression':eval=frame";
+  }
+
+  static String? _duckingVolumeExpression(
+    TimelineClip clip, {
+    required EditorTimeline timeline,
+    required List<TimelineRenderInput> inputs,
+    required Set<String> soloTrackIds,
+  }) {
+    final intervals = <(int, int)>[];
+    final clipStartMs = clip.startTime.inMilliseconds;
+    final clipDurationMs = clip.duration.inMilliseconds;
+
+    void addInterval(Duration start, Duration end) {
+      final localStart = math.max(0, start.inMilliseconds - clipStartMs);
+      final localEnd = math.min(
+        clipDurationMs,
+        end.inMilliseconds - clipStartMs,
+      );
+      if (localEnd > localStart) intervals.add((localStart, localEnd));
+    }
+
+    for (final track in timeline.tracks) {
+      if (track.isHidden ||
+          (track.type != TimelineTrackType.subtitle &&
+              track.type != TimelineTrackType.text)) {
+        continue;
+      }
+      for (final candidate in track.clips) {
+        if (!candidate.enabled ||
+            candidate.id == clip.id ||
+            candidate.endTime <= candidate.startTime) {
+          continue;
+        }
+        addInterval(candidate.startTime, candidate.endTime);
+      }
+    }
+
+    for (final input in inputs) {
+      if (input.clip.id == clip.id ||
+          !input.hasAudio ||
+          input.track.isMuted ||
+          input.clip.audioMix.muted ||
+          (soloTrackIds.isNotEmpty && !soloTrackIds.contains(input.track.id))) {
+        continue;
+      }
+      addInterval(input.clip.startTime, input.clip.endTime);
+    }
+    if (intervals.isEmpty) return null;
+
+    intervals.sort((a, b) => a.$1.compareTo(b.$1));
+    const attackMs = 120;
+    const releaseMs = 180;
+    final merged = <(int, int)>[];
+    for (final interval in intervals) {
+      if (merged.isEmpty ||
+          interval.$1 > merged.last.$2 + attackMs + releaseMs) {
+        merged.add(interval);
+      } else {
+        final previous = merged.removeLast();
+        merged.add((previous.$1, math.max(previous.$2, interval.$2)));
+      }
+    }
+
+    final gain = (1 - clip.duckAmount.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    final factors = <String>[];
+    for (final interval in merged) {
+      final attackStartMs = math.max(0, interval.$1 - attackMs);
+      final releaseEndMs = math.min(clipDurationMs, interval.$2 + releaseMs);
+      final attackStart = _number(attackStartMs / 1000);
+      final start = _number(interval.$1 / 1000);
+      final end = _number(interval.$2 / 1000);
+      final releaseEnd = _number(releaseEndMs / 1000);
+      final gainText = _number(gain);
+      final depth = _number(1 - gain);
+      final attack = interval.$1 > attackStartMs
+          ? '1-($depth)*clip((t-$attackStart)/'
+                '${_number((interval.$1 - attackStartMs) / 1000)},0,1)'
+          : gainText;
+      final release = releaseEndMs > interval.$2
+          ? '$gainText+($depth)*clip((t-$end)/'
+                '${_number((releaseEndMs - interval.$2) / 1000)},0,1)'
+          : gainText;
+      factors.add(
+        'if(lt(t,$attackStart),1,'
+        'if(lt(t,$start),($attack),'
+        'if(lte(t,$end),$gainText,'
+        'if(lt(t,$releaseEnd),($release),1))))',
+      );
+    }
+    return factors.reduce((left, right) => 'min(($left),($right))');
   }
 
   static List<String> _cropFilters(ClipCropSettings crop) {
@@ -938,23 +1488,6 @@ class TimelineExportService {
     return filters;
   }
 
-  static List<String> _transitionAlphaFilters(TimelineClip clip) {
-    final filters = <String>[];
-    final durationSeconds = clip.duration.inMilliseconds / 1000;
-    final introSeconds = clip.effectiveIntroTransitionMs / 1000;
-    final outroSeconds = clip.effectiveOutroTransitionMs / 1000;
-    if (_transitionUsesAlpha(clip.introTransition.type) && introSeconds > 0) {
-      filters.add('fade=t=in:st=0:d=${_number(introSeconds)}:alpha=1');
-    }
-    if (_transitionUsesAlpha(clip.outroTransition.type) && outroSeconds > 0) {
-      filters.add(
-        'fade=t=out:st=${_number(math.max(0, durationSeconds - outroSeconds))}:'
-        'd=${_number(outroSeconds)}:alpha=1',
-      );
-    }
-    return filters;
-  }
-
   static bool _transitionUsesAlpha(TransitionType type) {
     return type != TransitionType.none && type != TransitionType.cut;
   }
@@ -962,15 +1495,27 @@ class TimelineExportService {
   static (String, String) _overlayPosition(
     TimelineClip clip, {
     required ExportCanvasSize canvasSize,
-    required bool isBase,
   }) {
     const referenceWidth = kTimelineDesignWidth;
     const referenceHeight = kTimelineDesignHeight;
-    final offsetX = clip.transform.offsetX * canvasSize.width / referenceWidth;
-    final offsetY =
-        clip.transform.offsetY * canvasSize.height / referenceHeight;
-    final baseX = '(W-w)/2+${_number(offsetX)}';
-    final baseY = '(H-h)/2+${_number(offsetY)}';
+    final localTime =
+        '(t-${_number(clip.startTime.inMicroseconds / Duration.microsecondsPerSecond)})';
+    final offsetX = _keyframedValueExpression(
+      clip,
+      TimelineKeyframeProperty.positionX,
+      fallback: clip.transform.offsetX,
+      variable: localTime,
+    );
+    final offsetY = _keyframedValueExpression(
+      clip,
+      TimelineKeyframeProperty.positionY,
+      fallback: clip.transform.offsetY,
+      variable: localTime,
+    );
+    final baseX =
+        '(W-w)/2+($offsetX)*${_number(canvasSize.width / referenceWidth)}';
+    final baseY =
+        '(H-h)/2+($offsetY)*${_number(canvasSize.height / referenceHeight)}';
 
     final intro = clip.introTransition;
     final outro = clip.outroTransition;
@@ -1009,9 +1554,6 @@ class TimelineExportService {
       }
     }
 
-    if (isBase && clip.fitMode == ClipFitMode.contain) {
-      return (x, y);
-    }
     return (x, y);
   }
 
@@ -1234,6 +1776,7 @@ class TimelineRenderInput {
   final EditorAssetReference? asset;
   final String sourcePath;
   final bool hasAudio;
+  final double? frameRate;
 
   const TimelineRenderInput({
     required this.index,
@@ -1243,6 +1786,7 @@ class TimelineRenderInput {
     required this.asset,
     required this.sourcePath,
     required this.hasAudio,
+    this.frameRate,
   });
 
   bool get isVisual {

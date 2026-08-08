@@ -28,6 +28,7 @@ class ProjectCreationService {
 
   static Future<Project> createProjectFromVideos({
     required List<ImportedVideoSource> sources,
+    required String ownerUid,
     String? projectName,
     bool generateThumbnail = true,
     ProjectMediaInfoLoader? mediaInfoLoader,
@@ -119,6 +120,7 @@ class ProjectCreationService {
 
     return Project(
       id: const Uuid().v4(),
+      ownerUid: ownerUid,
       name: resolvedProjectName,
       videoPath: sources.first.filePath,
       thumbnailBase64: thumbnailBase64,

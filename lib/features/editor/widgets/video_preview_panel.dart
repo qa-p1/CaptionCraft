@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -19,6 +20,7 @@ double _previewAudioVolume({
   required TimelineClip clip,
   required Duration position,
   required bool isTrackAudible,
+  double duckingGain = 1,
 }) {
   final mix = clip.audioMix;
   if (!isTrackAudible || mix.muted) return 0;
@@ -26,9 +28,7 @@ double _previewAudioVolume({
   // Loudness normalization needs analysis of the complete source and remains
   // an export-time operation. Preview only the deterministic mix envelope.
   var volume = clip.volumeAt(position).clamp(0.0, 1.0).toDouble();
-  if (clip.autoDuck) {
-    volume *= (1 - clip.duckAmount.clamp(0.0, 1.0));
-  }
+  if (clip.autoDuck) volume *= duckingGain.clamp(0.0, 1.0);
 
   final durationMs = math.max(0, clip.duration.inMilliseconds);
   final fadeInMs = clip.effectiveAudioFadeInMs;
@@ -50,6 +50,268 @@ double _previewAudioVolume({
   return volume.clamp(0.0, 1.0).toDouble();
 }
 
+Widget _cropSourcePreview({
+  required Widget child,
+  required double sourceWidth,
+  required double sourceHeight,
+  required ClipCropSettings crop,
+}) {
+  if (crop.isIdentity) return child;
+  return SizedBox(
+    width: sourceWidth * crop.visibleWidth,
+    height: sourceHeight * crop.visibleHeight,
+    child: ClipRect(
+      child: OverflowBox(
+        alignment: Alignment.topLeft,
+        minWidth: sourceWidth,
+        maxWidth: sourceWidth,
+        minHeight: sourceHeight,
+        maxHeight: sourceHeight,
+        child: Transform.translate(
+          offset: Offset(
+            -sourceWidth * crop.safeLeft,
+            -sourceHeight * crop.safeTop,
+          ),
+          child: child,
+        ),
+      ),
+    ),
+  );
+}
+
+bool _isGifSource(String? value) {
+  if (value == null || value.trim().isEmpty) return false;
+  final path = Uri.tryParse(value)?.path ?? value;
+  return path.toLowerCase().endsWith('.gif');
+}
+
+const int _maxGifDecodeDimension = 2048;
+const int _maxGifDecodedBytes = 48 * 1024 * 1024;
+const int _maxGifEncodedBytes = 64 * 1024 * 1024;
+
+@visibleForTesting
+String? resolvePreviewSourcePathForTesting({
+  required EditorTimeline timeline,
+  required TimelineClip clip,
+  required String legacyVideoPath,
+  required bool Function(String path) fileExists,
+}) {
+  final asset = timeline.assetForClip(clip);
+  final sourcePath = asset?.sourcePath;
+  if (sourcePath != null && sourcePath.isNotEmpty && fileExists(sourcePath)) {
+    return sourcePath;
+  }
+
+  // Canonical projects link every media clip to an asset. Falling back to the
+  // project's first video for a referenced-but-missing asset silently previews
+  // the wrong clip in multi-source projects. Keep the fallback only for truly
+  // legacy, unlinked clips.
+  if (clip.assetId == null &&
+      legacyVideoPath.isNotEmpty &&
+      fileExists(legacyVideoPath)) {
+    return legacyVideoPath;
+  }
+  return null;
+}
+
+@visibleForTesting
+({Duration start, Duration end}) resolvePreviewPlaybackRangeForTesting({
+  required Duration timelineDuration,
+  required TimelineWorkspaceSettings workspaceSettings,
+}) {
+  final safeDuration = timelineDuration < Duration.zero
+      ? Duration.zero
+      : timelineDuration;
+  final requestedStart = workspaceSettings.normalizedWorkAreaStart;
+  final requestedEnd = workspaceSettings.normalizedWorkAreaEnd;
+  if (requestedStart == null || requestedEnd == null) {
+    return (start: Duration.zero, end: safeDuration);
+  }
+  final end = requestedEnd > safeDuration ? safeDuration : requestedEnd;
+  final start = requestedStart < Duration.zero
+      ? Duration.zero
+      : requestedStart > end
+      ? end
+      : requestedStart;
+  return (start: start, end: end);
+}
+
+@visibleForTesting
+List<double> buildPreviewColorMatrixForTesting(
+  ClipColorAdjustments adjustments,
+) {
+  final saturation = adjustments.saturation.clamp(0.0, 3.0);
+  final contrast = (adjustments.contrast * (1 - adjustments.fade * 0.22)).clamp(
+    0.1,
+    3.0,
+  );
+  final brightness = (adjustments.brightness + adjustments.fade * 0.05).clamp(
+    -1.0,
+    1.0,
+  );
+  final warmth = (adjustments.temperature * 0.16).clamp(-0.2, 0.2);
+  const redLuma = 0.2126;
+  const greenLuma = 0.7152;
+  const blueLuma = 0.0722;
+  final inverseSaturation = 1 - saturation;
+  final offset = 128 * (1 - contrast) + brightness * 255;
+  final redWarmth = 1 + warmth;
+  final blueWarmth = 1 - warmth;
+
+  // Export applies eq first, then colorchannelmixer. Scale the complete
+  // post-eq red/blue rows, including their offsets, to preserve that order.
+  return [
+    (redLuma * inverseSaturation + saturation) * contrast * redWarmth,
+    greenLuma * inverseSaturation * contrast * redWarmth,
+    blueLuma * inverseSaturation * contrast * redWarmth,
+    0,
+    offset * redWarmth,
+    redLuma * inverseSaturation * contrast,
+    (greenLuma * inverseSaturation + saturation) * contrast,
+    blueLuma * inverseSaturation * contrast,
+    0,
+    offset,
+    redLuma * inverseSaturation * contrast * blueWarmth,
+    greenLuma * inverseSaturation * contrast * blueWarmth,
+    (blueLuma * inverseSaturation + saturation) * contrast * blueWarmth,
+    0,
+    offset * blueWarmth,
+    0,
+    0,
+    0,
+    1,
+    0,
+  ];
+}
+
+@visibleForTesting
+Size calculateGifDecodeSizeForTesting({
+  required int intrinsicWidth,
+  required int intrinsicHeight,
+  required int frameCount,
+  required double maxWidth,
+  required double maxHeight,
+}) {
+  final sourceWidth = math.max(1, intrinsicWidth);
+  final sourceHeight = math.max(1, intrinsicHeight);
+  final widthLimit = maxWidth.isFinite && maxWidth > 0
+      ? math.min(_maxGifDecodeDimension, maxWidth.floor())
+      : 1;
+  final heightLimit = maxHeight.isFinite && maxHeight > 0
+      ? math.min(_maxGifDecodeDimension, maxHeight.floor())
+      : 1;
+  final perFramePixelBudget = math.max(
+    1,
+    _maxGifDecodedBytes ~/ (4 * math.max(1, frameCount)),
+  );
+  final scale = math.min(
+    1.0,
+    math.min(
+      widthLimit / sourceWidth,
+      math.min(
+        heightLimit / sourceHeight,
+        math.sqrt(perFramePixelBudget / (sourceWidth * sourceHeight)),
+      ),
+    ),
+  );
+  return Size(
+    math.max(1, (sourceWidth * scale).floor()).toDouble(),
+    math.max(1, (sourceHeight * scale).floor()).toDouble(),
+  );
+}
+
+@visibleForTesting
+Widget buildBlurredMediaPreviewForTesting({
+  required Widget child,
+  required ClipBlurSettings blur,
+}) {
+  if (!blur.isEnabled) return child;
+  final filter = ui.ImageFilter.blur(
+    sigmaX: blur.safeStrength,
+    sigmaY: blur.safeStrength,
+    tileMode: TileMode.clamp,
+  );
+  if (blur.mode == ClipBlurMode.full) {
+    return ImageFiltered(imageFilter: filter, child: child);
+  }
+  if (blur.mode != ClipBlurMode.region) return child;
+  return LayoutBuilder(
+    builder: (context, constraints) {
+      if (!constraints.hasBoundedWidth ||
+          !constraints.hasBoundedHeight ||
+          constraints.maxWidth <= 0 ||
+          constraints.maxHeight <= 0) {
+        return child;
+      }
+      final width = constraints.maxWidth;
+      final height = constraints.maxHeight;
+      final left = width * blur.safeRegionX;
+      final top = height * blur.safeRegionY;
+      final regionWidth = width * blur.safeRegionWidth;
+      final regionHeight = height * blur.safeRegionHeight;
+      return Stack(
+        fit: StackFit.expand,
+        children: [
+          child,
+          Positioned(
+            left: left,
+            top: top,
+            width: regionWidth,
+            height: regionHeight,
+            child: ClipRect(
+              child: OverflowBox(
+                alignment: Alignment.topLeft,
+                minWidth: width,
+                maxWidth: width,
+                minHeight: height,
+                maxHeight: height,
+                child: Transform.translate(
+                  offset: Offset(-left, -top),
+                  child: SizedBox(
+                    width: width,
+                    height: height,
+                    // Paint an explicitly filtered copy of the media in the
+                    // ROI. This works for texture-backed video without
+                    // relying on BackdropFilter sampling platform pixels.
+                    child: ImageFiltered(imageFilter: filter, child: child),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      );
+    },
+  );
+}
+
+Widget _buildComposedMediaPreview({
+  required Color backgroundColor,
+  required List<Widget> mediaLayers,
+  required Widget Function(Widget composedMedia) timelineEffectsBuilder,
+}) {
+  final composedMedia = ColoredBox(
+    key: const ValueKey('preview-composed-media-canvas'),
+    color: backgroundColor,
+    child: Stack(fit: StackFit.expand, children: mediaLayers),
+  );
+  return KeyedSubtree(
+    key: const ValueKey('preview-composed-effect-output'),
+    child: timelineEffectsBuilder(composedMedia),
+  );
+}
+
+@visibleForTesting
+Widget buildComposedMediaPreviewForTesting({
+  required Color backgroundColor,
+  required List<Widget> mediaLayers,
+  required Widget Function(Widget composedMedia) timelineEffectsBuilder,
+}) => _buildComposedMediaPreview(
+  backgroundColor: backgroundColor,
+  mediaLayers: mediaLayers,
+  timelineEffectsBuilder: timelineEffectsBuilder,
+);
+
 /// Video preview panel with subtitle overlay and playback controls.
 class VideoPreviewPanel extends ConsumerStatefulWidget {
   final String videoPath;
@@ -69,7 +331,8 @@ class VideoPreviewPanel extends ConsumerStatefulWidget {
   ConsumerState<VideoPreviewPanel> createState() => _VideoPreviewPanelState();
 }
 
-class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
+class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
+    with WidgetsBindingObserver {
   VideoPlayerController? _controller;
   TimelineClip? _controllerClip;
   TimelineTrack? _controllerTrack;
@@ -78,6 +341,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
   bool _isSwitchingClip = false;
   bool _isAdvancingClip = false;
   bool _playRequested = false;
+  bool _playbackSuspendedByLifecycle = false;
   Duration? _queuedSeekPosition;
   bool? _queuedSeekAutoplay;
   bool _queuedSeekForce = false;
@@ -92,6 +356,8 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
   EditorTimeline? _cachedCaptionTimeline;
   List<SubtitleEntry>? _cachedCaptionEntries;
   List<SubtitleEntry> _effectiveCaptionCache = const [];
+  double? _dragSourceOffsetX;
+  double? _dragSourceOffsetY;
 
   Duration _timelineDuration() {
     final timeline = ref.read(editorProvider).timeline;
@@ -103,13 +369,54 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
         );
   }
 
+  ({Duration start, Duration end}) _playbackRange(EditorTimeline timeline) {
+    return resolvePreviewPlaybackRangeForTesting(
+      timelineDuration: timeline.duration,
+      workspaceSettings: timeline.workspaceSettings,
+    );
+  }
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _initializeVideo();
     });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.resumed:
+        if (!_playbackSuspendedByLifecycle) return;
+        _playbackSuspendedByLifecycle = false;
+        if (!_playRequested || !mounted) return;
+        final position = ref.read(playbackProvider).position;
+        unawaited(
+          _seekTimelinePosition(position, autoplay: true, forceSeek: true),
+        );
+        break;
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+        if (_playbackSuspendedByLifecycle || !_playRequested) return;
+        _playbackSuspendedByLifecycle = true;
+        final position = ref.read(playbackProvider).position;
+        // Reverse, freeze-frame, and gap playback use wall-clock anchors.
+        // Rebase those anchors to the last published playhead so background
+        // time can never be counted when playback resumes.
+        _gapPlaybackStartPosition = position;
+        _gapPlaybackStartedAt = null;
+        _reversePlaybackStartPosition = position;
+        _reversePlaybackStartedAt = null;
+        _stopPlaybackTicker();
+        unawaited(_controller?.pause());
+        ref.read(playbackProvider.notifier).setPlaying(false);
+        break;
+    }
   }
 
   Future<void> _initializeVideo() async {
@@ -125,10 +432,15 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
 
   void _onPlaybackUpdate() {
     if (!mounted) return;
+    if (_playbackSuspendedByLifecycle) {
+      _stopPlaybackTicker();
+      return;
+    }
     _syncPlaybackState();
     if (_playRequested &&
         (_gapPlaybackStartedAt != null ||
-            _controllerClip?.isReversed == true)) {
+            _controllerClip?.isReversed == true ||
+            _controllerClip?.freezeFrame == true)) {
       _startPlaybackTicker();
     } else {
       _stopPlaybackTicker();
@@ -140,11 +452,13 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     final clip = _controllerClip;
     if (!_initialized ||
         !mounted ||
+        _playbackSuspendedByLifecycle ||
         controller == null ||
         clip == null ||
         !controller.value.isInitialized ||
         _gapPlaybackStartedAt != null ||
-        clip.isReversed) {
+        clip.isReversed ||
+        clip.freezeFrame) {
       return;
     }
     final controllerValue = controller.value;
@@ -167,30 +481,43 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     playback.setPlaying(_playRequested);
     unawaited(_applyBaseAudioVolume(clampedPosition));
 
-    if (_playRequested &&
-        (clampedPosition >= clip.endTime - const Duration(milliseconds: 34) ||
-            controllerValue.isCompleted)) {
-      unawaited(_advanceFromClip(clip));
+    if (_playRequested) {
+      final playbackRange = _playbackRange(ref.read(editorProvider).timeline);
+      if (clampedPosition >= playbackRange.end) {
+        unawaited(_handlePlaybackRangeEnd());
+      } else if (clampedPosition >=
+              clip.endTime - const Duration(milliseconds: 34) ||
+          controllerValue.isCompleted) {
+        unawaited(_advanceFromClip(clip));
+      }
     }
   }
 
   void _startPlaybackTicker() {
     if (_playbackTicker?.isActive == true) return;
     _playbackTicker = Timer.periodic(const Duration(milliseconds: 33), (_) {
-      if (!_initialized || !mounted) return;
+      if (!_initialized || !mounted || _playbackSuspendedByLifecycle) return;
       final reverseStarted = _reversePlaybackStartedAt;
       final reverseClip = _controllerClip;
       if (_playRequested &&
           reverseStarted != null &&
           reverseClip != null &&
-          reverseClip.isReversed) {
+          (reverseClip.isReversed || reverseClip.freezeFrame)) {
         final elapsed = DateTime.now().difference(reverseStarted);
         final advanced = Duration(
           microseconds: (elapsed.inMicroseconds * _playbackSpeed).round(),
         );
         final target = _reversePlaybackStartPosition + advanced;
-        if (target >= reverseClip.endTime) {
+        final timeline = ref.read(editorProvider).timeline;
+        if (target >= _playbackRange(timeline).end) {
+          unawaited(_handlePlaybackRangeEnd());
+        } else if (target >= reverseClip.endTime) {
           unawaited(_advanceFromClip(reverseClip));
+        } else if (reverseClip.freezeFrame) {
+          ref.read(playbackProvider.notifier)
+            ..updatePosition(target)
+            ..setPlaying(true);
+          unawaited(_applyBaseAudioVolume(target));
         } else if (!_isSeekingReverseFrame) {
           unawaited(_seekReversedFrame(target));
         }
@@ -203,14 +530,10 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
           microseconds: (elapsed.inMicroseconds * _playbackSpeed).round(),
         );
         final target = _gapPlaybackStartPosition + advanced;
-        final duration = _timelineDuration();
-        if (target >= duration) {
-          _playRequested = false;
-          _gapPlaybackStartedAt = null;
-          ref.read(playbackProvider.notifier)
-            ..updatePosition(duration)
-            ..setPlaying(false);
-          _stopPlaybackTicker();
+        final timeline = ref.read(editorProvider).timeline;
+        final playbackRange = _playbackRange(timeline);
+        if (target >= playbackRange.end) {
+          unawaited(_handlePlaybackRangeEnd());
           return;
         }
         final nextSelection = _baseSelectionAt(
@@ -240,6 +563,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _stopPlaybackTicker();
     final controller = _controller;
     if (controller != null) {
@@ -283,7 +607,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     final controller = _controller;
     final clip = _controllerClip;
     if (controller != null && clip != null) {
-      if (!clip.isReversed) {
+      if (!clip.isReversed && !clip.freezeFrame) {
         await controller.setPlaybackSpeed(
           (speed * clip.playbackRate).clamp(0.25, 4),
         );
@@ -327,15 +651,12 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
   }
 
   String? _sourcePathForClip(EditorTimeline timeline, TimelineClip clip) {
-    final asset = timeline.assetForClip(clip);
-    final sourcePath = asset?.sourcePath;
-    if (sourcePath != null &&
-        sourcePath.isNotEmpty &&
-        File(sourcePath).existsSync()) {
-      return sourcePath;
-    }
-    if (File(widget.videoPath).existsSync()) return widget.videoPath;
-    return null;
+    return resolvePreviewSourcePathForTesting(
+      timeline: timeline,
+      clip: clip,
+      legacyVideoPath: widget.videoPath,
+      fileExists: (path) => File(path).existsSync(),
+    );
   }
 
   Future<void> _seekTimelinePosition(
@@ -352,11 +673,19 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     }
     final timeline = ref.read(editorProvider).timeline;
     final duration = timeline.duration;
-    final targetMs = requested.inMilliseconds
+    final requestedTargetMs = requested.inMilliseconds
         .clamp(0, duration.inMilliseconds)
         .toInt();
-    final target = Duration(milliseconds: targetMs);
     final shouldPlay = autoplay ?? _playRequested;
+    final requestedTarget = Duration(milliseconds: requestedTargetMs);
+    final playbackRange = _playbackRange(timeline);
+    final target =
+        shouldPlay &&
+            playbackRange.end > playbackRange.start &&
+            (requestedTarget < playbackRange.start ||
+                requestedTarget >= playbackRange.end)
+        ? playbackRange.start
+        : requestedTarget;
     _playRequested = shouldPlay;
     final selection = _baseSelectionAt(timeline, target);
     final playbackNotifier = ref.read(playbackProvider.notifier);
@@ -364,20 +693,21 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     if (selection == null) {
       _reversePlaybackStartedAt = null;
       _gapPlaybackStartPosition = target;
-      _gapPlaybackStartedAt = shouldPlay ? DateTime.now() : null;
       final controller = _controller;
       if (controller?.value.isPlaying == true) {
         await controller!.pause();
       }
+      final playNow = shouldPlay && !_playbackSuspendedByLifecycle;
+      _gapPlaybackStartedAt = playNow ? DateTime.now() : null;
       _controllerClip = null;
       _controllerTrack = null;
       playbackNotifier
         ..updateDuration(duration)
         ..updatePosition(target)
-        ..setPlaying(shouldPlay)
+        ..setPlaying(playNow)
         ..setReady(true);
       if (mounted) setState(() {});
-      if (shouldPlay) _startPlaybackTicker();
+      if (playNow) _startPlaybackTicker();
       return;
     }
 
@@ -437,36 +767,43 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
       if (forceSeek || drift > 90) {
         await currentController.seekTo(sourceTarget);
       }
-      if (!clip.isReversed) {
+      if (!clip.isReversed && !clip.freezeFrame) {
         await currentController.setPlaybackSpeed(
           (_playbackSpeed * clip.playbackRate).clamp(0.25, 4),
         );
       }
       await _applyBaseAudioVolume(target);
-      if (clip.isReversed) {
+      var playNow = shouldPlay && !_playbackSuspendedByLifecycle;
+      if (clip.isReversed || clip.freezeFrame) {
         if (currentController.value.isPlaying) {
           await currentController.pause();
         }
         _reversePlaybackStartPosition = target;
-        _reversePlaybackStartedAt = shouldPlay ? DateTime.now() : null;
-      } else if (shouldPlay && !currentController.value.isPlaying) {
+        playNow = shouldPlay && !_playbackSuspendedByLifecycle;
+        _reversePlaybackStartedAt = playNow ? DateTime.now() : null;
+      } else if (playNow && !currentController.value.isPlaying) {
         _reversePlaybackStartedAt = null;
         await currentController.play();
-      } else if (!shouldPlay && currentController.value.isPlaying) {
+      } else if (!playNow && currentController.value.isPlaying) {
         _reversePlaybackStartedAt = null;
         await currentController.pause();
       } else {
         _reversePlaybackStartedAt = null;
       }
+      playNow = shouldPlay && !_playbackSuspendedByLifecycle;
+      if (!playNow && currentController.value.isPlaying) {
+        await currentController.pause();
+      }
       playbackNotifier
         ..updateDuration(duration)
         ..updatePosition(target)
-        ..setPlaying(shouldPlay);
-      if (shouldPlay) _startPlaybackTicker();
+        ..setPlaying(playNow);
+      if (playNow) _startPlaybackTicker();
       return;
     }
 
     _isSwitchingClip = true;
+    VideoPlayerController? nextController;
     try {
       _previewError = null;
       if (currentController != null) {
@@ -474,10 +811,10 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
         await currentController.pause();
         await currentController.dispose();
       }
-      final nextController = VideoPlayerController.file(File(sourcePath));
+      nextController = VideoPlayerController.file(File(sourcePath));
       await nextController.initialize();
       await nextController.seekTo(sourceTarget);
-      if (!clip.isReversed) {
+      if (!clip.isReversed && !clip.freezeFrame) {
         await nextController.setPlaybackSpeed(
           (_playbackSpeed * clip.playbackRate).clamp(0.25, 4),
         );
@@ -492,21 +829,35 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
       _controllerPath = sourcePath;
       nextController.addListener(_onPlaybackUpdate);
       await _applyBaseAudioVolume(target);
-      if (clip.isReversed) {
+      var playNow = shouldPlay && !_playbackSuspendedByLifecycle;
+      if (clip.isReversed || clip.freezeFrame) {
         _reversePlaybackStartPosition = target;
-        _reversePlaybackStartedAt = shouldPlay ? DateTime.now() : null;
+        _reversePlaybackStartedAt = playNow ? DateTime.now() : null;
       } else {
         _reversePlaybackStartedAt = null;
-        if (shouldPlay) await nextController.play();
+        if (playNow) await nextController.play();
+      }
+      playNow = shouldPlay && !_playbackSuspendedByLifecycle;
+      if (!playNow && nextController.value.isPlaying) {
+        await nextController.pause();
       }
       playbackNotifier
         ..updateDuration(duration)
         ..updatePosition(target)
-        ..setPlaying(shouldPlay)
+        ..setPlaying(playNow)
         ..setReady(true);
       setState(() {});
-      if (shouldPlay) _startPlaybackTicker();
+      if (playNow) _startPlaybackTicker();
     } catch (_) {
+      final failedController = nextController;
+      if (failedController != null) {
+        try {
+          failedController.removeListener(_onPlaybackUpdate);
+          await failedController.dispose();
+        } catch (_) {
+          // Initialization can leave the platform controller partly torn down.
+        }
+      }
       _controller = null;
       _controllerClip = null;
       _controllerTrack = null;
@@ -547,24 +898,8 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     try {
       final timeline = ref.read(editorProvider).timeline;
       final nextPosition = completedClip.endTime;
-      final workEnd = timeline.workspaceSettings.normalizedWorkAreaEnd;
-      final workStart = timeline.workspaceSettings.normalizedWorkAreaStart;
-      final loopEnd = workEnd ?? timeline.duration;
-      if (nextPosition >= loopEnd) {
-        if (timeline.workspaceSettings.loopPlayback) {
-          await _seekTimelinePosition(
-            workStart ?? Duration.zero,
-            autoplay: true,
-            forceSeek: true,
-          );
-          return;
-        }
-        _playRequested = false;
-        await _controller?.pause();
-        ref.read(playbackProvider.notifier)
-          ..updatePosition(timeline.duration)
-          ..setPlaying(false);
-        _stopPlaybackTicker();
+      if (nextPosition >= _playbackRange(timeline).end) {
+        await _finishPlaybackRange(timeline);
         return;
       }
       await _seekTimelinePosition(
@@ -575,6 +910,40 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     } finally {
       _isAdvancingClip = false;
     }
+  }
+
+  Future<void> _handlePlaybackRangeEnd() async {
+    if (_isAdvancingClip || !_playRequested || !mounted) return;
+    _isAdvancingClip = true;
+    _reversePlaybackStartedAt = null;
+    try {
+      await _finishPlaybackRange(ref.read(editorProvider).timeline);
+    } finally {
+      _isAdvancingClip = false;
+    }
+  }
+
+  Future<void> _finishPlaybackRange(EditorTimeline timeline) async {
+    final playbackRange = _playbackRange(timeline);
+    if (timeline.workspaceSettings.loopPlayback &&
+        playbackRange.end > playbackRange.start) {
+      await _seekTimelinePosition(
+        playbackRange.start,
+        autoplay: true,
+        forceSeek: true,
+      );
+      return;
+    }
+
+    _playRequested = false;
+    _gapPlaybackStartedAt = null;
+    _reversePlaybackStartedAt = null;
+    await _seekTimelinePosition(
+      playbackRange.end,
+      autoplay: false,
+      forceSeek: true,
+    );
+    _stopPlaybackTicker();
   }
 
   Future<void> _applyBaseAudioVolume(Duration position) async {
@@ -588,16 +957,18 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
       return;
     }
     final timeline = ref.read(editorProvider).timeline;
-    final hasSolo = timeline.tracks.any((candidate) => candidate.isSolo);
+    final hasSolo = _hasSoloMediaTrack(timeline);
     final volume = _previewAudioVolume(
       clip: clip,
       position: position,
       isTrackAudible: !track.isMuted && (!hasSolo || track.isSolo),
+      duckingGain: _previewDuckingGain(clip, position),
     );
     await controller.setVolume(volume);
   }
 
   Duration _sourceTargetForClip(TimelineClip clip, Duration timelinePosition) {
+    if (clip.freezeFrame) return clip.effectiveFreezeFrameSourceTime;
     final elapsedMs = (timelinePosition - clip.startTime).inMilliseconds.clamp(
       0,
       clip.duration.inMilliseconds,
@@ -766,13 +1137,18 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     }
   }
 
-  void _beginStyleGesture(SubtitleEntry activeEntry) {
+  void _beginStyleGesture(SubtitleEntry activeEntry, bool editPerEntry) {
+    final style = _readEditableStyleFor(activeEntry, editPerEntry);
+    _dragSourceOffsetX = style.offsetX;
+    _dragSourceOffsetY = style.verticalOffset + style.offsetY;
     final notifier = ref.read(subtitleProvider.notifier);
     notifier.selectEntry(activeEntry.id);
     notifier.beginStyleGestureEdit();
   }
 
   void _endStyleGesture() {
+    _dragSourceOffsetX = null;
+    _dragSourceOffsetY = null;
     ref.read(subtitleProvider.notifier).endStyleGestureEdit();
   }
 
@@ -818,7 +1194,9 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     items.sort((a, b) {
       final trackCompare = a.trackIndex.compareTo(b.trackIndex);
       if (trackCompare != 0) return trackCompare;
-      return a.clip.layer.compareTo(b.clip.layer);
+      final layerCompare = a.clip.layer.compareTo(b.clip.layer);
+      if (layerCompare != 0) return layerCompare;
+      return a.clip.startTime.compareTo(b.clip.startTime);
     });
     return items;
   }
@@ -854,7 +1232,9 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     items.sort((a, b) {
       final trackCompare = a.trackIndex.compareTo(b.trackIndex);
       if (trackCompare != 0) return trackCompare;
-      return a.clip.layer.compareTo(b.clip.layer);
+      final layerCompare = a.clip.layer.compareTo(b.clip.layer);
+      if (layerCompare != 0) return layerCompare;
+      return a.clip.startTime.compareTo(b.clip.startTime);
     });
     return items;
   }
@@ -974,6 +1354,166 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
         .setTimeline(editorState.timeline.copyWith(tracks: nextTracks));
   }
 
+  double _snapDesignCoordinate({
+    required double proposed,
+    required double designExtent,
+    required double viewportExtent,
+    double objectHalfExtent = 0,
+  }) {
+    final canvas = ref.read(editorProvider).timeline.canvasSettings;
+    if (!canvas.snapToGuides || viewportExtent <= 0) return proposed;
+
+    final guides = <double>{0};
+    if (canvas.showGrid) {
+      final divisions = canvas.gridDivisions.clamp(2, 6);
+      for (var index = 1; index < divisions; index++) {
+        guides.add(-designExtent / 2 + designExtent * index / divisions);
+      }
+    }
+    if (canvas.showSafeAreas) {
+      guides
+        ..add(-designExtent * 0.45)
+        ..add(designExtent * 0.45)
+        ..add(-designExtent * 0.40)
+        ..add(designExtent * 0.40);
+    }
+
+    final candidates = <double>{...guides};
+    if (objectHalfExtent > 0) {
+      for (final guide in guides) {
+        candidates
+          ..add(guide - objectHalfExtent)
+          ..add(guide + objectHalfExtent);
+      }
+    }
+    final threshold = 8 * designExtent / viewportExtent;
+    var nearest = proposed;
+    var nearestDistance = threshold;
+    for (final candidate in candidates) {
+      final distance = (candidate - proposed).abs();
+      if (distance <= nearestDistance) {
+        nearest = candidate;
+        nearestDistance = distance;
+      }
+    }
+    return nearest;
+  }
+
+  void _beginSnappedDrag(TimelineTransform transform) {
+    _dragSourceOffsetX = transform.offsetX;
+    _dragSourceOffsetY = transform.offsetY;
+  }
+
+  void _endSnappedDrag() {
+    _dragSourceOffsetX = null;
+    _dragSourceOffsetY = null;
+    ref.read(editorProvider.notifier).endTimelineGestureEdit();
+  }
+
+  bool _hasSoloMediaTrack(EditorTimeline timeline) {
+    return timeline.tracks.any(
+      (track) =>
+          track.isSolo &&
+          (!track.isHidden || track.section == TimelineTrackSection.audio) &&
+          track.clips.any(
+            (candidate) =>
+                candidate.enabled &&
+                candidate.endTime > candidate.startTime &&
+                candidate.type != TimelineTrackType.text &&
+                candidate.type != TimelineTrackType.subtitle &&
+                candidate.type != TimelineTrackType.effect,
+          ),
+    );
+  }
+
+  double _previewDuckingGain(TimelineClip clip, Duration position) {
+    if (!clip.autoDuck || clip.duckAmount <= 0.001) return 1;
+    final timeline = ref.read(editorProvider).timeline;
+    final duckedGain = (1 - clip.duckAmount.clamp(0.0, 1.0)).toDouble();
+    final positionMs = position.inMilliseconds;
+    final clipStartMs = clip.startTime.inMilliseconds;
+    final clipEndMs = clip.endTime.inMilliseconds;
+    final intervals = <(int, int)>[];
+
+    void addInterval(Duration start, Duration end) {
+      final startMs = math.max(clipStartMs, start.inMilliseconds);
+      final endMs = math.min(clipEndMs, end.inMilliseconds);
+      if (endMs > startMs) intervals.add((startMs, endMs));
+    }
+
+    for (final track in timeline.tracks) {
+      if (track.isHidden ||
+          (track.type != TimelineTrackType.subtitle &&
+              track.type != TimelineTrackType.text)) {
+        continue;
+      }
+      for (final candidate in track.clips) {
+        if (!candidate.enabled ||
+            candidate.id == clip.id ||
+            candidate.endTime <= candidate.startTime) {
+          continue;
+        }
+        addInterval(candidate.startTime, candidate.endTime);
+      }
+    }
+
+    final hasSoloTrack = _hasSoloMediaTrack(timeline);
+    for (final track in timeline.tracks) {
+      if (track.isMuted ||
+          (hasSoloTrack && !track.isSolo) ||
+          (track.isHidden && track.section != TimelineTrackSection.audio)) {
+        continue;
+      }
+      for (final candidate in track.clips) {
+        if (!candidate.enabled ||
+            candidate.id == clip.id ||
+            candidate.audioMix.muted ||
+            candidate.endTime <= candidate.startTime ||
+            !timeline.clipHasAudio(candidate)) {
+          continue;
+        }
+        addInterval(candidate.startTime, candidate.endTime);
+      }
+    }
+
+    if (intervals.isEmpty) return 1;
+    intervals.sort((a, b) => a.$1.compareTo(b.$1));
+    final merged = <(int, int)>[];
+    for (final interval in intervals) {
+      if (merged.isEmpty || interval.$1 > merged.last.$2 + 300) {
+        merged.add(interval);
+      } else {
+        final previous = merged.removeLast();
+        merged.add((previous.$1, math.max(previous.$2, interval.$2)));
+      }
+    }
+
+    var gain = 1.0;
+    for (final interval in merged) {
+      final startMs = interval.$1;
+      final endMs = interval.$2;
+      final attackStartMs = math.max(clipStartMs, startMs - 120);
+      final releaseEndMs = math.min(clipEndMs, endMs + 180);
+      if (positionMs < attackStartMs || positionMs > releaseEndMs) continue;
+
+      double intervalGain;
+      if (positionMs < startMs && startMs > attackStartMs) {
+        final progress =
+            (positionMs - attackStartMs) / (startMs - attackStartMs);
+        intervalGain = 1 - (1 - duckedGain) * progress.clamp(0.0, 1.0);
+      } else if (positionMs <= endMs) {
+        intervalGain = duckedGain;
+      } else if (releaseEndMs > endMs) {
+        final progress = (positionMs - endMs) / (releaseEndMs - endMs);
+        intervalGain = duckedGain + (1 - duckedGain) * progress.clamp(0.0, 1.0);
+      } else {
+        intervalGain = 1;
+      }
+      gain = math.min(gain, intervalGain);
+    }
+    return gain.clamp(0.0, 1.0).toDouble();
+  }
+
   void _updateEffectBlur(
     String clipId,
     ClipBlurSettings Function(ClipBlurSettings current) mapper,
@@ -994,11 +1534,28 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
         );
   }
 
+  Widget _applyClipMediaEffects(
+    Widget child,
+    TimelineClip clip,
+    Duration playbackPosition,
+  ) {
+    if (!clip.colorAdjustments.isNeutral) {
+      child = ColorFiltered(
+        colorFilter: ColorFilter.matrix(
+          _colorMatrixForAdjustments(clip.colorAdjustments),
+        ),
+        child: child,
+      );
+    }
+    child = _applyVignettePreview(child, clip.colorAdjustments);
+    child = _applyChromaKeyPreview(child, clip);
+    return _applyBlurPreview(child, _resolvedBlurAt(clip, playbackPosition));
+  }
+
   Widget _buildOverlayAsset(
     _OverlayCanvasItem item,
     BoxConstraints constraints,
     PlaybackState playbackState,
-    List<_EffectCanvasItem> activeFilterEffects,
   ) {
     final canvasWidth = constraints.hasBoundedWidth
         ? math.max(0.0, constraints.maxWidth)
@@ -1027,87 +1584,109 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
       playbackState.position,
     );
     final transform = item.clip.transformAt(playbackState.position);
-    Widget child = switch (item.asset.type) {
-      EditorAssetType.image || EditorAssetType.gif => ClipRRect(
-        borderRadius: BorderRadius.circular(10),
-        child: hasLocalFile
-            ? Image.file(
-                localFile!,
-                width: baseWidth,
-                height: previewHeight,
-                fit: overlayFit,
-                filterQuality: FilterQuality.medium,
-              )
-            : previewUrl != null
-            ? Image.network(
-                previewUrl,
-                width: baseWidth,
-                height: previewHeight,
-                fit: overlayFit,
-                filterQuality: FilterQuality.medium,
-                errorBuilder: (_, _, _) =>
-                    _buildMissingOverlay(item.clip.label),
-              )
-            : _buildMissingOverlay(item.clip.label),
-      ),
-      EditorAssetType.video =>
-        hasLocalFile
-            ? _OverlayVideoPreview(
-                key: ValueKey(item.clip.id),
-                videoPath: localFile!.path,
-                clip: item.clip,
-                playbackPosition: playbackState.position,
-                isPlaying: playbackState.isPlaying,
-                playbackSpeed: _playbackSpeed,
-                isTrackAudible:
-                    !item.track.isMuted &&
-                    (!ref
-                            .read(editorProvider)
-                            .timeline
-                            .tracks
-                            .any((track) => track.isSolo) ||
-                        item.track.isSolo),
-                width: baseWidth,
-                height: previewHeight,
-                fitMode: item.clip.fitMode,
-              )
-            : _buildMissingOverlay(item.clip.label),
-      EditorAssetType.sticker => ClipRRect(
-        borderRadius: BorderRadius.circular(10),
-        child: hasLocalFile
-            ? Image.file(
-                localFile!,
-                width: baseWidth,
-                height: previewHeight,
-                fit: overlayFit,
-                filterQuality: FilterQuality.medium,
-              )
-            : previewUrl != null
-            ? Image.network(
-                previewUrl,
-                width: baseWidth,
-                height: previewHeight,
-                fit: overlayFit,
-                filterQuality: FilterQuality.medium,
-                errorBuilder: (_, _, _) =>
-                    _buildMissingOverlay(item.clip.label),
-              )
-            : _buildMissingOverlay(item.clip.label),
-      ),
-      _ => _buildMissingOverlay(item.clip.label),
-    };
-    child = SizedBox(width: baseWidth, height: previewHeight, child: child);
-    child = _applyNormalizedCropPreview(child, item.clip.crop);
-    if (!item.clip.colorAdjustments.isNeutral) {
-      child = ColorFiltered(
-        colorFilter: ColorFilter.matrix(
-          _colorMatrixForAdjustments(item.clip.colorAdjustments),
-        ),
-        child: child,
+    final remoteMediaUrl = item.asset.remoteUrl ?? previewUrl;
+    final isAnimatedImage =
+        item.asset.type == EditorAssetType.gif ||
+        (item.asset.type == EditorAssetType.sticker &&
+            (_isGifSource(localPath) || _isGifSource(remoteMediaUrl)));
+    Widget child;
+    if (isAnimatedImage && (hasLocalFile || remoteMediaUrl != null)) {
+      child = _TimelineGifPreview(
+        key: ValueKey('gif_${item.clip.id}'),
+        filePath: hasLocalFile ? localFile!.path : null,
+        remoteUrl: hasLocalFile ? null : remoteMediaUrl,
+        clip: item.clip,
+        playbackPosition: playbackState.position,
+        width: baseWidth,
+        height: previewHeight,
+        fitMode: item.clip.fitMode,
+        crop: item.clip.crop,
+        label: item.clip.label,
+        mediaEffectsBuilder: (media) =>
+            _applyClipMediaEffects(media, item.clip, playbackState.position),
       );
+    } else {
+      child = switch (item.asset.type) {
+        EditorAssetType.image || EditorAssetType.gif => ClipRRect(
+          borderRadius: BorderRadius.circular(10),
+          child: hasLocalFile
+              ? Image.file(
+                  localFile!,
+                  width: baseWidth,
+                  height: previewHeight,
+                  fit: overlayFit,
+                  filterQuality: FilterQuality.medium,
+                )
+              : previewUrl != null
+              ? Image.network(
+                  previewUrl,
+                  width: baseWidth,
+                  height: previewHeight,
+                  fit: overlayFit,
+                  filterQuality: FilterQuality.medium,
+                  errorBuilder: (_, _, _) =>
+                      _buildMissingOverlay(item.clip.label),
+                )
+              : _buildMissingOverlay(item.clip.label),
+        ),
+        EditorAssetType.video =>
+          hasLocalFile
+              ? _OverlayVideoPreview(
+                  key: ValueKey(item.clip.id),
+                  videoPath: localFile!.path,
+                  clip: item.clip,
+                  playbackPosition: playbackState.position,
+                  isPlaying: playbackState.isPlaying,
+                  playbackSpeed: _playbackSpeed,
+                  // Timeline region effects paint a filtered media copy.
+                  // Keep visual controllers silent so that copy can never
+                  // double the monitored audio; one hidden controller below
+                  // owns audio for each overlay clip.
+                  duckingGain: 1,
+                  isTrackAudible: false,
+                  width: baseWidth,
+                  height: previewHeight,
+                  fitMode: item.clip.fitMode,
+                  crop: item.clip.crop,
+                  mediaEffectsBuilder: (media) => _applyClipMediaEffects(
+                    media,
+                    item.clip,
+                    playbackState.position,
+                  ),
+                )
+              : _buildMissingOverlay(item.clip.label),
+        EditorAssetType.sticker => ClipRRect(
+          borderRadius: BorderRadius.circular(10),
+          child: hasLocalFile
+              ? Image.file(
+                  localFile!,
+                  width: baseWidth,
+                  height: previewHeight,
+                  fit: overlayFit,
+                  filterQuality: FilterQuality.medium,
+                )
+              : previewUrl != null
+              ? Image.network(
+                  previewUrl,
+                  width: baseWidth,
+                  height: previewHeight,
+                  fit: overlayFit,
+                  filterQuality: FilterQuality.medium,
+                  errorBuilder: (_, _, _) =>
+                      _buildMissingOverlay(item.clip.label),
+                )
+              : _buildMissingOverlay(item.clip.label),
+        ),
+        _ => _buildMissingOverlay(item.clip.label),
+      };
     }
-    child = _applyBlurPreview(child, item.clip.blur);
-    child = _applyEffectFilters(child, activeFilterEffects);
+    child = SizedBox(width: baseWidth, height: previewHeight, child: child);
+    // Video is cropped in source space before fitting. Applying this target-
+    // space fallback as well would crop video overlays twice.
+    if (item.asset.type != EditorAssetType.video && !isAnimatedImage) {
+      child = _applyNormalizedCropPreview(child, item.clip.crop);
+      child = _applyClipMediaEffects(child, item.clip, playbackState.position);
+    }
     child = Transform(
       alignment: Alignment.center,
       transform: Matrix4.diagonal3Values(
@@ -1156,13 +1735,22 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
         return;
       }
 
-      // Export applies a complete alpha ramp to every non-cut transition.
-      opacity *= (1 - hiddenAmount).clamp(0.0, 1.0);
+      // Dissolve uses the same eased alpha curve as export; the remaining
+      // transitions deliberately retain a linear envelope.
+      final visibleAmount = (1 - hiddenAmount).clamp(0.0, 1.0).toDouble();
+      final alphaAmount = transition.type == TransitionType.dissolve
+          ? visibleAmount * visibleAmount * (3 - 2 * visibleAmount)
+          : visibleAmount;
+      opacity *= alphaAmount;
       switch (transition.type) {
         case TransitionType.fade:
         case TransitionType.dissolve:
+          break;
         case TransitionType.zoom:
-          // Zoom currently exports as an alpha transition only.
+          // A zoom animation should change geometry as well as opacity. Keep
+          // the range restrained so it reads as motion without exposing the
+          // fitted media outside the canvas bounds.
+          scale *= 1 - (hiddenAmount * 0.15);
           break;
         case TransitionType.slideLeft:
           offset += Offset(-constraints.maxWidth * hiddenAmount, 0);
@@ -1224,7 +1812,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     required TimelineClip clip,
     required BoxConstraints constraints,
     required Duration playbackPosition,
-    required List<_EffectCanvasItem> activeFilterEffects,
   }) {
     final animation = _resolveOverlayAnimation(
       clip,
@@ -1240,49 +1827,22 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     final sourceWidth = videoSize.width <= 0 ? 16.0 : videoSize.width;
     final sourceHeight = videoSize.height <= 0 ? 9.0 : videoSize.height;
     final transform = clip.transformAt(playbackPosition);
-    final crop = clip.crop;
-
     Widget source = SizedBox(
       width: sourceWidth,
       height: sourceHeight,
       child: VideoPlayer(controller),
     );
-    if (!crop.isIdentity) {
-      source = SizedBox(
-        width: sourceWidth * crop.visibleWidth,
-        height: sourceHeight * crop.visibleHeight,
-        child: ClipRect(
-          child: OverflowBox(
-            alignment: Alignment.topLeft,
-            minWidth: sourceWidth,
-            maxWidth: sourceWidth,
-            minHeight: sourceHeight,
-            maxHeight: sourceHeight,
-            child: Transform.translate(
-              offset: Offset(
-                -sourceWidth * crop.safeLeft,
-                -sourceHeight * crop.safeTop,
-              ),
-              child: source,
-            ),
-          ),
-        ),
-      );
-    }
+    source = _cropSourcePreview(
+      child: source,
+      sourceWidth: sourceWidth,
+      sourceHeight: sourceHeight,
+      crop: clip.crop,
+    );
 
     Widget child = SizedBox.expand(
       child: FittedBox(fit: fit, clipBehavior: Clip.hardEdge, child: source),
     );
-    if (!clip.colorAdjustments.isNeutral) {
-      child = ColorFiltered(
-        colorFilter: ColorFilter.matrix(
-          _colorMatrixForAdjustments(clip.colorAdjustments),
-        ),
-        child: child,
-      );
-    }
-    child = _applyBlurPreview(child, clip.blur);
-    child = _applyEffectFilters(child, activeFilterEffects);
+    child = _applyClipMediaEffects(child, clip, playbackPosition);
     child = Transform(
       alignment: Alignment.center,
       transform: Matrix4.diagonal3Values(
@@ -1312,21 +1872,37 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
     );
   }
 
-  Widget _applyEffectFilters(
+  Widget _applyTimelineEffectsToMedia(
     Widget child,
-    List<_EffectCanvasItem> activeFilterEffects,
+    List<_EffectCanvasItem> activeEffects,
+    Duration playbackPosition,
   ) {
-    var filtered = child;
-    for (final effect in activeFilterEffects) {
-      final adjustments = effect.clip.colorAdjustments;
-      filtered = ColorFiltered(
-        colorFilter: ColorFilter.matrix(
-          _colorMatrixForAdjustments(adjustments),
-        ),
-        child: filtered,
-      );
+    var effected = child;
+    for (final effect in activeEffects) {
+      switch (effect.clip.effectKind) {
+        case TimelineEffectKind.filter:
+          final adjustments = effect.clip.colorAdjustments;
+          if (!adjustments.isNeutral) {
+            effected = ColorFiltered(
+              colorFilter: ColorFilter.matrix(
+                _colorMatrixForAdjustments(adjustments),
+              ),
+              child: effected,
+            );
+            effected = _applyVignettePreview(effected, adjustments);
+          }
+          break;
+        case TimelineEffectKind.blur:
+          effected = _applyBlurPreview(
+            effected,
+            _resolvedBlurAt(effect.clip, playbackPosition),
+          );
+          break;
+        case null:
+          break;
+      }
     }
-    return filtered;
+    return effected;
   }
 
   Widget _buildEffectLayer({
@@ -1343,22 +1919,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
             children: effects.map((item) {
               final clip = item.clip;
               if (clip.effectKind == TimelineEffectKind.filter) {
-                final vignette = clip.colorAdjustments.vignette.clamp(0.0, 1.0);
-                if (vignette <= 0.001) return const SizedBox.shrink();
-                return IgnorePointer(
-                  child: DecoratedBox(
-                    decoration: BoxDecoration(
-                      gradient: RadialGradient(
-                        radius: 0.78,
-                        colors: [
-                          Colors.transparent,
-                          Colors.black.withValues(alpha: vignette * 0.68),
-                        ],
-                        stops: const [0.52, 1],
-                      ),
-                    ),
-                  ),
-                );
+                return const SizedBox.shrink();
               }
 
               final blur = clip.blur;
@@ -1366,20 +1927,8 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                   !blur.isEnabled) {
                 return const SizedBox.shrink();
               }
-              final imageFilter = ui.ImageFilter.blur(
-                sigmaX: blur.safeStrength,
-                sigmaY: blur.safeStrength,
-                tileMode: TileMode.decal,
-              );
               if (blur.mode == ClipBlurMode.full) {
-                return IgnorePointer(
-                  child: ClipRect(
-                    child: BackdropFilter(
-                      filter: imageFilter,
-                      child: const ColoredBox(color: Colors.transparent),
-                    ),
-                  ),
-                );
+                return const SizedBox.shrink();
               }
 
               if (blur.mode != ClipBlurMode.region) {
@@ -1462,15 +2011,10 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                   onHeightResizeEnd: () => ref
                       .read(editorProvider.notifier)
                       .endTimelineGestureEdit(),
-                  child: ClipRect(
-                    child: BackdropFilter(
-                      filter: imageFilter,
-                      child: ColoredBox(
-                        color: isSelected
-                            ? kAccent.withValues(alpha: 0.035)
-                            : Colors.transparent,
-                      ),
-                    ),
+                  child: ColoredBox(
+                    color: isSelected
+                        ? kAccent.withValues(alpha: 0.035)
+                        : Colors.transparent,
                   ),
                 ),
               );
@@ -1482,85 +2026,111 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
   }
 
   List<double> _colorMatrixForAdjustments(ClipColorAdjustments adjustments) {
-    final saturation = adjustments.saturation.clamp(0.0, 3.0);
-    final contrast = (adjustments.contrast * (1 - adjustments.fade * 0.22))
-        .clamp(0.1, 3.0);
-    final brightness = (adjustments.brightness + adjustments.fade * 0.05).clamp(
-      -1.0,
-      1.0,
-    );
-    final warmth = adjustments.temperature.clamp(-1.0, 1.0);
-    const redLuma = 0.2126;
-    const greenLuma = 0.7152;
-    const blueLuma = 0.0722;
-    final inverseSaturation = 1 - saturation;
-    final offset = 128 * (1 - contrast) + brightness * 255;
-    final redWarmth = 1 + warmth * 0.16;
-    final blueWarmth = 1 - warmth * 0.16;
-
-    return [
-      (redLuma * inverseSaturation + saturation) * contrast * redWarmth,
-      greenLuma * inverseSaturation * contrast,
-      blueLuma * inverseSaturation * contrast,
-      0,
-      offset,
-      redLuma * inverseSaturation * contrast,
-      (greenLuma * inverseSaturation + saturation) * contrast,
-      blueLuma * inverseSaturation * contrast,
-      0,
-      offset,
-      redLuma * inverseSaturation * contrast,
-      greenLuma * inverseSaturation * contrast,
-      (blueLuma * inverseSaturation + saturation) * contrast * blueWarmth,
-      0,
-      offset,
-      0,
-      0,
-      0,
-      1,
-      0,
-    ];
+    return buildPreviewColorMatrixForTesting(adjustments);
   }
 
-  Widget _applyBlurPreview(Widget child, ClipBlurSettings blur) {
-    if (!blur.isEnabled) return child;
-    final filter = ui.ImageFilter.blur(
-      sigmaX: blur.safeStrength,
-      sigmaY: blur.safeStrength,
-      tileMode: TileMode.decal,
+  ClipBlurSettings _resolvedBlurAt(
+    TimelineClip clip,
+    Duration playbackPosition,
+  ) {
+    final strength = clip.keyframedValue(
+      TimelineKeyframeProperty.blurStrength,
+      playbackPosition,
+      fallback: clip.blur.safeStrength,
     );
-    if (blur.mode == ClipBlurMode.full) {
-      return ImageFiltered(imageFilter: filter, child: child);
-    }
-    if (blur.mode != ClipBlurMode.region) return child;
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        if (!constraints.hasBoundedWidth ||
-            !constraints.hasBoundedHeight ||
-            constraints.maxWidth <= 0 ||
-            constraints.maxHeight <= 0) {
-          return child;
-        }
-        return Stack(
-          fit: StackFit.expand,
-          children: [
-            child,
-            Positioned(
-              left: constraints.maxWidth * blur.safeRegionX,
-              top: constraints.maxHeight * blur.safeRegionY,
-              width: constraints.maxWidth * blur.safeRegionWidth,
-              height: constraints.maxHeight * blur.safeRegionHeight,
-              child: ClipRect(
-                child: BackdropFilter(
-                  filter: filter,
-                  child: const ColoredBox(color: Colors.transparent),
+    return clip.blur.copyWith(strength: strength.clamp(0.0, 30.0).toDouble());
+  }
+
+  Widget _applyVignettePreview(Widget child, ClipColorAdjustments adjustments) {
+    final vignette = adjustments.vignette.clamp(0.0, 1.0).toDouble();
+    if (vignette <= 0.001) return child;
+    return Stack(
+      fit: StackFit.passthrough,
+      children: [
+        child,
+        Positioned.fill(
+          child: IgnorePointer(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: RadialGradient(
+                  radius: 0.78,
+                  colors: [
+                    Colors.transparent,
+                    Colors.black.withValues(alpha: vignette * 0.68),
+                  ],
+                  stops: const [0.52, 1],
                 ),
               ),
             ),
-          ],
-        );
-      },
+          ),
+        ),
+      ],
     );
+  }
+
+  Widget _applyChromaKeyPreview(Widget child, TimelineClip clip) {
+    if (!clip.chromaKeyEnabled) return child;
+    final argb = clip.chromaKeyColor.toARGB32();
+    final red = ((argb >> 16) & 0xff).toDouble();
+    final green = ((argb >> 8) & 0xff).toDouble();
+    final blue = (argb & 0xff).toDouble();
+    final mean = (red + green + blue) / 3;
+    var redWeight = red - mean;
+    var greenWeight = green - mean;
+    var blueWeight = blue - mean;
+    final chromaMagnitude =
+        redWeight.abs() + greenWeight.abs() + blueWeight.abs();
+
+    if (chromaMagnitude < 1) {
+      // Achromatic keys use luminance distance; chromatic keys use their
+      // direction away from neutral gray. A color matrix cannot calculate a
+      // true RGB-radius key, but this gives stable, immediate alpha feedback
+      // while FFmpeg performs the exact radial key during export.
+      final direction = mean >= 127.5 ? 1.0 : -1.0;
+      redWeight = 0.2126 * direction;
+      greenWeight = 0.7152 * direction;
+      blueWeight = 0.0722 * direction;
+    } else {
+      redWeight /= chromaMagnitude;
+      greenWeight /= chromaMagnitude;
+      blueWeight /= chromaMagnitude;
+    }
+
+    final keyProjection =
+        redWeight * red + greenWeight * green + blueWeight * blue;
+    final similarity = clip.chromaKeySimilarity.clamp(0.01, 1.0).toDouble();
+    const softness = 0.08;
+    const alphaGain = 1 / softness;
+    final alphaOffset = alphaGain * (keyProjection - similarity * 255) - 255;
+    return ColorFiltered(
+      colorFilter: ColorFilter.matrix([
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        -alphaGain * redWeight,
+        -alphaGain * greenWeight,
+        -alphaGain * blueWeight,
+        1,
+        alphaOffset,
+      ]),
+      child: child,
+    );
+  }
+
+  Widget _applyBlurPreview(Widget child, ClipBlurSettings blur) {
+    return buildBlurredMediaPreviewForTesting(child: child, blur: blur);
   }
 
   Widget _applyNormalizedCropPreview(Widget child, ClipCropSettings crop) {
@@ -1629,9 +2199,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
       editorState.timeline,
       playbackState.position,
     );
-    final activeFilterEffects = activeEffectItems
-        .where((item) => item.clip.effectKind == TimelineEffectKind.filter)
-        .toList(growable: false);
     final activeTextItems = _activeTextItems(
       editorState.timeline,
       playbackState.position,
@@ -1649,6 +2216,8 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
       subtitleState.entries,
     );
     final controller = _controller;
+    final controllerPath = _controllerPath;
+    final controllerTrack = _controllerTrack;
     final controllerReady =
         controller != null &&
         controller.value.isInitialized &&
@@ -1693,78 +2262,103 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                           Center(
                             child: AspectRatio(
                               aspectRatio: previewAspectRatio,
-                              child: Container(
-                                color: editorState
-                                    .timeline
-                                    .canvasSettings
-                                    .backgroundColor,
-                                child: Stack(
-                                  fit: StackFit.expand,
-                                  children: [
-                                    LayoutBuilder(
-                                      builder: (context, constraints) {
-                                        if (!controllerReady) {
-                                          return const SizedBox.expand();
-                                        }
-                                        return _buildBaseVideoLayer(
+                              child: ClipRect(
+                                child: LayoutBuilder(
+                                  builder: (context, constraints) {
+                                    final mediaLayers = <Widget>[
+                                      if (controllerReady)
+                                        _buildBaseVideoLayer(
                                           controller: controller,
                                           clip: activeBaseClip,
                                           constraints: constraints,
                                           playbackPosition:
                                               playbackState.position,
-                                          activeFilterEffects:
-                                              activeFilterEffects,
-                                        );
-                                      },
-                                    ),
-                                    if (_previewError != null)
-                                      Center(
-                                        child: Container(
-                                          margin: const EdgeInsets.all(20),
-                                          padding: const EdgeInsets.symmetric(
-                                            horizontal: 14,
-                                            vertical: 11,
-                                          ),
-                                          decoration: BoxDecoration(
-                                            color: kBackground.withValues(
-                                              alpha: 0.78,
+                                        ),
+                                      for (final item in activeOverlayItems)
+                                        Align(
+                                          child: Transform.translate(
+                                            offset: Offset(
+                                              item.clip
+                                                      .transformAt(
+                                                        playbackState.position,
+                                                      )
+                                                      .offsetX *
+                                                  constraints.maxWidth /
+                                                  kTimelineDesignWidth,
+                                              item.clip
+                                                      .transformAt(
+                                                        playbackState.position,
+                                                      )
+                                                      .offsetY *
+                                                  constraints.maxHeight /
+                                                  kTimelineDesignHeight,
                                             ),
-                                            borderRadius: BorderRadius.circular(
-                                              10,
+                                            child: _buildOverlayAsset(
+                                              item,
+                                              constraints,
+                                              playbackState,
                                             ),
-                                            border: Border.all(
-                                              color: kWarning.withValues(
-                                                alpha: 0.45,
-                                              ),
-                                            ),
-                                          ),
-                                          child: Row(
-                                            mainAxisSize: MainAxisSize.min,
-                                            children: [
-                                              const Icon(
-                                                Icons.warning_amber_rounded,
-                                                color: kWarning,
-                                                size: 17,
-                                              ),
-                                              const SizedBox(width: 8),
-                                              Flexible(
-                                                child: Text(
-                                                  _previewError!,
-                                                  style: const TextStyle(
-                                                    color: kTextPrimary,
-                                                    fontSize: 11,
-                                                  ),
-                                                ),
-                                              ),
-                                            ],
                                           ),
                                         ),
-                                      ),
-                                  ],
+                                    ];
+                                    return _buildComposedMediaPreview(
+                                      backgroundColor: editorState
+                                          .timeline
+                                          .canvasSettings
+                                          .backgroundColor,
+                                      mediaLayers: mediaLayers,
+                                      timelineEffectsBuilder: (composedMedia) =>
+                                          _applyTimelineEffectsToMedia(
+                                            composedMedia,
+                                            activeEffectItems,
+                                            playbackState.position,
+                                          ),
+                                    );
+                                  },
                                 ),
                               ),
                             ),
                           ),
+                          if (_previewError != null)
+                            _CanvasBoundLayer(
+                              aspectRatio: previewAspectRatio,
+                              child: Center(
+                                child: Container(
+                                  margin: const EdgeInsets.all(20),
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 14,
+                                    vertical: 11,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: kBackground.withValues(alpha: 0.78),
+                                    borderRadius: BorderRadius.circular(10),
+                                    border: Border.all(
+                                      color: kWarning.withValues(alpha: 0.45),
+                                    ),
+                                  ),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      const Icon(
+                                        Icons.warning_amber_rounded,
+                                        color: kWarning,
+                                        size: 17,
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Flexible(
+                                        child: Text(
+                                          _previewError!,
+                                          style: const TextStyle(
+                                            color: kTextPrimary,
+                                            fontSize: 11,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
                           Positioned.fill(
                             child: GestureDetector(
                               onTap: _togglePlayPause,
@@ -1820,36 +2414,59 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                                                 _selectOverlayClip(item),
                                             onMoveStart: () {
                                               _selectOverlayClip(item);
+                                              _beginSnappedDrag(transform);
                                               ref
                                                   .read(editorProvider.notifier)
                                                   .beginTimelineGestureEdit();
                                             },
                                             onMoveUpdate: (delta) {
-                                              _updateOverlayTransform(
-                                                item.clip.id,
-                                                (current) => current.copyWith(
-                                                  offsetX:
-                                                      (current.offsetX +
-                                                              delta.dx *
-                                                                  kTimelineDesignWidth /
-                                                                  constraints
-                                                                      .maxWidth)
-                                                          .clamp(-maxX, maxX)
-                                                          .toDouble(),
-                                                  offsetY:
-                                                      (current.offsetY +
-                                                              delta.dy *
-                                                                  kTimelineDesignHeight /
-                                                                  constraints
-                                                                      .maxHeight)
-                                                          .clamp(-maxY, maxY)
-                                                          .toDouble(),
-                                                ),
-                                              );
+                                              _updateOverlayTransform(item.clip.id, (
+                                                current,
+                                              ) {
+                                                final proposedX =
+                                                    (_dragSourceOffsetX ??
+                                                        current.offsetX) +
+                                                    delta.dx *
+                                                        kTimelineDesignWidth /
+                                                        constraints.maxWidth;
+                                                final proposedY =
+                                                    (_dragSourceOffsetY ??
+                                                        current.offsetY) +
+                                                    delta.dy *
+                                                        kTimelineDesignHeight /
+                                                        constraints.maxHeight;
+                                                _dragSourceOffsetX = proposedX;
+                                                _dragSourceOffsetY = proposedY;
+                                                final halfWidth =
+                                                    kTimelineDesignWidth *
+                                                    0.18 *
+                                                    current.scale;
+                                                final halfHeight =
+                                                    kTimelineDesignHeight *
+                                                    0.25 *
+                                                    current.scale;
+                                                return current.copyWith(
+                                                  offsetX: _snapDesignCoordinate(
+                                                    proposed: proposedX,
+                                                    designExtent:
+                                                        kTimelineDesignWidth,
+                                                    viewportExtent:
+                                                        constraints.maxWidth,
+                                                    objectHalfExtent: halfWidth,
+                                                  ).clamp(-maxX, maxX).toDouble(),
+                                                  offsetY: _snapDesignCoordinate(
+                                                    proposed: proposedY,
+                                                    designExtent:
+                                                        kTimelineDesignHeight,
+                                                    viewportExtent:
+                                                        constraints.maxHeight,
+                                                    objectHalfExtent:
+                                                        halfHeight,
+                                                  ).clamp(-maxY, maxY).toDouble(),
+                                                );
+                                              });
                                             },
-                                            onMoveEnd: () => ref
-                                                .read(editorProvider.notifier)
-                                                .endTimelineGestureEdit(),
+                                            onMoveEnd: _endSnappedDrag,
                                             onWidthResizeStart: () {
                                               _selectOverlayClip(item);
                                               ref
@@ -1896,11 +2513,21 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                                             onHeightResizeEnd: () => ref
                                                 .read(editorProvider.notifier)
                                                 .endTimelineGestureEdit(),
-                                            child: _buildOverlayAsset(
-                                              item,
-                                              constraints,
-                                              playbackState,
-                                              activeFilterEffects,
+                                            // Media is painted once in the
+                                            // composed canvas below timeline
+                                            // effects. Keep only this clear
+                                            // edit target above the effects so
+                                            // selection chrome stays crisp and
+                                            // video controllers are not
+                                            // duplicated.
+                                            child: SizedBox(
+                                              key: ValueKey(
+                                                'preview-overlay-interaction-${item.clip.id}',
+                                              ),
+                                              width:
+                                                  constraints.maxWidth * 0.36,
+                                              height:
+                                                  constraints.maxHeight * 0.5,
                                             ),
                                           ),
                                         ),
@@ -2008,36 +2635,48 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                                               ref
                                                   .read(editorProvider.notifier)
                                                   .selectClip(item.clip.id);
+                                              _beginSnappedDrag(transform);
                                               ref
                                                   .read(editorProvider.notifier)
                                                   .beginTimelineGestureEdit();
                                             },
                                             onMoveUpdate: (delta) {
-                                              _updateOverlayTransform(
-                                                item.clip.id,
-                                                (current) => current.copyWith(
-                                                  offsetX:
-                                                      (current.offsetX +
-                                                              delta.dx *
-                                                                  kTimelineDesignWidth /
-                                                                  constraints
-                                                                      .maxWidth)
-                                                          .clamp(-maxX, maxX)
-                                                          .toDouble(),
-                                                  offsetY:
-                                                      (current.offsetY +
-                                                              delta.dy *
-                                                                  kTimelineDesignHeight /
-                                                                  constraints
-                                                                      .maxHeight)
-                                                          .clamp(-maxY, maxY)
-                                                          .toDouble(),
-                                                ),
-                                              );
+                                              _updateOverlayTransform(item.clip.id, (
+                                                current,
+                                              ) {
+                                                final proposedX =
+                                                    (_dragSourceOffsetX ??
+                                                        current.offsetX) +
+                                                    delta.dx *
+                                                        kTimelineDesignWidth /
+                                                        constraints.maxWidth;
+                                                final proposedY =
+                                                    (_dragSourceOffsetY ??
+                                                        current.offsetY) +
+                                                    delta.dy *
+                                                        kTimelineDesignHeight /
+                                                        constraints.maxHeight;
+                                                _dragSourceOffsetX = proposedX;
+                                                _dragSourceOffsetY = proposedY;
+                                                return current.copyWith(
+                                                  offsetX: _snapDesignCoordinate(
+                                                    proposed: proposedX,
+                                                    designExtent:
+                                                        kTimelineDesignWidth,
+                                                    viewportExtent:
+                                                        constraints.maxWidth,
+                                                  ).clamp(-maxX, maxX).toDouble(),
+                                                  offsetY: _snapDesignCoordinate(
+                                                    proposed: proposedY,
+                                                    designExtent:
+                                                        kTimelineDesignHeight,
+                                                    viewportExtent:
+                                                        constraints.maxHeight,
+                                                  ).clamp(-maxY, maxY).toDouble(),
+                                                );
+                                              });
                                             },
-                                            onMoveEnd: () => ref
-                                                .read(editorProvider.notifier)
-                                                .endTimelineGestureEdit(),
+                                            onMoveEnd: _endSnappedDrag,
                                             onWidthResizeStart: () {
                                               ref
                                                   .read(editorProvider.notifier)
@@ -2112,9 +2751,11 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                                   final isSelected =
                                       subtitleState.selectedEntryId ==
                                       activeEntry.id;
-                                  // Keep transform edits global so move/resize
-                                  // applies consistently to all subtitle blocks.
-                                  const editPerEntry = false;
+                                  // A style override is a complete cue style in
+                                  // the export model, so preview and direct
+                                  // manipulation must edit that same style.
+                                  final editPerEntry =
+                                      activeEntry.styleOverride != null;
                                   final editableStyle = _readEditableStyleFor(
                                     activeEntry,
                                     editPerEntry,
@@ -2149,27 +2790,54 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                                               .read(subtitleProvider.notifier)
                                               .selectEntry(activeEntry.id);
                                         },
-                                        onMoveStart: () =>
-                                            _beginStyleGesture(activeEntry),
+                                        onMoveStart: () => _beginStyleGesture(
+                                          activeEntry,
+                                          editPerEntry,
+                                        ),
                                         onMoveUpdate: (delta) {
                                           final style = _readEditableStyleFor(
                                             activeEntry,
                                             editPerEntry,
                                           );
+                                          final proposedX =
+                                              (_dragSourceOffsetX ??
+                                                  style.offsetX) +
+                                              delta.dx *
+                                                  kTimelineDesignWidth /
+                                                  constraints.maxWidth;
+                                          final proposedEffectiveY =
+                                              (_dragSourceOffsetY ??
+                                                  style.verticalOffset +
+                                                      style.offsetY) +
+                                              delta.dy *
+                                                  kTimelineDesignHeight /
+                                                  constraints.maxHeight;
+                                          _dragSourceOffsetX = proposedX;
+                                          _dragSourceOffsetY =
+                                              proposedEffectiveY;
                                           final nextOffsetX =
-                                              (style.offsetX +
-                                                      delta.dx *
-                                                          kTimelineDesignWidth /
-                                                          constraints.maxWidth)
-                                                  .clamp(-maxX, maxX)
-                                                  .toDouble();
+                                              _snapDesignCoordinate(
+                                                proposed: proposedX,
+                                                designExtent:
+                                                    kTimelineDesignWidth,
+                                                viewportExtent:
+                                                    constraints.maxWidth,
+                                              ).clamp(-maxX, maxX).toDouble();
+                                          final snappedEffectiveY =
+                                              _snapDesignCoordinate(
+                                                proposed: proposedEffectiveY,
+                                                designExtent:
+                                                    kTimelineDesignHeight,
+                                                viewportExtent:
+                                                    constraints.maxHeight,
+                                              ).clamp(-maxY, maxY).toDouble();
+                                          // verticalOffset is the style's
+                                          // anchored baseline. Store only the
+                                          // user's delta so switching subtitle
+                                          // positions keeps its semantics.
                                           final nextOffsetY =
-                                              (style.offsetY +
-                                                      delta.dy *
-                                                          kTimelineDesignHeight /
-                                                          constraints.maxHeight)
-                                                  .clamp(-maxY, maxY)
-                                                  .toDouble();
+                                              snappedEffectiveY -
+                                              style.verticalOffset;
 
                                           _applyStyleLive(
                                             activeEntry: activeEntry,
@@ -2182,7 +2850,10 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                                         },
                                         onMoveEnd: _endStyleGesture,
                                         onWidthResizeStart: () =>
-                                            _beginStyleGesture(activeEntry),
+                                            _beginStyleGesture(
+                                              activeEntry,
+                                              editPerEntry,
+                                            ),
                                         onWidthResizeUpdate: (delta) {
                                           final style = _readEditableStyleFor(
                                             activeEntry,
@@ -2206,7 +2877,10 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                                         },
                                         onWidthResizeEnd: _endStyleGesture,
                                         onHeightResizeStart: () =>
-                                            _beginStyleGesture(activeEntry),
+                                            _beginStyleGesture(
+                                              activeEntry,
+                                              editPerEntry,
+                                            ),
                                         onHeightResizeUpdate: (delta) {
                                           final style = _readEditableStyleFor(
                                             activeEntry,
@@ -2273,6 +2947,38 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                                 ),
                               ),
                             ),
+                          for (final item in activeOverlayItems)
+                            if (item.asset.type == EditorAssetType.video &&
+                                item.asset.sourcePath != null &&
+                                File(item.asset.sourcePath!).existsSync() &&
+                                editorState.timeline.clipHasAudio(item.clip))
+                              Positioned(
+                                left: 0,
+                                top: 0,
+                                width: 1,
+                                height: 1,
+                                child: _TimelineAudioPreview(
+                                  key: ValueKey(
+                                    'overlay_audio_${item.clip.id}',
+                                  ),
+                                  audioPath: item.asset.sourcePath!,
+                                  clip: item.clip,
+                                  playbackPosition: playbackState.position,
+                                  isPlaying: playbackState.isPlaying,
+                                  playbackSpeed: _playbackSpeed,
+                                  duckingGain: _previewDuckingGain(
+                                    item.clip,
+                                    playbackState.position,
+                                  ),
+                                  isTrackAudible:
+                                      !item.track.isMuted &&
+                                      (!_hasSoloMediaTrack(
+                                            editorState.timeline,
+                                          ) ||
+                                          item.track.isSolo),
+                                  continueFreezeFrameAudio: true,
+                                ),
+                              ),
                           for (final item in activeAudioItems)
                             Positioned(
                               left: 0,
@@ -2286,12 +2992,49 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel> {
                                 playbackPosition: playbackState.position,
                                 isPlaying: playbackState.isPlaying,
                                 playbackSpeed: _playbackSpeed,
+                                duckingGain: _previewDuckingGain(
+                                  item.clip,
+                                  playbackState.position,
+                                ),
                                 isTrackAudible:
                                     !item.track.isMuted &&
-                                    (!editorState.timeline.tracks.any(
-                                          (track) => track.isSolo,
+                                    (!_hasSoloMediaTrack(
+                                          editorState.timeline,
                                         ) ||
                                         item.track.isSolo),
+                              ),
+                            ),
+                          if (controllerReady &&
+                              activeBaseClip.freezeFrame &&
+                              !activeBaseClip.isReversed &&
+                              controllerPath != null &&
+                              controllerTrack != null &&
+                              editorState.timeline.clipHasAudio(activeBaseClip))
+                            Positioned(
+                              left: 0,
+                              top: 0,
+                              width: 1,
+                              height: 1,
+                              child: _TimelineAudioPreview(
+                                key: ValueKey(
+                                  'freeze_audio_${activeBaseClip.id}',
+                                ),
+                                audioPath: controllerPath,
+                                clip: activeBaseClip,
+                                playbackPosition: playbackState.position,
+                                isPlaying: playbackState.isPlaying,
+                                playbackSpeed: _playbackSpeed,
+                                duckingGain: _previewDuckingGain(
+                                  activeBaseClip,
+                                  playbackState.position,
+                                ),
+                                isTrackAudible:
+                                    !controllerTrack.isMuted &&
+                                    (!_hasSoloMediaTrack(
+                                          editorState.timeline,
+                                        ) ||
+                                        controllerTrack.isSolo),
+                                continueFreezeFrameAudio: true,
                               ),
                             ),
                         ],
@@ -2651,16 +3394,292 @@ class _TextCanvasItem {
   });
 }
 
+class _DecodedGifFrame {
+  final ui.Image image;
+  final int endMilliseconds;
+
+  const _DecodedGifFrame({required this.image, required this.endMilliseconds});
+}
+
+class _TimelineGifPreview extends StatefulWidget {
+  final String? filePath;
+  final String? remoteUrl;
+  final TimelineClip clip;
+  final Duration playbackPosition;
+  final double width;
+  final double height;
+  final ClipFitMode fitMode;
+  final ClipCropSettings crop;
+  final String label;
+  final Widget Function(Widget child) mediaEffectsBuilder;
+
+  const _TimelineGifPreview({
+    super.key,
+    required this.filePath,
+    required this.remoteUrl,
+    required this.clip,
+    required this.playbackPosition,
+    required this.width,
+    required this.height,
+    required this.fitMode,
+    required this.crop,
+    required this.label,
+    required this.mediaEffectsBuilder,
+  });
+
+  @override
+  State<_TimelineGifPreview> createState() => _TimelineGifPreviewState();
+}
+
+class _TimelineGifPreviewState extends State<_TimelineGifPreview> {
+  List<_DecodedGifFrame> _frames = const [];
+  int _totalDurationMs = 0;
+  int _decodeGeneration = 0;
+  bool _loading = true;
+  bool _failed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_decodeFrames());
+  }
+
+  @override
+  void didUpdateWidget(covariant _TimelineGifPreview oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.filePath != widget.filePath ||
+        oldWidget.remoteUrl != widget.remoteUrl ||
+        oldWidget.width.ceil() != widget.width.ceil() ||
+        oldWidget.height.ceil() != widget.height.ceil()) {
+      unawaited(_decodeFrames());
+    }
+  }
+
+  Future<Uint8List> _loadBytes() async {
+    final filePath = widget.filePath;
+    if (filePath != null && filePath.isNotEmpty) {
+      final file = File(filePath);
+      if (await file.length() > _maxGifEncodedBytes) {
+        throw const FormatException('GIF exceeds the preview size limit');
+      }
+      final bytes = await file.readAsBytes();
+      if (bytes.length > _maxGifEncodedBytes) {
+        throw const FormatException('GIF exceeds the preview size limit');
+      }
+      return bytes;
+    }
+    final uri = Uri.tryParse(widget.remoteUrl ?? '');
+    if (uri == null || !uri.hasScheme) {
+      throw const FormatException('Invalid GIF source');
+    }
+    final client = HttpClient();
+    try {
+      final request = await client.getUrl(uri);
+      final response = await request.close();
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw HttpException(
+          'GIF request failed (${response.statusCode})',
+          uri: uri,
+        );
+      }
+      if (response.contentLength > _maxGifEncodedBytes) {
+        throw HttpException('GIF exceeds the preview size limit', uri: uri);
+      }
+      final bytes = BytesBuilder(copy: false);
+      await for (final chunk in response) {
+        bytes.add(chunk);
+        if (bytes.length > _maxGifEncodedBytes) {
+          throw HttpException('GIF exceeds the preview size limit', uri: uri);
+        }
+      }
+      return bytes.takeBytes();
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> _decodeFrames() async {
+    final generation = ++_decodeGeneration;
+    _disposeFrames();
+    _loading = true;
+    _failed = false;
+    try {
+      final bytes = await _loadBytes();
+      if (!mounted || generation != _decodeGeneration) return;
+
+      var intrinsicWidth = 1;
+      var intrinsicHeight = 1;
+      final probeBuffer = await ui.ImmutableBuffer.fromUint8List(bytes);
+      // instantiateImageCodecWithSize takes ownership of probeBuffer and
+      // disposes it after creating the lightweight 1x1 probe codec.
+      final probeCodec = await ui.instantiateImageCodecWithSize(
+        probeBuffer,
+        getTargetSize: (width, height) {
+          intrinsicWidth = width;
+          intrinsicHeight = height;
+          return const ui.TargetImageSize(width: 1, height: 1);
+        },
+      );
+      final frameCount = probeCodec.frameCount;
+      probeCodec.dispose();
+      if (!mounted || generation != _decodeGeneration) return;
+
+      final targetSize = calculateGifDecodeSizeForTesting(
+        intrinsicWidth: intrinsicWidth,
+        intrinsicHeight: intrinsicHeight,
+        frameCount: frameCount,
+        maxWidth: widget.width,
+        maxHeight: widget.height,
+      );
+      final codec = await ui.instantiateImageCodec(
+        bytes,
+        targetWidth: targetSize.width.toInt(),
+        targetHeight: targetSize.height.toInt(),
+        allowUpscaling: false,
+      );
+      final decoded = <_DecodedGifFrame>[];
+      var elapsedMs = 0;
+      try {
+        for (var index = 0; index < codec.frameCount; index++) {
+          final frame = await codec.getNextFrame();
+          if (!mounted || generation != _decodeGeneration) {
+            frame.image.dispose();
+            for (final decodedFrame in decoded) {
+              decodedFrame.image.dispose();
+            }
+            return;
+          }
+          elapsedMs += math.max(1, frame.duration.inMilliseconds);
+          decoded.add(
+            _DecodedGifFrame(image: frame.image, endMilliseconds: elapsedMs),
+          );
+        }
+      } catch (_) {
+        for (final frame in decoded) {
+          frame.image.dispose();
+        }
+        rethrow;
+      } finally {
+        codec.dispose();
+      }
+      if (!mounted || generation != _decodeGeneration) {
+        for (final frame in decoded) {
+          frame.image.dispose();
+        }
+        return;
+      }
+      setState(() {
+        _frames = decoded;
+        _totalDurationMs = math.max(1, elapsedMs);
+        _loading = false;
+        _failed = decoded.isEmpty;
+      });
+    } catch (_) {
+      if (!mounted || generation != _decodeGeneration) return;
+      setState(() {
+        _loading = false;
+        _failed = true;
+      });
+    }
+  }
+
+  void _disposeFrames() {
+    for (final frame in _frames) {
+      frame.image.dispose();
+    }
+    _frames = const [];
+    _totalDurationMs = 0;
+  }
+
+  @override
+  void dispose() {
+    _decodeGeneration++;
+    _disposeFrames();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading || _failed || _frames.isEmpty) {
+      return Container(
+        width: widget.width,
+        height: widget.height,
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.65),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: kBorder),
+        ),
+        alignment: Alignment.center,
+        child: _loading
+            ? const CircularProgressIndicator(
+                color: Colors.white,
+                strokeWidth: 2,
+              )
+            : Text(
+                widget.label,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: kTextSecondary, fontSize: 11),
+              ),
+      );
+    }
+
+    final sourcePosition = _previewSourcePosition(
+      widget.clip,
+      widget.playbackPosition,
+    );
+    final frameTimeMs = sourcePosition.inMilliseconds % _totalDurationMs;
+    var selectedFrame = _frames.last;
+    for (final frame in _frames) {
+      if (frameTimeMs < frame.endMilliseconds) {
+        selectedFrame = frame;
+        break;
+      }
+    }
+    final fit = switch (widget.fitMode) {
+      ClipFitMode.cover => BoxFit.cover,
+      ClipFitMode.contain => BoxFit.contain,
+      ClipFitMode.stretch => BoxFit.fill,
+    };
+    Widget source = SizedBox(
+      width: selectedFrame.image.width.toDouble(),
+      height: selectedFrame.image.height.toDouble(),
+      child: RawImage(
+        image: selectedFrame.image,
+        filterQuality: FilterQuality.medium,
+      ),
+    );
+    source = _cropSourcePreview(
+      child: source,
+      sourceWidth: selectedFrame.image.width.toDouble(),
+      sourceHeight: selectedFrame.image.height.toDouble(),
+      crop: widget.crop,
+    );
+    final media = ClipRRect(
+      borderRadius: BorderRadius.circular(10),
+      child: SizedBox(
+        width: widget.width,
+        height: widget.height,
+        child: FittedBox(fit: fit, clipBehavior: Clip.hardEdge, child: source),
+      ),
+    );
+    return widget.mediaEffectsBuilder(media);
+  }
+}
+
 class _OverlayVideoPreview extends StatefulWidget {
   final String videoPath;
   final TimelineClip clip;
   final Duration playbackPosition;
   final bool isPlaying;
   final double playbackSpeed;
+  final double duckingGain;
   final bool isTrackAudible;
   final double width;
   final double height;
   final ClipFitMode fitMode;
+  final ClipCropSettings crop;
+  final Widget Function(Widget child) mediaEffectsBuilder;
 
   const _OverlayVideoPreview({
     super.key,
@@ -2669,10 +3688,13 @@ class _OverlayVideoPreview extends StatefulWidget {
     required this.playbackPosition,
     required this.isPlaying,
     required this.playbackSpeed,
+    required this.duckingGain,
     required this.isTrackAudible,
     required this.width,
     required this.height,
     required this.fitMode,
+    required this.crop,
+    required this.mediaEffectsBuilder,
   });
 
   @override
@@ -2705,8 +3727,10 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
   }
 
   Future<void> _initialize() async {
+    VideoPlayerController? createdController;
     try {
       final controller = VideoPlayerController.file(File(widget.videoPath));
+      createdController = controller;
       await controller.initialize();
       await controller.setVolume(0);
       if (!mounted) {
@@ -2720,6 +3744,14 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
       _lastVolume = 0;
       _schedulePlaybackSync(forceSeek: true);
     } catch (_) {
+      final controller = createdController;
+      if (controller != null && !identical(controller, _controller)) {
+        try {
+          await controller.dispose();
+        } catch (_) {
+          // A failed platform initialization may already release its handle.
+        }
+      }
       if (mounted) setState(() => _ready = false);
     }
   }
@@ -2772,12 +3804,13 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
       clip: widget.clip,
       position: widget.playbackPosition,
       isTrackAudible: widget.isTrackAudible,
+      duckingGain: widget.duckingGain,
     );
     if (_lastVolume == null || (_lastVolume! - volume).abs() > 0.01) {
       await controller.setVolume(volume);
       _lastVolume = volume;
     }
-    if (!widget.clip.isReversed) {
+    if (!widget.clip.isReversed && !widget.clip.freezeFrame) {
       final speed = (widget.playbackSpeed * widget.clip.playbackRate)
           .clamp(0.25, 4)
           .toDouble();
@@ -2788,7 +3821,7 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
       }
     }
     if (!mounted) return;
-    if (widget.clip.isReversed) {
+    if (widget.clip.isReversed || widget.clip.freezeFrame) {
       if (controller.value.isPlaying) {
         await controller.pause();
       }
@@ -2851,22 +3884,26 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
       ClipFitMode.contain => BoxFit.contain,
       ClipFitMode.stretch => BoxFit.fill,
     };
-    return ClipRRect(
+    Widget source = SizedBox(
+      width: sourceWidth,
+      height: sourceHeight,
+      child: VideoPlayer(controller),
+    );
+    source = _cropSourcePreview(
+      child: source,
+      sourceWidth: sourceWidth,
+      sourceHeight: sourceHeight,
+      crop: widget.crop,
+    );
+    final media = ClipRRect(
       borderRadius: BorderRadius.circular(10),
       child: SizedBox(
         width: widget.width,
         height: widget.height,
-        child: FittedBox(
-          fit: fit,
-          clipBehavior: Clip.hardEdge,
-          child: SizedBox(
-            width: sourceWidth,
-            height: sourceHeight,
-            child: VideoPlayer(controller),
-          ),
-        ),
+        child: FittedBox(fit: fit, clipBehavior: Clip.hardEdge, child: source),
       ),
     );
+    return widget.mediaEffectsBuilder(media);
   }
 }
 
@@ -2876,7 +3913,9 @@ class _TimelineAudioPreview extends StatefulWidget {
   final Duration playbackPosition;
   final bool isPlaying;
   final double playbackSpeed;
+  final double duckingGain;
   final bool isTrackAudible;
+  final bool continueFreezeFrameAudio;
 
   const _TimelineAudioPreview({
     super.key,
@@ -2885,7 +3924,9 @@ class _TimelineAudioPreview extends StatefulWidget {
     required this.playbackPosition,
     required this.isPlaying,
     required this.playbackSpeed,
+    required this.duckingGain,
     required this.isTrackAudible,
+    this.continueFreezeFrameAudio = false,
   });
 
   @override
@@ -2918,8 +3959,10 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
   }
 
   Future<void> _initialize() async {
+    VideoPlayerController? createdController;
     try {
       final controller = VideoPlayerController.file(File(widget.audioPath));
+      createdController = controller;
       await controller.initialize();
       if (!mounted) {
         await controller.dispose();
@@ -2929,6 +3972,14 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
       _ready = true;
       _schedulePlaybackSync(forceSeek: true);
     } catch (_) {
+      final controller = createdController;
+      if (controller != null && !identical(controller, _controller)) {
+        try {
+          await controller.dispose();
+        } catch (_) {
+          // A failed platform initialization may already release its handle.
+        }
+      }
       _ready = false;
     }
   }
@@ -2975,9 +4026,14 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
     if (!_ready || controller == null || !controller.value.isInitialized) {
       return;
     }
+    final continuesFrozenAudio =
+        widget.continueFreezeFrameAudio &&
+        widget.clip.freezeFrame &&
+        !widget.clip.isReversed;
     final sourcePosition = _previewSourcePosition(
       widget.clip,
       widget.playbackPosition,
+      holdFreezeFrame: !continuesFrozenAudio,
     );
     final target = Duration(
       milliseconds: sourcePosition.inMilliseconds
@@ -2988,7 +4044,10 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
         (controller.value.position - target).inMilliseconds.abs() > 180) {
       await controller.seekTo(target);
     }
-    if (!widget.clip.isReversed) {
+    final canPlayForward =
+        !widget.clip.isReversed &&
+        (!widget.clip.freezeFrame || continuesFrozenAudio);
+    if (canPlayForward) {
       final speed = (widget.playbackSpeed * widget.clip.playbackRate)
           .clamp(0.25, 4)
           .toDouble();
@@ -3003,12 +4062,13 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
       clip: widget.clip,
       position: widget.playbackPosition,
       isTrackAudible: widget.isTrackAudible,
+      duckingGain: widget.duckingGain,
     );
     if (_lastVolume == null || (_lastVolume! - safeVolume).abs() > 0.01) {
       await controller.setVolume(safeVolume);
       _lastVolume = safeVolume;
     }
-    if (widget.clip.isReversed) {
+    if (!canPlayForward) {
       if (controller.value.isPlaying) {
         await controller.pause();
       }
@@ -3029,7 +4089,14 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
   Widget build(BuildContext context) => const SizedBox.shrink();
 }
 
-Duration _previewSourcePosition(TimelineClip clip, Duration timelinePosition) {
+Duration _previewSourcePosition(
+  TimelineClip clip,
+  Duration timelinePosition, {
+  bool holdFreezeFrame = true,
+}) {
+  if (clip.freezeFrame && holdFreezeFrame) {
+    return clip.effectiveFreezeFrameSourceTime;
+  }
   final elapsedMs = (timelinePosition - clip.startTime).inMilliseconds.clamp(
     0,
     clip.duration.inMilliseconds,

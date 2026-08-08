@@ -18,6 +18,17 @@
 	<string>caption_craft</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>com.googleusercontent.apps.241322582096-gj0gd8aha12bcrpf7ltvk7e2dv21cvat</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleShortVersionString</key>
 	<string>$(FLUTTER_BUILD_NAME)</string>
 	<key>CFBundleSignature</key>
@@ -26,6 +37,8 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>GIDClientID</key>
+	<string>241322582096-gj0gd8aha12bcrpf7ltvk7e2dv21cvat.apps.googleusercontent.com</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>CaptionCraft needs access to save your exported video.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>

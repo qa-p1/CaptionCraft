@@ -5,6 +5,30 @@ import '../models/subtitle_entry.dart';
 import '../models/subtitle_style_model.dart';
 import '../../../core/theme/app_theme.dart';
 
+@visibleForTesting
+SubtitleStyleModel resolvePreviewSubtitleStyleForTesting({
+  required SubtitleEntry entry,
+  required SubtitleStyleModel globalStyle,
+}) {
+  final override = entry.styleOverride;
+  if (override == null) return globalStyle;
+  final animationPreset =
+      override.animationPreset ?? globalStyle.animationPreset;
+  return animationPreset == null
+      ? override
+      : override.copyWith(animationPreset: animationPreset);
+}
+
+@visibleForTesting
+String typewriterTextAtProgressForTesting(String text, double progress) {
+  final graphemes = text.characters;
+  final totalGraphemes = graphemes.length;
+  final visibleCount = (progress.clamp(0.0, 1.0) * totalGraphemes)
+      .round()
+      .clamp(0, totalGraphemes);
+  return graphemes.take(visibleCount).toString();
+}
+
 /// Animated subtitle overlay that renders word-level animations
 /// based on the selected SubtitleAnimationPreset.
 class AnimatedSubtitleOverlay extends StatelessWidget {
@@ -22,17 +46,9 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
   });
 
   SubtitleStyleModel get _style {
-    final base = entry.styleOverride ?? globalStyle;
-    final resolvedAnimationPreset =
-        entry.styleOverride?.animationPreset ?? globalStyle.animationPreset;
-    // Spatial + size controls are treated as global editor transforms.
-    return base.copyWith(
-      fontSize: globalStyle.fontSize,
-      verticalOffset: globalStyle.verticalOffset,
-      offsetX: globalStyle.offsetX,
-      offsetY: globalStyle.offsetY,
-      maxWidthFactor: globalStyle.maxWidthFactor,
-      animationPreset: resolvedAnimationPreset,
+    return resolvePreviewSubtitleStyleForTesting(
+      entry: entry,
+      globalStyle: globalStyle,
     );
   }
 
@@ -44,20 +60,15 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
       return _buildStaticOverlay();
     }
 
-    final hasWordTiming = entry.words != null && entry.words!.isNotEmpty;
     switch (_preset!) {
       case SubtitleAnimationPreset.wordPop:
-        return hasWordTiming ? _buildWordPop() : _buildWordPopFallback();
+        return _buildWordPop();
       case SubtitleAnimationPreset.lineFade:
         return _buildLineFade();
       case SubtitleAnimationPreset.karaokeHighlight:
-        return hasWordTiming
-            ? _buildKaraokeHighlight()
-            : _buildKaraokeHighlightFallback();
+        return _buildKaraokeHighlight();
       case SubtitleAnimationPreset.wordSlideUp:
-        return hasWordTiming
-            ? _buildWordSlideUp()
-            : _buildWordSlideUpFallback();
+        return _buildLineSlideUp();
       case SubtitleAnimationPreset.typewriter:
         return _buildTypewriter();
     }
@@ -77,10 +88,12 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
   }
 
   // ─── Preset 1: Word Pop ───
-  // Words scale from 0.6→1.0 + fade in as their timestamp arrives.
-  // Current word pulses 1.0→1.08→1.0.
+  // Words scale from 0.6→1.0 + fade in as their timestamp arrives. Cues
+  // without usable word timing get the same deterministic 160ms stagger used
+  // by ASS export.
   Widget _buildWordPop() {
-    final words = entry.words!;
+    final words = _resolveWordPopWords();
+    if (words.isEmpty) return _buildStaticOverlay();
     final style = _style;
     final posMs = currentPosition.inMilliseconds;
 
@@ -90,7 +103,6 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
         alignment: _wrapAlignment(style.textAlignment),
         children: words.map((word) {
           final wordStartMs = word.startTime.inMilliseconds;
-          final wordEndMs = word.endTime.inMilliseconds;
           final elapsed = posMs - wordStartMs;
 
           double opacity;
@@ -105,28 +117,18 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
             final t = elapsed / 120.0;
             opacity = t.clamp(0.0, 1.0);
             scale = 0.6 + 0.4 * t.clamp(0.0, 1.0);
-          } else if (posMs <= wordEndMs) {
-            // Current word — subtle pulse
-            final pulseT = ((elapsed - 120) % 600) / 600.0;
-            final pulse = sin(pulseT * pi * 2) * 0.04;
-            opacity = 1.0;
-            scale = 1.0 + pulse;
           } else {
-            // Already spoken — fully visible
             opacity = 1.0;
             scale = 1.0;
           }
 
-          final displayWord = style.isAllCaps
-              ? word.word.toUpperCase()
-              : word.word;
           return Padding(
             padding: const EdgeInsets.symmetric(horizontal: 2),
             child: Opacity(
               opacity: opacity,
               child: Transform.scale(
                 scale: scale,
-                child: Text(displayWord, style: _textStyle(style)),
+                child: Text(word.text, style: _textStyle(style)),
               ),
             ),
           );
@@ -135,26 +137,34 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
     );
   }
 
-  Widget _buildWordPopFallback() {
+  List<_PreviewAnimationWord> _resolveWordPopWords() {
     final style = _style;
-    final elapsed = (currentPosition - entry.startTime).inMilliseconds;
-    final t = (elapsed / 160.0).clamp(0.0, 1.0);
-    final pulse = sin(t * pi) * 0.06;
+    final text = style.isAllCaps ? entry.text.toUpperCase() : entry.text;
+    final matches = RegExp(r'\S+').allMatches(text).toList(growable: false);
+    if (matches.isEmpty) return const [];
 
-    return _wrapBackground(
-      style,
-      Opacity(
-        opacity: t,
-        child: Transform.scale(
-          scale: 0.88 + (t * 0.12) + pulse,
-          child: Text(
-            style.isAllCaps ? entry.text.toUpperCase() : entry.text,
-            textAlign: style.textAlignment,
-            style: _textStyle(style),
-          ),
-        ),
-      ),
-    );
+    final validWords = entry.words
+        ?.where(
+          (word) =>
+              word.word.trim().isNotEmpty && word.endTime > word.startTime,
+        )
+        .toList(growable: false);
+    final useProviderTiming = validWords?.length == matches.length;
+    final durationMs = max(entry.duration.inMilliseconds, 0);
+    final availableMs = max(durationMs - 120, 0);
+    final fallbackStaggerMs = matches.length <= 1
+        ? 0
+        : min(availableMs ~/ (matches.length - 1), 160);
+
+    return List.generate(matches.length, (index) {
+      final startTime = useProviderTiming
+          ? validWords![index].startTime
+          : entry.startTime + Duration(milliseconds: index * fallbackStaggerMs);
+      return _PreviewAnimationWord(
+        text: text.substring(matches[index].start, matches[index].end),
+        startTime: startTime,
+      );
+    }, growable: false);
   }
 
   // ─── Preset 2: Line Fade ───
@@ -183,34 +193,59 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
   // ─── Preset 3: Karaoke Highlight ───
   // All words shown at 40% opacity, each lights up at its timestamp.
   Widget _buildKaraokeHighlight() {
-    final words = entry.words!;
+    final fragments = _resolveTimedKaraokeFragments();
+    if (fragments.isEmpty) return _buildKaraokeHighlightFallback();
     final style = _style;
     final posMs = currentPosition.inMilliseconds;
 
     return _wrapBackground(
       style,
-      Wrap(
-        alignment: _wrapAlignment(style.textAlignment),
-        children: words.map((word) {
-          final isReached = posMs >= word.startTime.inMilliseconds;
-          final displayWord = style.isAllCaps
-              ? word.word.toUpperCase()
-              : word.word;
-
-          return Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 2),
-            child: Text(
-              displayWord,
-              style: _textStyle(style).copyWith(
-                color: isReached
-                    ? kAccent
-                    : style.textColor.withValues(alpha: 0.4),
-              ),
-            ),
-          );
-        }).toList(),
+      Text.rich(
+        TextSpan(
+          children: fragments
+              .map((fragment) {
+                final isReached = posMs >= fragment.startTime.inMilliseconds;
+                return TextSpan(
+                  text: style.isAllCaps
+                      ? fragment.text.toUpperCase()
+                      : fragment.text,
+                  style: _textStyle(style).copyWith(
+                    color: isReached
+                        ? kAccent
+                        : style.textColor.withValues(alpha: 0.4),
+                  ),
+                );
+              })
+              .toList(growable: false),
+        ),
+        textAlign: style.textAlignment,
       ),
     );
+  }
+
+  List<_PreviewAnimationWord> _resolveTimedKaraokeFragments() {
+    final matches = RegExp(
+      r'\S+',
+    ).allMatches(entry.text).toList(growable: false);
+    final validWords = entry.words
+        ?.where(
+          (word) =>
+              word.word.trim().isNotEmpty && word.endTime > word.startTime,
+        )
+        .toList(growable: false);
+    if (matches.isEmpty || validWords?.length != matches.length) {
+      return const [];
+    }
+    return List.generate(matches.length, (index) {
+      final start = index == 0 ? 0 : matches[index].start;
+      final end = index + 1 < matches.length
+          ? matches[index + 1].start
+          : entry.text.length;
+      return _PreviewAnimationWord(
+        text: entry.text.substring(start, end),
+        startTime: validWords![index].startTime,
+      );
+    }, growable: false);
   }
 
   Widget _buildKaraokeHighlightFallback() {
@@ -231,7 +266,12 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
           return LinearGradient(
             begin: Alignment.centerLeft,
             end: Alignment.centerRight,
-            colors: [kAccent, kAccent, style.textColor, style.textColor],
+            colors: [
+              kAccent,
+              kAccent,
+              style.textColor.withValues(alpha: 0.4),
+              style.textColor.withValues(alpha: 0.4),
+            ],
             stops: [0, highlightStop, highlightStop, 1],
           ).createShader(bounds);
         },
@@ -244,47 +284,11 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
     );
   }
 
-  // ─── Preset 4: Word Slide Up ───
-  // Each word slides up from 12px below + fades in.
-  // 80ms stagger per word, 150ms duration per word.
-  Widget _buildWordSlideUp() {
-    final words = entry.words!;
-    final style = _style;
-    final posMs = currentPosition.inMilliseconds;
-    final lineStartMs = entry.startTime.inMilliseconds;
-
-    return _wrapBackground(
-      style,
-      Wrap(
-        alignment: _wrapAlignment(style.textAlignment),
-        children: List.generate(words.length, (i) {
-          final word = words[i];
-          final staggerStartMs = lineStartMs + (i * 80);
-          final elapsed = posMs - staggerStartMs;
-          final t = (elapsed / 150.0).clamp(0.0, 1.0);
-
-          final opacity = t;
-          final offsetY = 12.0 * scaleFactor * (1.0 - t);
-          final displayWord = style.isAllCaps
-              ? word.word.toUpperCase()
-              : word.word;
-
-          return Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 2),
-            child: Transform.translate(
-              offset: Offset(0, offsetY),
-              child: Opacity(
-                opacity: opacity,
-                child: Text(displayWord, style: _textStyle(style)),
-              ),
-            ),
-          );
-        }),
-      ),
-    );
-  }
-
-  Widget _buildWordSlideUpFallback() {
+  // ─── Preset 4: Line Slide Up ───
+  // ASS supports motion for a complete dialogue event, not independently for
+  // inline word runs. Preview uses that same 180ms whole-line move and fade so
+  // wrapping, alignment, and backgrounds stay identical in the export.
+  Widget _buildLineSlideUp() {
     final style = _style;
     final elapsed = (currentPosition - entry.startTime).inMilliseconds;
     final t = (elapsed / 180.0).clamp(0.0, 1.0);
@@ -292,7 +296,7 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
     return _wrapBackground(
       style,
       Transform.translate(
-        offset: Offset(0, 14 * scaleFactor * (1 - t)),
+        offset: Offset(0, 12 * scaleFactor * (1 - t)),
         child: Opacity(
           opacity: t,
           child: Text(
@@ -318,12 +322,10 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
 
     final elapsed = posMs - startMs;
     final text = style.isAllCaps ? entry.text.toUpperCase() : entry.text;
-    final totalChars = text.length;
-    final charsToShow = ((elapsed / durationMs) * totalChars).round().clamp(
-      0,
-      totalChars,
+    final visibleText = typewriterTextAtProgressForTesting(
+      text,
+      elapsed / durationMs,
     );
-    final visibleText = text.substring(0, charsToShow);
 
     return _wrapBackground(
       style,
@@ -398,6 +400,13 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
   }
 }
 
+class _PreviewAnimationWord {
+  final String text;
+  final Duration startTime;
+
+  const _PreviewAnimationWord({required this.text, required this.startTime});
+}
+
 /// Selectable preset card for the style panel.
 class AnimationPresetCard extends StatelessWidget {
   final SubtitleAnimationPreset preset;
@@ -415,7 +424,7 @@ class AnimationPresetCard extends StatelessWidget {
     SubtitleAnimationPreset.wordPop: 'Word Pop',
     SubtitleAnimationPreset.lineFade: 'Line Fade',
     SubtitleAnimationPreset.karaokeHighlight: 'Karaoke',
-    SubtitleAnimationPreset.wordSlideUp: 'Slide Up',
+    SubtitleAnimationPreset.wordSlideUp: 'Line Slide Up',
     SubtitleAnimationPreset.typewriter: 'Typewriter',
   };
 
@@ -423,7 +432,7 @@ class AnimationPresetCard extends StatelessWidget {
     SubtitleAnimationPreset.wordPop: 'Words pop in one by one',
     SubtitleAnimationPreset.lineFade: 'Clean fade-in as a line',
     SubtitleAnimationPreset.karaokeHighlight: 'Words light up in sync',
-    SubtitleAnimationPreset.wordSlideUp: 'Words slide up smoothly',
+    SubtitleAnimationPreset.wordSlideUp: 'Whole line slides up smoothly',
     SubtitleAnimationPreset.typewriter: 'Character by character reveal',
   };
 

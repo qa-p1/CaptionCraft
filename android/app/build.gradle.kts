@@ -4,7 +4,6 @@ import java.util.Properties
 plugins {
     id("com.android.application")
     id("kotlin-android")
-    id("com.google.gms.google-services")
     id("dev.flutter.flutter-gradle-plugin")
 }
 
@@ -17,6 +16,13 @@ val hasReleaseSigning =
     listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
         .all { !keystoreProperties.getProperty(it).isNullOrBlank() } &&
         rootProject.file(keystoreProperties.getProperty("storeFile", "")).exists()
+val isReleaseBuildRequested =
+    gradle.startParameter.taskNames.any { it.contains("release", ignoreCase = true) }
+if (isReleaseBuildRequested && !hasReleaseSigning) {
+    throw GradleException(
+        "Release signing is not configured. Add android/key.properties and its keystore before building a release.",
+    )
+}
 
 android {
     namespace = "com.captioncraft.caption_craft"
@@ -53,12 +59,8 @@ android {
 
     buildTypes {
         release {
-            // Local/CI release credentials live in ignored key.properties.
-            // A clean development checkout remains buildable with the debug key.
-            signingConfig = if (hasReleaseSigning) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
             }
             isMinifyEnabled = false
             isShrinkResources = false

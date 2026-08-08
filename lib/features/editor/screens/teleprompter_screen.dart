@@ -20,8 +20,9 @@ class TeleprompterScreen extends StatefulWidget {
   State<TeleprompterScreen> createState() => _TeleprompterScreenState();
 }
 
-class _TeleprompterScreenState extends State<TeleprompterScreen> {
-  static const double _itemExtent = 168;
+class _TeleprompterScreenState extends State<TeleprompterScreen>
+    with WidgetsBindingObserver {
+  static const double _minimumItemExtent = 168;
 
   final ScrollController _scrollController = ScrollController();
   late final List<SubtitleEntry> _entries;
@@ -35,9 +36,13 @@ class _TeleprompterScreenState extends State<TeleprompterScreen> {
   double _fontSize = 38;
   int _currentIndex = 0;
 
+  double get _itemExtent =>
+      math.max(_minimumItemExtent, _fontSize * 3 * 1.18 + 24);
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _entries = List<SubtitleEntry>.from(widget.entries)
       ..sort((a, b) => a.startTime.compareTo(b.startTime));
     _endPosition = _entries.isEmpty ? Duration.zero : _entries.last.endTime;
@@ -46,9 +51,27 @@ class _TeleprompterScreenState extends State<TeleprompterScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _ticker?.cancel();
     _scrollController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.resumed:
+        if (_isRunning) _startTicker();
+        break;
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+        _ticker?.cancel();
+        _ticker = null;
+        _lastTickAt = null;
+        break;
+    }
   }
 
   void _onTick() {
@@ -265,8 +288,12 @@ class _TeleprompterScreenState extends State<TeleprompterScreen> {
   }
 
   Widget _buildProgressHeader(List<SubtitleEntry> entries) {
-    final totalMs = math.max(1, _endPosition.inMilliseconds);
-    final progress = (_position.inMilliseconds / totalMs).clamp(0.0, 1.0);
+    final startMs = entries.first.startTime.inMilliseconds;
+    final totalMs = math.max(1, _endPosition.inMilliseconds - startMs);
+    final progress = ((_position.inMilliseconds - startMs) / totalMs).clamp(
+      0.0,
+      1.0,
+    );
     return Container(
       padding: const EdgeInsets.fromLTRB(18, 8, 18, 12),
       decoration: const BoxDecoration(
@@ -383,7 +410,12 @@ class _TeleprompterScreenState extends State<TeleprompterScreen> {
                     max: 58,
                     divisions: 8,
                     label: '${_fontSize.round()}',
-                    onChanged: (value) => setState(() => _fontSize = value),
+                    onChanged: (value) {
+                      setState(() => _fontSize = value);
+                      WidgetsBinding.instance.addPostFrameCallback((_) {
+                        if (mounted) _scrollToCurrent();
+                      });
+                    },
                   ),
                 ),
               ],

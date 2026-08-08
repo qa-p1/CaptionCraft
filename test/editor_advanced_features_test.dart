@@ -75,6 +75,56 @@ void main() {
     expect(restored.autoDuck, isTrue);
   });
 
+  test('freeze selection and blur-strength keyframes survive persistence', () {
+    final clip = TimelineClip(
+      id: 'freeze_blur',
+      trackId: 'video',
+      type: TimelineTrackType.video,
+      label: 'Freeze and blur',
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 2),
+      sourceDuration: const Duration(seconds: 2),
+      freezeFrame: true,
+      freezeFrameSourceTime: const Duration(milliseconds: 750),
+      blur: const ClipBlurSettings(mode: ClipBlurMode.full, strength: 4),
+      keyframes: [
+        TimelineKeyframe(
+          id: 'blur_start',
+          time: Duration.zero,
+          property: TimelineKeyframeProperty.blurStrength,
+          value: 4,
+        ),
+        TimelineKeyframe(
+          id: 'blur_end',
+          time: const Duration(seconds: 1),
+          property: TimelineKeyframeProperty.blurStrength,
+          value: 20,
+        ),
+      ],
+    );
+
+    final restored = TimelineClip.fromJson(clip.toJson());
+
+    expect(restored.freezeFrameSourceTime, const Duration(milliseconds: 750));
+    expect(
+      restored.effectiveFreezeFrameSourceTime,
+      const Duration(milliseconds: 750),
+    );
+    expect(
+      restored.blurAt(const Duration(milliseconds: 500)).strength,
+      closeTo(12, 0.0001),
+    );
+    expect(
+      restored.keyframes
+          .where(
+            (keyframe) =>
+                keyframe.property == TimelineKeyframeProperty.blurStrength,
+          )
+          .map((keyframe) => keyframe.id),
+      ['blur_start', 'blur_end'],
+    );
+  });
+
   test(
     'editor notifier supports multi-selection, keyframes, and track tools',
     () {

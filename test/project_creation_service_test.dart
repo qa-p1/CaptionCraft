@@ -7,6 +7,7 @@ void main() {
   group('project creation', () {
     test('builds a loadable multi-clip timeline in import order', () async {
       final project = await ProjectCreationService.createProjectFromVideos(
+        ownerUid: 'user-a',
         sources: const [
           ImportedVideoSource(
             filePath: '/media/first.mp4',
@@ -29,6 +30,7 @@ void main() {
       );
 
       expect(project.name, 'New montage');
+      expect(project.ownerUid, 'user-a');
       expect(project.durationMs, 4250);
       expect(project.thumbnailBase64, isNull);
       expect(project.timeline.assets, hasLength(2));
@@ -56,6 +58,7 @@ void main() {
     test('rejects media that has no readable duration', () async {
       await expectLater(
         ProjectCreationService.createProjectFromVideos(
+          ownerUid: 'user-a',
           sources: const [
             ImportedVideoSource(
               filePath: '/media/broken.mp4',

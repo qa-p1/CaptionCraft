@@ -12,6 +12,37 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   group('caption export safeguards', () {
+    test('bounds imported cues to the playable composition', () {
+      final inside = SubtitleEntry(
+        id: 'inside',
+        startTime: const Duration(seconds: 1),
+        endTime: const Duration(seconds: 2),
+        text: 'Inside',
+      );
+      final crossing = SubtitleEntry(
+        id: 'crossing',
+        startTime: const Duration(milliseconds: 2500),
+        endTime: const Duration(seconds: 5),
+        text: 'Crossing',
+      );
+      final outside = SubtitleEntry(
+        id: 'outside',
+        startTime: const Duration(seconds: 6),
+        endTime: const Duration(seconds: 7),
+        text: 'Outside',
+      );
+
+      final result = SubtitleExportService.clampEntriesToDuration([
+        outside,
+        crossing,
+        inside,
+      ], const Duration(seconds: 3));
+
+      expect(result.map((entry) => entry.id), ['inside', 'crossing']);
+      expect(result.first, same(inside));
+      expect(result.last.endTime, const Duration(seconds: 3));
+    });
+
     test('resolves visible captions without losing rich cue data', () {
       final richEntry = SubtitleEntry(
         id: 'enabled',
@@ -246,8 +277,8 @@ void main() {
       );
       final graph = arguments[arguments.indexOf('-filter_complex') + 1];
 
-      expect(graph, contains('between(t,0.500000,1.500000)'));
-      expect(graph, contains('between(t,1.000000,2.500000)'));
+      expect(graph, contains('gte(t,0.500000)*lt(t,1.500000)'));
+      expect(graph, contains('gte(t,1.000000)*lt(t,2.500000)'));
       expect(graph, contains('effectBlurRegion'));
       expect(graph, contains('colorchannelmixer=rr='));
       expect(graph, contains("fontsdir='C\\:/tmp/caption fonts'"));

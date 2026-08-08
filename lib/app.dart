@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'core/theme/app_theme.dart';
+import 'core/utils/firebase_service.dart';
 import 'features/auth/screens/login_screen.dart';
 import 'features/home/screens/home_screen.dart';
 import 'features/auth/providers/auth_provider.dart';
@@ -24,7 +25,75 @@ class CaptionCraftApp extends ConsumerWidget {
           return const HomeScreen();
         },
         loading: () => const _AppBootScreen(),
-        error: (e, st) => const LoginScreen(),
+        error: (error, _) {
+          // A transient auth-stream failure is not a sign-out event. Keep an
+          // already restored Firebase session usable; otherwise offer retry.
+          if (FirebaseService.currentUser != null) {
+            return const HomeScreen();
+          }
+          return _AppAuthErrorScreen(
+            message: error.toString(),
+            onRetry: () => ref.invalidate(authStateProvider),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _AppAuthErrorScreen extends StatelessWidget {
+  const _AppAuthErrorScreen({required this.message, required this.onRetry});
+
+  final String message;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: kBackground,
+      body: SafeArea(
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 430),
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(
+                    Icons.cloud_off_rounded,
+                    color: kWarning,
+                    size: 42,
+                  ),
+                  const SizedBox(height: 18),
+                  const Text(
+                    'Could not restore your session',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: kTextPrimary,
+                      fontSize: 22,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    message.replaceFirst('Exception: ', ''),
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: kTextSecondary, height: 1.4),
+                  ),
+                  const SizedBox(height: 22),
+                  FilledButton.icon(
+                    onPressed: onRetry,
+                    icon: const Icon(Icons.refresh_rounded),
+                    label: const Text('Try again'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }

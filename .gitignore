@@ -100,7 +100,6 @@ atlassian-ide-plugin.xml
 .env.*
 !.env.example
 firebase-debug.log
-firebase.json
 google-services.json
 GoogleService-Info.plist
 

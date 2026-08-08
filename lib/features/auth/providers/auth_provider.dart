@@ -11,7 +11,14 @@ final authStateProvider = StreamProvider<User?>((ref) {
 
 /// Convenience provider for the current user.
 final currentUserProvider = Provider<User?>((ref) {
-  return ref.watch(authStateProvider).asData?.value;
+  final authState = ref.watch(authStateProvider);
+  return authState.when(
+    data: (user) => user,
+    loading: () => FirebaseService.currentUser,
+    // A transient token/stream error must not turn a restored Firebase
+    // session into an apparent sign-out for screens already in the app.
+    error: (_, _) => FirebaseService.currentUser,
+  );
 });
 
 /// Notifier for auth operations (sign in, register, sign out, Google).

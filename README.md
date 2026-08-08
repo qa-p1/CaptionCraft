@@ -1,80 +1,47 @@
 # CaptionCraft
 
-CaptionCraft is a local-first, multi-track video editor built with Flutter. It
-combines a conventional timeline workflow with word-timed captions and a real
-FFmpeg composition pipeline.
+CaptionCraft is a local-first Flutter video editor for Android and iOS. It
+combines a multi-track timeline, word-timed captions, Creator Lab tools, and an
+FFmpeg H.264/AAC export pipeline.
 
-## Editing workflow
+## Highlights
 
-- Multi-video timeline with gaps, overlays, text, captions, and audio lanes
-- Trim, split, ripple editing, snapping, markers, zoom, copy, paste, duplicate,
-  track reorder, lock, hide, mute, solo, and editor-wide undo/redo
-- Clip transforms, fit modes, opacity, layer order, playback speed, filters,
-  color correction, fades, transitions, and clip animation
-- Audio volume, stereo pan, normalization, mute, and fade controls
-- Canvas presets for original, 16:9, 9:16, 1:1, and 4:5 with background,
-  grids, safe areas, and guide snapping
-- Automatic word-timed captions, manual editing, style overrides, karaoke
-  timing, quality checks, overlap repair, find/replace, batch shifting,
-  normalization, and SRT/VTT import/export
-- H.264/AAC delivery with selectable resolution, frame rate, quality, audio,
-  caption burn-in, gallery saving, output verification, and playback preview
+- Multi-video editing with overlays, text, audio, effects, transitions, and keyframes
+- Automatic and manual captions with per-cue styling, karaoke timing, and SRT/VTT I/O
+- Undo/redo, autosave, account-scoped local projects, and Firestore reconciliation
+- Canvas presets, work-area playback, export preview, and gallery delivery
 
-## Creator Lab
-
-Creator Lab adds 23 offline-first workflows directly inside the editor:
-
-- 15 precision tools for line balancing, reading-speed timing, automatic
-  splitting and merging, filler and echo cleanup, punctuation, frame snapping,
-  empty and sound-cue cleanup, term masking, speaker labels, glossary
-  enforcement, and collision-safe timing padding
-- A pace heatmap and confidence review queue with jump-to-cue navigation
-- Seven signature experiences: Viral Moment Radar, Magic Chapter Director,
-  Kinetic Caption Director, B-roll Storyboard, Social Launch Pack, Karaoke Time
-  Machine, and a mirrored full-screen Teleprompter Stage
-
-Projects autosave locally and reconcile with Firestore when the signed-in
-workspace is online. Original media and delivered files are not deleted when a
-project is removed.
-
-## Local setup
-
-1. Install Flutter and an Android/iOS toolchain.
-2. Copy `.env.example` to `.env`.
-3. Add development API credentials.
-4. Run:
+## Run locally
 
 ```sh
+cp .env.example .env
+# Add GROQ_API_KEY and GIPHY_API_KEY to .env
 flutter pub get
-flutter run
+flutter run --dart-define-from-file=.env
 ```
 
-`.env`, Firebase platform files, and release signing files are intentionally
-ignored. Client-side API credentials can always be recovered from a distributed
-app; production deployments should put paid transcription credentials behind an
-authenticated server proxy.
+Firebase client options are tracked. Deploy the matching Firestore policy before
+using cloud sync:
 
-For Android release signing, create `android/key.properties`:
-
-```properties
-storeFile=your-release-key.jks
-storePassword=...
-keyAlias=...
-keyPassword=...
+```sh
+firebase deploy --only firestore:rules
 ```
 
-Without that local file, release builds use the debug key so development and CI
-validation remain possible; do not publish that fallback build.
-
-## Verification
+## Verify and build
 
 ```sh
 flutter analyze
 flutter test
-flutter build apk --debug
-flutter build apk --release
+flutter build apk --release --split-per-abi --dart-define-from-file=.env
 ```
 
-The test suite includes schema compatibility, editor history, subtitle
-workflows, responsive UI/goldens, and a real FFmpeg integration render that
-probes the delivered video, audio, duration, and dimensions.
+Release builds require `android/key.properties` with `storeFile`,
+`storePassword`, `keyAlias`, and `keyPassword`; they fail instead of silently
+using a debug key.
+
+## Distribution note
+
+Do not ship a Groq key in a public client: proxy transcription through an
+authenticated backend with App Check and server-side quota enforcement. The
+FFmpeg package includes Full-GPL components, so satisfy its licensing and source
+distribution requirements before publishing binaries.

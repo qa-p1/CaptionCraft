@@ -63,9 +63,10 @@ class DefaultFirebaseOptions {
     messagingSenderId: '241322582096',
     projectId: 'captioncraft-b1abb',
     storageBucket: 'captioncraft-b1abb.firebasestorage.app',
-    androidClientId: '241322582096-f7fpfvuu9nuddoa0pq0n03u3av500e7n.apps.googleusercontent.com',
-    iosClientId: '241322582096-gj0gd8aha12bcrpf7ltvk7e2dv21cvat.apps.googleusercontent.com',
+    androidClientId:
+        '241322582096-f7fpfvuu9nuddoa0pq0n03u3av500e7n.apps.googleusercontent.com',
+    iosClientId:
+        '241322582096-gj0gd8aha12bcrpf7ltvk7e2dv21cvat.apps.googleusercontent.com',
     iosBundleId: 'com.captioncraft.captionCraft',
   );
-
 }

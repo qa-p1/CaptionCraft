@@ -260,11 +260,16 @@ class SubtitleStylePanel extends ConsumerWidget {
                   max: 48,
                   activeColor: kAccent,
                   inactiveColor: kBorder,
+                  onChangeStart: (_) => ref
+                      .read(subtitleProvider.notifier)
+                      .beginStyleGestureEdit(),
                   onChanged: (value) {
                     ref
                         .read(subtitleProvider.notifier)
-                        .updateGlobalStyle(style.copyWith(fontSize: value));
+                        .updateGlobalStyleLive(style.copyWith(fontSize: value));
                   },
+                  onChangeEnd: (_) =>
+                      ref.read(subtitleProvider.notifier).endStyleGestureEdit(),
                 ),
               ),
             ],
@@ -291,13 +296,18 @@ class SubtitleStylePanel extends ConsumerWidget {
                   max: 1.0,
                   activeColor: kAccent,
                   inactiveColor: kBorder,
+                  onChangeStart: (_) => ref
+                      .read(subtitleProvider.notifier)
+                      .beginStyleGestureEdit(),
                   onChanged: (value) {
                     ref
                         .read(subtitleProvider.notifier)
-                        .updateGlobalStyle(
+                        .updateGlobalStyleLive(
                           style.copyWith(maxWidthFactor: value),
                         );
                   },
+                  onChangeEnd: (_) =>
+                      ref.read(subtitleProvider.notifier).endStyleGestureEdit(),
                 ),
               ),
             ],
@@ -360,13 +370,17 @@ class SubtitleStylePanel extends ConsumerWidget {
               max: 1,
               activeColor: kAccent,
               inactiveColor: kBorder,
+              onChangeStart: (_) =>
+                  ref.read(subtitleProvider.notifier).beginStyleGestureEdit(),
               onChanged: (value) {
                 ref
                     .read(subtitleProvider.notifier)
-                    .updateGlobalStyle(
+                    .updateGlobalStyleLive(
                       style.copyWith(backgroundOpacity: value),
                     );
               },
+              onChangeEnd: (_) =>
+                  ref.read(subtitleProvider.notifier).endStyleGestureEdit(),
             ),
           ],
           const SizedBox(height: 16),
@@ -397,13 +411,18 @@ class SubtitleStylePanel extends ConsumerWidget {
                   max: 60,
                   activeColor: kAccent,
                   inactiveColor: kBorder,
+                  onChangeStart: (_) => ref
+                      .read(subtitleProvider.notifier)
+                      .beginStyleGestureEdit(),
                   onChanged: (value) {
                     ref
                         .read(subtitleProvider.notifier)
-                        .updateGlobalStyle(
+                        .updateGlobalStyleLive(
                           style.copyWith(verticalOffset: value),
                         );
                   },
+                  onChangeEnd: (_) =>
+                      ref.read(subtitleProvider.notifier).endStyleGestureEdit(),
                 ),
               ),
             ],
