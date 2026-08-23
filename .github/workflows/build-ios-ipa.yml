@@ -1,0 +1,101 @@
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ios:
+    name: Flutter 3.41.2 / iOS 15+
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install pinned Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.2'
+          channel: stable
+          cache: true
+
+      - name: Record build toolchain
+        run: |
+          flutter --version
+          xcodebuild -version
+          pod --version
+
+      - name: Restore locked Dart packages
+        run: flutter pub get --enforce-lockfile
+
+      - name: Build unsigned iPhone application
+        shell: bash
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GIPHY_API_KEY: ${{ secrets.GIPHY_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          CAPTIONCRAFT_ASSET_MANIFEST_URL: ${{ vars.CAPTIONCRAFT_ASSET_MANIFEST_URL }}
+        run: |
+          set -euo pipefail
+
+          required_values=(
+            GROQ_API_KEY
+            GIPHY_API_KEY
+            PEXELS_API_KEY
+            PIXABAY_API_KEY
+            CAPTIONCRAFT_ASSET_MANIFEST_URL
+          )
+          for value_name in "${required_values[@]}"; do
+            if [[ -z "${!value_name:-}" ]]; then
+              echo "::error::Missing GitHub Actions configuration: ${value_name}"
+              exit 1
+            fi
+          done
+
+          define_file="$RUNNER_TEMP/captioncraft.env"
+          trap 'rm -f "$define_file"' EXIT
+          umask 077
+          printf '%s\n' \
+            "GROQ_API_KEY=$GROQ_API_KEY" \
+            "GIPHY_API_KEY=$GIPHY_API_KEY" \
+            "PEXELS_API_KEY=$PEXELS_API_KEY" \
+            "PIXABAY_API_KEY=$PIXABAY_API_KEY" \
+            "CAPTIONCRAFT_ASSET_MANIFEST_URL=$CAPTIONCRAFT_ASSET_MANIFEST_URL" \
+            > "$define_file"
+
+          flutter build ios \
+            --release \
+            --no-codesign \
+            --dart-define-from-file="$define_file"
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d build/ios/iphoneos/Runner.app
+
+          ipa_root="$RUNNER_TEMP/captioncraft-ipa"
+          mkdir -p "$ipa_root/Payload"
+          ditto build/ios/iphoneos/Runner.app "$ipa_root/Payload/Runner.app"
+          cd "$ipa_root"
+          ditto -c -k --keepParent Payload "$GITHUB_WORKSPACE/CaptionCraft-unsigned.ipa"
+
+      - name: Upload IPA and resolved pods
+        uses: actions/upload-artifact@v4
+        with:
+          name: CaptionCraft-unsigned-ipa
+          path: |
+            CaptionCraft-unsigned.ipa
+            ios/Podfile.lock
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
