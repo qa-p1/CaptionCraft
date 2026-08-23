@@ -17,7 +17,7 @@ import UIKit
     )
     let channel = FlutterMethodChannel(
       name: "captioncraft/asset_pack_storage",
-      binaryMessenger: registrar.messenger()
+      binaryMessenger: registrar!.messenger()
     )
     channel.setMethodCallHandler { call, result in
       guard call.method == "availableBytes" else {
