@@ -400,9 +400,12 @@ class SubtitleExportService {
                     (playResY / kTimelineDesignHeight))
             .clamp(0, playResY)
             .round();
-    final escaped = _escapeAssText(entry.text);
+    final renderedEntry = style.isAllCaps
+        ? entry.copyWith(text: entry.text.toUpperCase())
+        : entry;
+    final escaped = _escapeAssText(renderedEntry.text);
     if (style.animationPreset == SubtitleAnimationPreset.wordPop) {
-      final fragments = _resolveWordAnimationFragments(entry);
+      final fragments = _resolveWordAnimationFragments(renderedEntry);
       if (fragments.isNotEmpty) {
         final primaryAlpha = _assAlpha(style.textColor.a);
         final secondaryAlpha = primaryAlpha;
@@ -415,7 +418,7 @@ class SubtitleExportService {
           final startMs = fragment.startOffset.inMilliseconds;
           final endMs = (startMs + _wordPopDuration.inMilliseconds).clamp(
             startMs,
-            entry.duration.inMilliseconds,
+            renderedEntry.duration.inMilliseconds,
           );
           pop
             ..write(
@@ -431,11 +434,10 @@ class SubtitleExportService {
       }
     }
     if (style.animationPreset == SubtitleAnimationPreset.karaokeHighlight) {
-      final fragments = _resolveKaraokeAnimationFragments(entry);
+      final fragments = _resolveKaraokeAnimationFragments(renderedEntry);
       if (fragments.isEmpty) {
-        final durationCentiseconds = (entry.duration.inMilliseconds / 10)
-            .round()
-            .clamp(1, 9999);
+        final durationCentiseconds =
+            (renderedEntry.duration.inMilliseconds / 10).round().clamp(1, 9999);
         return '{\\pos($x,$y)\\kf$durationCentiseconds}$escaped';
       }
       final karaoke = StringBuffer('{\\pos($x,$y)}');
@@ -462,13 +464,12 @@ class SubtitleExportService {
     }
 
     if (style.animationPreset == SubtitleAnimationPreset.typewriter) {
-      final characters = entry.text.runes
+      final characters = renderedEntry.text.runes
           .map(String.fromCharCode)
           .toList(growable: false);
       if (characters.isNotEmpty) {
-        final durationCentiseconds = (entry.duration.inMilliseconds / 10)
-            .round()
-            .clamp(1, 9999);
+        final durationCentiseconds =
+            (renderedEntry.duration.inMilliseconds / 10).round().clamp(1, 9999);
         final characterDuration = (durationCentiseconds / characters.length)
             .round()
             .clamp(1, 9999);
@@ -489,6 +490,20 @@ class SubtitleExportService {
     if (style.animationPreset == SubtitleAnimationPreset.wordSlideUp) {
       final travel = (12 * (playResY / kTimelineDesignHeight)).round();
       return '{\\move($x,${y + travel},$x,$y,0,180)\\fad(180,0)}$escaped';
+    }
+    if (style.animationPreset == SubtitleAnimationPreset.zoomIn) {
+      return '{\\pos($x,$y)\\alpha&HFF&\\fscx72\\fscy72'
+          '\\t(0,220,\\alpha&H00&\\fscx100\\fscy100)}$escaped';
+    }
+    if (style.animationPreset == SubtitleAnimationPreset.slideFromLeft) {
+      final travel = (28 * (playResX / kTimelineDesignWidth)).round();
+      return '{\\move(${x - travel},$y,$x,$y,0,240)\\fad(180,0)}$escaped';
+    }
+    if (style.animationPreset == SubtitleAnimationPreset.bounceIn) {
+      return '{\\pos($x,$y)\\alpha&HFF&\\fscx55\\fscy55'
+          '\\t(0,110,\\alpha&H00&)'
+          '\\t(0,218,\\fscx110\\fscy110)'
+          '\\t(218,320,\\fscx100\\fscy100)}$escaped';
     }
     return '{\\pos($x,$y)$animationOverride}$escaped';
   }

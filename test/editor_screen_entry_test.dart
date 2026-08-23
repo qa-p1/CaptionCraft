@@ -72,7 +72,7 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('bottom tools use five groups and at most three subgroups', (
+  testWidgets('progressive dock drills from categories to grouped tools', (
     tester,
   ) async {
     _setTestView(tester, const Size(390, 844));
@@ -81,49 +81,255 @@ void main() {
     );
     await tester.pump(const Duration(milliseconds: 600));
 
-    for (final group in const ['Add', 'Edit', 'Effects', 'Audio', 'Canvas']) {
-      expect(find.text(group), findsWidgets);
+    final dock = find.byKey(const ValueKey('editor_tool_dock'));
+    Finder inDock(Finder matching) =>
+        find.descendant(of: dock, matching: matching);
+
+    Future<void> tapDock(String key) async {
+      final target = find.byKey(ValueKey(key));
+      await tester.ensureVisible(target);
+      await tester.tap(target);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 260));
     }
 
-    await tester.tap(find.text('Edit').last);
-    await tester.pump(const Duration(milliseconds: 260));
-    expect(find.text('Timing'), findsOneWidget);
-    expect(find.text('Transform'), findsOneWidget);
-    expect(find.text('Arrange'), findsOneWidget);
+    expect(dock, findsOneWidget);
+    expect(find.byKey(const ValueKey('categories')), findsOneWidget);
+    for (final category in const {
+      'edit': 'Edit',
+      'effects': 'Effects',
+      'audio': 'Audio',
+      'text': 'Text',
+      'timeline': 'Timeline',
+      'canvas': 'Canvas',
+      'studio': 'Studio',
+      'discover': 'Discover',
+    }.entries) {
+      expect(
+        find.byKey(ValueKey('dock_category_${category.key}')),
+        findsOneWidget,
+      );
+      expect(inDock(find.text(category.value)), findsOneWidget);
+    }
+    final editCategory = find.byKey(const ValueKey('dock_category_edit'));
+    expect(tester.getSize(editCategory).width, 72);
+    expect(
+      tester
+          .widget<Icon>(
+            find.descendant(
+              of: editCategory,
+              matching: find.byIcon(Icons.content_cut_rounded),
+            ),
+          )
+          .size,
+      22,
+    );
+    final categoryScroll = tester.state<ScrollableState>(
+      find.descendant(
+        of: find.byKey(const ValueKey('categories')),
+        matching: find.byType(Scrollable),
+      ),
+    );
+    expect(categoryScroll.position.maxScrollExtent, greaterThan(0));
+    expect(find.byKey(const ValueKey('editor_export_button')), findsOneWidget);
+    expect(find.byTooltip('Editor tools'), findsNothing);
+    expect(find.byIcon(Icons.more_horiz_rounded), findsNothing);
+    expect(find.text('Creator Lab'), findsNothing);
 
-    await tester.tap(find.text('Transform'));
-    await tester.pump(const Duration(milliseconds: 260));
-    for (final tool in const [
-      'Crop',
-      'Fill',
-      'Fit',
-      'Stretch',
-      'Rotate L',
-      'Rotate R',
-      'Mirror',
-      'Flip V',
-      'Reset',
+    // Timeline track controls already own creation and the toolbar owns the
+    // selected-clip split action, so the dock root must not repeat them.
+    for (final duplicate in const ['Overlay', 'Add Text', 'Split', 'Add']) {
+      expect(inDock(find.text(duplicate)), findsNothing);
+    }
+
+    await tapDock('dock_category_edit');
+    expect(find.byKey(const ValueKey('subgroups_edit')), findsOneWidget);
+    expect(find.byKey(const ValueKey('categories')), findsNothing);
+    expect(find.byKey(const ValueKey('dock_back_button')), findsOneWidget);
+    for (final subgroup in const [
+      'editTiming',
+      'editTransform',
+      'editDetails',
     ]) {
-      expect(find.text(tool), findsOneWidget);
+      expect(find.byKey(ValueKey('dock_subgroup_$subgroup')), findsOneWidget);
     }
 
-    await tester.ensureVisible(find.text('Back').last);
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Back').last);
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Back').last);
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Effects'));
-    await tester.pump(const Duration(milliseconds: 260));
-    expect(find.text('Looks'), findsOneWidget);
-    expect(find.text('Blur'), findsOneWidget);
-    expect(find.text('Motion'), findsOneWidget);
+    await tapDock('dock_subgroup_editTransform');
+    expect(find.byKey(const ValueKey('tools_editTransform')), findsOneWidget);
+    expect(find.byKey(const ValueKey('subgroups_edit')), findsNothing);
+    expect(find.byKey(const ValueKey('dock_back_button')), findsOneWidget);
+    for (final tool in const ['inspector', 'crop']) {
+      expect(
+        find.byKey(ValueKey('dock_tool_edit_editTransform_$tool')),
+        findsOneWidget,
+      );
+    }
 
-    await tester.tap(find.text('Blur'));
-    await tester.pump(const Duration(milliseconds: 260));
-    expect(find.text('Whole'), findsOneWidget);
-    expect(find.text('Region'), findsOneWidget);
-    expect(find.text('Remove'), findsOneWidget);
+    await tapDock('dock_back_button');
+    expect(find.byKey(const ValueKey('subgroups_edit')), findsOneWidget);
+    await tapDock('dock_back_button');
+    expect(find.byKey(const ValueKey('categories')), findsOneWidget);
+
+    await tapDock('dock_category_effects');
+    for (final subgroup in const [
+      'effectsColor',
+      'effectsBlur',
+      'effectsMotion',
+      'effectsKeyframes',
+      'effectsEnhance',
+    ]) {
+      expect(find.byKey(ValueKey('dock_subgroup_$subgroup')), findsOneWidget);
+    }
+    await tapDock('dock_subgroup_effectsColor');
+    for (final tool in const ['chroma_key', 'filters', 'adjust']) {
+      expect(
+        find.byKey(ValueKey('dock_tool_effects_effectsColor_$tool')),
+        findsOneWidget,
+      );
+    }
+    await tapDock('dock_back_button');
+    await tapDock('dock_back_button');
+
+    await tapDock('dock_category_text');
+    for (final subgroup in const ['textObjects', 'textCaptions', 'textFiles']) {
+      expect(find.byKey(ValueKey('dock_subgroup_$subgroup')), findsOneWidget);
+    }
+    await tapDock('dock_subgroup_textCaptions');
+    expect(
+      find.byKey(const ValueKey('dock_tool_text_textCaptions_style')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('dock_tool_text_textCaptions_workshop')),
+      findsOneWidget,
+    );
+    await tapDock('dock_back_button');
+    await tapDock('dock_back_button');
+
+    // Canvas, Studio, and Discover are intentionally large, direct
+    // destinations. Discover has its own injected sheet coverage so this
+    // editor smoke test does not instantiate a native platform WebView.
+    await tapDock('dock_category_canvas');
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('resizable_editor_sheet')),
+      findsOneWidget,
+    );
+    expect(find.text('Format, background and guides'), findsOneWidget);
+    await tester.tap(find.byTooltip('Close'));
+    await tester.pumpAndSettle();
+
+    await tapDock('dock_category_studio');
+    await tester.pumpAndSettle();
+    expect(find.text('Creator Lab'), findsOneWidget);
+    await tester.pageBack();
+    await tester.pumpAndSettle();
+    expect(find.byType(EditorScreen), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('compact add choices stay fixed and libraries resize', (
+    tester,
+  ) async {
+    _setTestView(tester, const Size(390, 844));
+    await tester.pumpWidget(
+      _testApp(home: EditorScreen(project: _layeredProject())),
+    );
+    await tester.pump(const Duration(milliseconds: 700));
+
+    await tester.tap(
+      find.byKey(const ValueKey('timeline_track_add_overlay-primary')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Add overlay'), findsOneWidget);
+    expect(find.text('Photos'), findsOneWidget);
+    expect(find.text('Videos'), findsOneWidget);
+    expect(find.text('GIF'), findsNothing);
+    expect(find.text('Elements'), findsOneWidget);
+    expect(find.byKey(const ValueKey('fixed_editor_sheet')), findsOneWidget);
+    expect(find.byKey(const ValueKey('resizable_sheet_handle')), findsNothing);
+    await tester.ensureVisible(find.text('Elements'));
+    await tester.tap(find.text('Elements'));
+    await tester.pumpAndSettle();
+    expect(find.text('Library placeholder'), findsNothing);
+    expect(
+      find.byKey(const ValueKey('element-library-navigation')),
+      findsOneWidget,
+    );
+    for (final destination in const [
+      'GIPHY',
+      'Pexels',
+      'Pixabay',
+      'BG Videos',
+      'Overlays',
+    ]) {
+      expect(find.text(destination), findsOneWidget);
+    }
+    expect(
+      find.byKey(const ValueKey('resizable_sheet_handle')),
+      findsOneWidget,
+    );
+    await tester.tap(find.byTooltip('Close'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(
+      find.byKey(const ValueKey('timeline_track_add_text-primary')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Add Text'), findsOneWidget);
+    expect(find.text('Subtitles'), findsOneWidget);
+    expect(find.byKey(const ValueKey('resizable_sheet_handle')), findsNothing);
+    await tester.tap(find.text('Add Text'));
+    // The add menu closes before the persistent text editor animates in.
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('text_editor_field')), findsOneWidget);
+    await tester.enterText(
+      find.byKey(const ValueKey('text_editor_field')),
+      'Direct canvas title',
+    );
+    await tester.pump();
+    expect(find.text('Direct canvas title'), findsWidgets);
+    tester.testTextInput.hide();
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('text_editor_done')));
+    await tester.pumpAndSettle();
+
+    await tester.tap(
+      find.byKey(const ValueKey('timeline_track_add_source-audio')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Select a local track'), findsOneWidget);
+    expect(find.text('SFX'), findsOneWidget);
+    expect(find.text('Music'), findsOneWidget);
+    expect(find.byKey(const ValueKey('resizable_sheet_handle')), findsNothing);
+    await tester.ensureVisible(find.text('SFX'));
+    await tester.tap(find.text('SFX'));
+    await tester.pumpAndSettle();
+    expect(find.text('Sound effects'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('sfx-library-openverse-search')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('sfx-library-openverse-notice')),
+      findsOneWidget,
+    );
+    expect(find.text('Library placeholder'), findsNothing);
+    expect(
+      find.byKey(const ValueKey('resizable_sheet_handle')),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.byTooltip('Close'));
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.byKey(const ValueKey('timeline_track_add_source-audio')),
+    );
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('Music'));
+    await tester.tap(find.text('Music'));
+    await tester.pumpAndSettle();
+    expect(find.text('Library placeholder'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -226,6 +432,81 @@ Project _freshProject() {
   return Project(
     id: 'fresh-project',
     name: 'Fresh editor project',
+    videoPath: sourcePath,
+    durationMs: duration.inMilliseconds,
+    timeline: timeline,
+  )..cacheVideoAvailability(true);
+}
+
+Project _layeredProject() {
+  const duration = Duration(seconds: 12);
+  const sourcePath = 'layered-source.mp4';
+  final asset = EditorAssetReference(
+    id: 'layered-asset',
+    type: EditorAssetType.video,
+    label: 'Layered source',
+    sourcePath: sourcePath,
+    metadata: const {'durationMs': 12000, 'hasAudio': true},
+  );
+  final video = TimelineClip(
+    id: 'layered-video',
+    trackId: 'source-video',
+    type: TimelineTrackType.video,
+    label: 'Layered source',
+    assetId: asset.id,
+    startTime: Duration.zero,
+    endTime: duration,
+    sourceDuration: duration,
+    audioMix: const AudioMixSettings(muted: true),
+  );
+  final timeline = EditorTimeline(
+    assets: [asset],
+    tracks: [
+      TimelineTrack(
+        id: 'text-primary',
+        name: 'Text',
+        type: TimelineTrackType.text,
+        section: TimelineTrackSection.textSubtitle,
+      ),
+      TimelineTrack(
+        id: 'overlay-primary',
+        name: 'Overlay',
+        type: TimelineTrackType.video,
+        section: TimelineTrackSection.overlay,
+      ),
+      TimelineTrack(
+        id: 'source-video',
+        name: 'Source video',
+        type: TimelineTrackType.video,
+        section: TimelineTrackSection.baseVideo,
+        role: TimelineTrackRole.sourceVideo,
+        clips: [video],
+      ),
+      TimelineTrack(
+        id: 'source-audio',
+        name: 'Source audio',
+        type: TimelineTrackType.audio,
+        section: TimelineTrackSection.audio,
+        role: TimelineTrackRole.sourceAudio,
+        clips: [
+          TimelineClip(
+            id: 'layered-audio',
+            trackId: 'source-audio',
+            type: TimelineTrackType.audio,
+            label: 'Layered source audio',
+            assetId: asset.id,
+            linkedClipId: video.id,
+            startTime: Duration.zero,
+            endTime: duration,
+            sourceDuration: duration,
+          ),
+        ],
+      ),
+    ],
+  );
+  return Project(
+    id: 'layered-project',
+    name: 'Layered editor project',
     videoPath: sourcePath,
     durationMs: duration.inMilliseconds,
     timeline: timeline,

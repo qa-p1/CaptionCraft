@@ -55,6 +55,7 @@ class SubtitleStyleModel {
     bool? isItalic,
     bool? isAllCaps,
     SubtitleAnimationPreset? animationPreset,
+    bool clearAnimationPreset = false,
   }) {
     return SubtitleStyleModel(
       fontFamily: fontFamily ?? this.fontFamily,
@@ -72,7 +73,9 @@ class SubtitleStyleModel {
       isBold: isBold ?? this.isBold,
       isItalic: isItalic ?? this.isItalic,
       isAllCaps: isAllCaps ?? this.isAllCaps,
-      animationPreset: animationPreset ?? this.animationPreset,
+      animationPreset: clearAnimationPreset
+          ? null
+          : (animationPreset ?? this.animationPreset),
     );
   }
 
@@ -150,4 +153,7 @@ enum SubtitleAnimationPreset {
   karaokeHighlight,
   wordSlideUp,
   typewriter,
+  zoomIn,
+  slideFromLeft,
+  bounceIn,
 }

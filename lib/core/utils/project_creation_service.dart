@@ -13,15 +13,35 @@ import 'ffmpeg_service.dart';
 typedef ProjectMediaInfoLoader =
     Future<Map<String, dynamic>> Function(String filePath);
 
-class ImportedVideoSource {
+class ImportedMediaSource {
   final String filePath;
   final String displayName;
 
-  const ImportedVideoSource({
+  const ImportedMediaSource({
     required this.filePath,
     required this.displayName,
   });
+
+  EditorAssetType get assetType {
+    return switch (path.extension(filePath).toLowerCase()) {
+      '.png' || '.jpg' || '.jpeg' || '.webp' => EditorAssetType.image,
+      '.gif' => EditorAssetType.gif,
+      _ => EditorAssetType.video,
+    };
+  }
+
+  TimelineTrackType get clipType {
+    return switch (assetType) {
+      EditorAssetType.image => TimelineTrackType.image,
+      EditorAssetType.gif => TimelineTrackType.gif,
+      _ => TimelineTrackType.video,
+    };
+  }
 }
+
+// Kept as a source-compatible alias for callers compiled against the earlier
+// video-only project creator.
+typedef ImportedVideoSource = ImportedMediaSource;
 
 class ProjectCreationService {
   ProjectCreationService._();
@@ -32,9 +52,23 @@ class ProjectCreationService {
     String? projectName,
     bool generateThumbnail = true,
     ProjectMediaInfoLoader? mediaInfoLoader,
+  }) => createProjectFromMedia(
+    sources: sources,
+    ownerUid: ownerUid,
+    projectName: projectName,
+    generateThumbnail: generateThumbnail,
+    mediaInfoLoader: mediaInfoLoader,
+  );
+
+  static Future<Project> createProjectFromMedia({
+    required List<ImportedMediaSource> sources,
+    required String ownerUid,
+    String? projectName,
+    bool generateThumbnail = true,
+    ProjectMediaInfoLoader? mediaInfoLoader,
   }) async {
     if (sources.isEmpty) {
-      throw Exception('Select at least one video to create a project.');
+      throw Exception('Select at least one visual to create a project.');
     }
 
     final assets = <EditorAssetReference>[];
@@ -45,46 +79,54 @@ class ProjectCreationService {
 
     for (var index = 0; index < sources.length; index++) {
       final source = sources[index];
-      final mediaInfo = await loadMediaInfo(source.filePath).timeout(
-        const Duration(seconds: 20),
-        onTimeout: () => throw TimeoutException(
-          'Reading ${source.displayName} took too long. Try importing it again.',
-        ),
-      );
-      final durationMs = (mediaInfo['durationMs'] as int?) ?? 0;
-      if (durationMs <= 0) {
+      Map<String, dynamic> mediaInfo;
+      try {
+        mediaInfo = await loadMediaInfo(source.filePath).timeout(
+          const Duration(seconds: 20),
+          onTimeout: () => throw TimeoutException(
+            'Reading ${source.displayName} took too long. Try importing it again.',
+          ),
+        );
+      } catch (_) {
+        if (source.assetType == EditorAssetType.video) rethrow;
+        mediaInfo = const {};
+      }
+      var durationMs = (mediaInfo['durationMs'] as int?) ?? 0;
+      if (source.assetType == EditorAssetType.video && durationMs <= 0) {
         throw Exception('Could not read duration for ${source.displayName}.');
       }
+      if (durationMs <= 0) durationMs = 4000;
 
       final asset = EditorAssetReference(
-        type: EditorAssetType.video,
+        type: source.assetType,
         label: source.displayName,
         sourcePath: source.filePath,
         metadata: {
           'durationMs': durationMs,
           'width': mediaInfo['width'],
           'height': mediaInfo['height'],
-          'hasAudio': mediaInfo['hasAudio'],
+          'hasAudio':
+              source.assetType == EditorAssetType.video &&
+              mediaInfo['hasAudio'] == true,
           'frameRate': mediaInfo['frameRate'],
         },
       );
       assets.add(asset);
 
       final clipDuration = Duration(milliseconds: durationMs);
-      clips.add(
-        TimelineClip(
-          trackId: 'track_video_primary',
-          type: TimelineTrackType.video,
-          label: source.displayName,
-          assetId: asset.id,
-          startTime: timelineCursor,
-          endTime: timelineCursor + clipDuration,
-          sourceStartTime: Duration.zero,
-          sourceDuration: clipDuration,
-          fitMode: ClipFitMode.cover,
-          layer: index,
-        ),
+      final videoClip = TimelineClip(
+        trackId: 'track_video_primary',
+        type: source.clipType,
+        label: source.displayName,
+        assetId: asset.id,
+        startTime: timelineCursor,
+        endTime: timelineCursor + clipDuration,
+        sourceStartTime: Duration.zero,
+        sourceDuration: clipDuration,
+        fitMode: ClipFitMode.cover,
+        layer: index,
       );
+      clips.add(videoClip);
 
       timelineCursor += clipDuration;
       totalDurationMs += durationMs;
@@ -102,18 +144,26 @@ class ProjectCreationService {
       assets: assets,
       tracks: [
         TimelineTrack(
-          id: 'track_video_primary',
-          name: 'Video 1',
-          type: TimelineTrackType.video,
-          section: TimelineTrackSection.baseVideo,
-          clips: clips,
-        ),
-        TimelineTrack(
-          id: 'track_subtitles',
-          name: 'Subtitles',
-          type: TimelineTrackType.subtitle,
+          id: 'track_text_primary',
+          name: 'Text',
+          type: TimelineTrackType.text,
           section: TimelineTrackSection.textSubtitle,
           clips: const [],
+        ),
+        TimelineTrack(
+          id: 'track_overlay_primary',
+          name: 'Overlay',
+          type: TimelineTrackType.video,
+          section: TimelineTrackSection.overlay,
+          clips: const [],
+        ),
+        TimelineTrack(
+          id: 'track_video_primary',
+          name: 'Base layer',
+          type: TimelineTrackType.video,
+          section: TimelineTrackSection.baseVideo,
+          role: TimelineTrackRole.regular,
+          clips: clips,
         ),
       ],
     );

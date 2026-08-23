@@ -15,6 +15,7 @@ import '../providers/editor_provider.dart';
 import '../providers/playback_provider.dart';
 import '../providers/subtitle_provider.dart';
 import '../widgets/animated_subtitle_overlay.dart';
+import '../widgets/preview_playback_clock.dart';
 
 double _previewAudioVolume({
   required TimelineClip clip,
@@ -85,9 +86,277 @@ bool _isGifSource(String? value) {
   return path.toLowerCase().endsWith('.gif');
 }
 
-const int _maxGifDecodeDimension = 2048;
-const int _maxGifDecodedBytes = 48 * 1024 * 1024;
-const int _maxGifEncodedBytes = 64 * 1024 * 1024;
+/// Every preview decoder participates in one editor mix. Without this option,
+/// platform players can take exclusive audio focus from one another as soon as
+/// a second video or separated-audio controller starts.
+VideoPlayerOptions buildPreviewVideoPlayerOptions() {
+  return VideoPlayerOptions(mixWithOthers: true);
+}
+
+const int _maxPreviewDecodeDimension = 2048;
+const int _maxGifDecodeDimension = 1280;
+const int _maxGifDecodedBytes = 24 * 1024 * 1024;
+const int _maxGifEncodedBytes = 32 * 1024 * 1024;
+const double _gifDecodeSizeQuantum = 32;
+const Duration _gifResizeDecodeDebounce = Duration(milliseconds: 120);
+
+typedef PreviewDuckingInterval = ({int startMs, int endMs});
+
+@visibleForTesting
+bool previewHasSoloMediaTrackForTesting(EditorTimeline timeline) {
+  return timeline.tracks.any(
+    (track) =>
+        track.isSolo &&
+        (!track.isHidden || track.section == TimelineTrackSection.audio) &&
+        track.clips.any(
+          (candidate) =>
+              candidate.enabled &&
+              candidate.endTime > candidate.startTime &&
+              candidate.type != TimelineTrackType.text &&
+              candidate.type != TimelineTrackType.subtitle &&
+              candidate.type != TimelineTrackType.effect,
+        ),
+  );
+}
+
+@visibleForTesting
+bool shouldCreateTimelineAudioPreviewForTesting({
+  required TimelineTrack track,
+  required TimelineClip clip,
+  required bool hasSoloMediaTrack,
+  String? baseMonitoredClipId,
+}) {
+  if (!clip.enabled || clip.audioMix.muted) return false;
+  if (track.isMuted || (hasSoloMediaTrack && !track.isSolo)) return false;
+  return clip.id != baseMonitoredClipId;
+}
+
+@visibleForTesting
+({TimelineTrack track, TimelineClip clip})?
+resolvePreviewLinkedAudioMonitorForTesting({
+  required EditorTimeline timeline,
+  required TimelineClip visualClip,
+  required Duration position,
+}) {
+  if (visualClip.type != TimelineTrackType.video) {
+    return null;
+  }
+  for (final track in timeline.tracks) {
+    if (track.section != TimelineTrackSection.audio) {
+      continue;
+    }
+    for (final candidate in track.clips) {
+      final timingMatches =
+          candidate.startTime == visualClip.startTime &&
+          candidate.endTime == visualClip.endTime &&
+          candidate.sourceStartTime == visualClip.sourceStartTime &&
+          candidate.sourceDuration == visualClip.sourceDuration &&
+          (candidate.playbackRate - visualClip.playbackRate).abs() < 0.0001;
+      if (candidate.enabled &&
+          candidate.type == TimelineTrackType.audio &&
+          candidate.linkedClipId == visualClip.id &&
+          candidate.assetId != null &&
+          candidate.assetId == visualClip.assetId &&
+          !candidate.isReversed &&
+          !candidate.freezeFrame &&
+          timingMatches &&
+          position >= candidate.startTime &&
+          position < candidate.endTime) {
+        return (track: track, clip: candidate);
+      }
+    }
+  }
+  return null;
+}
+
+@visibleForTesting
+({TimelineTrack track, TimelineClip clip})?
+resolvePreviewBaseAudioMonitorForTesting({
+  required EditorTimeline timeline,
+  required TimelineClip baseClip,
+  required Duration position,
+}) {
+  if (baseClip.isReversed || baseClip.freezeFrame) return null;
+  return resolvePreviewLinkedAudioMonitorForTesting(
+    timeline: timeline,
+    visualClip: baseClip,
+    position: position,
+  );
+}
+
+@visibleForTesting
+bool previewHasExplicitLinkedAudioForTesting({
+  required EditorTimeline timeline,
+  required TimelineClip visualClip,
+}) {
+  if (visualClip.type != TimelineTrackType.video) return false;
+  return timeline.tracks.any(
+    (track) =>
+        track.section == TimelineTrackSection.audio &&
+        track.clips.any(
+          (candidate) =>
+              candidate.type == TimelineTrackType.audio &&
+              candidate.linkedClipId == visualClip.id &&
+              candidate.assetId != null &&
+              candidate.assetId == visualClip.assetId,
+        ),
+  );
+}
+
+/// Whether a visual video controller should emit its own embedded audio.
+///
+/// Embedded audio belongs to the visual clip by default. An explicit linked
+/// audio clip transfers ownership to that audio lane, so preview never
+/// doubles the same stream through two platform controllers.
+@visibleForTesting
+bool previewVisualUsesEmbeddedAudioForTesting({
+  required EditorTimeline timeline,
+  required TimelineTrack visualTrack,
+  required TimelineClip visualClip,
+  required Duration position,
+  required bool hasSoloMediaTrack,
+}) {
+  if (!visualClip.enabled ||
+      visualClip.type != TimelineTrackType.video ||
+      visualClip.audioMix.muted ||
+      visualTrack.isMuted ||
+      (hasSoloMediaTrack && !visualTrack.isSolo) ||
+      !timeline.clipHasAudio(visualClip)) {
+    return false;
+  }
+  return !previewHasExplicitLinkedAudioForTesting(
+    timeline: timeline,
+    visualClip: visualClip,
+  );
+}
+
+@visibleForTesting
+List<PreviewDuckingInterval> buildPreviewDuckingIntervalsForTesting({
+  required EditorTimeline timeline,
+  required TimelineClip clip,
+}) {
+  final clipStartMs = clip.startTime.inMilliseconds;
+  final clipEndMs = clip.endTime.inMilliseconds;
+  final intervals = <PreviewDuckingInterval>[];
+
+  void addInterval(Duration start, Duration end) {
+    final startMs = math.max(clipStartMs, start.inMilliseconds);
+    final endMs = math.min(clipEndMs, end.inMilliseconds);
+    if (endMs > startMs) intervals.add((startMs: startMs, endMs: endMs));
+  }
+
+  for (final track in timeline.tracks) {
+    if (track.isHidden ||
+        (track.type != TimelineTrackType.subtitle &&
+            track.type != TimelineTrackType.text)) {
+      continue;
+    }
+    for (final candidate in track.clips) {
+      if (!candidate.enabled ||
+          candidate.id == clip.id ||
+          candidate.endTime <= candidate.startTime) {
+        continue;
+      }
+      addInterval(candidate.startTime, candidate.endTime);
+    }
+  }
+
+  final hasSoloTrack = previewHasSoloMediaTrackForTesting(timeline);
+  for (final track in timeline.tracks) {
+    if (track.isMuted ||
+        (hasSoloTrack && !track.isSolo) ||
+        (track.isHidden && track.section != TimelineTrackSection.audio)) {
+      continue;
+    }
+    for (final candidate in track.clips) {
+      if (!candidate.enabled ||
+          candidate.id == clip.id ||
+          candidate.audioMix.muted ||
+          candidate.endTime <= candidate.startTime ||
+          !timeline.clipHasAudio(candidate)) {
+        continue;
+      }
+      addInterval(candidate.startTime, candidate.endTime);
+    }
+  }
+
+  if (intervals.isEmpty) return const [];
+  intervals.sort((a, b) => a.startMs.compareTo(b.startMs));
+  final merged = <PreviewDuckingInterval>[];
+  for (final interval in intervals) {
+    if (merged.isEmpty || interval.startMs > merged.last.endMs + 300) {
+      merged.add(interval);
+    } else {
+      final previous = merged.removeLast();
+      merged.add((
+        startMs: previous.startMs,
+        endMs: math.max(previous.endMs, interval.endMs),
+      ));
+    }
+  }
+  return List.unmodifiable(merged);
+}
+
+@visibleForTesting
+Size quantizeGifPreviewSizeForTesting(double width, double height) {
+  double quantize(double value) {
+    if (!value.isFinite || value <= 0) return 1;
+    return math.max(
+      1,
+      (value / _gifDecodeSizeQuantum).ceil() * _gifDecodeSizeQuantum,
+    );
+  }
+
+  return Size(quantize(width), quantize(height));
+}
+
+bool _clipHasFlutterDrivenMotionAt(TimelineClip clip, Duration position) {
+  bool transitionAnimates(ClipTransition transition) =>
+      transition.type != TransitionType.none &&
+      transition.type != TransitionType.cut;
+  final elapsedMs = (position - clip.startTime).inMilliseconds;
+  final remainingMs = (clip.endTime - position).inMilliseconds;
+  if ((transitionAnimates(clip.introTransition) &&
+          elapsedMs >= 0 &&
+          elapsedMs < clip.effectiveIntroTransitionMs) ||
+      (transitionAnimates(clip.outroTransition) &&
+          remainingMs >= 0 &&
+          remainingMs < clip.effectiveOutroTransitionMs)) {
+    return true;
+  }
+
+  final relativeMs = elapsedMs;
+  for (final property in TimelineKeyframeProperty.values) {
+    if (property == TimelineKeyframeProperty.volume) continue;
+    final frames =
+        clip.keyframes
+            .where((keyframe) => keyframe.property == property)
+            .toList()
+          ..sort((a, b) => a.time.compareTo(b.time));
+    for (var index = 1; index < frames.length; index++) {
+      final previous = frames[index - 1];
+      final next = frames[index];
+      if (relativeMs >= previous.time.inMilliseconds &&
+          relativeMs < next.time.inMilliseconds &&
+          (previous.value - next.value).abs() > 0.0001) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+@visibleForTesting
+int calculatePreviewDecodeDimensionForTesting({
+  required double logicalExtent,
+  required double devicePixelRatio,
+}) {
+  if (!logicalExtent.isFinite || logicalExtent <= 0) return 1;
+  final ratio = devicePixelRatio.isFinite && devicePixelRatio > 0
+      ? devicePixelRatio
+      : 1.0;
+  return (logicalExtent * ratio).ceil().clamp(1, _maxPreviewDecodeDimension);
+}
 
 @visibleForTesting
 String? resolvePreviewSourcePathForTesting({
@@ -312,6 +581,22 @@ Widget buildComposedMediaPreviewForTesting({
   timelineEffectsBuilder: timelineEffectsBuilder,
 );
 
+@visibleForTesting
+List<String> previewVisualTrackPaintOrderForTesting(EditorTimeline timeline) {
+  return timeline.visualTracksInPaintOrder.map((track) => track.id).toList();
+}
+
+@visibleForTesting
+bool isPreviewBaseLayerClipForTesting(TimelineClip clip) {
+  return switch (clip.type) {
+    TimelineTrackType.video ||
+    TimelineTrackType.image ||
+    TimelineTrackType.gif ||
+    TimelineTrackType.sticker => true,
+    _ => false,
+  };
+}
+
 /// Video preview panel with subtitle overlay and playback controls.
 class VideoPreviewPanel extends ConsumerStatefulWidget {
   final String videoPath;
@@ -337,6 +622,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   TimelineClip? _controllerClip;
   TimelineTrack? _controllerTrack;
   String? _controllerPath;
+  int _controllerGeneration = 0;
   bool _initialized = false;
   bool _isSwitchingClip = false;
   bool _isAdvancingClip = false;
@@ -345,19 +631,76 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   Duration? _queuedSeekPosition;
   bool? _queuedSeekAutoplay;
   bool _queuedSeekForce = false;
+  bool _queuedSeekPreserveClock = true;
   String? _previewError;
   Timer? _playbackTicker;
+  final Stopwatch _timelineClock = Stopwatch();
+  Duration _timelineClockAnchorElapsed = Duration.zero;
+  Duration _timelineClockAnchorPosition = Duration.zero;
+  bool _timelineClockAnchored = false;
+  bool _baseFollowerSyncInFlight = false;
+  DateTime? _lastBaseFollowerSyncAt;
   double _playbackSpeed = 1.0;
-  DateTime? _gapPlaybackStartedAt;
-  Duration _gapPlaybackStartPosition = Duration.zero;
-  DateTime? _reversePlaybackStartedAt;
-  Duration _reversePlaybackStartPosition = Duration.zero;
+  double? _lastBaseVolume;
+  double? _lastBasePlaybackSpeed;
   bool _isSeekingReverseFrame = false;
   EditorTimeline? _cachedCaptionTimeline;
   List<SubtitleEntry>? _cachedCaptionEntries;
   List<SubtitleEntry> _effectiveCaptionCache = const [];
+  EditorTimeline? _cachedPreviewTimeline;
+  int? _cachedPreviewEditRevision;
+  Map<String, EditorAssetReference> _cachedAssetsById = const {};
+  final Map<String, bool> _cachedFileAvailability = {};
+  final Map<String, List<PreviewDuckingInterval>> _cachedDuckingIntervals = {};
+  bool _cachedHasSoloMediaTrack = false;
+  final Map<String, GlobalKey> _stableMediaPreviewKeys = {};
   double? _dragSourceOffsetX;
   double? _dragSourceOffsetY;
+  double? _freeTransformStartScale;
+  double? _freeTransformStartRotation;
+  double? _freeTransformStartFontSize;
+
+  void _ensurePreviewCaches(EditorTimeline timeline, {int? editRevision}) {
+    if (identical(_cachedPreviewTimeline, timeline) &&
+        (editRevision == null || editRevision == _cachedPreviewEditRevision)) {
+      return;
+    }
+    _cachedPreviewTimeline = timeline;
+    _cachedPreviewEditRevision = editRevision;
+    _cachedAssetsById = {for (final asset in timeline.assets) asset.id: asset};
+    _cachedHasSoloMediaTrack = previewHasSoloMediaTrackForTesting(timeline);
+    _cachedFileAvailability.clear();
+    _cachedDuckingIntervals.clear();
+    final liveMediaClipIds = timeline.tracks
+        .expand((track) => track.clips)
+        .where(
+          (clip) =>
+              clip.type == TimelineTrackType.video ||
+              clip.type == TimelineTrackType.gif ||
+              clip.type == TimelineTrackType.sticker,
+        )
+        .map((clip) => clip.id)
+        .toSet();
+    _stableMediaPreviewKeys.removeWhere(
+      (clipId, _) => !liveMediaClipIds.contains(clipId),
+    );
+  }
+
+  bool _cachedFileExists(String path) {
+    return _cachedFileAvailability.putIfAbsent(
+      path,
+      () => File(path).existsSync(),
+    );
+  }
+
+  EditorAssetReference? _cachedAssetForClip(
+    EditorTimeline timeline,
+    TimelineClip clip,
+  ) {
+    _ensurePreviewCaches(timeline);
+    final assetId = clip.assetId;
+    return assetId == null ? null : _cachedAssetsById[assetId];
+  }
 
   Duration _timelineDuration() {
     final timeline = ref.read(editorProvider).timeline;
@@ -367,6 +710,31 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
           Duration.zero,
           (current, clip) => clip.endTime > current ? clip.endTime : current,
         );
+  }
+
+  GlobalKey _stableMediaPreviewKey(String clipId) {
+    return _stableMediaPreviewKeys.putIfAbsent(clipId, GlobalKey.new);
+  }
+
+  void _anchorTimelineClock(Duration position) {
+    _timelineClockAnchorPosition = position;
+    _timelineClockAnchorElapsed = _timelineClock.elapsed;
+    _timelineClockAnchored = true;
+  }
+
+  Duration _timelineClockPosition(EditorTimeline timeline) {
+    if (!_timelineClockAnchored || !_playRequested) {
+      return ref.read(playbackProvider).position;
+    }
+    final range = _playbackRange(timeline);
+    final position = extrapolatePreviewPosition(
+      basePosition: _timelineClockAnchorPosition,
+      elapsed: _timelineClock.elapsed - _timelineClockAnchorElapsed,
+      duration: range.end,
+      playbackSpeed: _playbackSpeed,
+      isPlaying: true,
+    );
+    return position < range.start ? range.start : position;
   }
 
   ({Duration start, Duration end}) _playbackRange(EditorTimeline timeline) {
@@ -379,6 +747,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   @override
   void initState() {
     super.initState();
+    _timelineClock.start();
     WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
@@ -394,6 +763,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         _playbackSuspendedByLifecycle = false;
         if (!_playRequested || !mounted) return;
         final position = ref.read(playbackProvider).position;
+        _anchorTimelineClock(position);
         unawaited(
           _seekTimelinePosition(position, autoplay: true, forceSeek: true),
         );
@@ -404,14 +774,12 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       case AppLifecycleState.detached:
         if (_playbackSuspendedByLifecycle || !_playRequested) return;
         _playbackSuspendedByLifecycle = true;
-        final position = ref.read(playbackProvider).position;
-        // Reverse, freeze-frame, and gap playback use wall-clock anchors.
-        // Rebase those anchors to the last published playhead so background
-        // time can never be counted when playback resumes.
-        _gapPlaybackStartPosition = position;
-        _gapPlaybackStartedAt = null;
-        _reversePlaybackStartPosition = position;
-        _reversePlaybackStartedAt = null;
+        final timeline = ref.read(editorProvider).timeline;
+        final position = _timelineClockPosition(timeline);
+        ref.read(playbackProvider.notifier).updatePosition(position);
+        _anchorTimelineClock(position);
+        // Rebase the shared monotonic clock so background time can never be
+        // counted when playback resumes.
         _stopPlaybackTicker();
         unawaited(_controller?.pause());
         ref.read(playbackProvider.notifier).setPlaying(false);
@@ -437,10 +805,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       return;
     }
     _syncPlaybackState();
-    if (_playRequested &&
-        (_gapPlaybackStartedAt != null ||
-            _controllerClip?.isReversed == true ||
-            _controllerClip?.freezeFrame == true)) {
+    if (_playRequested) {
       _startPlaybackTicker();
     } else {
       _stopPlaybackTicker();
@@ -456,104 +821,110 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         controller == null ||
         clip == null ||
         !controller.value.isInitialized ||
-        _gapPlaybackStartedAt != null ||
         clip.isReversed ||
         clip.freezeFrame) {
       return;
     }
-    final controllerValue = controller.value;
-    final playback = ref.read(playbackProvider.notifier);
-    final editorDuration = _timelineDuration();
-    if (editorDuration > Duration.zero) {
-      playback.updateDuration(editorDuration);
-    }
-    final sourceElapsed = controllerValue.position - clip.sourceStartTime;
-    final timelineElapsedMs = (sourceElapsed.inMilliseconds / clip.playbackRate)
-        .round();
-    final timelinePosition =
-        clip.startTime + Duration(milliseconds: timelineElapsedMs);
-    final clampedPosition = timelinePosition < clip.startTime
-        ? clip.startTime
-        : timelinePosition > clip.endTime
-        ? clip.endTime
-        : timelinePosition;
-    playback.updatePosition(clampedPosition);
-    playback.setPlaying(_playRequested);
-    unawaited(_applyBaseAudioVolume(clampedPosition));
-
-    if (_playRequested) {
-      final playbackRange = _playbackRange(ref.read(editorProvider).timeline);
-      if (clampedPosition >= playbackRange.end) {
-        unawaited(_handlePlaybackRangeEnd());
-      } else if (clampedPosition >=
-              clip.endTime - const Duration(milliseconds: 34) ||
-          controllerValue.isCompleted) {
-        unawaited(_advanceFromClip(clip));
-      }
-    }
+    // Platform decoder callbacks are deliberately not the timeline clock.
+    // With several simultaneous videos a busy decoder can report late (or not
+    // at all for a frame); letting that callback own the shared playhead made
+    // the scrubber and every other media layer stall with it.
+    final position = ref.read(playbackProvider).position;
+    ref.read(playbackProvider.notifier).setPlaying(_playRequested);
+    unawaited(_applyBaseAudioVolume(position));
   }
 
   void _startPlaybackTicker() {
     if (_playbackTicker?.isActive == true) return;
+    if (!_timelineClockAnchored) {
+      _anchorTimelineClock(ref.read(playbackProvider).position);
+    }
     _playbackTicker = Timer.periodic(const Duration(milliseconds: 33), (_) {
       if (!_initialized || !mounted || _playbackSuspendedByLifecycle) return;
-      final reverseStarted = _reversePlaybackStartedAt;
-      final reverseClip = _controllerClip;
-      if (_playRequested &&
-          reverseStarted != null &&
-          reverseClip != null &&
-          (reverseClip.isReversed || reverseClip.freezeFrame)) {
-        final elapsed = DateTime.now().difference(reverseStarted);
-        final advanced = Duration(
-          microseconds: (elapsed.inMicroseconds * _playbackSpeed).round(),
+      if (!_playRequested) {
+        _stopPlaybackTicker();
+        return;
+      }
+
+      final timeline = ref.read(editorProvider).timeline;
+      final playbackRange = _playbackRange(timeline);
+      final target = _timelineClockPosition(timeline);
+      if (target >= playbackRange.end) {
+        unawaited(_handlePlaybackRangeEnd());
+        return;
+      }
+
+      ref.read(playbackProvider.notifier)
+        ..updatePosition(target)
+        ..setPlaying(true);
+      final selection = _baseSelectionAt(timeline, target);
+      final selectedClip = selection?.$2;
+      if (!_isSwitchingClip && selectedClip?.id != _controllerClip?.id) {
+        unawaited(
+          _seekTimelinePosition(
+            target,
+            autoplay: true,
+            forceSeek: true,
+            preserveTimelineClock: true,
+          ),
         );
-        final target = _reversePlaybackStartPosition + advanced;
-        final timeline = ref.read(editorProvider).timeline;
-        if (target >= _playbackRange(timeline).end) {
-          unawaited(_handlePlaybackRangeEnd());
-        } else if (target >= reverseClip.endTime) {
-          unawaited(_advanceFromClip(reverseClip));
-        } else if (reverseClip.freezeFrame) {
-          ref.read(playbackProvider.notifier)
-            ..updatePosition(target)
-            ..setPlaying(true);
-          unawaited(_applyBaseAudioVolume(target));
-        } else if (!_isSeekingReverseFrame) {
+      } else if (selectedClip?.type == TimelineTrackType.video) {
+        if (selectedClip!.isReversed && !_isSeekingReverseFrame) {
           unawaited(_seekReversedFrame(target));
+        } else if (!selectedClip.isReversed && !selectedClip.freezeFrame) {
+          unawaited(_synchronizeBaseControllerFollower(target));
         }
-        return;
       }
-      final gapStarted = _gapPlaybackStartedAt;
-      if (_playRequested && gapStarted != null) {
-        final elapsed = DateTime.now().difference(gapStarted);
-        final advanced = Duration(
-          microseconds: (elapsed.inMicroseconds * _playbackSpeed).round(),
-        );
-        final target = _gapPlaybackStartPosition + advanced;
-        final timeline = ref.read(editorProvider).timeline;
-        final playbackRange = _playbackRange(timeline);
-        if (target >= playbackRange.end) {
-          unawaited(_handlePlaybackRangeEnd());
-          return;
-        }
-        final nextSelection = _baseSelectionAt(
-          ref.read(editorProvider).timeline,
-          target,
-        );
-        if (nextSelection != null) {
-          unawaited(
-            _seekTimelinePosition(target, autoplay: true, forceSeek: true),
-          );
-          return;
-        }
-        ref.read(playbackProvider.notifier).updatePosition(target);
-        return;
-      }
-      // Forward playback is driven by VideoPlayerController's listener. A
-      // second 30 Hz state publisher here doubled provider updates and rebuilt
-      // the editor twice per frame.
-      _stopPlaybackTicker();
+      unawaited(_applyBaseAudioVolume(target));
     });
+  }
+
+  Future<void> _synchronizeBaseControllerFollower(
+    Duration timelinePosition,
+  ) async {
+    final controller = _controller;
+    final clip = _controllerClip;
+    if (_baseFollowerSyncInFlight ||
+        controller == null ||
+        clip == null ||
+        !controller.value.isInitialized ||
+        clip.type != TimelineTrackType.video ||
+        clip.isReversed ||
+        clip.freezeFrame) {
+      return;
+    }
+    final now = DateTime.now();
+    final lastSync = _lastBaseFollowerSyncAt;
+    if (lastSync != null &&
+        now.difference(lastSync) < const Duration(milliseconds: 240)) {
+      return;
+    }
+    _lastBaseFollowerSyncAt = now;
+    _baseFollowerSyncInFlight = true;
+    final generation = _controllerGeneration;
+    try {
+      final target = _sourceTargetForClip(clip, timelinePosition);
+      if (shouldCorrectPreviewMediaDrift(
+        timelineTarget: target,
+        decoderPosition: controller.value.position,
+      )) {
+        await controller.seekTo(target);
+      }
+      if (!mounted ||
+          generation != _controllerGeneration ||
+          !identical(controller, _controller)) {
+        return;
+      }
+      if (_playRequested &&
+          !_playbackSuspendedByLifecycle &&
+          !controller.value.isPlaying) {
+        await controller.play();
+      }
+    } catch (_) {
+      // A follower may be replaced while a platform seek is in flight.
+    } finally {
+      _baseFollowerSyncInFlight = false;
+    }
   }
 
   void _stopPlaybackTicker() {
@@ -565,10 +936,16 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _stopPlaybackTicker();
+    _timelineClock.stop();
+    _controllerGeneration++;
     final controller = _controller;
+    _controller = null;
+    _controllerClip = null;
+    _controllerTrack = null;
+    _controllerPath = null;
     if (controller != null) {
       controller.removeListener(_onPlaybackUpdate);
-      controller.dispose();
+      unawaited(controller.dispose());
     }
     super.dispose();
   }
@@ -576,17 +953,21 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   void _togglePlayPause() {
     final playback = ref.read(playbackProvider);
     if (_playRequested) {
+      final current = _timelineClockPosition(ref.read(editorProvider).timeline);
       _playRequested = false;
-      _gapPlaybackStartedAt = null;
-      _reversePlaybackStartedAt = null;
+      _anchorTimelineClock(current);
       unawaited(_controller?.pause());
       _stopPlaybackTicker();
-      ref.read(playbackProvider.notifier).setPlaying(false);
+      ref.read(playbackProvider.notifier)
+        ..updatePosition(current)
+        ..setPlaying(false);
     } else {
       final startPosition = playback.position >= playback.duration
           ? Duration.zero
           : playback.position;
       _playRequested = true;
+      _anchorTimelineClock(startPosition);
+      _startPlaybackTicker();
       unawaited(
         _seekTimelinePosition(
           startPosition,
@@ -604,26 +985,25 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
 
   Future<void> _setPlaybackSpeed(double speed) async {
     if (!_initialized) return;
+    final timeline = ref.read(editorProvider).timeline;
+    final current = _playRequested
+        ? _timelineClockPosition(timeline)
+        : ref.read(playbackProvider).position;
+    if (mounted) setState(() => _playbackSpeed = speed);
+    _anchorTimelineClock(current);
     final controller = _controller;
     final clip = _controllerClip;
     if (controller != null && clip != null) {
       if (!clip.isReversed && !clip.freezeFrame) {
-        await controller.setPlaybackSpeed(
-          (speed * clip.playbackRate).clamp(0.25, 4),
-        );
+        final effectiveSpeed = (speed * clip.playbackRate)
+            .clamp(0.25, 4)
+            .toDouble();
+        if (_lastBasePlaybackSpeed == null ||
+            (_lastBasePlaybackSpeed! - effectiveSpeed).abs() > 0.001) {
+          await controller.setPlaybackSpeed(effectiveSpeed);
+          _lastBasePlaybackSpeed = effectiveSpeed;
+        }
       }
-    }
-    if (!mounted) return;
-    setState(() => _playbackSpeed = speed);
-    if (_gapPlaybackStartedAt != null) {
-      final current = ref.read(playbackProvider).position;
-      _gapPlaybackStartPosition = current;
-      _gapPlaybackStartedAt = DateTime.now();
-    }
-    if (_reversePlaybackStartedAt != null) {
-      final current = ref.read(playbackProvider).position;
-      _reversePlaybackStartPosition = current;
-      _reversePlaybackStartedAt = DateTime.now();
     }
   }
 
@@ -638,7 +1018,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       final clips = [...track.clips]
         ..sort((a, b) => a.startTime.compareTo(b.startTime));
       for (final clip in clips) {
-        if (!clip.enabled) continue;
+        if (!clip.enabled || !isPreviewBaseLayerClipForTesting(clip)) continue;
         final isLastFrame =
             position == timeline.duration && position == clip.endTime;
         if (position >= clip.startTime &&
@@ -651,11 +1031,14 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   }
 
   String? _sourcePathForClip(EditorTimeline timeline, TimelineClip clip) {
+    _ensurePreviewCaches(timeline);
     return resolvePreviewSourcePathForTesting(
       timeline: timeline,
       clip: clip,
-      legacyVideoPath: widget.videoPath,
-      fileExists: (path) => File(path).existsSync(),
+      legacyVideoPath: clip.type == TimelineTrackType.video
+          ? widget.videoPath
+          : '',
+      fileExists: _cachedFileExists,
     );
   }
 
@@ -663,12 +1046,15 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     Duration requested, {
     bool? autoplay,
     bool forceSeek = false,
+    bool preserveTimelineClock = false,
   }) async {
     if (!_initialized || !mounted) return;
     if (_isSwitchingClip) {
       _queuedSeekPosition = requested;
       _queuedSeekAutoplay = autoplay;
       _queuedSeekForce = _queuedSeekForce || forceSeek;
+      _queuedSeekPreserveClock =
+          _queuedSeekPreserveClock && preserveTimelineClock;
       return;
     }
     final timeline = ref.read(editorProvider).timeline;
@@ -687,23 +1073,30 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         ? playbackRange.start
         : requestedTarget;
     _playRequested = shouldPlay;
+    if (!preserveTimelineClock || !_timelineClockAnchored) {
+      _anchorTimelineClock(target);
+    }
     final selection = _baseSelectionAt(timeline, target);
     final playbackNotifier = ref.read(playbackProvider.notifier);
 
     if (selection == null) {
-      _reversePlaybackStartedAt = null;
-      _gapPlaybackStartPosition = target;
       final controller = _controller;
+      // Detach the old base clip before yielding to the platform pause. The
+      // shared ticker can fire meanwhile; seeing the stale clip here used to
+      // launch several overlapping gap-transition seeks.
+      _controllerClip = null;
+      _controllerTrack = null;
+      _previewError = null;
       if (controller?.value.isPlaying == true) {
         await controller!.pause();
       }
       final playNow = shouldPlay && !_playbackSuspendedByLifecycle;
-      _gapPlaybackStartedAt = playNow ? DateTime.now() : null;
-      _controllerClip = null;
-      _controllerTrack = null;
+      final publishedPosition = playNow && preserveTimelineClock
+          ? _timelineClockPosition(timeline)
+          : target;
       playbackNotifier
         ..updateDuration(duration)
-        ..updatePosition(target)
+        ..updatePosition(publishedPosition)
         ..setPlaying(playNow)
         ..setReady(true);
       if (mounted) setState(() {});
@@ -711,26 +1104,75 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       return;
     }
 
-    _gapPlaybackStartedAt = null;
     final track = selection.$1;
     final clip = selection.$2;
     final sourcePath = _sourcePathForClip(timeline, clip);
+    if (clip.type != TimelineTrackType.video) {
+      final previous = _controller;
+      if (previous != null) previous.removeListener(_onPlaybackUpdate);
+      _controllerGeneration++;
+      _controller = null;
+      _controllerClip = clip;
+      _controllerTrack = track;
+      _controllerPath = sourcePath;
+      _lastBaseVolume = null;
+      _lastBasePlaybackSpeed = null;
+      _lastBaseFollowerSyncAt = null;
+      _previewError = null;
+      final asset = _cachedAssetForClip(timeline, clip);
+      final hasRenderableSource =
+          sourcePath != null ||
+          asset?.remoteUrl?.isNotEmpty == true ||
+          (asset?.metadata['previewUrl'] as String?)?.isNotEmpty == true;
+      if (!hasRenderableSource) {
+        _previewError =
+            'Media is missing for "${clip.label}". Relink it first.';
+      }
+      final playNow = shouldPlay && !_playbackSuspendedByLifecycle;
+      final publishedPosition = playNow && preserveTimelineClock
+          ? _timelineClockPosition(timeline)
+          : target;
+      playbackNotifier
+        ..updateDuration(duration)
+        ..updatePosition(publishedPosition)
+        ..setPlaying(playNow)
+        ..setReady(true);
+      if (mounted) setState(() {});
+      if (previous != null) {
+        unawaited(() async {
+          try {
+            await previous.pause();
+          } catch (_) {
+            // The previous platform decoder may already be unavailable.
+          }
+          try {
+            await previous.dispose();
+          } catch (_) {
+            // Controller disposal is best-effort after ownership is detached.
+          }
+        }());
+      }
+      if (playNow) _startPlaybackTicker();
+      return;
+    }
     if (sourcePath == null) {
       final unavailableController = _controller;
       unavailableController?.removeListener(_onPlaybackUpdate);
       _controller = null;
-      _controllerClip = null;
-      _controllerTrack = null;
+      _controllerClip = clip;
+      _controllerTrack = track;
       _controllerPath = null;
-      _playRequested = false;
-      _gapPlaybackStartedAt = null;
-      _reversePlaybackStartedAt = null;
+      _lastBaseVolume = null;
+      _lastBasePlaybackSpeed = null;
       _previewError = 'Media is missing for "${clip.label}". Relink it first.';
-      _stopPlaybackTicker();
+      final playNow = shouldPlay && !_playbackSuspendedByLifecycle;
+      final publishedPosition = playNow && preserveTimelineClock
+          ? _timelineClockPosition(timeline)
+          : target;
       playbackNotifier
         ..updateDuration(duration)
-        ..updatePosition(target)
-        ..setPlaying(false)
+        ..updatePosition(publishedPosition)
+        ..setPlaying(playNow)
         ..setReady(true);
       if (mounted) setState(() {});
       if (unavailableController != null) {
@@ -745,9 +1187,10 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
           // Disposal is best-effort after detaching the listener and ownership.
         }
       }
+      if (playNow) _startPlaybackTicker();
       return;
     }
-    final sourceTarget = _sourceTargetForClip(clip, target);
+    var sourceTarget = _sourceTargetForClip(clip, target);
 
     final currentController = _controller;
     final canReuse =
@@ -768,9 +1211,14 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         await currentController.seekTo(sourceTarget);
       }
       if (!clip.isReversed && !clip.freezeFrame) {
-        await currentController.setPlaybackSpeed(
-          (_playbackSpeed * clip.playbackRate).clamp(0.25, 4),
-        );
+        final effectiveSpeed = (_playbackSpeed * clip.playbackRate)
+            .clamp(0.25, 4)
+            .toDouble();
+        if (_lastBasePlaybackSpeed == null ||
+            (_lastBasePlaybackSpeed! - effectiveSpeed).abs() > 0.001) {
+          await currentController.setPlaybackSpeed(effectiveSpeed);
+          _lastBasePlaybackSpeed = effectiveSpeed;
+        }
       }
       await _applyBaseAudioVolume(target);
       var playNow = shouldPlay && !_playbackSuspendedByLifecycle;
@@ -778,49 +1226,100 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         if (currentController.value.isPlaying) {
           await currentController.pause();
         }
-        _reversePlaybackStartPosition = target;
         playNow = shouldPlay && !_playbackSuspendedByLifecycle;
-        _reversePlaybackStartedAt = playNow ? DateTime.now() : null;
       } else if (playNow && !currentController.value.isPlaying) {
-        _reversePlaybackStartedAt = null;
         await currentController.play();
       } else if (!playNow && currentController.value.isPlaying) {
-        _reversePlaybackStartedAt = null;
         await currentController.pause();
-      } else {
-        _reversePlaybackStartedAt = null;
       }
       playNow = shouldPlay && !_playbackSuspendedByLifecycle;
       if (!playNow && currentController.value.isPlaying) {
         await currentController.pause();
       }
+      final publishedPosition = playNow && preserveTimelineClock
+          ? _timelineClockPosition(timeline)
+          : target;
       playbackNotifier
         ..updateDuration(duration)
-        ..updatePosition(target)
+        ..updatePosition(publishedPosition)
         ..setPlaying(playNow);
       if (playNow) _startPlaybackTicker();
       return;
     }
 
     _isSwitchingClip = true;
+    final controllerGeneration = ++_controllerGeneration;
     VideoPlayerController? nextController;
     try {
       _previewError = null;
       if (currentController != null) {
         currentController.removeListener(_onPlaybackUpdate);
-        await currentController.pause();
-        await currentController.dispose();
+        // Relinquish widget ownership before the first await. Builds triggered
+        // while the replacement initializes must never read a disposed texture.
+        if (identical(_controller, currentController)) {
+          _controller = null;
+          _controllerClip = null;
+          _controllerTrack = null;
+          _controllerPath = null;
+          if (mounted) setState(() {});
+        }
+        try {
+          await currentController.pause();
+        } catch (_) {
+          // A platform controller can already be invalid during a relink.
+        }
+        try {
+          await currentController.dispose();
+        } catch (_) {
+          // Disposal is best-effort once ownership has been cleared.
+        }
       }
-      nextController = VideoPlayerController.file(File(sourcePath));
+      if (!mounted || controllerGeneration != _controllerGeneration) return;
+      _lastBaseVolume = null;
+      _lastBasePlaybackSpeed = null;
+      nextController = VideoPlayerController.file(
+        File(sourcePath),
+        videoPlayerOptions: buildPreviewVideoPlayerOptions(),
+      );
       await nextController.initialize();
-      await nextController.seekTo(sourceTarget);
-      if (!clip.isReversed && !clip.freezeFrame) {
-        await nextController.setPlaybackSpeed(
-          (_playbackSpeed * clip.playbackRate).clamp(0.25, 4),
-        );
-      }
-      if (!mounted) {
+      if (!mounted || controllerGeneration != _controllerGeneration) {
         await nextController.dispose();
+        nextController = null;
+        return;
+      }
+      final synchronizedTimelineTarget = shouldPlay && preserveTimelineClock
+          ? _timelineClockPosition(timeline)
+          : target;
+      final synchronizedSelection = _baseSelectionAt(
+        timeline,
+        synchronizedTimelineTarget,
+      );
+      if (synchronizedSelection?.$2.id != clip.id) {
+        await nextController.dispose();
+        nextController = null;
+        _queuedSeekPosition = synchronizedTimelineTarget;
+        _queuedSeekAutoplay = shouldPlay;
+        _queuedSeekForce = true;
+        _queuedSeekPreserveClock = true;
+        return;
+      }
+      sourceTarget = _sourceTargetForClip(clip, synchronizedTimelineTarget);
+      await nextController.seekTo(sourceTarget);
+      if (!mounted || controllerGeneration != _controllerGeneration) {
+        await nextController.dispose();
+        nextController = null;
+        return;
+      }
+      if (!clip.isReversed && !clip.freezeFrame) {
+        final effectiveSpeed = (_playbackSpeed * clip.playbackRate)
+            .clamp(0.25, 4)
+            .toDouble();
+        await nextController.setPlaybackSpeed(effectiveSpeed);
+        _lastBasePlaybackSpeed = effectiveSpeed;
+      }
+      if (!mounted || controllerGeneration != _controllerGeneration) {
+        await nextController.dispose();
+        nextController = null;
         return;
       }
       _controller = nextController;
@@ -828,22 +1327,21 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       _controllerTrack = track;
       _controllerPath = sourcePath;
       nextController.addListener(_onPlaybackUpdate);
-      await _applyBaseAudioVolume(target);
+      await _applyBaseAudioVolume(synchronizedTimelineTarget);
       var playNow = shouldPlay && !_playbackSuspendedByLifecycle;
-      if (clip.isReversed || clip.freezeFrame) {
-        _reversePlaybackStartPosition = target;
-        _reversePlaybackStartedAt = playNow ? DateTime.now() : null;
-      } else {
-        _reversePlaybackStartedAt = null;
+      if (!clip.isReversed && !clip.freezeFrame) {
         if (playNow) await nextController.play();
       }
       playNow = shouldPlay && !_playbackSuspendedByLifecycle;
       if (!playNow && nextController.value.isPlaying) {
         await nextController.pause();
       }
+      final publishedPosition = playNow && preserveTimelineClock
+          ? _timelineClockPosition(timeline)
+          : synchronizedTimelineTarget;
       playbackNotifier
         ..updateDuration(duration)
-        ..updatePosition(target)
+        ..updatePosition(publishedPosition)
         ..setPlaying(playNow)
         ..setReady(true);
       setState(() {});
@@ -851,6 +1349,12 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     } catch (_) {
       final failedController = nextController;
       if (failedController != null) {
+        if (identical(failedController, _controller)) {
+          _controller = null;
+          _controllerClip = null;
+          _controllerTrack = null;
+          _controllerPath = null;
+        }
         try {
           failedController.removeListener(_onPlaybackUpdate);
           await failedController.dispose();
@@ -858,64 +1362,53 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
           // Initialization can leave the platform controller partly torn down.
         }
       }
+      if (!mounted || controllerGeneration != _controllerGeneration) return;
       _controller = null;
-      _controllerClip = null;
-      _controllerTrack = null;
-      _controllerPath = null;
-      _playRequested = false;
-      _reversePlaybackStartedAt = null;
+      _controllerClip = clip;
+      _controllerTrack = track;
+      _controllerPath = sourcePath;
+      _lastBaseVolume = null;
+      _lastBasePlaybackSpeed = null;
       _previewError = 'This clip could not be decoded on this device.';
+      final playNow = shouldPlay && !_playbackSuspendedByLifecycle;
+      final publishedPosition = playNow && preserveTimelineClock
+          ? _timelineClockPosition(timeline)
+          : target;
       playbackNotifier
         ..updateDuration(duration)
-        ..updatePosition(target)
-        ..setPlaying(false)
+        ..updatePosition(publishedPosition)
+        ..setPlaying(playNow)
         ..setReady(true);
-      if (mounted) setState(() {});
+      setState(() {});
+      if (playNow) _startPlaybackTicker();
     } finally {
-      _isSwitchingClip = false;
+      if (controllerGeneration == _controllerGeneration) {
+        _isSwitchingClip = false;
+      }
       final queuedPosition = _queuedSeekPosition;
       final queuedAutoplay = _queuedSeekAutoplay;
       final queuedForce = _queuedSeekForce;
+      final queuedPreserveClock = _queuedSeekPreserveClock;
       _queuedSeekPosition = null;
       _queuedSeekAutoplay = null;
       _queuedSeekForce = false;
-      if (queuedPosition != null && mounted) {
+      _queuedSeekPreserveClock = true;
+      if (queuedPosition != null && mounted && !_isSwitchingClip) {
         unawaited(
           _seekTimelinePosition(
             queuedPosition,
             autoplay: queuedAutoplay,
             forceSeek: queuedForce,
+            preserveTimelineClock: queuedPreserveClock,
           ),
         );
       }
     }
   }
 
-  Future<void> _advanceFromClip(TimelineClip completedClip) async {
-    if (_isAdvancingClip || !_playRequested || !mounted) return;
-    _isAdvancingClip = true;
-    _reversePlaybackStartedAt = null;
-    try {
-      final timeline = ref.read(editorProvider).timeline;
-      final nextPosition = completedClip.endTime;
-      if (nextPosition >= _playbackRange(timeline).end) {
-        await _finishPlaybackRange(timeline);
-        return;
-      }
-      await _seekTimelinePosition(
-        nextPosition,
-        autoplay: true,
-        forceSeek: true,
-      );
-    } finally {
-      _isAdvancingClip = false;
-    }
-  }
-
   Future<void> _handlePlaybackRangeEnd() async {
     if (_isAdvancingClip || !_playRequested || !mounted) return;
     _isAdvancingClip = true;
-    _reversePlaybackStartedAt = null;
     try {
       await _finishPlaybackRange(ref.read(editorProvider).timeline);
     } finally {
@@ -936,8 +1429,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     }
 
     _playRequested = false;
-    _gapPlaybackStartedAt = null;
-    _reversePlaybackStartedAt = null;
     await _seekTimelinePosition(
       playbackRange.end,
       autoplay: false,
@@ -958,13 +1449,31 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     }
     final timeline = ref.read(editorProvider).timeline;
     final hasSolo = _hasSoloMediaTrack(timeline);
-    final volume = _previewAudioVolume(
-      clip: clip,
+    final linkedAudio = resolvePreviewBaseAudioMonitorForTesting(
+      timeline: timeline,
+      baseClip: clip,
       position: position,
-      isTrackAudible: !track.isMuted && (!hasSolo || track.isSolo),
-      duckingGain: _previewDuckingGain(clip, position),
     );
+    final hasExplicitLinkedAudio = previewHasExplicitLinkedAudioForTesting(
+      timeline: timeline,
+      visualClip: clip,
+    );
+    final monitoredClip = linkedAudio?.clip ?? clip;
+    final monitoredTrack = linkedAudio?.track ?? track;
+    final volume = _previewAudioVolume(
+      clip: monitoredClip,
+      position: position,
+      isTrackAudible:
+          (!hasExplicitLinkedAudio || linkedAudio != null) &&
+          !monitoredTrack.isMuted &&
+          (!hasSolo || monitoredTrack.isSolo),
+      duckingGain: _previewDuckingGain(monitoredClip, position),
+    );
+    if (_lastBaseVolume != null && (_lastBaseVolume! - volume).abs() <= 0.01) {
+      return;
+    }
     await controller.setVolume(volume);
+    if (identical(controller, _controller)) _lastBaseVolume = volume;
   }
 
   Duration _sourceTargetForClip(TimelineClip clip, Duration timelinePosition) {
@@ -1141,6 +1650,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     final style = _readEditableStyleFor(activeEntry, editPerEntry);
     _dragSourceOffsetX = style.offsetX;
     _dragSourceOffsetY = style.verticalOffset + style.offsetY;
+    _freeTransformStartFontSize = style.fontSize;
     final notifier = ref.read(subtitleProvider.notifier);
     notifier.selectEntry(activeEntry.id);
     notifier.beginStyleGestureEdit();
@@ -1149,6 +1659,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   void _endStyleGesture() {
     _dragSourceOffsetX = null;
     _dragSourceOffsetY = null;
+    _freeTransformStartFontSize = null;
     ref.read(subtitleProvider.notifier).endStyleGestureEdit();
   }
 
@@ -1172,13 +1683,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
             position >= clip.endTime) {
           continue;
         }
-        EditorAssetReference? asset;
-        for (final candidate in timeline.assets) {
-          if (candidate.id == clip.assetId) {
-            asset = candidate;
-            break;
-          }
-        }
+        final asset = _cachedAssetForClip(timeline, clip);
         if (asset == null) continue;
         items.add(
           _OverlayCanvasItem(
@@ -1192,7 +1697,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     }
 
     items.sort((a, b) {
-      final trackCompare = a.trackIndex.compareTo(b.trackIndex);
+      final trackCompare = b.trackIndex.compareTo(a.trackIndex);
       if (trackCompare != 0) return trackCompare;
       final layerCompare = a.clip.layer.compareTo(b.clip.layer);
       if (layerCompare != 0) return layerCompare;
@@ -1212,7 +1717,9 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       trackIndex++
     ) {
       final track = timeline.tracks[trackIndex];
-      if (track.type != TimelineTrackType.effect || track.isHidden) continue;
+      if (track.section != TimelineTrackSection.overlay || track.isHidden) {
+        continue;
+      }
       for (final clip in track.clips) {
         if (!clip.enabled ||
             !clip.isEffect ||
@@ -1230,7 +1737,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       }
     }
     items.sort((a, b) {
-      final trackCompare = a.trackIndex.compareTo(b.trackIndex);
+      final trackCompare = b.trackIndex.compareTo(a.trackIndex);
       if (trackCompare != 0) return trackCompare;
       final layerCompare = a.clip.layer.compareTo(b.clip.layer);
       if (layerCompare != 0) return layerCompare;
@@ -1268,7 +1775,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     }
 
     items.sort((a, b) {
-      final trackCompare = a.trackIndex.compareTo(b.trackIndex);
+      final trackCompare = b.trackIndex.compareTo(a.trackIndex);
       if (trackCompare != 0) return trackCompare;
       return a.clip.layer.compareTo(b.clip.layer);
     });
@@ -1278,21 +1785,28 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   List<_AudioCanvasItem> _activeAudioItems(
     EditorTimeline timeline,
     Duration position,
+    String? baseMonitoredClipId,
   ) {
     final items = <_AudioCanvasItem>[];
+    final hasSoloMediaTrack = _hasSoloMediaTrack(timeline);
     for (final track in timeline.tracks) {
       if (track.section != TimelineTrackSection.audio) continue;
       for (final clip in track.clips) {
-        if (!clip.enabled ||
+        if (!shouldCreateTimelineAudioPreviewForTesting(
+              track: track,
+              clip: clip,
+              hasSoloMediaTrack: hasSoloMediaTrack,
+              baseMonitoredClipId: baseMonitoredClipId,
+            ) ||
             position < clip.startTime ||
             position >= clip.endTime) {
           continue;
         }
-        final asset = timeline.assetForClip(clip);
+        final asset = _cachedAssetForClip(timeline, clip);
         final sourcePath = asset?.sourcePath;
         if (asset == null ||
             sourcePath == null ||
-            !File(sourcePath).existsSync()) {
+            !_cachedFileExists(sourcePath)) {
           continue;
         }
         items.add(_AudioCanvasItem(track: track, clip: clip, asset: asset));
@@ -1402,28 +1916,22 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   void _beginSnappedDrag(TimelineTransform transform) {
     _dragSourceOffsetX = transform.offsetX;
     _dragSourceOffsetY = transform.offsetY;
+    _freeTransformStartScale = transform.scale;
+    _freeTransformStartRotation = transform.rotation;
   }
 
   void _endSnappedDrag() {
     _dragSourceOffsetX = null;
     _dragSourceOffsetY = null;
+    _freeTransformStartScale = null;
+    _freeTransformStartRotation = null;
+    _freeTransformStartFontSize = null;
     ref.read(editorProvider.notifier).endTimelineGestureEdit();
   }
 
   bool _hasSoloMediaTrack(EditorTimeline timeline) {
-    return timeline.tracks.any(
-      (track) =>
-          track.isSolo &&
-          (!track.isHidden || track.section == TimelineTrackSection.audio) &&
-          track.clips.any(
-            (candidate) =>
-                candidate.enabled &&
-                candidate.endTime > candidate.startTime &&
-                candidate.type != TimelineTrackType.text &&
-                candidate.type != TimelineTrackType.subtitle &&
-                candidate.type != TimelineTrackType.effect,
-          ),
-    );
+    _ensurePreviewCaches(timeline);
+    return _cachedHasSoloMediaTrack;
   }
 
   double _previewDuckingGain(TimelineClip clip, Duration position) {
@@ -1433,65 +1941,20 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     final positionMs = position.inMilliseconds;
     final clipStartMs = clip.startTime.inMilliseconds;
     final clipEndMs = clip.endTime.inMilliseconds;
-    final intervals = <(int, int)>[];
-
-    void addInterval(Duration start, Duration end) {
-      final startMs = math.max(clipStartMs, start.inMilliseconds);
-      final endMs = math.min(clipEndMs, end.inMilliseconds);
-      if (endMs > startMs) intervals.add((startMs, endMs));
-    }
-
-    for (final track in timeline.tracks) {
-      if (track.isHidden ||
-          (track.type != TimelineTrackType.subtitle &&
-              track.type != TimelineTrackType.text)) {
-        continue;
-      }
-      for (final candidate in track.clips) {
-        if (!candidate.enabled ||
-            candidate.id == clip.id ||
-            candidate.endTime <= candidate.startTime) {
-          continue;
-        }
-        addInterval(candidate.startTime, candidate.endTime);
-      }
-    }
-
-    final hasSoloTrack = _hasSoloMediaTrack(timeline);
-    for (final track in timeline.tracks) {
-      if (track.isMuted ||
-          (hasSoloTrack && !track.isSolo) ||
-          (track.isHidden && track.section != TimelineTrackSection.audio)) {
-        continue;
-      }
-      for (final candidate in track.clips) {
-        if (!candidate.enabled ||
-            candidate.id == clip.id ||
-            candidate.audioMix.muted ||
-            candidate.endTime <= candidate.startTime ||
-            !timeline.clipHasAudio(candidate)) {
-          continue;
-        }
-        addInterval(candidate.startTime, candidate.endTime);
-      }
-    }
-
+    _ensurePreviewCaches(timeline);
+    final intervals = _cachedDuckingIntervals.putIfAbsent(
+      clip.id,
+      () => buildPreviewDuckingIntervalsForTesting(
+        timeline: timeline,
+        clip: clip,
+      ),
+    );
     if (intervals.isEmpty) return 1;
-    intervals.sort((a, b) => a.$1.compareTo(b.$1));
-    final merged = <(int, int)>[];
-    for (final interval in intervals) {
-      if (merged.isEmpty || interval.$1 > merged.last.$2 + 300) {
-        merged.add(interval);
-      } else {
-        final previous = merged.removeLast();
-        merged.add((previous.$1, math.max(previous.$2, interval.$2)));
-      }
-    }
 
     var gain = 1.0;
-    for (final interval in merged) {
-      final startMs = interval.$1;
-      final endMs = interval.$2;
+    for (final interval in intervals) {
+      final startMs = interval.startMs;
+      final endMs = interval.endMs;
       final attackStartMs = math.max(clipStartMs, startMs - 120);
       final releaseEndMs = math.min(clipEndMs, endMs + 180);
       if (positionMs < attackStartMs || positionMs > releaseEndMs) continue;
@@ -1512,26 +1975,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       gain = math.min(gain, intervalGain);
     }
     return gain.clamp(0.0, 1.0).toDouble();
-  }
-
-  void _updateEffectBlur(
-    String clipId,
-    ClipBlurSettings Function(ClipBlurSettings current) mapper,
-  ) {
-    final editorState = ref.read(editorProvider);
-    final nextTracks = editorState.timeline.tracks.map((track) {
-      final updatedClips = track.clips.map((clip) {
-        if (clip.id != clipId) return clip;
-        return clip.copyWith(blur: mapper(clip.blur));
-      }).toList();
-      return track.copyWith(clips: updatedClips);
-    }).toList();
-    ref
-        .read(editorProvider.notifier)
-        .setTimeline(
-          editorState.timeline.copyWith(tracks: nextTracks),
-          recordHistory: false,
-        );
   }
 
   Widget _applyClipMediaEffects(
@@ -1556,6 +1999,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     _OverlayCanvasItem item,
     BoxConstraints constraints,
     PlaybackState playbackState,
+    EditorTimeline timeline,
   ) {
     final canvasWidth = constraints.hasBoundedWidth
         ? math.max(0.0, constraints.maxWidth)
@@ -1568,11 +2012,20 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     // in preview and keeps their crop/distortion consistent with rendering.
     final baseWidth = canvasWidth * 0.36;
     final previewHeight = canvasHeight * 0.5;
+    final pixelRatio = MediaQuery.devicePixelRatioOf(context);
+    final cacheWidth = calculatePreviewDecodeDimensionForTesting(
+      logicalExtent: baseWidth,
+      devicePixelRatio: pixelRatio,
+    );
+    final cacheHeight = calculatePreviewDecodeDimensionForTesting(
+      logicalExtent: previewHeight,
+      devicePixelRatio: pixelRatio,
+    );
     final previewUrl =
         item.asset.metadata['previewUrl'] as String? ?? item.asset.remoteUrl;
     final localPath = item.asset.sourcePath;
     final localFile = localPath == null ? null : File(localPath);
-    final hasLocalFile = localFile?.existsSync() ?? false;
+    final hasLocalFile = localPath != null && _cachedFileExists(localPath);
     final overlayFit = switch (item.clip.fitMode) {
       ClipFitMode.cover => BoxFit.cover,
       ClipFitMode.contain => BoxFit.contain,
@@ -1592,7 +2045,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     Widget child;
     if (isAnimatedImage && (hasLocalFile || remoteMediaUrl != null)) {
       child = _TimelineGifPreview(
-        key: ValueKey('gif_${item.clip.id}'),
+        key: _stableMediaPreviewKey(item.clip.id),
         filePath: hasLocalFile ? localFile!.path : null,
         remoteUrl: hasLocalFile ? null : remoteMediaUrl,
         clip: item.clip,
@@ -1615,7 +2068,10 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                   width: baseWidth,
                   height: previewHeight,
                   fit: overlayFit,
-                  filterQuality: FilterQuality.medium,
+                  cacheWidth: cacheWidth,
+                  cacheHeight: cacheHeight,
+                  filterQuality: FilterQuality.low,
+                  gaplessPlayback: true,
                 )
               : previewUrl != null
               ? Image.network(
@@ -1623,7 +2079,10 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                   width: baseWidth,
                   height: previewHeight,
                   fit: overlayFit,
-                  filterQuality: FilterQuality.medium,
+                  cacheWidth: cacheWidth,
+                  cacheHeight: cacheHeight,
+                  filterQuality: FilterQuality.low,
+                  gaplessPlayback: true,
                   errorBuilder: (_, _, _) =>
                       _buildMissingOverlay(item.clip.label),
                 )
@@ -1632,18 +2091,30 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         EditorAssetType.video =>
           hasLocalFile
               ? _OverlayVideoPreview(
-                  key: ValueKey(item.clip.id),
+                  key: _stableMediaPreviewKey(item.clip.id),
                   videoPath: localFile!.path,
                   clip: item.clip,
                   playbackPosition: playbackState.position,
                   isPlaying: playbackState.isPlaying,
                   playbackSpeed: _playbackSpeed,
-                  // Timeline region effects paint a filtered media copy.
-                  // Keep visual controllers silent so that copy can never
-                  // double the monitored audio; one hidden controller below
-                  // owns audio for each overlay clip.
-                  duckingGain: 1,
-                  isTrackAudible: false,
+                  duckingGain: _previewDuckingGain(
+                    item.clip,
+                    playbackState.position,
+                  ),
+                  // The visual controller already owns one platform decoder
+                  // and audio output. Reusing it for normal overlays avoids a
+                  // second hidden decoder per active video. Freeze frames keep
+                  // a separate audio-only controller so their audio can carry
+                  // on while the visual frame is held.
+                  isTrackAudible:
+                      !item.clip.freezeFrame &&
+                      previewVisualUsesEmbeddedAudioForTesting(
+                        timeline: timeline,
+                        visualTrack: item.track,
+                        visualClip: item.clip,
+                        position: playbackState.position,
+                        hasSoloMediaTrack: _hasSoloMediaTrack(timeline),
+                      ),
                   width: baseWidth,
                   height: previewHeight,
                   fitMode: item.clip.fitMode,
@@ -1663,7 +2134,10 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                   width: baseWidth,
                   height: previewHeight,
                   fit: overlayFit,
-                  filterQuality: FilterQuality.medium,
+                  cacheWidth: cacheWidth,
+                  cacheHeight: cacheHeight,
+                  filterQuality: FilterQuality.low,
+                  gaplessPlayback: true,
                 )
               : previewUrl != null
               ? Image.network(
@@ -1671,7 +2145,10 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                   width: baseWidth,
                   height: previewHeight,
                   fit: overlayFit,
-                  filterQuality: FilterQuality.medium,
+                  cacheWidth: cacheWidth,
+                  cacheHeight: cacheHeight,
+                  filterQuality: FilterQuality.low,
+                  gaplessPlayback: true,
                   errorBuilder: (_, _, _) =>
                       _buildMissingOverlay(item.clip.label),
                 )
@@ -1686,6 +2163,13 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     if (item.asset.type != EditorAssetType.video && !isAnimatedImage) {
       child = _applyNormalizedCropPreview(child, item.clip.crop);
       child = _applyClipMediaEffects(child, item.clip, playbackState.position);
+      // The bitmap/effect subtree is static while only its outer transition
+      // transform changes. Isolating it avoids repainting color and blur work
+      // for every animation tick.
+      child = RepaintBoundary(
+        key: ValueKey('static_overlay_${item.clip.id}'),
+        child: child,
+      );
     }
     child = Transform(
       alignment: Alignment.center,
@@ -1702,7 +2186,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       child: Opacity(
         opacity: (animation.opacity * transform.opacity).clamp(0.0, 1.0),
         child: Transform.rotate(
-          angle: transform.rotation,
+          angle: transform.rotation + animation.rotation,
           child: Transform.scale(
             scale: (animation.scale * transform.scale).clamp(0.2, 4.0),
             child: child,
@@ -1719,6 +2203,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   ) {
     var opacity = 1.0;
     var scale = 1.0;
+    var rotation = 0.0;
     var offset = Offset.zero;
 
     final elapsedMs = (position - clip.startTime).inMilliseconds
@@ -1728,41 +2213,74 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         .clamp(0, clip.duration.inMilliseconds)
         .toDouble();
 
-    void applyTransition(ClipTransition transition, double hiddenAmount) {
+    void applyTransition(
+      ClipTransition transition,
+      double hiddenAmount, {
+      required bool isOutro,
+    }) {
       if (transition.type == TransitionType.none ||
           transition.type == TransitionType.cut ||
           hiddenAmount <= 0) {
         return;
       }
 
-      // Dissolve uses the same eased alpha curve as export; the remaining
-      // transitions deliberately retain a linear envelope.
       final visibleAmount = (1 - hiddenAmount).clamp(0.0, 1.0).toDouble();
-      final alphaAmount = transition.type == TransitionType.dissolve
+      final easedVisible =
+          visibleAmount * visibleAmount * (3 - 2 * visibleAmount);
+      final easedHidden = 1 - easedVisible;
+      final alphaAmount = transition.type == TransitionType.fade
+          ? visibleAmount
+          : transition.type == TransitionType.dissolve
           ? visibleAmount * visibleAmount * (3 - 2 * visibleAmount)
-          : visibleAmount;
+          : easedVisible;
       opacity *= alphaAmount;
       switch (transition.type) {
         case TransitionType.fade:
         case TransitionType.dissolve:
           break;
         case TransitionType.zoom:
-          // A zoom animation should change geometry as well as opacity. Keep
-          // the range restrained so it reads as motion without exposing the
-          // fitted media outside the canvas bounds.
-          scale *= 1 - (hiddenAmount * 0.15);
+          scale *= 0.82 + 0.18 * easedVisible;
+          break;
+        case TransitionType.zoomOut:
+          scale *= 1.18 - 0.18 * easedVisible;
+          break;
+        case TransitionType.pop:
+          // A compact ease-out-back curve gives the preset a restrained
+          // overshoot without allocating a separate animation controller.
+          final shifted = visibleAmount - 1;
+          final back =
+              1 +
+              2.70158 * shifted * shifted * shifted +
+              1.70158 * shifted * shifted;
+          scale *= 0.68 + 0.32 * back;
+          break;
+        case TransitionType.spin:
+          scale *= 0.86 + 0.14 * easedVisible;
+          rotation += (isOutro ? 1 : -1) * easedHidden * math.pi / 2;
           break;
         case TransitionType.slideLeft:
-          offset += Offset(-constraints.maxWidth * hiddenAmount, 0);
+          offset += Offset(-constraints.maxWidth * easedHidden, 0);
           break;
         case TransitionType.slideRight:
-          offset += Offset(constraints.maxWidth * hiddenAmount, 0);
+          offset += Offset(constraints.maxWidth * easedHidden, 0);
           break;
         case TransitionType.slideUp:
-          offset += Offset(0, -constraints.maxHeight * hiddenAmount);
+          offset += Offset(0, -constraints.maxHeight * easedHidden);
           break;
         case TransitionType.slideDown:
-          offset += Offset(0, constraints.maxHeight * hiddenAmount);
+          offset += Offset(0, constraints.maxHeight * easedHidden);
+          break;
+        case TransitionType.slideUpLeft:
+          offset += Offset(
+            -constraints.maxWidth * easedHidden,
+            -constraints.maxHeight * easedHidden,
+          );
+          break;
+        case TransitionType.slideUpRight:
+          offset += Offset(
+            constraints.maxWidth * easedHidden,
+            -constraints.maxHeight * easedHidden,
+          );
           break;
         case TransitionType.none:
         case TransitionType.cut:
@@ -1773,18 +2291,19 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     final introDuration = clip.effectiveIntroTransitionMs;
     if (introDuration > 0 && elapsedMs < introDuration) {
       final hiddenAmount = 1 - (elapsedMs / introDuration).clamp(0.0, 1.0);
-      applyTransition(clip.introTransition, hiddenAmount);
+      applyTransition(clip.introTransition, hiddenAmount, isOutro: false);
     }
 
     final outroDuration = clip.effectiveOutroTransitionMs;
     if (outroDuration > 0 && remainingMs < outroDuration) {
       final hiddenAmount = 1 - (remainingMs / outroDuration).clamp(0.0, 1.0);
-      applyTransition(clip.outroTransition, hiddenAmount);
+      applyTransition(clip.outroTransition, hiddenAmount, isOutro: true);
     }
 
     return _OverlayAnimationState(
       opacity: opacity.clamp(0.0, 1.0),
       scale: scale.clamp(0.2, 4.0),
+      rotation: rotation,
       offset: offset,
     );
   }
@@ -1852,7 +2371,10 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       ),
       child: child,
     );
-    child = Transform.rotate(angle: transform.rotation, child: child);
+    child = Transform.rotate(
+      angle: transform.rotation + animation.rotation,
+      child: child,
+    );
     child = Transform.scale(
       scale: (animation.scale * transform.scale).clamp(0.2, 4),
       child: child,
@@ -1869,6 +2391,345 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
             transform.offsetY * constraints.maxHeight / kTimelineDesignHeight,
           ),
       child: child,
+    );
+  }
+
+  Widget _buildBaseAssetLayer({
+    required EditorTimeline timeline,
+    required TimelineClip clip,
+    required BoxConstraints constraints,
+    required Duration playbackPosition,
+  }) {
+    final asset = _cachedAssetForClip(timeline, clip);
+    if (asset == null) return _buildMissingOverlay(clip.label);
+    final localPath = asset.sourcePath;
+    final hasLocalFile =
+        localPath != null &&
+        localPath.isNotEmpty &&
+        _cachedFileExists(localPath);
+    final previewUrl =
+        asset.metadata['previewUrl'] as String? ?? asset.remoteUrl;
+    final remoteMediaUrl = asset.remoteUrl ?? previewUrl;
+    final isAnimatedImage =
+        clip.type == TimelineTrackType.gif ||
+        asset.type == EditorAssetType.gif ||
+        (asset.type == EditorAssetType.sticker &&
+            (_isGifSource(localPath) || _isGifSource(remoteMediaUrl)));
+    final fit = switch (clip.fitMode) {
+      ClipFitMode.cover => BoxFit.cover,
+      ClipFitMode.contain => BoxFit.contain,
+      ClipFitMode.stretch => BoxFit.fill,
+    };
+    final pixelRatio = MediaQuery.devicePixelRatioOf(context);
+    final cacheWidth = calculatePreviewDecodeDimensionForTesting(
+      logicalExtent: constraints.maxWidth,
+      devicePixelRatio: pixelRatio,
+    );
+    final cacheHeight = calculatePreviewDecodeDimensionForTesting(
+      logicalExtent: constraints.maxHeight,
+      devicePixelRatio: pixelRatio,
+    );
+
+    Widget child;
+    if (isAnimatedImage && (hasLocalFile || remoteMediaUrl != null)) {
+      child = _TimelineGifPreview(
+        key: _stableMediaPreviewKey(clip.id),
+        filePath: hasLocalFile ? localPath : null,
+        remoteUrl: hasLocalFile ? null : remoteMediaUrl,
+        clip: clip,
+        playbackPosition: playbackPosition,
+        width: constraints.maxWidth,
+        height: constraints.maxHeight,
+        fitMode: clip.fitMode,
+        crop: clip.crop,
+        label: clip.label,
+        borderRadius: BorderRadius.zero,
+        mediaEffectsBuilder: (media) =>
+            _applyClipMediaEffects(media, clip, playbackPosition),
+      );
+    } else if (hasLocalFile) {
+      child = Image.file(
+        File(localPath),
+        width: constraints.maxWidth,
+        height: constraints.maxHeight,
+        fit: fit,
+        cacheWidth: cacheWidth,
+        cacheHeight: cacheHeight,
+        filterQuality: FilterQuality.medium,
+        gaplessPlayback: true,
+        errorBuilder: (_, _, _) => _buildMissingOverlay(clip.label),
+      );
+      child = _applyNormalizedCropPreview(child, clip.crop);
+      child = _applyClipMediaEffects(child, clip, playbackPosition);
+    } else if (previewUrl != null) {
+      child = Image.network(
+        previewUrl,
+        width: constraints.maxWidth,
+        height: constraints.maxHeight,
+        fit: fit,
+        cacheWidth: cacheWidth,
+        cacheHeight: cacheHeight,
+        filterQuality: FilterQuality.medium,
+        gaplessPlayback: true,
+        errorBuilder: (_, _, _) => _buildMissingOverlay(clip.label),
+      );
+      child = _applyNormalizedCropPreview(child, clip.crop);
+      child = _applyClipMediaEffects(child, clip, playbackPosition);
+    } else {
+      child = _buildMissingOverlay(clip.label);
+    }
+
+    final animation = _resolveOverlayAnimation(
+      clip,
+      constraints,
+      playbackPosition,
+    );
+    final transform = clip.transformAt(playbackPosition);
+    child = Transform(
+      alignment: Alignment.center,
+      transform: Matrix4.diagonal3Values(
+        transform.flipX ? -1 : 1,
+        transform.flipY ? -1 : 1,
+        1,
+      ),
+      child: child,
+    );
+    child = Transform.rotate(
+      angle: transform.rotation + animation.rotation,
+      child: child,
+    );
+    child = Transform.scale(
+      scale: (animation.scale * transform.scale).clamp(0.2, 4),
+      child: child,
+    );
+    child = Opacity(
+      opacity: (animation.opacity * transform.opacity).clamp(0.0, 1.0),
+      child: child,
+    );
+    return Transform.translate(
+      offset:
+          animation.offset +
+          Offset(
+            transform.offsetX * constraints.maxWidth / kTimelineDesignWidth,
+            transform.offsetY * constraints.maxHeight / kTimelineDesignHeight,
+          ),
+      child: child,
+    );
+  }
+
+  Widget _buildTextVisualLayer(
+    _TextCanvasItem item,
+    BoxConstraints constraints,
+    Duration playbackPosition,
+  ) {
+    final style =
+        item.clip.subtitleStyle ??
+        const SubtitleStyleModel(
+          position: SubtitlePosition.center,
+          fontSize: 32,
+        );
+    final transform = item.clip.transformAt(playbackPosition);
+    final previewEntry = SubtitleEntry(
+      id: item.clip.id,
+      startTime: item.clip.startTime,
+      endTime: item.clip.endTime,
+      text: item.clip.text ?? item.clip.label,
+      styleOverride: style,
+    );
+    Widget text = AnimatedSubtitleOverlay(
+      entry: previewEntry,
+      globalStyle: style,
+      currentPosition: playbackPosition,
+      scaleFactor: constraints.maxHeight / kTimelineDesignHeight,
+    );
+    text = Transform.scale(
+      scale: transform.scale.clamp(0.25, 4.0),
+      child: text,
+    );
+    text = Transform.rotate(angle: transform.rotation, child: text);
+    text = Opacity(opacity: transform.opacity.clamp(0.0, 1.0), child: text);
+    return Align(
+      child: Transform.translate(
+        offset: Offset(
+          transform.offsetX * constraints.maxWidth / kTimelineDesignWidth,
+          transform.offsetY * constraints.maxHeight / kTimelineDesignHeight,
+        ),
+        child: text,
+      ),
+    );
+  }
+
+  Widget _buildSubtitleVisualLayer({
+    required SubtitleEntry entry,
+    required SubtitleState subtitleState,
+    required BoxConstraints constraints,
+    required Duration playbackPosition,
+  }) {
+    final style = entry.styleOverride ?? subtitleState.globalStyle;
+    final effectiveOffsetY = style.verticalOffset + style.offsetY;
+    return Align(
+      alignment: _alignmentForPosition(style.position),
+      child: Transform.translate(
+        offset: Offset(
+          style.offsetX * constraints.maxWidth / kTimelineDesignWidth,
+          effectiveOffsetY * constraints.maxHeight / kTimelineDesignHeight,
+        ),
+        child: AnimatedSubtitleOverlay(
+          entry: entry,
+          globalStyle: subtitleState.globalStyle,
+          currentPosition: playbackPosition,
+          scaleFactor: constraints.maxHeight / kTimelineDesignHeight,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTrackOrderedComposition({
+    required EditorTimeline timeline,
+    required BoxConstraints constraints,
+    required PlaybackState playbackState,
+    required SubtitleState subtitleState,
+    required VideoPlayerController? controller,
+    required TimelineClip? activeBaseClip,
+    required bool controllerReady,
+    required List<_OverlayCanvasItem> overlays,
+    required List<_EffectCanvasItem> effects,
+    required List<_TextCanvasItem> textItems,
+    required List<SubtitleEntry> activeSubtitles,
+  }) {
+    final overlaysByTrack = <String, List<_OverlayCanvasItem>>{};
+    for (final item in overlays) {
+      overlaysByTrack.putIfAbsent(item.track.id, () => []).add(item);
+    }
+    final effectsByTrack = <String, List<_EffectCanvasItem>>{};
+    for (final item in effects) {
+      effectsByTrack.putIfAbsent(item.trackId, () => []).add(item);
+    }
+    final textByTrack = <String, List<_TextCanvasItem>>{};
+    for (final item in textItems) {
+      textByTrack.putIfAbsent(item.trackId, () => []).add(item);
+    }
+    final subtitleTrackByClipId = <String, String>{
+      for (final track in timeline.tracks)
+        if (track.type == TimelineTrackType.subtitle)
+          for (final clip in track.clips) clip.id: track.id,
+    };
+    final subtitlesByTrack = <String, List<SubtitleEntry>>{};
+    for (final entry in activeSubtitles) {
+      final trackId = subtitleTrackByClipId[entry.id];
+      if (trackId != null) {
+        subtitlesByTrack.putIfAbsent(trackId, () => []).add(entry);
+      }
+    }
+
+    Widget composed = ColoredBox(
+      key: const ValueKey('preview-composed-media-canvas'),
+      color: activeBaseClip?.mayRevealCanvasBackground == true
+          ? Colors.black
+          : timeline.canvasSettings.backgroundColor,
+    );
+
+    for (final track in timeline.visualTracksInPaintOrder) {
+      if (track.section == TimelineTrackSection.baseVideo &&
+          activeBaseClip != null &&
+          activeBaseClip.trackId == track.id) {
+        final baseLayer = activeBaseClip.type == TimelineTrackType.video
+            ? controllerReady && controller != null
+                  ? _buildBaseVideoLayer(
+                      controller: controller,
+                      clip: activeBaseClip,
+                      constraints: constraints,
+                      playbackPosition: playbackState.position,
+                    )
+                  : null
+            : _buildBaseAssetLayer(
+                timeline: timeline,
+                clip: activeBaseClip,
+                constraints: constraints,
+                playbackPosition: playbackState.position,
+              );
+        if (baseLayer != null) {
+          composed = Stack(
+            fit: StackFit.expand,
+            children: [composed, baseLayer],
+          );
+        }
+      }
+
+      final operations =
+          <({int layer, Duration start, Object item})>[
+            for (final item in overlaysByTrack[track.id] ?? const [])
+              (layer: item.clip.layer, start: item.clip.startTime, item: item),
+            for (final item in effectsByTrack[track.id] ?? const [])
+              (layer: item.clip.layer, start: item.clip.startTime, item: item),
+            for (final item in textByTrack[track.id] ?? const [])
+              (layer: item.clip.layer, start: item.clip.startTime, item: item),
+          ]..sort((a, b) {
+            final layer = a.layer.compareTo(b.layer);
+            return layer != 0 ? layer : a.start.compareTo(b.start);
+          });
+
+      for (final operation in operations) {
+        final item = operation.item;
+        if (item is _EffectCanvasItem) {
+          composed = _applyTimelineEffectsToMedia(composed, [
+            item,
+          ], playbackState.position);
+        } else if (item is _OverlayCanvasItem) {
+          composed = Stack(
+            fit: StackFit.expand,
+            children: [
+              composed,
+              Align(
+                child: Transform.translate(
+                  offset: Offset(
+                    item.clip.transformAt(playbackState.position).offsetX *
+                        constraints.maxWidth /
+                        kTimelineDesignWidth,
+                    item.clip.transformAt(playbackState.position).offsetY *
+                        constraints.maxHeight /
+                        kTimelineDesignHeight,
+                  ),
+                  child: _buildOverlayAsset(
+                    item,
+                    constraints,
+                    playbackState,
+                    timeline,
+                  ),
+                ),
+              ),
+            ],
+          );
+        } else if (item is _TextCanvasItem) {
+          composed = Stack(
+            fit: StackFit.expand,
+            children: [
+              composed,
+              _buildTextVisualLayer(item, constraints, playbackState.position),
+            ],
+          );
+        }
+      }
+
+      for (final entry in subtitlesByTrack[track.id] ?? const []) {
+        composed = Stack(
+          fit: StackFit.expand,
+          children: [
+            composed,
+            _buildSubtitleVisualLayer(
+              entry: entry,
+              subtitleState: subtitleState,
+              constraints: constraints,
+              playbackPosition: playbackState.position,
+            ),
+          ],
+        );
+      }
+    }
+
+    return KeyedSubtree(
+      key: const ValueKey('preview-composed-effect-output'),
+      child: composed,
     );
   }
 
@@ -1893,16 +2754,79 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
           }
           break;
         case TimelineEffectKind.blur:
-          effected = _applyBlurPreview(
-            effected,
-            _resolvedBlurAt(effect.clip, playbackPosition),
-          );
+          final resolvedBlur = _resolvedBlurAt(effect.clip, playbackPosition);
+          effected = resolvedBlur.mode == ClipBlurMode.region
+              ? _applyTransformedRegionBlurPreview(
+                  effected,
+                  effect.clip,
+                  resolvedBlur,
+                  playbackPosition,
+                )
+              : _applyBlurPreview(effected, resolvedBlur);
           break;
         case null:
           break;
       }
     }
     return effected;
+  }
+
+  Widget _applyTransformedRegionBlurPreview(
+    Widget child,
+    TimelineClip clip,
+    ClipBlurSettings blur,
+    Duration playbackPosition,
+  ) {
+    if (!blur.isEnabled) return child;
+    final transform = clip.transformAt(playbackPosition);
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (!constraints.hasBoundedWidth ||
+            !constraints.hasBoundedHeight ||
+            constraints.maxWidth <= 0 ||
+            constraints.maxHeight <= 0) {
+          return child;
+        }
+        final scale = transform.scale.clamp(0.2, 4.0).toDouble();
+        final width = constraints.maxWidth * blur.safeRegionWidth * scale;
+        final height = constraints.maxHeight * blur.safeRegionHeight * scale;
+        final centerX =
+            constraints.maxWidth *
+                (blur.safeRegionX + blur.safeRegionWidth / 2) +
+            transform.offsetX * constraints.maxWidth / kTimelineDesignWidth;
+        final centerY =
+            constraints.maxHeight *
+                (blur.safeRegionY + blur.safeRegionHeight / 2) +
+            transform.offsetY * constraints.maxHeight / kTimelineDesignHeight;
+        return Stack(
+          fit: StackFit.expand,
+          clipBehavior: Clip.hardEdge,
+          children: [
+            child,
+            Positioned(
+              left: centerX - width / 2,
+              top: centerY - height / 2,
+              width: width,
+              height: height,
+              child: Transform.rotate(
+                angle: transform.rotation,
+                child: ClipRect(
+                  child: BackdropFilter(
+                    key: ValueKey('effect_blur_region_${clip.id}'),
+                    filter: ui.ImageFilter.blur(
+                      sigmaX: blur.safeStrength,
+                      sigmaY: blur.safeStrength,
+                      tileMode: TileMode.clamp,
+                    ),
+                    child: const ColoredBox(color: Colors.transparent),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   Widget _buildEffectLayer({
@@ -1935,86 +2859,86 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                 return const SizedBox.shrink();
               }
               final isSelected = selectedClipId == clip.id;
+              final transform = clip.transform;
               return Positioned(
                 left: constraints.maxWidth * blur.safeRegionX,
                 top: constraints.maxHeight * blur.safeRegionY,
                 width: constraints.maxWidth * blur.safeRegionWidth,
                 height: constraints.maxHeight * blur.safeRegionHeight,
-                child: _OverlayTransformBox(
-                  isSelected: isSelected,
-                  onTap: () => _selectEffectClip(item),
-                  onMoveStart: () {
-                    _selectEffectClip(item);
-                    ref
-                        .read(editorProvider.notifier)
-                        .beginTimelineGestureEdit();
-                  },
-                  onMoveUpdate: (delta) {
-                    _updateEffectBlur(
-                      clip.id,
-                      (current) => current.copyWith(
-                        regionX:
-                            (current.safeRegionX +
-                                    delta.dx / constraints.maxWidth)
-                                .clamp(0.0, 1 - current.safeRegionWidth)
-                                .toDouble(),
-                        regionY:
-                            (current.safeRegionY +
-                                    delta.dy / constraints.maxHeight)
-                                .clamp(0.0, 1 - current.safeRegionHeight)
-                                .toDouble(),
+                child: Transform.translate(
+                  offset: Offset(
+                    transform.offsetX *
+                        constraints.maxWidth /
+                        kTimelineDesignWidth,
+                    transform.offsetY *
+                        constraints.maxHeight /
+                        kTimelineDesignHeight,
+                  ),
+                  child: Transform.rotate(
+                    angle: transform.rotation,
+                    child: Transform.scale(
+                      scale: transform.scale.clamp(0.2, 4.0),
+                      child: _OverlayTransformBox(
+                        isSelected: isSelected,
+                        onTap: () => _selectEffectClip(item),
+                        onMoveStart: () {
+                          _selectEffectClip(item);
+                          _beginSnappedDrag(transform);
+                          ref
+                              .read(editorProvider.notifier)
+                              .beginTimelineGestureEdit();
+                        },
+                        onMoveUpdate: (delta) {
+                          _updateOverlayTransform(clip.id, (current) {
+                            final proposedX =
+                                (_dragSourceOffsetX ?? current.offsetX) +
+                                delta.dx *
+                                    kTimelineDesignWidth /
+                                    constraints.maxWidth;
+                            final proposedY =
+                                (_dragSourceOffsetY ?? current.offsetY) +
+                                delta.dy *
+                                    kTimelineDesignHeight /
+                                    constraints.maxHeight;
+                            _dragSourceOffsetX = proposedX;
+                            _dragSourceOffsetY = proposedY;
+                            return current.copyWith(
+                              offsetX: proposedX,
+                              offsetY: proposedY,
+                            );
+                          });
+                        },
+                        onMoveEnd: _endSnappedDrag,
+                        onScaleFactorUpdate: (factor) {
+                          _updateOverlayTransform(
+                            clip.id,
+                            (current) => current.copyWith(
+                              scale:
+                                  ((_freeTransformStartScale ?? current.scale) *
+                                          factor)
+                                      .clamp(0.2, 4.0)
+                                      .toDouble(),
+                            ),
+                          );
+                        },
+                        onRotationUpdate: (rotation) {
+                          _updateOverlayTransform(
+                            clip.id,
+                            (current) => current.copyWith(
+                              rotation:
+                                  (_freeTransformStartRotation ??
+                                      current.rotation) +
+                                  rotation,
+                            ),
+                          );
+                        },
+                        child: ColoredBox(
+                          color: isSelected
+                              ? kAccent.withValues(alpha: 0.035)
+                              : Colors.transparent,
+                        ),
                       ),
-                    );
-                  },
-                  onMoveEnd: () => ref
-                      .read(editorProvider.notifier)
-                      .endTimelineGestureEdit(),
-                  onWidthResizeStart: () {
-                    _selectEffectClip(item);
-                    ref
-                        .read(editorProvider.notifier)
-                        .beginTimelineGestureEdit();
-                  },
-                  onWidthResizeUpdate: (delta) {
-                    _updateEffectBlur(
-                      clip.id,
-                      (current) => current.copyWith(
-                        regionWidth:
-                            (current.safeRegionWidth +
-                                    delta.dx / constraints.maxWidth)
-                                .clamp(0.08, 1 - current.safeRegionX)
-                                .toDouble(),
-                      ),
-                    );
-                  },
-                  onWidthResizeEnd: () => ref
-                      .read(editorProvider.notifier)
-                      .endTimelineGestureEdit(),
-                  onHeightResizeStart: () {
-                    _selectEffectClip(item);
-                    ref
-                        .read(editorProvider.notifier)
-                        .beginTimelineGestureEdit();
-                  },
-                  onHeightResizeUpdate: (delta) {
-                    _updateEffectBlur(
-                      clip.id,
-                      (current) => current.copyWith(
-                        regionHeight:
-                            (current.safeRegionHeight +
-                                    delta.dy / constraints.maxHeight)
-                                .clamp(0.08, 1 - current.safeRegionY)
-                                .toDouble(),
-                      ),
-                    );
-                  },
-                  onHeightResizeEnd: () => ref
-                      .read(editorProvider.notifier)
-                      .endTimelineGestureEdit(),
-                  child: ColoredBox(
-                    color: isSelected
-                        ? kAccent.withValues(alpha: 0.035)
-                        : Colors.transparent,
+                    ),
                   ),
                 ),
               );
@@ -2190,6 +3114,10 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     final playbackState = ref.watch(playbackProvider);
     final subtitleState = ref.watch(subtitleProvider);
     final editorState = ref.watch(editorProvider);
+    _ensurePreviewCaches(
+      editorState.timeline,
+      editRevision: editorState.editRevision,
+    );
     final workspaceLoop = editorState.timeline.workspaceSettings.loopPlayback;
     final activeOverlayItems = _activeOverlayItems(
       editorState.timeline,
@@ -2203,13 +3131,21 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       editorState.timeline,
       playbackState.position,
     );
-    final activeAudioItems = _activeAudioItems(
-      editorState.timeline,
-      playbackState.position,
-    );
     final activeBaseClip = _activeBaseClip(
       editorState.timeline,
       playbackState.position,
+    );
+    final baseAudioMonitor = activeBaseClip == null
+        ? null
+        : resolvePreviewBaseAudioMonitorForTesting(
+            timeline: editorState.timeline,
+            baseClip: activeBaseClip,
+            position: playbackState.position,
+          );
+    final activeAudioItems = _activeAudioItems(
+      editorState.timeline,
+      playbackState.position,
+      baseAudioMonitor?.clip.id,
     );
     final effectiveCaptions = _effectiveCaptions(
       editorState.timeline,
@@ -2227,14 +3163,45 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         widget.targetAspectRatio ??
         (controllerReady ? controller.value.aspectRatio : 16 / 9);
 
-    SubtitleEntry? activeSubtitle;
-    for (final entry in effectiveCaptions) {
-      if (playbackState.position >= entry.startTime &&
-          playbackState.position < entry.endTime) {
-        activeSubtitle = entry;
-        break;
-      }
-    }
+    final activeSubtitles = effectiveCaptions
+        .where(
+          (entry) =>
+              playbackState.position >= entry.startTime &&
+              playbackState.position < entry.endTime,
+        )
+        .toList(growable: false);
+    final activeSubtitle =
+        activeSubtitles
+            .where((entry) => entry.id == subtitleState.selectedEntryId)
+            .firstOrNull ??
+        activeSubtitles.firstOrNull;
+    final needsSmoothPreviewClock =
+        (activeBaseClip != null &&
+            (activeBaseClip.type == TimelineTrackType.gif ||
+                _clipHasFlutterDrivenMotionAt(
+                  activeBaseClip,
+                  playbackState.position,
+                ))) ||
+        activeOverlayItems.any(
+          (item) =>
+              item.asset.type == EditorAssetType.gif ||
+              _clipHasFlutterDrivenMotionAt(item.clip, playbackState.position),
+        ) ||
+        activeEffectItems.any(
+          (item) =>
+              _clipHasFlutterDrivenMotionAt(item.clip, playbackState.position),
+        ) ||
+        activeTextItems.any(
+          (item) =>
+              item.clip.subtitleStyle?.animationPreset != null ||
+              _clipHasFlutterDrivenMotionAt(item.clip, playbackState.position),
+        ) ||
+        activeSubtitles.any(
+          (entry) =>
+              (entry.styleOverride?.animationPreset ??
+                  subtitleState.globalStyle.animationPreset) !=
+              null,
+        );
 
     return LayoutBuilder(
       builder: (context, panelConstraints) {
@@ -2265,54 +3232,29 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                               child: ClipRect(
                                 child: LayoutBuilder(
                                   builder: (context, constraints) {
-                                    final mediaLayers = <Widget>[
-                                      if (controllerReady)
-                                        _buildBaseVideoLayer(
-                                          controller: controller,
-                                          clip: activeBaseClip,
+                                    return PreviewPlaybackClock(
+                                      position: playbackState.position,
+                                      duration: playbackState.duration,
+                                      isPlaying: playbackState.isPlaying,
+                                      enabled: needsSmoothPreviewClock,
+                                      playbackSpeed: _playbackSpeed,
+                                      builder: (context, previewPosition) {
+                                        return _buildTrackOrderedComposition(
+                                          timeline: editorState.timeline,
                                           constraints: constraints,
-                                          playbackPosition:
-                                              playbackState.position,
-                                        ),
-                                      for (final item in activeOverlayItems)
-                                        Align(
-                                          child: Transform.translate(
-                                            offset: Offset(
-                                              item.clip
-                                                      .transformAt(
-                                                        playbackState.position,
-                                                      )
-                                                      .offsetX *
-                                                  constraints.maxWidth /
-                                                  kTimelineDesignWidth,
-                                              item.clip
-                                                      .transformAt(
-                                                        playbackState.position,
-                                                      )
-                                                      .offsetY *
-                                                  constraints.maxHeight /
-                                                  kTimelineDesignHeight,
-                                            ),
-                                            child: _buildOverlayAsset(
-                                              item,
-                                              constraints,
-                                              playbackState,
-                                            ),
+                                          playbackState: playbackState.copyWith(
+                                            position: previewPosition,
                                           ),
-                                        ),
-                                    ];
-                                    return _buildComposedMediaPreview(
-                                      backgroundColor: editorState
-                                          .timeline
-                                          .canvasSettings
-                                          .backgroundColor,
-                                      mediaLayers: mediaLayers,
-                                      timelineEffectsBuilder: (composedMedia) =>
-                                          _applyTimelineEffectsToMedia(
-                                            composedMedia,
-                                            activeEffectItems,
-                                            playbackState.position,
-                                          ),
+                                          subtitleState: subtitleState,
+                                          controller: controller,
+                                          activeBaseClip: activeBaseClip,
+                                          controllerReady: controllerReady,
+                                          overlays: activeOverlayItems,
+                                          effects: activeEffectItems,
+                                          textItems: activeTextItems,
+                                          activeSubtitles: activeSubtitles,
+                                        );
+                                      },
                                     );
                                   },
                                 ),
@@ -2363,19 +3305,177 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                             child: GestureDetector(
                               onTap: _togglePlayPause,
                               behavior: HitTestBehavior.translucent,
-                              child: AnimatedOpacity(
-                                opacity: playbackState.isPlaying ? 0 : 0.7,
-                                duration: const Duration(milliseconds: 200),
-                                child: const Center(
-                                  child: Icon(
-                                    Icons.play_circle_filled_rounded,
-                                    size: 56,
-                                    color: Colors.white,
-                                  ),
-                                ),
-                              ),
+                              child: const SizedBox.expand(),
                             ),
                           ),
+                          if (controllerReady &&
+                              (activeBaseClip.fitMode == ClipFitMode.contain ||
+                                  activeBaseClip.transform.scale < 0.999 ||
+                                  activeBaseClip.transform.rotation.abs() >
+                                      0.0001 ||
+                                  activeBaseClip.transform.offsetX.abs() >
+                                      0.0001 ||
+                                  activeBaseClip.transform.offsetY.abs() >
+                                      0.0001))
+                            _CanvasBoundLayer(
+                              aspectRatio: previewAspectRatio,
+                              child: LayoutBuilder(
+                                builder: (context, constraints) {
+                                  final sourceSize = controller.value.size;
+                                  final safeSourceSize = Size(
+                                    sourceSize.width <= 0
+                                        ? constraints.maxWidth
+                                        : sourceSize.width,
+                                    sourceSize.height <= 0
+                                        ? constraints.maxHeight
+                                        : sourceSize.height,
+                                  );
+                                  final destination = applyBoxFit(
+                                    BoxFit.contain,
+                                    safeSourceSize,
+                                    constraints.biggest,
+                                  ).destination;
+                                  final transform = activeBaseClip.transformAt(
+                                    playbackState.position,
+                                  );
+                                  final isSelected =
+                                      editorState.selectedClipId ==
+                                      activeBaseClip.id;
+                                  return Align(
+                                    child: Transform.translate(
+                                      offset: Offset(
+                                        transform.offsetX *
+                                            constraints.maxWidth /
+                                            kTimelineDesignWidth,
+                                        transform.offsetY *
+                                            constraints.maxHeight /
+                                            kTimelineDesignHeight,
+                                      ),
+                                      child: Transform.rotate(
+                                        angle: transform.rotation,
+                                        child: Transform.scale(
+                                          scale: transform.scale.clamp(
+                                            0.2,
+                                            4.0,
+                                          ),
+                                          child: _OverlayTransformBox(
+                                            isSelected: isSelected,
+                                            onTap: () {
+                                              final track = controllerTrack;
+                                              if (track == null) return;
+                                              ref
+                                                  .read(editorProvider.notifier)
+                                                  .selectTrack(track.id);
+                                              ref
+                                                  .read(editorProvider.notifier)
+                                                  .selectClip(
+                                                    activeBaseClip.id,
+                                                  );
+                                            },
+                                            onMoveStart: () {
+                                              final track = controllerTrack;
+                                              if (track == null ||
+                                                  track.isLocked) {
+                                                return;
+                                              }
+                                              ref
+                                                  .read(editorProvider.notifier)
+                                                  .selectTrack(track.id);
+                                              ref
+                                                  .read(editorProvider.notifier)
+                                                  .selectClip(
+                                                    activeBaseClip.id,
+                                                  );
+                                              _beginSnappedDrag(transform);
+                                              ref
+                                                  .read(editorProvider.notifier)
+                                                  .beginTimelineGestureEdit();
+                                            },
+                                            onMoveUpdate: (delta) {
+                                              if (controllerTrack?.isLocked ==
+                                                  true) {
+                                                return;
+                                              }
+                                              _updateOverlayTransform(
+                                                activeBaseClip.id,
+                                                (current) {
+                                                  final proposedX =
+                                                      (_dragSourceOffsetX ??
+                                                          current.offsetX) +
+                                                      delta.dx *
+                                                          kTimelineDesignWidth /
+                                                          constraints.maxWidth;
+                                                  final proposedY =
+                                                      (_dragSourceOffsetY ??
+                                                          current.offsetY) +
+                                                      delta.dy *
+                                                          kTimelineDesignHeight /
+                                                          constraints.maxHeight;
+                                                  _dragSourceOffsetX =
+                                                      proposedX;
+                                                  _dragSourceOffsetY =
+                                                      proposedY;
+                                                  return current.copyWith(
+                                                    offsetX: proposedX,
+                                                    offsetY: proposedY,
+                                                  );
+                                                },
+                                              );
+                                            },
+                                            onMoveEnd: () {
+                                              if (_freeTransformStartScale !=
+                                                  null) {
+                                                _endSnappedDrag();
+                                              }
+                                            },
+                                            onScaleFactorUpdate: (factor) {
+                                              if (controllerTrack?.isLocked ==
+                                                  true) {
+                                                return;
+                                              }
+                                              _updateOverlayTransform(
+                                                activeBaseClip.id,
+                                                (current) => current.copyWith(
+                                                  scale:
+                                                      ((_freeTransformStartScale ??
+                                                                  current
+                                                                      .scale) *
+                                                              factor)
+                                                          .clamp(0.2, 4.0)
+                                                          .toDouble(),
+                                                ),
+                                              );
+                                            },
+                                            onRotationUpdate: (rotation) {
+                                              if (controllerTrack?.isLocked ==
+                                                  true) {
+                                                return;
+                                              }
+                                              _updateOverlayTransform(
+                                                activeBaseClip.id,
+                                                (current) => current.copyWith(
+                                                  rotation:
+                                                      (_freeTransformStartRotation ??
+                                                          current.rotation) +
+                                                      rotation,
+                                                ),
+                                              );
+                                            },
+                                            child: SizedBox(
+                                              key: ValueKey(
+                                                'preview-source-interaction-${activeBaseClip.id}',
+                                              ),
+                                              width: destination.width,
+                                              height: destination.height,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                },
+                              ),
+                            ),
                           if (activeOverlayItems.isNotEmpty)
                             _CanvasBoundLayer(
                               aspectRatio: previewAspectRatio,
@@ -2467,52 +3567,31 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                               });
                                             },
                                             onMoveEnd: _endSnappedDrag,
-                                            onWidthResizeStart: () {
-                                              _selectOverlayClip(item);
-                                              ref
-                                                  .read(editorProvider.notifier)
-                                                  .beginTimelineGestureEdit();
-                                            },
-                                            onWidthResizeUpdate: (delta) {
+                                            onScaleFactorUpdate: (factor) {
                                               _updateOverlayTransform(
                                                 item.clip.id,
                                                 (current) => current.copyWith(
                                                   scale:
-                                                      (current.scale +
-                                                              (delta.dx /
-                                                                  constraints
-                                                                      .maxWidth))
+                                                      ((_freeTransformStartScale ??
+                                                                  current
+                                                                      .scale) *
+                                                              factor)
                                                           .clamp(0.2, 4.0)
                                                           .toDouble(),
                                                 ),
                                               );
                                             },
-                                            onWidthResizeEnd: () => ref
-                                                .read(editorProvider.notifier)
-                                                .endTimelineGestureEdit(),
-                                            onHeightResizeStart: () {
-                                              _selectOverlayClip(item);
-                                              ref
-                                                  .read(editorProvider.notifier)
-                                                  .beginTimelineGestureEdit();
-                                            },
-                                            onHeightResizeUpdate: (delta) {
+                                            onRotationUpdate: (rotation) {
                                               _updateOverlayTransform(
                                                 item.clip.id,
                                                 (current) => current.copyWith(
-                                                  scale:
-                                                      (current.scale +
-                                                              (delta.dy /
-                                                                  constraints
-                                                                      .maxHeight))
-                                                          .clamp(0.2, 4.0)
-                                                          .toDouble(),
+                                                  rotation:
+                                                      (_freeTransformStartRotation ??
+                                                          current.rotation) +
+                                                      rotation,
                                                 ),
                                               );
                                             },
-                                            onHeightResizeEnd: () => ref
-                                                .read(editorProvider.notifier)
-                                                .endTimelineGestureEdit(),
                                             // Media is painted once in the
                                             // composed canvas below timeline
                                             // effects. Keep only this clear
@@ -2565,29 +3644,21 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                       final transform = item.clip.transformAt(
                                         playbackState.position,
                                       );
-                                      Widget textPreview = ConstrainedBox(
-                                        constraints: BoxConstraints(
-                                          maxWidth:
-                                              constraints.maxWidth *
-                                              style.maxWidthFactor,
+                                      Widget
+                                      textPreview = AnimatedSubtitleOverlay(
+                                        entry: SubtitleEntry(
+                                          id: item.clip.id,
+                                          startTime: item.clip.startTime,
+                                          endTime: item.clip.endTime,
+                                          text:
+                                              item.clip.text ?? item.clip.label,
+                                          styleOverride: style,
                                         ),
-                                        child: Text(
-                                          item.clip.text ?? item.clip.label,
-                                          textAlign: style.textAlignment,
-                                          style: TextStyle(
-                                            color: style.textColor,
-                                            fontSize:
-                                                style.fontSize *
-                                                constraints.maxHeight /
-                                                kTimelineDesignHeight,
-                                            fontWeight: style.isBold
-                                                ? FontWeight.w700
-                                                : FontWeight.w500,
-                                            fontStyle: style.isItalic
-                                                ? FontStyle.italic
-                                                : FontStyle.normal,
-                                          ),
-                                        ),
+                                        globalStyle: style,
+                                        currentPosition: playbackState.position,
+                                        scaleFactor:
+                                            constraints.maxHeight /
+                                            kTimelineDesignHeight,
                                       );
                                       // Text clips export through ASS today,
                                       // which supports editor offsets and font
@@ -2677,63 +3748,42 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                               });
                                             },
                                             onMoveEnd: _endSnappedDrag,
-                                            onWidthResizeStart: () {
-                                              ref
-                                                  .read(editorProvider.notifier)
-                                                  .selectTrack(item.trackId);
-                                              ref
-                                                  .read(editorProvider.notifier)
-                                                  .selectClip(item.clip.id);
-                                              ref
-                                                  .read(editorProvider.notifier)
-                                                  .beginTimelineGestureEdit();
-                                            },
-                                            onWidthResizeUpdate: (delta) {
+                                            onScaleFactorUpdate: (factor) {
                                               _updateOverlayTransform(
                                                 item.clip.id,
                                                 (current) => current.copyWith(
                                                   scale:
-                                                      (current.scale +
-                                                              (delta.dx /
-                                                                  constraints
-                                                                      .maxWidth))
+                                                      ((_freeTransformStartScale ??
+                                                                  current
+                                                                      .scale) *
+                                                              factor)
                                                           .clamp(0.25, 4.0)
                                                           .toDouble(),
                                                 ),
                                               );
                                             },
-                                            onWidthResizeEnd: () => ref
-                                                .read(editorProvider.notifier)
-                                                .endTimelineGestureEdit(),
-                                            onHeightResizeStart: () {
-                                              ref
-                                                  .read(editorProvider.notifier)
-                                                  .selectTrack(item.trackId);
-                                              ref
-                                                  .read(editorProvider.notifier)
-                                                  .selectClip(item.clip.id);
-                                              ref
-                                                  .read(editorProvider.notifier)
-                                                  .beginTimelineGestureEdit();
-                                            },
-                                            onHeightResizeUpdate: (delta) {
+                                            onRotationUpdate: (rotation) {
                                               _updateOverlayTransform(
                                                 item.clip.id,
                                                 (current) => current.copyWith(
-                                                  scale:
-                                                      (current.scale +
-                                                              (delta.dy /
-                                                                  constraints
-                                                                      .maxHeight))
-                                                          .clamp(0.25, 4.0)
-                                                          .toDouble(),
+                                                  rotation:
+                                                      (_freeTransformStartRotation ??
+                                                          current.rotation) +
+                                                      rotation,
                                                 ),
                                               );
                                             },
-                                            onHeightResizeEnd: () => ref
-                                                .read(editorProvider.notifier)
-                                                .endTimelineGestureEdit(),
-                                            child: textPreview,
+                                            child: Opacity(
+                                              opacity: 0,
+                                              child: ConstrainedBox(
+                                                constraints:
+                                                    const BoxConstraints(
+                                                      minWidth: 48,
+                                                      minHeight: 36,
+                                                    ),
+                                                child: textPreview,
+                                              ),
+                                            ),
                                           ),
                                         ),
                                       );
@@ -2747,7 +3797,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                               aspectRatio: previewAspectRatio,
                               child: LayoutBuilder(
                                 builder: (context, constraints) {
-                                  final activeEntry = activeSubtitle!;
+                                  final activeEntry = activeSubtitle;
                                   final isSelected =
                                       subtitleState.selectedEntryId ==
                                       activeEntry.id;
@@ -2849,71 +3899,36 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                           );
                                         },
                                         onMoveEnd: _endStyleGesture,
-                                        onWidthResizeStart: () =>
-                                            _beginStyleGesture(
-                                              activeEntry,
-                                              editPerEntry,
-                                            ),
-                                        onWidthResizeUpdate: (delta) {
+                                        onScaleFactorUpdate: (factor) {
                                           final style = _readEditableStyleFor(
                                             activeEntry,
                                             editPerEntry,
                                           );
-                                          final widthDelta =
-                                              delta.dx / constraints.maxWidth;
-                                          final nextWidth =
-                                              (style.maxWidthFactor +
-                                                      widthDelta)
-                                                  .clamp(0.25, 1.0)
-                                                  .toDouble();
-
                                           _applyStyleLive(
                                             activeEntry: activeEntry,
                                             editPerEntry: editPerEntry,
                                             style: style.copyWith(
-                                              maxWidthFactor: nextWidth,
+                                              fontSize:
+                                                  ((_freeTransformStartFontSize ??
+                                                              style.fontSize) *
+                                                          factor)
+                                                      .clamp(1.0, 72.0)
+                                                      .toDouble(),
                                             ),
                                           );
                                         },
-                                        onWidthResizeEnd: _endStyleGesture,
-                                        onHeightResizeStart: () =>
-                                            _beginStyleGesture(
-                                              activeEntry,
-                                              editPerEntry,
-                                            ),
-                                        onHeightResizeUpdate: (delta) {
-                                          final style = _readEditableStyleFor(
-                                            activeEntry,
-                                            editPerEntry,
-                                          );
-                                          final nextFontSize =
-                                              (style.fontSize +
-                                                      delta.dy *
-                                                          kTimelineDesignHeight /
-                                                          constraints
-                                                              .maxHeight *
-                                                          0.25)
-                                                  .clamp(1.0, 72.0)
-                                                  .toDouble();
-
-                                          _applyStyleLive(
-                                            activeEntry: activeEntry,
-                                            editPerEntry: editPerEntry,
-                                            style: style.copyWith(
-                                              fontSize: nextFontSize,
-                                            ),
-                                          );
-                                        },
-                                        onHeightResizeEnd: _endStyleGesture,
-                                        child: AnimatedSubtitleOverlay(
-                                          entry: activeEntry,
-                                          globalStyle:
-                                              subtitleState.globalStyle,
-                                          currentPosition:
-                                              playbackState.position,
-                                          scaleFactor:
-                                              constraints.maxHeight /
-                                              kTimelineDesignHeight,
+                                        child: Opacity(
+                                          opacity: 0,
+                                          child: AnimatedSubtitleOverlay(
+                                            entry: activeEntry,
+                                            globalStyle:
+                                                subtitleState.globalStyle,
+                                            currentPosition:
+                                                playbackState.position,
+                                            scaleFactor:
+                                                constraints.maxHeight /
+                                                kTimelineDesignHeight,
+                                          ),
                                         ),
                                       ),
                                     ),
@@ -2949,8 +3964,19 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                             ),
                           for (final item in activeOverlayItems)
                             if (item.asset.type == EditorAssetType.video &&
+                                item.clip.freezeFrame &&
+                                !item.clip.isReversed &&
+                                previewVisualUsesEmbeddedAudioForTesting(
+                                  timeline: editorState.timeline,
+                                  visualTrack: item.track,
+                                  visualClip: item.clip,
+                                  position: playbackState.position,
+                                  hasSoloMediaTrack: _hasSoloMediaTrack(
+                                    editorState.timeline,
+                                  ),
+                                ) &&
                                 item.asset.sourcePath != null &&
-                                File(item.asset.sourcePath!).existsSync() &&
+                                _cachedFileExists(item.asset.sourcePath!) &&
                                 editorState.timeline.clipHasAudio(item.clip))
                               Positioned(
                                 left: 0,
@@ -2970,12 +3996,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                     item.clip,
                                     playbackState.position,
                                   ),
-                                  isTrackAudible:
-                                      !item.track.isMuted &&
-                                      (!_hasSoloMediaTrack(
-                                            editorState.timeline,
-                                          ) ||
-                                          item.track.isSolo),
+                                  isTrackAudible: true,
                                   continueFreezeFrameAudio: true,
                                 ),
                               ),
@@ -2996,19 +4017,18 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                   item.clip,
                                   playbackState.position,
                                 ),
-                                isTrackAudible:
-                                    !item.track.isMuted &&
-                                    (!_hasSoloMediaTrack(
-                                          editorState.timeline,
-                                        ) ||
-                                        item.track.isSolo),
+                                isTrackAudible: true,
                               ),
                             ),
                           if (controllerReady &&
                               activeBaseClip.freezeFrame &&
                               !activeBaseClip.isReversed &&
+                              !activeBaseClip.audioMix.muted &&
                               controllerPath != null &&
                               controllerTrack != null &&
+                              !controllerTrack.isMuted &&
+                              (!_hasSoloMediaTrack(editorState.timeline) ||
+                                  controllerTrack.isSolo) &&
                               editorState.timeline.clipHasAudio(activeBaseClip))
                             Positioned(
                               left: 0,
@@ -3028,12 +4048,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                   activeBaseClip,
                                   playbackState.position,
                                 ),
-                                isTrackAudible:
-                                    !controllerTrack.isMuted &&
-                                    (!_hasSoloMediaTrack(
-                                          editorState.timeline,
-                                        ) ||
-                                        controllerTrack.isSolo),
+                                isTrackAudible: true,
                                 continueFreezeFrameAudio: true,
                               ),
                             ),
@@ -3335,11 +4350,13 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
 class _OverlayAnimationState {
   final double opacity;
   final double scale;
+  final double rotation;
   final Offset offset;
 
   const _OverlayAnimationState({
     required this.opacity,
     required this.scale,
+    required this.rotation,
     required this.offset,
   });
 }
@@ -3411,6 +4428,7 @@ class _TimelineGifPreview extends StatefulWidget {
   final ClipFitMode fitMode;
   final ClipCropSettings crop;
   final String label;
+  final BorderRadius borderRadius;
   final Widget Function(Widget child) mediaEffectsBuilder;
 
   const _TimelineGifPreview({
@@ -3424,6 +4442,7 @@ class _TimelineGifPreview extends StatefulWidget {
     required this.fitMode,
     required this.crop,
     required this.label,
+    this.borderRadius = const BorderRadius.all(Radius.circular(10)),
     required this.mediaEffectsBuilder,
   });
 
@@ -3435,28 +4454,73 @@ class _TimelineGifPreviewState extends State<_TimelineGifPreview> {
   List<_DecodedGifFrame> _frames = const [];
   int _totalDurationMs = 0;
   int _decodeGeneration = 0;
+  Timer? _resizeDecodeTimer;
+  HttpClient? _activeHttpClient;
   bool _loading = true;
   bool _failed = false;
 
   @override
   void initState() {
     super.initState();
-    unawaited(_decodeFrames());
+    _requestDecode(immediate: true);
   }
 
   @override
   void didUpdateWidget(covariant _TimelineGifPreview oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.filePath != widget.filePath ||
-        oldWidget.remoteUrl != widget.remoteUrl ||
-        oldWidget.width.ceil() != widget.width.ceil() ||
-        oldWidget.height.ceil() != widget.height.ceil()) {
-      unawaited(_decodeFrames());
+    final sourceChanged =
+        oldWidget.filePath != widget.filePath ||
+        oldWidget.remoteUrl != widget.remoteUrl;
+    final oldSize = quantizeGifPreviewSizeForTesting(
+      oldWidget.width,
+      oldWidget.height,
+    );
+    final nextSize = quantizeGifPreviewSizeForTesting(
+      widget.width,
+      widget.height,
+    );
+    if (sourceChanged || oldSize != nextSize) {
+      _requestDecode(immediate: sourceChanged);
     }
   }
 
-  Future<Uint8List> _loadBytes() async {
+  void _requestDecode({required bool immediate}) {
+    final generation = ++_decodeGeneration;
+    _resizeDecodeTimer?.cancel();
+    _activeHttpClient?.close(force: true);
+    _activeHttpClient = null;
     final filePath = widget.filePath;
+    final remoteUrl = widget.remoteUrl;
+    final targetSize = quantizeGifPreviewSizeForTesting(
+      widget.width,
+      widget.height,
+    );
+    final retainCurrentFrames = !immediate && _frames.isNotEmpty;
+    void start() {
+      if (!mounted || generation != _decodeGeneration) return;
+      unawaited(
+        _decodeFrames(
+          generation: generation,
+          filePath: filePath,
+          remoteUrl: remoteUrl,
+          targetSize: targetSize,
+          retainCurrentFrames: retainCurrentFrames,
+        ),
+      );
+    }
+
+    if (immediate) {
+      start();
+    } else {
+      _resizeDecodeTimer = Timer(_gifResizeDecodeDebounce, start);
+    }
+  }
+
+  Future<Uint8List> _loadBytes({
+    required int generation,
+    required String? filePath,
+    required String? remoteUrl,
+  }) async {
     if (filePath != null && filePath.isNotEmpty) {
       final file = File(filePath);
       if (await file.length() > _maxGifEncodedBytes) {
@@ -3468,11 +4532,12 @@ class _TimelineGifPreviewState extends State<_TimelineGifPreview> {
       }
       return bytes;
     }
-    final uri = Uri.tryParse(widget.remoteUrl ?? '');
+    final uri = Uri.tryParse(remoteUrl ?? '');
     if (uri == null || !uri.hasScheme) {
       throw const FormatException('Invalid GIF source');
     }
     final client = HttpClient();
+    if (generation == _decodeGeneration) _activeHttpClient = client;
     try {
       final request = await client.getUrl(uri);
       final response = await request.close();
@@ -3494,17 +4559,27 @@ class _TimelineGifPreviewState extends State<_TimelineGifPreview> {
       }
       return bytes.takeBytes();
     } finally {
+      if (identical(client, _activeHttpClient)) _activeHttpClient = null;
       client.close(force: true);
     }
   }
 
-  Future<void> _decodeFrames() async {
-    final generation = ++_decodeGeneration;
-    _disposeFrames();
-    _loading = true;
+  Future<void> _decodeFrames({
+    required int generation,
+    required String? filePath,
+    required String? remoteUrl,
+    required Size targetSize,
+    required bool retainCurrentFrames,
+  }) async {
+    if (!retainCurrentFrames) _disposeFrames();
+    _loading = _frames.isEmpty;
     _failed = false;
     try {
-      final bytes = await _loadBytes();
+      final bytes = await _loadBytes(
+        generation: generation,
+        filePath: filePath,
+        remoteUrl: remoteUrl,
+      );
       if (!mounted || generation != _decodeGeneration) return;
 
       var intrinsicWidth = 1;
@@ -3524,17 +4599,52 @@ class _TimelineGifPreviewState extends State<_TimelineGifPreview> {
       probeCodec.dispose();
       if (!mounted || generation != _decodeGeneration) return;
 
-      final targetSize = calculateGifDecodeSizeForTesting(
+      final decodeSize = calculateGifDecodeSizeForTesting(
         intrinsicWidth: intrinsicWidth,
         intrinsicHeight: intrinsicHeight,
         frameCount: frameCount,
-        maxWidth: widget.width,
-        maxHeight: widget.height,
+        maxWidth: targetSize.width,
+        maxHeight: targetSize.height,
       );
+      // Show a decoded first frame immediately while the deterministic
+      // timeline frame cache is prepared. Large GIFs can contain hundreds of
+      // frames; waiting for all of them made a durable local file look like it
+      // was still network-buffering.
+      if (_frames.isEmpty) {
+        final firstFrameCodec = await ui.instantiateImageCodec(
+          bytes,
+          targetWidth: decodeSize.width.toInt(),
+          targetHeight: decodeSize.height.toInt(),
+          allowUpscaling: false,
+        );
+        try {
+          final firstFrame = await firstFrameCodec.getNextFrame();
+          if (!mounted || generation != _decodeGeneration) {
+            firstFrame.image.dispose();
+            return;
+          }
+          setState(() {
+            _frames = [
+              _DecodedGifFrame(
+                image: firstFrame.image,
+                endMilliseconds: math.max(
+                  1,
+                  firstFrame.duration.inMilliseconds,
+                ),
+              ),
+            ];
+            _totalDurationMs = math.max(1, firstFrame.duration.inMilliseconds);
+            _loading = false;
+            _failed = false;
+          });
+        } finally {
+          firstFrameCodec.dispose();
+        }
+      }
       final codec = await ui.instantiateImageCodec(
         bytes,
-        targetWidth: targetSize.width.toInt(),
-        targetHeight: targetSize.height.toInt(),
+        targetWidth: decodeSize.width.toInt(),
+        targetHeight: decodeSize.height.toInt(),
         allowUpscaling: false,
       );
       final decoded = <_DecodedGifFrame>[];
@@ -3568,17 +4678,23 @@ class _TimelineGifPreviewState extends State<_TimelineGifPreview> {
         }
         return;
       }
+      final previousFrames = _frames;
       setState(() {
         _frames = decoded;
         _totalDurationMs = math.max(1, elapsedMs);
         _loading = false;
         _failed = decoded.isEmpty;
       });
+      if (!identical(previousFrames, decoded)) {
+        for (final frame in previousFrames) {
+          frame.image.dispose();
+        }
+      }
     } catch (_) {
       if (!mounted || generation != _decodeGeneration) return;
       setState(() {
         _loading = false;
-        _failed = true;
+        _failed = _frames.isEmpty;
       });
     }
   }
@@ -3594,6 +4710,9 @@ class _TimelineGifPreviewState extends State<_TimelineGifPreview> {
   @override
   void dispose() {
     _decodeGeneration++;
+    _resizeDecodeTimer?.cancel();
+    _activeHttpClient?.close(force: true);
+    _activeHttpClient = null;
     _disposeFrames();
     super.dispose();
   }
@@ -3606,7 +4725,7 @@ class _TimelineGifPreviewState extends State<_TimelineGifPreview> {
         height: widget.height,
         decoration: BoxDecoration(
           color: Colors.black.withValues(alpha: 0.65),
-          borderRadius: BorderRadius.circular(10),
+          borderRadius: widget.borderRadius,
           border: Border.all(color: kBorder),
         ),
         alignment: Alignment.center,
@@ -3656,7 +4775,7 @@ class _TimelineGifPreviewState extends State<_TimelineGifPreview> {
       crop: widget.crop,
     );
     final media = ClipRRect(
-      borderRadius: BorderRadius.circular(10),
+      borderRadius: widget.borderRadius,
       child: SizedBox(
         width: widget.width,
         height: widget.height,
@@ -3703,37 +4822,72 @@ class _OverlayVideoPreview extends StatefulWidget {
 
 class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
   VideoPlayerController? _controller;
+  int _controllerGeneration = 0;
   bool _ready = false;
   bool _syncInFlight = false;
   bool _syncQueued = false;
   bool _forceSeekQueued = false;
   double? _lastVolume;
   double? _lastPlaybackSpeed;
+  DateTime? _lastSyncStartedAt;
 
   @override
   void initState() {
     super.initState();
-    _initialize();
+    unawaited(_loadController(widget.videoPath));
   }
 
   @override
   void didUpdateWidget(covariant _OverlayVideoPreview oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.videoPath != widget.videoPath) {
-      unawaited(_replaceController());
+      unawaited(_loadController(widget.videoPath));
       return;
     }
-    _schedulePlaybackSync();
+    final positionJump =
+        (oldWidget.playbackPosition - widget.playbackPosition).inMilliseconds
+            .abs() >
+        250;
+    final controlsChanged =
+        oldWidget.isPlaying != widget.isPlaying ||
+        oldWidget.playbackSpeed != widget.playbackSpeed ||
+        !identical(oldWidget.clip, widget.clip) ||
+        !widget.isPlaying;
+    _schedulePlaybackSync(
+      forceSeek: positionJump,
+      urgent: controlsChanged || positionJump,
+    );
   }
 
-  Future<void> _initialize() async {
+  Future<void> _loadController(String videoPath) async {
+    final generation = ++_controllerGeneration;
+    final previous = _controller;
+    _controller = null;
+    _ready = false;
+    _lastVolume = null;
+    _lastPlaybackSpeed = null;
+    _lastSyncStartedAt = null;
+    if (mounted) setState(() {});
+    if (previous != null) {
+      try {
+        await previous.dispose();
+      } catch (_) {
+        // Ownership was cleared synchronously; disposal remains best-effort.
+      }
+    }
+    if (!mounted || generation != _controllerGeneration) return;
     VideoPlayerController? createdController;
     try {
-      final controller = VideoPlayerController.file(File(widget.videoPath));
+      final controller = VideoPlayerController.file(
+        File(videoPath),
+        videoPlayerOptions: buildPreviewVideoPlayerOptions(),
+      );
       createdController = controller;
       await controller.initialize();
       await controller.setVolume(0);
-      if (!mounted) {
+      if (!mounted ||
+          generation != _controllerGeneration ||
+          widget.videoPath != videoPath) {
         await controller.dispose();
         return;
       }
@@ -3752,16 +4906,27 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
           // A failed platform initialization may already release its handle.
         }
       }
-      if (mounted) setState(() => _ready = false);
+      if (mounted && generation == _controllerGeneration) {
+        setState(() => _ready = false);
+      }
     }
   }
 
-  void _schedulePlaybackSync({bool forceSeek = false}) {
+  void _schedulePlaybackSync({bool forceSeek = false, bool urgent = false}) {
+    final now = DateTime.now();
+    if (!forceSeek && !urgent) {
+      final previous = _lastSyncStartedAt;
+      if (previous != null &&
+          now.difference(previous) < const Duration(milliseconds: 120)) {
+        return;
+      }
+    }
     if (_syncInFlight) {
       _syncQueued = true;
       _forceSeekQueued = _forceSeekQueued || forceSeek;
       return;
     }
+    _lastSyncStartedAt = now;
     unawaited(_runPlaybackSync(forceSeek: forceSeek));
   }
 
@@ -3785,9 +4950,14 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
 
   Future<void> _syncPlaybackOnce({bool forceSeek = false}) async {
     final controller = _controller;
+    final generation = _controllerGeneration;
     if (!_ready || controller == null || !controller.value.isInitialized) {
       return;
     }
+    bool stillOwnsController() =>
+        mounted &&
+        generation == _controllerGeneration &&
+        identical(controller, _controller);
 
     final relative = _previewSourcePosition(
       widget.clip,
@@ -3799,6 +4969,7 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
     final currentMs = controller.value.position.inMilliseconds;
     if (forceSeek || (currentMs - targetMs).abs() > 200) {
       await controller.seekTo(Duration(milliseconds: targetMs));
+      if (!stillOwnsController()) return;
     }
     final volume = _previewAudioVolume(
       clip: widget.clip,
@@ -3808,6 +4979,7 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
     );
     if (_lastVolume == null || (_lastVolume! - volume).abs() > 0.01) {
       await controller.setVolume(volume);
+      if (!stillOwnsController()) return;
       _lastVolume = volume;
     }
     if (!widget.clip.isReversed && !widget.clip.freezeFrame) {
@@ -3817,6 +4989,7 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
       if (_lastPlaybackSpeed == null ||
           (_lastPlaybackSpeed! - speed).abs() > 0.001) {
         await controller.setPlaybackSpeed(speed);
+        if (!stillOwnsController()) return;
         _lastPlaybackSpeed = speed;
       }
     }
@@ -3836,17 +5009,14 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
     }
   }
 
-  Future<void> _replaceController() async {
-    await _disposeController();
-    if (mounted) await _initialize();
-  }
-
   Future<void> _disposeController() async {
+    _controllerGeneration++;
     final controller = _controller;
     _controller = null;
     _ready = false;
     _lastVolume = null;
     _lastPlaybackSpeed = null;
+    _lastSyncStartedAt = null;
     if (controller != null) {
       await controller.dispose();
     }
@@ -3854,7 +5024,7 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
 
   @override
   void dispose() {
-    _disposeController();
+    unawaited(_disposeController());
     super.dispose();
   }
 
@@ -3935,36 +5105,70 @@ class _TimelineAudioPreview extends StatefulWidget {
 
 class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
   VideoPlayerController? _controller;
+  int _controllerGeneration = 0;
   bool _ready = false;
   bool _syncInFlight = false;
   bool _syncQueued = false;
   bool _forceSeekQueued = false;
   double? _lastVolume;
   double? _lastPlaybackSpeed;
+  DateTime? _lastSyncStartedAt;
 
   @override
   void initState() {
     super.initState();
-    unawaited(_initialize());
+    unawaited(_loadController(widget.audioPath));
   }
 
   @override
   void didUpdateWidget(covariant _TimelineAudioPreview oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.audioPath != widget.audioPath) {
-      unawaited(_replaceController());
+      unawaited(_loadController(widget.audioPath));
     } else {
-      _schedulePlaybackSync();
+      final positionJump =
+          (oldWidget.playbackPosition - widget.playbackPosition).inMilliseconds
+              .abs() >
+          220;
+      final controlsChanged =
+          oldWidget.isPlaying != widget.isPlaying ||
+          oldWidget.playbackSpeed != widget.playbackSpeed ||
+          !identical(oldWidget.clip, widget.clip) ||
+          !widget.isPlaying;
+      _schedulePlaybackSync(
+        forceSeek: positionJump,
+        urgent: controlsChanged || positionJump,
+      );
     }
   }
 
-  Future<void> _initialize() async {
+  Future<void> _loadController(String audioPath) async {
+    final generation = ++_controllerGeneration;
+    final previous = _controller;
+    _controller = null;
+    _ready = false;
+    _lastVolume = null;
+    _lastPlaybackSpeed = null;
+    _lastSyncStartedAt = null;
+    if (previous != null) {
+      try {
+        await previous.dispose();
+      } catch (_) {
+        // Ownership was cleared synchronously; disposal remains best-effort.
+      }
+    }
+    if (!mounted || generation != _controllerGeneration) return;
     VideoPlayerController? createdController;
     try {
-      final controller = VideoPlayerController.file(File(widget.audioPath));
+      final controller = VideoPlayerController.file(
+        File(audioPath),
+        videoPlayerOptions: buildPreviewVideoPlayerOptions(),
+      );
       createdController = controller;
       await controller.initialize();
-      if (!mounted) {
+      if (!mounted ||
+          generation != _controllerGeneration ||
+          widget.audioPath != audioPath) {
         await controller.dispose();
         return;
       }
@@ -3980,26 +5184,25 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
           // A failed platform initialization may already release its handle.
         }
       }
-      _ready = false;
+      if (mounted && generation == _controllerGeneration) _ready = false;
     }
   }
 
-  Future<void> _replaceController() async {
-    final previous = _controller;
-    _controller = null;
-    _ready = false;
-    _lastVolume = null;
-    _lastPlaybackSpeed = null;
-    if (previous != null) await previous.dispose();
-    await _initialize();
-  }
-
-  void _schedulePlaybackSync({bool forceSeek = false}) {
+  void _schedulePlaybackSync({bool forceSeek = false, bool urgent = false}) {
+    final now = DateTime.now();
+    if (!forceSeek && !urgent) {
+      final previous = _lastSyncStartedAt;
+      if (previous != null &&
+          now.difference(previous) < const Duration(milliseconds: 50)) {
+        return;
+      }
+    }
     if (_syncInFlight) {
       _syncQueued = true;
       _forceSeekQueued = _forceSeekQueued || forceSeek;
       return;
     }
+    _lastSyncStartedAt = now;
     unawaited(_runPlaybackSync(forceSeek: forceSeek));
   }
 
@@ -4023,9 +5226,14 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
 
   Future<void> _syncPlaybackOnce({bool forceSeek = false}) async {
     final controller = _controller;
+    final generation = _controllerGeneration;
     if (!_ready || controller == null || !controller.value.isInitialized) {
       return;
     }
+    bool stillOwnsController() =>
+        mounted &&
+        generation == _controllerGeneration &&
+        identical(controller, _controller);
     final continuesFrozenAudio =
         widget.continueFreezeFrameAudio &&
         widget.clip.freezeFrame &&
@@ -4043,6 +5251,7 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
     if (forceSeek ||
         (controller.value.position - target).inMilliseconds.abs() > 180) {
       await controller.seekTo(target);
+      if (!stillOwnsController()) return;
     }
     final canPlayForward =
         !widget.clip.isReversed &&
@@ -4054,6 +5263,7 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
       if (_lastPlaybackSpeed == null ||
           (_lastPlaybackSpeed! - speed).abs() > 0.001) {
         await controller.setPlaybackSpeed(speed);
+        if (!stillOwnsController()) return;
         _lastPlaybackSpeed = speed;
       }
     }
@@ -4066,6 +5276,7 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
     );
     if (_lastVolume == null || (_lastVolume! - safeVolume).abs() > 0.01) {
       await controller.setVolume(safeVolume);
+      if (!stillOwnsController()) return;
       _lastVolume = safeVolume;
     }
     if (!canPlayForward) {
@@ -4081,7 +5292,10 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
 
   @override
   void dispose() {
-    _controller?.dispose();
+    _controllerGeneration++;
+    final controller = _controller;
+    _controller = null;
+    if (controller != null) unawaited(controller.dispose());
     super.dispose();
   }
 
@@ -4191,19 +5405,15 @@ class _CanvasGuidesPainter extends CustomPainter {
   }
 }
 
-class _OverlayTransformBox extends StatelessWidget {
+class _OverlayTransformBox extends StatefulWidget {
   final Widget child;
   final bool isSelected;
   final VoidCallback onTap;
   final VoidCallback onMoveStart;
   final ValueChanged<Offset> onMoveUpdate;
   final VoidCallback onMoveEnd;
-  final VoidCallback onWidthResizeStart;
-  final ValueChanged<Offset> onWidthResizeUpdate;
-  final VoidCallback onWidthResizeEnd;
-  final VoidCallback onHeightResizeStart;
-  final ValueChanged<Offset> onHeightResizeUpdate;
-  final VoidCallback onHeightResizeEnd;
+  final ValueChanged<double> onScaleFactorUpdate;
+  final ValueChanged<double>? onRotationUpdate;
 
   const _OverlayTransformBox({
     required this.child,
@@ -4212,23 +5422,29 @@ class _OverlayTransformBox extends StatelessWidget {
     required this.onMoveStart,
     required this.onMoveUpdate,
     required this.onMoveEnd,
-    required this.onWidthResizeStart,
-    required this.onWidthResizeUpdate,
-    required this.onWidthResizeEnd,
-    required this.onHeightResizeStart,
-    required this.onHeightResizeUpdate,
-    required this.onHeightResizeEnd,
+    required this.onScaleFactorUpdate,
+    this.onRotationUpdate,
   });
 
+  @override
+  State<_OverlayTransformBox> createState() => _OverlayTransformBoxState();
+}
+
+class _OverlayTransformBoxState extends State<_OverlayTransformBox> {
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
       behavior: HitTestBehavior.translucent,
-      onTap: onTap,
-      onPanStart: (_) => onMoveStart(),
-      onPanUpdate: (details) => onMoveUpdate(details.delta),
-      onPanEnd: (_) => onMoveEnd(),
-      onPanCancel: onMoveEnd,
+      onTap: widget.onTap,
+      onScaleStart: (_) {
+        widget.onMoveStart();
+      },
+      onScaleUpdate: (details) {
+        widget.onMoveUpdate(details.focalPointDelta);
+        widget.onScaleFactorUpdate(details.scale);
+        widget.onRotationUpdate?.call(details.rotation);
+      },
+      onScaleEnd: (_) => widget.onMoveEnd(),
       child: Stack(
         clipBehavior: Clip.none,
         children: [
@@ -4237,78 +5453,15 @@ class _OverlayTransformBox extends StatelessWidget {
             padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
             decoration: BoxDecoration(
               border: Border.all(
-                color: isSelected
+                color: widget.isSelected
                     ? kAccent.withValues(alpha: 0.8)
                     : Colors.transparent,
               ),
               borderRadius: BorderRadius.circular(8),
             ),
-            child: child,
+            child: widget.child,
           ),
-          if (isSelected)
-            Positioned(
-              right: -10,
-              top: 0,
-              bottom: 0,
-              child: Center(
-                child: _TransformHandle(
-                  icon: Icons.open_in_full_rounded,
-                  onPanStart: onWidthResizeStart,
-                  onPanUpdate: onWidthResizeUpdate,
-                  onPanEnd: onWidthResizeEnd,
-                ),
-              ),
-            ),
-          if (isSelected)
-            Positioned(
-              bottom: -10,
-              left: 0,
-              right: 0,
-              child: Center(
-                child: _TransformHandle(
-                  icon: Icons.height_rounded,
-                  onPanStart: onHeightResizeStart,
-                  onPanUpdate: onHeightResizeUpdate,
-                  onPanEnd: onHeightResizeEnd,
-                ),
-              ),
-            ),
         ],
-      ),
-    );
-  }
-}
-
-class _TransformHandle extends StatelessWidget {
-  final IconData icon;
-  final VoidCallback onPanStart;
-  final ValueChanged<Offset> onPanUpdate;
-  final VoidCallback onPanEnd;
-
-  const _TransformHandle({
-    required this.icon,
-    required this.onPanStart,
-    required this.onPanUpdate,
-    required this.onPanEnd,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onPanStart: (_) => onPanStart(),
-      onPanUpdate: (details) => onPanUpdate(details.delta),
-      onPanEnd: (_) => onPanEnd(),
-      onPanCancel: onPanEnd,
-      child: Container(
-        width: 20,
-        height: 20,
-        decoration: BoxDecoration(
-          color: kAccent,
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: Colors.white, width: 1),
-        ),
-        child: Icon(icon, size: 12, color: Colors.white),
       ),
     );
   }

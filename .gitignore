@@ -147,3 +147,8 @@ tags
 .Trash-*
 migrate_working_dir/
 /.idea/
+
+# Local source copies and generated ZIPs for optional downloadable media packs.
+# These files are deployment inputs only and must never enter the Flutter bundle.
+/tool/asset_pack_staging/
+/tool/asset_pack_dist/

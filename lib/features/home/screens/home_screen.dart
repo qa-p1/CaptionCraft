@@ -322,19 +322,31 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     }
   }
 
-  Future<void> _importVideos() async {
+  Future<void> _importMedia() async {
     if (_isCreatingProject) return;
     try {
       final result = await FilePicker.platform.pickFiles(
-        type: FileType.video,
+        type: FileType.custom,
         allowMultiple: true,
+        allowedExtensions: const [
+          'mp4',
+          'mov',
+          'm4v',
+          'webm',
+          'mkv',
+          'png',
+          'jpg',
+          'jpeg',
+          'webp',
+          'gif',
+        ],
       );
       if (result == null || result.files.isEmpty) return;
 
       final sources = result.files
           .where((file) => file.path != null)
           .map(
-            (file) => ImportedVideoSource(
+            (file) => ImportedMediaSource(
               filePath: file.path!,
               displayName: file.name,
             ),
@@ -345,12 +357,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       }
     } catch (error) {
       if (mounted) {
-        SnackBarHelper.showError(context, 'Could not import video: $error');
+        SnackBarHelper.showError(context, 'Could not import media: $error');
       }
     }
   }
 
-  void _showImportSheet({required List<ImportedVideoSource> sources}) {
+  void _showImportSheet({required List<ImportedMediaSource> sources}) {
     final baseName = path.basenameWithoutExtension(sources.first.displayName);
     final defaultProjectName = sources.length == 1
         ? baseName
@@ -399,7 +411,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                                 ),
                               ),
                               child: const Icon(
-                                Icons.movie_creation_outlined,
+                                Icons.perm_media_outlined,
                                 color: kAccent,
                               ),
                             ),
@@ -552,7 +564,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   Future<void> _createEditorProject(
-    List<ImportedVideoSource> sources, {
+    List<ImportedMediaSource> sources, {
     String? projectName,
   }) async {
     if (_isCreatingProject) return;
@@ -560,20 +572,20 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     final user = ref.read(currentUserProvider);
     try {
       SnackBarHelper.showInfo(context, 'Securing media and building timeline…');
-      final durableSources = <ImportedVideoSource>[];
+      final durableSources = <ImportedMediaSource>[];
       for (final source in sources) {
         final durablePath = await MediaImportService.persistFile(
           source.filePath,
           originalFileName: source.displayName,
         );
         durableSources.add(
-          ImportedVideoSource(
+          ImportedMediaSource(
             filePath: durablePath,
             displayName: source.displayName,
           ),
         );
       }
-      final result = await ProjectCreationService.createProjectFromVideos(
+      final result = await ProjectCreationService.createProjectFromMedia(
         sources: durableSources,
         ownerUid:
             user?.uid ??
@@ -618,13 +630,16 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     _isOpeningEditor = true;
     try {
       var projectToOpen = project;
-      if (!project.videoAvailability.primarySourceAvailable) {
+      // No individual "primary" clip owns the project. Let partially missing
+      // timelines open when any visual is still usable; unavailable clips can
+      // then be replaced in context without blocking the whole edit.
+      if (!project.videoAvailability.anySourceAvailable) {
         final relinked = await _pickAndRelinkProject(project);
         if (relinked == null || !mounted) {
           if (mounted) {
             SnackBarHelper.showInfo(
               context,
-              'Relink the source video to open this project.',
+              'Relink the missing visual to open this project.',
             );
           }
           return;
@@ -759,7 +774,59 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   Future<Project?> _pickAndRelinkProject(Project project) async {
-    final picked = await FilePicker.platform.pickFiles(type: FileType.video);
+    final mainVisuals = project.timeline.visualMediaClips.where((clip) {
+      final track = project.timeline.tracks
+          .where((candidate) => candidate.id == clip.trackId)
+          .firstOrNull;
+      return track?.section == TimelineTrackSection.baseVideo;
+    }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
+    final allVisuals = project.timeline.visualMediaClips.toList()
+      ..sort((a, b) => a.startTime.compareTo(b.startTime));
+    final orderedVisuals = <TimelineClip>[
+      ...mainVisuals,
+      ...allVisuals.where(
+        (clip) => !mainVisuals.any((candidate) => candidate.id == clip.id),
+      ),
+    ];
+    bool clipIsAvailable(TimelineClip clip) {
+      final asset = project.timeline.assetForClip(clip);
+      if (asset?.isNetworkBacked == true) return true;
+      final sourcePath = asset?.sourcePath;
+      if (sourcePath?.trim().isNotEmpty == true) {
+        return File(sourcePath!).existsSync();
+      }
+      return clip.type == TimelineTrackType.video &&
+          project.videoPath.trim().isNotEmpty &&
+          File(project.videoPath).existsSync();
+    }
+
+    final targetClip =
+        orderedVisuals.where((clip) => !clipIsAvailable(clip)).firstOrNull ??
+        orderedVisuals.firstOrNull;
+    final targetAsset = targetClip == null
+        ? null
+        : project.timeline.assetForClip(targetClip);
+    final picked = await FilePicker.platform.pickFiles(
+      type: targetClip == null
+          ? FileType.custom
+          : targetClip.type == TimelineTrackType.video
+          ? FileType.video
+          : FileType.image,
+      allowedExtensions: targetClip == null
+          ? const [
+              'png',
+              'jpg',
+              'jpeg',
+              'webp',
+              'gif',
+              'mp4',
+              'mov',
+              'm4v',
+              'webm',
+              'mkv',
+            ]
+          : null,
+    );
     final pickedFile = picked?.files.single;
     final selectedPath = pickedFile?.path;
     if (selectedPath == null) return null;
@@ -769,37 +836,166 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         selectedPath,
         originalFileName: pickedFile!.name,
       );
-      final info = await FFmpegService.getMediaInfo(nextPath);
-      final oldPath = project.videoPath;
-      var replacedAsset = false;
-      final assets = project.timeline.assets.map((asset) {
-        final isTarget =
-            asset.sourcePath == oldPath ||
-            (!replacedAsset && asset.type == EditorAssetType.video);
-        if (!isTarget) return asset;
-        replacedAsset = true;
-        return asset.copyWith(
-          label: path.basename(nextPath),
-          sourcePath: nextPath,
-          clearRemoteUrl: true,
-          isNetworkBacked: false,
-          metadata: {
-            ...asset.metadata,
-            'durationMs': info['durationMs'],
-            'width': info['width'],
-            'height': info['height'],
-            'hasAudio': info['hasAudio'],
-            'frameRate': info['frameRate'],
-          },
+      final extension = path.extension(nextPath).toLowerCase();
+      final replacementClipType = switch (extension) {
+        '.mp4' ||
+        '.mov' ||
+        '.m4v' ||
+        '.webm' ||
+        '.mkv' => TimelineTrackType.video,
+        '.gif' => TimelineTrackType.gif,
+        '.png' || '.jpg' || '.jpeg' || '.webp' => TimelineTrackType.image,
+        _ => throw StateError('That visual format is not supported.'),
+      };
+      final shouldProbe =
+          replacementClipType == TimelineTrackType.video ||
+          replacementClipType == TimelineTrackType.gif;
+      final info = shouldProbe
+          ? await FFmpegService.getMediaInfo(nextPath)
+          : <String, dynamic>{};
+      final replacementDurationMs = (info['durationMs'] as num?)?.toInt() ?? 0;
+      if (replacementClipType == TimelineTrackType.video &&
+          replacementDurationMs <= 0) {
+        throw StateError('Could not read the selected video duration.');
+      }
+      final replacementAssetType = switch (replacementClipType) {
+        TimelineTrackType.video => EditorAssetType.video,
+        TimelineTrackType.gif => EditorAssetType.gif,
+        TimelineTrackType.sticker => EditorAssetType.sticker,
+        _ => EditorAssetType.image,
+      };
+      final replacementAsset = EditorAssetReference(
+        type: replacementAssetType,
+        label: path.basename(nextPath),
+        sourcePath: nextPath,
+        metadata: {
+          ...?targetAsset?.metadata,
+          if (replacementDurationMs > 0) 'durationMs': replacementDurationMs,
+          if (info['width'] != null) 'width': info['width'],
+          if (info['height'] != null) 'height': info['height'],
+          if (info['hasAudio'] != null) 'hasAudio': info['hasAudio'],
+          if (info['frameRate'] != null) 'frameRate': info['frameRate'],
+        },
+      );
+
+      var nextTimeline = project.timeline;
+      if (targetClip != null) {
+        final nextTracks = nextTimeline.tracks.map((track) {
+          return track.copyWith(
+            clips: track.clips.map((clip) {
+              if (clip.id != targetClip.id) return clip;
+              return clip.copyWith(
+                type: replacementClipType,
+                label: replacementAsset.label,
+                assetId: replacementAsset.id,
+                sourceStartTime: Duration.zero,
+                sourceDuration: replacementDurationMs > 0
+                    ? Duration(milliseconds: replacementDurationMs)
+                    : clip.sourceDuration,
+              );
+            }).toList(),
+          );
+        }).toList();
+        final referencedAssetIds = nextTracks
+            .expand((track) => track.clips)
+            .map((clip) => clip.assetId)
+            .whereType<String>()
+            .toSet();
+        nextTimeline = nextTimeline.copyWith(
+          tracks: nextTracks,
+          assets: [
+            for (final asset in nextTimeline.assets)
+              if (asset.id != targetAsset?.id ||
+                  referencedAssetIds.contains(asset.id))
+                asset,
+            replacementAsset,
+          ],
         );
-      }).toList();
+      } else {
+        final clipDuration = replacementDurationMs > 0
+            ? Duration(milliseconds: replacementDurationMs)
+            : const Duration(seconds: 4);
+        const section = TimelineTrackSection.baseVideo;
+        final candidateTracks = nextTimeline.tracks.where(
+          (track) =>
+              track.section == section &&
+              track.acceptsClipType(replacementClipType),
+        );
+        TimelineTrack? targetTrack;
+        TimelineClip? newClip;
+        for (final candidate in candidateTracks) {
+          final probe = TimelineClip(
+            trackId: candidate.id,
+            type: replacementClipType,
+            label: replacementAsset.label,
+            assetId: replacementAsset.id,
+            startTime: Duration.zero,
+            endTime: clipDuration,
+            sourceDuration: clipDuration,
+          );
+          if (candidate.canPlaceClip(probe)) {
+            targetTrack = candidate;
+            newClip = probe;
+            break;
+          }
+        }
+        targetTrack ??= TimelineTrack(
+          name: 'Base layer',
+          type: TimelineTrackType.video,
+          section: section,
+        );
+        newClip ??= TimelineClip(
+          trackId: targetTrack.id,
+          type: replacementClipType,
+          label: replacementAsset.label,
+          assetId: replacementAsset.id,
+          startTime: Duration.zero,
+          endTime: clipDuration,
+          sourceDuration: clipDuration,
+        );
+        final trackExists = nextTimeline.tracks.any(
+          (track) => track.id == targetTrack!.id,
+        );
+        nextTimeline = trackExists
+            ? nextTimeline.copyWith(
+                assets: [...nextTimeline.assets, replacementAsset],
+                tracks: nextTimeline.tracks.map((track) {
+                  return track.id == targetTrack!.id
+                      ? track.copyWith(clips: [...track.clips, newClip!])
+                      : track;
+                }).toList(),
+              )
+            : nextTimeline
+                  .copyWith(assets: [...nextTimeline.assets, replacementAsset])
+                  .insertTrackUsingEditorRules(
+                    targetTrack.copyWith(clips: [newClip]),
+                  );
+      }
 
       final updated = project.copyWith(
-        videoPath: nextPath,
-        timeline: project.timeline.copyWith(assets: assets),
+        videoPath:
+            targetClip == null ||
+                targetClip.trackId ==
+                    nextTimeline.tracks
+                        .where(
+                          (track) =>
+                              track.section == TimelineTrackSection.baseVideo,
+                        )
+                        .firstOrNull
+                        ?.id
+            ? nextPath
+            : project.videoPath,
+        durationMs: math.max(
+          project.durationMs,
+          nextTimeline.duration.inMilliseconds,
+        ),
+        timeline: nextTimeline,
         lastModifiedAt: DateTime.now(),
       );
       await _cacheVideoAvailability([updated]);
+      if (!updated.videoAvailability.anySourceAvailable) {
+        throw StateError('The selected file could not repair this project.');
+      }
       await _persistProject(updated);
       if (mounted) {
         SnackBarHelper.showInfo(context, 'Media relinked successfully');
@@ -833,7 +1029,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       builder: (dialogContext) => AlertDialog(
         title: const Text('Delete project?'),
         content: Text(
-          '“${project.name}” will be removed from this device and your synced project library. Source videos and exported files are not deleted.',
+          '“${project.name}” will be removed from this device and your synced project library. Imported media and exported files are not deleted.',
           style: const TextStyle(color: kTextSecondary, height: 1.45),
         ),
         actions: [
@@ -999,7 +1195,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       floatingActionButton: _projects.isEmpty
           ? null
           : FloatingActionButton.extended(
-              onPressed: _isCreatingProject ? null : _importVideos,
+              onPressed: _isCreatingProject ? null : _importMedia,
               backgroundColor: kAccent,
               foregroundColor: kOnAccent,
               elevation: 4,
@@ -1173,7 +1369,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                   runSpacing: 10,
                   children: [
                     FilledButton.icon(
-                      onPressed: _isCreatingProject ? null : _importVideos,
+                      onPressed: _isCreatingProject ? null : _importMedia,
                       icon: const Icon(Icons.add_rounded, size: 19),
                       label: const Text('Start new edit'),
                     ),
@@ -1548,7 +1744,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           ),
           const SizedBox(height: 7),
           Text(
-            '${project.timeline.videoClips.length} clips  ·  ${project.subtitles.length} captions',
+            '${project.timeline.visualMediaClips.length} visual clips  ·  ${project.subtitles.length} captions',
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: AppTextStyles.bodySmall,
@@ -1733,9 +1929,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               ),
               const SizedBox(height: 24),
               AppButton(
-                label: 'Import your footage',
+                label: 'Import visual media',
                 icon: Icons.add_rounded,
-                onPressed: _isCreatingProject ? null : _importVideos,
+                onPressed: _isCreatingProject ? null : _importMedia,
                 isLoading: _isCreatingProject,
                 width: 220,
               ),

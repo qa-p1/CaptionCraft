@@ -171,6 +171,65 @@ void main() {
     expect(networkOverlay.allRequiredSourcesAvailable, isTrue);
   });
 
+  test('overlay-only image projects stay valid with an empty main lane', () {
+    final imageAsset = EditorAssetReference(
+      id: 'image-asset',
+      type: EditorAssetType.image,
+      label: 'Poster',
+      sourcePath: '/poster.png',
+    );
+    final project = Project(
+      id: 'image-project',
+      ownerUid: 'account-a',
+      name: 'Image project',
+      videoPath: '/obsolete-first-video.mp4',
+      durationMs: 4000,
+      timeline: EditorTimeline(
+        assets: [imageAsset],
+        tracks: [
+          TimelineTrack(
+            id: 'main',
+            name: 'Main video',
+            type: TimelineTrackType.video,
+            section: TimelineTrackSection.baseVideo,
+          ),
+          TimelineTrack(
+            id: 'overlay',
+            name: 'Overlay',
+            type: TimelineTrackType.video,
+            section: TimelineTrackSection.overlay,
+            clips: [
+              TimelineClip(
+                id: 'poster',
+                trackId: 'overlay',
+                type: TimelineTrackType.image,
+                label: 'Poster',
+                assetId: imageAsset.id,
+                startTime: Duration.zero,
+                endTime: const Duration(seconds: 4),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+
+    final restored = Project.fromJson(project.toJson());
+    expect(
+      restored.timeline.tracks
+          .singleWhere(
+            (track) => track.section == TimelineTrackSection.baseVideo,
+          )
+          .clips,
+      isEmpty,
+    );
+    final availability = restored.evaluateVideoAvailability(
+      pathExists: (path) => path == '/poster.png',
+    );
+    expect(availability.primarySourceAvailable, isTrue);
+    expect(availability.allRequiredSourcesAvailable, isTrue);
+  });
+
   test('most recent project ignores favorite and display ordering', () {
     final olderFavorite = _project(
       'older',
@@ -244,9 +303,17 @@ void main() {
       entries: [edited, next],
       globalStyle: const SubtitleStyleModel(),
     );
+    final normalized = notifier.state.entries;
+    // Initial loading must preserve intentional overlaps between captions from
+    // different video sources. An explicit repair still fixes this pair when
+    // no source-lane map is supplied.
+    expect(normalized[1].startTime, const Duration(milliseconds: 2500));
     notifier.fixOverlaps(minimumGap: const Duration(milliseconds: 100));
     final trimmed = notifier.state.entries.first;
-    expect(trimmed.endTime, const Duration(milliseconds: 2400));
+    expect(
+      trimmed.endTime,
+      normalized[1].startTime - const Duration(milliseconds: 100),
+    );
     expect(trimmed.words!.last.endTime, trimmed.endTime);
   });
 

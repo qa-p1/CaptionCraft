@@ -180,6 +180,7 @@ void main() {
       );
 
       expect(notifier.renameTrack('audio', 'Music'), isTrue);
+      expect(notifier.duplicateTrack('video'), isFalse);
       expect(notifier.duplicateTrack('audio'), isTrue);
       expect(container.read(editorProvider).timeline.tracks, hasLength(3));
       notifier.setAllTracks(collapsed: true);

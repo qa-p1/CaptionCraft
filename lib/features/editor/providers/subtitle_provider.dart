@@ -128,17 +128,16 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
   /// Load subtitles from transcription results.
   void loadSubtitles(List<SubtitleEntry> entries) {
     _pushUndo();
-    final sorted = List<SubtitleEntry>.from(entries)
-      ..sort((a, b) => a.startTime.compareTo(b.startTime));
-    state = state.copyWith(entries: sorted);
+    state = state.copyWith(entries: _normalizeEntries(entries));
   }
 
   /// Sync subtitle entries from timeline edits without creating a new undo step.
   void syncFromTimeline(List<SubtitleEntry> entries) {
+    final normalizedEntries = _normalizeEntries(entries);
     final existingById = {for (final entry in state.entries) entry.id: entry};
     final isUnchanged =
-        entries.length == state.entries.length &&
-        entries.every((entry) {
+        normalizedEntries.length == state.entries.length &&
+        normalizedEntries.every((entry) {
           final existing = existingById[entry.id];
           return existing != null &&
               existing.startTime == entry.startTime &&
@@ -150,7 +149,7 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
               );
         });
     if (isUnchanged) return;
-    final mergedEntries = entries.map((entry) {
+    final mergedEntries = normalizedEntries.map((entry) {
       final existing = existingById[entry.id];
       if (existing == null) return entry;
       final mappedWords = _remapWords(
@@ -182,7 +181,7 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
     _undoStack.clear();
     _redoStack.clear();
     state = SubtitleState(
-      entries: List<SubtitleEntry>.from(entries),
+      entries: _normalizeEntries(entries),
       globalStyle: globalStyle,
       selectedEntryId: null,
     );
@@ -199,7 +198,7 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
         selectedEntryId != null &&
         entries.any((entry) => entry.id == selectedEntryId);
     state = SubtitleState(
-      entries: List<SubtitleEntry>.from(entries),
+      entries: _normalizeEntries(entries),
       globalStyle: globalStyle,
       selectedEntryId: hasSelection ? selectedEntryId : null,
     );
@@ -246,8 +245,8 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
         );
       }
       return e;
-    }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
-    state = state.copyWith(entries: entries);
+    }).toList();
+    state = state.copyWith(entries: _normalizeEntries(entries));
   }
 
   void updateTimingLive(String id, Duration startTime, Duration endTime) {
@@ -277,8 +276,7 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
       text: 'New subtitle',
     );
     state = state.copyWith(
-      entries: [...state.entries, entry]
-        ..sort((a, b) => a.startTime.compareTo(b.startTime)),
+      entries: _normalizeEntries([...state.entries, entry]),
       selectedEntryId: entry.id,
     );
   }
@@ -312,8 +310,7 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
       ),
     );
     state = state.copyWith(
-      entries: [...state.entries, copy]
-        ..sort((a, b) => a.startTime.compareTo(b.startTime)),
+      entries: _normalizeEntries([...state.entries, copy]),
       selectedEntryId: copy.id,
     );
   }
@@ -330,8 +327,7 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
       words: null,
     );
     state = state.copyWith(
-      entries: [...state.entries, copy]
-        ..sort((a, b) => a.startTime.compareTo(b.startTime)),
+      entries: _normalizeEntries([...state.entries, copy]),
       selectedEntryId: copy.id,
     );
   }
@@ -402,7 +398,7 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
         ),
       );
     }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
-    state = state.copyWith(entries: shifted);
+    state = state.copyWith(entries: _normalizeEntries(shifted));
   }
 
   int replaceText({
@@ -455,41 +451,49 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
     state = state.copyWith(entries: entries);
   }
 
-  /// Removes cue overlaps while preserving each cue's start where possible.
-  void fixOverlaps({Duration minimumGap = const Duration(milliseconds: 80)}) {
+  /// Removes cue overlaps within each caption lane.
+  ///
+  /// Entries from different source videos may intentionally be simultaneous,
+  /// so callers that know timeline ownership should provide [laneByEntryId].
+  void fixOverlaps({
+    Duration minimumGap = const Duration(milliseconds: 80),
+    Map<String, String>? laneByEntryId,
+  }) {
     if (state.entries.length < 2) return;
-    final sorted = List<SubtitleEntry>.from(state.entries)
-      ..sort((a, b) => a.startTime.compareTo(b.startTime));
     var changed = false;
-    final fixed = <SubtitleEntry>[];
-    for (var index = 0; index < sorted.length; index++) {
-      final entry = sorted[index];
-      if (index == sorted.length - 1) {
-        fixed.add(entry);
-        continue;
-      }
-      final next = sorted[index + 1];
-      final latestEnd = next.startTime - minimumGap;
-      if (entry.endTime > latestEnd &&
-          latestEnd > entry.startTime + const Duration(milliseconds: 100)) {
-        fixed.add(
-          entry.copyWith(
+    final lanes = <String, List<SubtitleEntry>>{};
+    for (final entry in state.entries) {
+      final laneId = laneByEntryId?[entry.id] ?? '__captions__';
+      lanes.putIfAbsent(laneId, () => []).add(entry);
+    }
+    final replacements = <String, SubtitleEntry>{};
+    for (final lane in lanes.values) {
+      lane.sort((a, b) => a.startTime.compareTo(b.startTime));
+      for (var index = 0; index < lane.length - 1; index++) {
+        final entry = lane[index];
+        final next = lane[index + 1];
+        final latestEnd = next.startTime - minimumGap;
+        if (entry.endTime > latestEnd &&
+            latestEnd > entry.startTime + const Duration(milliseconds: 100)) {
+          replacements[entry.id] = entry.copyWith(
             endTime: latestEnd,
             words: _remapWords(
               entry,
               newStartTime: entry.startTime,
               newEndTime: latestEnd,
             ),
-          ),
-        );
-        changed = true;
-      } else {
-        fixed.add(entry);
+          );
+          changed = true;
+        }
       }
     }
     if (!changed) return;
     _pushUndo();
-    state = state.copyWith(entries: fixed);
+    state = state.copyWith(
+      entries: state.entries
+          .map((entry) => replacements[entry.id] ?? entry)
+          .toList(),
+    );
   }
 
   /// Update the global style.
@@ -547,6 +551,31 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
 
   void endStyleGestureEdit() {
     _isStyleGestureEditing = false;
+  }
+
+  List<SubtitleEntry> _normalizeEntries(Iterable<SubtitleEntry> entries) {
+    final normalized =
+        entries.map((entry) {
+          final originalDuration = entry.duration > Duration.zero
+              ? entry.duration
+              : const Duration(milliseconds: 100);
+          final start = entry.startTime < Duration.zero
+              ? Duration.zero
+              : entry.startTime;
+          final end = start + originalDuration;
+          if (start == entry.startTime && end == entry.endTime) return entry;
+          return entry.copyWith(
+            startTime: start,
+            endTime: end,
+            words: _remapWords(entry, newStartTime: start, newEndTime: end),
+          );
+        }).toList()..sort((a, b) {
+          final byStart = a.startTime.compareTo(b.startTime);
+          if (byStart != 0) return byStart;
+          final byEnd = a.endTime.compareTo(b.endTime);
+          return byEnd != 0 ? byEnd : a.id.compareTo(b.id);
+        });
+    return normalized;
   }
 
   List<WordTiming>? _remapWords(

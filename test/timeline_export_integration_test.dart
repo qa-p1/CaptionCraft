@@ -465,6 +465,117 @@ void main() {
     },
     timeout: const Timeout(Duration(minutes: 2)),
   );
+
+  test(
+    'planned command renders an image-only overlay with an empty main lane',
+    () async {
+      if (!await _commandExists('ffmpeg') || !await _commandExists('ffprobe')) {
+        markTestSkipped('Desktop FFmpeg tools are not installed.');
+        return;
+      }
+      final directory = await Directory.systemTemp.createTemp(
+        'captioncraft_image_project_',
+      );
+      addTearDown(() async {
+        if (await directory.exists()) await directory.delete(recursive: true);
+      });
+      final imagePath = p.join(directory.path, 'poster.bmp');
+      final outputPath = p.join(directory.path, 'poster.mp4');
+      await _runFfmpeg([
+        '-f',
+        'lavfi',
+        '-i',
+        'color=c=0x7A3EF0:size=320x240',
+        '-frames:v',
+        '1',
+        imagePath,
+      ]);
+      final asset = EditorAssetReference(
+        id: 'poster-asset',
+        type: EditorAssetType.image,
+        label: 'Poster',
+        sourcePath: imagePath,
+        metadata: const {'width': 320, 'height': 240, 'hasAudio': false},
+      );
+      final clip = TimelineClip(
+        id: 'poster-clip',
+        trackId: 'overlay',
+        type: TimelineTrackType.image,
+        label: 'Poster',
+        assetId: asset.id,
+        startTime: Duration.zero,
+        endTime: const Duration(seconds: 1),
+        fitMode: ClipFitMode.cover,
+      );
+      final overlay = TimelineTrack(
+        id: 'overlay',
+        name: 'Overlay',
+        type: TimelineTrackType.video,
+        section: TimelineTrackSection.overlay,
+        clips: [clip],
+      );
+      final timeline = EditorTimeline(
+        assets: [asset],
+        tracks: [
+          overlay,
+          TimelineTrack(
+            id: 'main',
+            name: 'Main video',
+            type: TimelineTrackType.video,
+            section: TimelineTrackSection.baseVideo,
+          ),
+        ],
+      );
+      final arguments = TimelineExportService.buildFfmpegArguments(
+        timeline: timeline,
+        inputs: [
+          TimelineRenderInput(
+            index: 0,
+            trackIndex: 0,
+            track: overlay,
+            clip: clip,
+            asset: asset,
+            sourcePath: imagePath,
+            hasAudio: false,
+          ),
+        ],
+        settings: const ExportSettings(
+          resolution: ExportResolution.p480,
+          frameRate: ExportFrameRate.fps30,
+          quality: ExportQuality.compact,
+          saveToGallery: false,
+        ),
+        canvasSize: const ExportCanvasSize(
+          width: 320,
+          height: 240,
+          framesPerSecond: 30,
+        ),
+        timelineDuration: const Duration(seconds: 1),
+        assPath: null,
+        outputPath: outputPath,
+      );
+      final render = await Process.run('ffmpeg', arguments);
+      expect(render.exitCode, 0, reason: '${render.stdout}\n${render.stderr}');
+      final probe = await Process.run('ffprobe', [
+        '-v',
+        'error',
+        '-show_entries',
+        'stream=codec_type,width,height',
+        '-of',
+        'json',
+        outputPath,
+      ]);
+      expect(probe.exitCode, 0, reason: '${probe.stderr}');
+      final metadata =
+          jsonDecode(probe.stdout as String) as Map<String, dynamic>;
+      final video = (metadata['streams'] as List<dynamic>)
+          .cast<Map<String, dynamic>>()
+          .singleWhere((stream) => stream['codec_type'] == 'video');
+      expect(video['width'], 320);
+      expect(video['height'], 240);
+    },
+    timeout: const Timeout(Duration(minutes: 1)),
+  );
 }
 
 Future<bool> _commandExists(String executable) async {

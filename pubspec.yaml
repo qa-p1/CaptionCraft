@@ -56,6 +56,18 @@
     # HTTP for Groq API calls
     dio: ^5.4.3+1
 
+    # In-editor Discover browser and bounded DOM media extraction
+    flutter_inappwebview: ^6.1.5
+
+    # User-initiated YouTube inspection and stream downloads
+    youtube_explode_dart: ^3.1.0
+
+    # Validate downloaded payloads independently of untrusted URL extensions
+    mime: ^2.0.0
+
+    # Provider attribution/source links in the Elements library
+    url_launcher: ^6.3.2
+
     # Color picker
     flutter_colorpicker: ^1.1.0
 
@@ -64,6 +76,9 @@
 
     # Crypto for device fingerprint hashing
     crypto: ^3.0.3
+
+    # Streaming ZIP extraction for optional, user-downloaded asset packs
+    archive: ^4.0.9
 
   dev_dependencies:
     flutter_test:

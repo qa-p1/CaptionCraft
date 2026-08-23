@@ -7,6 +7,16 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   group('timeline persistence', () {
+    test('all clip transition presets survive project persistence', () {
+      for (final type in TransitionType.values) {
+        final restored = ClipTransition.fromJson(
+          ClipTransition(type: type, durationMs: 725).toJson(),
+        );
+        expect(restored.type, type);
+        expect(restored.durationMs, 725);
+      }
+    });
+
     test(
       'round-trips professional clip, track, canvas, and marker settings',
       () {
@@ -116,7 +126,7 @@ void main() {
         final restoredTrack = restored.tracks.single;
         final restoredClip = restoredTrack.clips.single;
 
-        expect(restored.schemaVersion, 4);
+        expect(restored.schemaVersion, 6);
         expect(
           restored.canvasSettings.aspectRatioPreset,
           CanvasAspectRatioPreset.ratio9x16,
@@ -125,6 +135,7 @@ void main() {
         expect(restored.canvasSettings.gridDivisions, 4);
         expect(restoredTrack.isSolo, isTrue);
         expect(restoredTrack.isLocked, isTrue);
+        expect(restoredTrack.role, TimelineTrackRole.regular);
         expect(restoredClip.playbackRate, 1.25);
         expect(restoredClip.isReversed, isTrue);
         expect(restoredClip.crop.safeLeft, closeTo(0.08, 0.0001));
@@ -179,6 +190,29 @@ void main() {
       expect(clip.colorAdjustments.isNeutral, isTrue);
       expect(clip.audioMix.pan, 0);
       expect(clip.audioMix.normalize, isFalse);
+    });
+
+    test('chroma key capability is limited to actual visual media', () {
+      TimelineClip clip(TimelineTrackType type, {bool effect = false}) =>
+          TimelineClip(
+            type: type,
+            trackId: 'track',
+            label: type.name,
+            startTime: Duration.zero,
+            endTime: const Duration(seconds: 1),
+            effectKind: effect ? TimelineEffectKind.blur : null,
+          );
+
+      expect(clip(TimelineTrackType.image).supportsChromaKey, isTrue);
+      expect(clip(TimelineTrackType.video).supportsChromaKey, isTrue);
+      expect(clip(TimelineTrackType.gif).supportsChromaKey, isTrue);
+      expect(clip(TimelineTrackType.sticker).supportsChromaKey, isTrue);
+      expect(clip(TimelineTrackType.audio).supportsChromaKey, isFalse);
+      expect(clip(TimelineTrackType.text).supportsChromaKey, isFalse);
+      expect(
+        clip(TimelineTrackType.effect, effect: true).supportsChromaKey,
+        isFalse,
+      );
     });
 
     test('legacy projects create and link a source asset automatically', () {

@@ -304,4 +304,67 @@ void main() {
       containsAllInOrder(['-ss', '9.400000', '-t', '2.000000']),
     );
   });
+
+  test(
+    'expanded transitions plan smooth scale, rotation, and diagonal motion',
+    () {
+      final clip = TimelineClip(
+        id: 'animated',
+        trackId: 'base',
+        type: TimelineTrackType.video,
+        label: 'Animated',
+        startTime: Duration.zero,
+        endTime: const Duration(seconds: 4),
+        sourceDuration: const Duration(seconds: 4),
+        introTransition: const ClipTransition(
+          type: TransitionType.spin,
+          durationMs: 600,
+        ),
+        outroTransition: const ClipTransition(
+          type: TransitionType.slideUpRight,
+          durationMs: 700,
+        ),
+      );
+      final track = TimelineTrack(
+        id: 'base',
+        name: 'Video',
+        type: TimelineTrackType.video,
+        section: TimelineTrackSection.baseVideo,
+        clips: [clip],
+      );
+      final timeline = EditorTimeline(tracks: [track]);
+
+      final arguments = TimelineExportService.buildFfmpegArguments(
+        timeline: timeline,
+        inputs: [
+          TimelineRenderInput(
+            index: 0,
+            trackIndex: 0,
+            track: track,
+            clip: clip,
+            asset: null,
+            sourcePath: 'source.mp4',
+            hasAudio: false,
+          ),
+        ],
+        settings: const ExportSettings(includeAudio: false),
+        canvasSize: const ExportCanvasSize(
+          width: 640,
+          height: 360,
+          framesPerSecond: 30,
+        ),
+        timelineDuration: const Duration(seconds: 4),
+        assPath: null,
+        outputPath: 'output.mp4',
+      );
+      final filterGraph = arguments[arguments.indexOf('-filter_complex') + 1];
+
+      expect(filterGraph, contains('rotate=angle='));
+      expect(filterGraph, contains('1.570796'));
+      expect(filterGraph, contains('scale=w='));
+      expect(filterGraph, contains('+W*'));
+      expect(filterGraph, contains('-H*'));
+      expect(filterGraph, contains('(3-2*'));
+    },
+  );
 }

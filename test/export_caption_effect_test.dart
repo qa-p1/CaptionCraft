@@ -225,30 +225,53 @@ void main() {
       );
       final warmFilter = TimelineClip.effect(
         id: 'filter_effect',
-        trackId: 'effect_track',
+        trackId: 'filter_track',
         effectKind: TimelineEffectKind.filter,
         label: 'Warm',
         startTime: const Duration(seconds: 1),
         endTime: const Duration(milliseconds: 2500),
         colorAdjustments: ClipColorAdjustments.forPreset(ClipFilterPreset.warm),
       );
-      final effectTrack = TimelineTrack(
+      final blurTrack = TimelineTrack(
         id: 'effect_track',
-        name: 'Effects',
+        name: 'Blur',
         type: TimelineTrackType.effect,
         section: TimelineTrackSection.overlay,
-        clips: [regionBlur, warmFilter],
+        clips: [regionBlur],
       );
-      final timeline = EditorTimeline(tracks: [baseTrack, effectTrack]);
+      final filterTrack = TimelineTrack(
+        id: 'filter_track',
+        name: 'Filter',
+        type: TimelineTrackType.effect,
+        section: TimelineTrackSection.overlay,
+        clips: [warmFilter],
+      );
+      // Rows are persisted top-to-bottom. Concurrent effects belong on
+      // separate lanes, both above the main visual lane.
+      final timeline = EditorTimeline(
+        tracks: [blurTrack, filterTrack, baseTrack],
+      );
 
       final restored = EditorTimeline.fromJson(timeline.toJson());
       expect(
-        restored.tracks.last.clips.first.effectKind,
+        restored.tracks
+            .singleWhere((track) => track.id == blurTrack.id)
+            .clips
+            .single
+            .effectKind,
         TimelineEffectKind.blur,
       );
       expect(
-        restored.tracks.last.clips.last.effectKind,
+        restored.tracks
+            .singleWhere((track) => track.id == filterTrack.id)
+            .clips
+            .single
+            .effectKind,
         TimelineEffectKind.filter,
+      );
+
+      final restoredBase = restored.tracks.singleWhere(
+        (track) => track.id == baseTrack.id,
       );
 
       final arguments = TimelineExportService.buildFfmpegArguments(
@@ -256,9 +279,9 @@ void main() {
         inputs: [
           TimelineRenderInput(
             index: 0,
-            trackIndex: 0,
-            track: restored.tracks.first,
-            clip: restored.tracks.first.clips.single,
+            trackIndex: restored.tracks.indexOf(restoredBase),
+            track: restoredBase,
+            clip: restoredBase.clips.single,
             asset: null,
             sourcePath: 'base.mp4',
             hasAudio: false,

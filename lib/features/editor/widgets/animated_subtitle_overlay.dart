@@ -71,6 +71,12 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
         return _buildLineSlideUp();
       case SubtitleAnimationPreset.typewriter:
         return _buildTypewriter();
+      case SubtitleAnimationPreset.zoomIn:
+        return _buildZoomIn();
+      case SubtitleAnimationPreset.slideFromLeft:
+        return _buildSlideFromLeft();
+      case SubtitleAnimationPreset.bounceIn:
+        return _buildBounceIn();
     }
   }
 
@@ -337,6 +343,81 @@ class AnimatedSubtitleOverlay extends StatelessWidget {
     );
   }
 
+  // ─── Preset 6: Zoom In ───
+  // A short scale-and-fade entrance that remains cheap to render because it
+  // only transforms the completed text layer.
+  Widget _buildZoomIn() {
+    final style = _style;
+    final elapsed = (currentPosition - entry.startTime).inMilliseconds;
+    final rawT = (elapsed / 220.0).clamp(0.0, 1.0);
+    final t = Curves.easeOutCubic.transform(rawT);
+    return Opacity(
+      opacity: rawT,
+      child: Transform.scale(
+        scale: 0.72 + (0.28 * t),
+        child: _wrapBackground(
+          style,
+          Text(
+            style.isAllCaps ? entry.text.toUpperCase() : entry.text,
+            textAlign: style.textAlignment,
+            style: _textStyle(style),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ─── Preset 7: Slide From Left ───
+  Widget _buildSlideFromLeft() {
+    final style = _style;
+    final elapsed = (currentPosition - entry.startTime).inMilliseconds;
+    final rawT = (elapsed / 240.0).clamp(0.0, 1.0);
+    final t = Curves.easeOutCubic.transform(rawT);
+    return Transform.translate(
+      offset: Offset(-28 * scaleFactor * (1 - t), 0),
+      child: Opacity(
+        opacity: rawT,
+        child: _wrapBackground(
+          style,
+          Text(
+            style.isAllCaps ? entry.text.toUpperCase() : entry.text,
+            textAlign: style.textAlignment,
+            style: _textStyle(style),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ─── Preset 8: Bounce In ───
+  Widget _buildBounceIn() {
+    final style = _style;
+    final elapsed = (currentPosition - entry.startTime).inMilliseconds;
+    final rawT = (elapsed / 320.0).clamp(0.0, 1.0);
+    final double scale;
+    if (rawT < 0.68) {
+      final rise = Curves.easeOutCubic.transform(rawT / 0.68);
+      scale = 0.55 + (0.55 * rise);
+    } else {
+      final settle = Curves.easeInOut.transform((rawT - 0.68) / 0.32);
+      scale = 1.10 - (0.10 * settle);
+    }
+    return Opacity(
+      opacity: (elapsed / 110.0).clamp(0.0, 1.0),
+      child: Transform.scale(
+        scale: scale,
+        child: _wrapBackground(
+          style,
+          Text(
+            style.isAllCaps ? entry.text.toUpperCase() : entry.text,
+            textAlign: style.textAlignment,
+            style: _textStyle(style),
+          ),
+        ),
+      ),
+    );
+  }
+
   // ─── Shared helpers ───
 
   TextStyle _textStyle(SubtitleStyleModel style) {
@@ -426,6 +507,9 @@ class AnimationPresetCard extends StatelessWidget {
     SubtitleAnimationPreset.karaokeHighlight: 'Karaoke',
     SubtitleAnimationPreset.wordSlideUp: 'Line Slide Up',
     SubtitleAnimationPreset.typewriter: 'Typewriter',
+    SubtitleAnimationPreset.zoomIn: 'Zoom In',
+    SubtitleAnimationPreset.slideFromLeft: 'Slide Left',
+    SubtitleAnimationPreset.bounceIn: 'Bounce In',
   };
 
   static const _descriptions = {
@@ -434,6 +518,9 @@ class AnimationPresetCard extends StatelessWidget {
     SubtitleAnimationPreset.karaokeHighlight: 'Words light up in sync',
     SubtitleAnimationPreset.wordSlideUp: 'Whole line slides up smoothly',
     SubtitleAnimationPreset.typewriter: 'Character by character reveal',
+    SubtitleAnimationPreset.zoomIn: 'Clean scale and fade entrance',
+    SubtitleAnimationPreset.slideFromLeft: 'Line glides in from the left',
+    SubtitleAnimationPreset.bounceIn: 'Playful overshoot and settle',
   };
 
   static const _icons = {
@@ -442,6 +529,9 @@ class AnimationPresetCard extends StatelessWidget {
     SubtitleAnimationPreset.karaokeHighlight: Icons.mic_rounded,
     SubtitleAnimationPreset.wordSlideUp: Icons.arrow_upward_rounded,
     SubtitleAnimationPreset.typewriter: Icons.keyboard_rounded,
+    SubtitleAnimationPreset.zoomIn: Icons.zoom_in_rounded,
+    SubtitleAnimationPreset.slideFromLeft: Icons.arrow_forward_rounded,
+    SubtitleAnimationPreset.bounceIn: Icons.sports_basketball_rounded,
   };
 
   @override

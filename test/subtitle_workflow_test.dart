@@ -37,10 +37,9 @@ void main() {
       );
 
       notifier.normalizeText();
-      expect(notifier.state.entries.first.id, 'second');
-      // initializeFromProject intentionally preserves input order; timing edits
-      // and batch operations sort only when timing changes.
-      expect(notifier.state.entries.first.text, 'second LINE');
+      expect(notifier.state.entries.first.id, 'first');
+      // Restoration sorts cues; overlap repair remains an explicit edit.
+      expect(notifier.state.entries.first.text, 'hello world');
       expect(
         notifier.replaceText(
           query: 'line',
@@ -77,6 +76,67 @@ void main() {
             .endTime,
         const Duration(milliseconds: 1700),
       );
+    });
+
+    test('overlap repair and quality checks stay within caption lanes', () {
+      final mainFirst = SubtitleEntry(
+        id: 'main-first',
+        startTime: Duration.zero,
+        endTime: const Duration(seconds: 2),
+        text: 'Main first',
+      );
+      final overlay = SubtitleEntry(
+        id: 'overlay',
+        startTime: Duration.zero,
+        endTime: const Duration(seconds: 2),
+        text: 'Overlay simultaneous',
+      );
+      final mainSecond = SubtitleEntry(
+        id: 'main-second',
+        startTime: const Duration(milliseconds: 1500),
+        endTime: const Duration(seconds: 3),
+        text: 'Main second',
+      );
+      const lanes = {
+        'main-first': 'captions-main',
+        'main-second': 'captions-main',
+        'overlay': 'captions-overlay',
+      };
+      final notifier = SubtitleNotifier();
+      notifier.initializeFromProject(
+        entries: [mainFirst, overlay, mainSecond],
+        globalStyle: const SubtitleStyleModel(),
+      );
+
+      expect(
+        notifier.state.entries
+            .firstWhere((entry) => entry.id == 'overlay')
+            .startTime,
+        Duration.zero,
+      );
+      notifier.fixOverlaps(
+        minimumGap: const Duration(milliseconds: 100),
+        laneByEntryId: lanes,
+      );
+
+      expect(
+        notifier.state.entries
+            .firstWhere((entry) => entry.id == 'main-first')
+            .endTime,
+        const Duration(milliseconds: 1400),
+      );
+      expect(
+        notifier.state.entries
+            .firstWhere((entry) => entry.id == 'overlay')
+            .endTime,
+        const Duration(seconds: 2),
+      );
+      final report = SubtitleQualityService.analyze([
+        mainFirst,
+        overlay,
+        mainSecond,
+      ], laneByEntryId: lanes);
+      expect(report.countFor(SubtitleIssueType.overlap), 1);
     });
 
     test('splits text near the playhead and remaps word timing on resize', () {
@@ -189,7 +249,7 @@ void main() {
             .tracks
             .firstWhere((track) => track.id == 'track')
             .name,
-        'Video 1',
+        'Base layer',
       );
       // The timeline edit snapshot captures the subtitle state that existed
       // when the edit began, so subtitle-only edits remain intact.
@@ -351,6 +411,53 @@ void main() {
       expect(document, contains(r'{\k'));
       expect(document, contains(r'\p1'));
       expect(document, contains('&H004875FF'));
+    });
+
+    test('ASS delivery supports expanded title entrance presets', () {
+      final entries = [
+        SubtitleEntry(
+          id: 'zoom',
+          startTime: Duration.zero,
+          endTime: const Duration(seconds: 2),
+          text: 'Zoom title',
+          styleOverride: const SubtitleStyleModel(
+            isAllCaps: true,
+            animationPreset: SubtitleAnimationPreset.zoomIn,
+          ),
+        ),
+        SubtitleEntry(
+          id: 'slide-left',
+          startTime: const Duration(seconds: 2),
+          endTime: const Duration(seconds: 4),
+          text: 'Slide title',
+          styleOverride: const SubtitleStyleModel(
+            animationPreset: SubtitleAnimationPreset.slideFromLeft,
+          ),
+        ),
+        SubtitleEntry(
+          id: 'bounce',
+          startTime: const Duration(seconds: 4),
+          endTime: const Duration(seconds: 6),
+          text: 'Bounce title',
+          styleOverride: const SubtitleStyleModel(
+            animationPreset: SubtitleAnimationPreset.bounceIn,
+          ),
+        ),
+      ];
+
+      final document = SubtitleExportService.buildAssDocument(
+        entries,
+        const SubtitleStyleModel(),
+        playResX: 1920,
+        playResY: 1080,
+      );
+
+      expect(document, contains(r'\fscx72\fscy72'));
+      expect(document, contains('ZOOM TITLE'));
+      expect(document, isNot(contains('Zoom title')));
+      expect(document, contains(r'\move('));
+      expect(document, contains(r'\fscx110\fscy110'));
+      expect(document, contains(r'\t(218,320,\fscx100\fscy100)'));
     });
 
     test(

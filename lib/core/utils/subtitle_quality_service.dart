@@ -46,6 +46,7 @@ class SubtitleQualityService {
 
   static SubtitleQualityReport analyze(
     List<SubtitleEntry> entries, {
+    Map<String, String>? laneByEntryId,
     double maximumCharactersPerSecond = 20,
     int maximumLineLength = 42,
     int maximumLines = 2,
@@ -58,8 +59,19 @@ class SubtitleQualityService {
     var charactersPerSecondTotal = 0.0;
     var measuredCueCount = 0;
 
-    for (var index = 0; index < sorted.length; index++) {
-      final entry = sorted[index];
+    final nextEntryInLane = <String, SubtitleEntry>{};
+    final lanes = <String, List<SubtitleEntry>>{};
+    for (final entry in sorted) {
+      final laneId = laneByEntryId?[entry.id] ?? '__captions__';
+      lanes.putIfAbsent(laneId, () => []).add(entry);
+    }
+    for (final lane in lanes.values) {
+      for (var index = 0; index < lane.length - 1; index++) {
+        nextEntryInLane[lane[index].id] = lane[index + 1];
+      }
+    }
+
+    for (final entry in sorted) {
       final text = entry.text.trim();
       final durationMs = entry.duration.inMilliseconds;
 
@@ -139,10 +151,9 @@ class SubtitleQualityService {
         );
       }
 
-      if (index < sorted.length - 1 &&
-          entry.endTime > sorted[index + 1].startTime) {
-        final overlapMs =
-            (entry.endTime - sorted[index + 1].startTime).inMilliseconds;
+      final nextInLane = nextEntryInLane[entry.id];
+      if (nextInLane != null && entry.endTime > nextInLane.startTime) {
+        final overlapMs = (entry.endTime - nextInLane.startTime).inMilliseconds;
         issues.add(
           SubtitleQualityIssue(
             type: SubtitleIssueType.overlap,

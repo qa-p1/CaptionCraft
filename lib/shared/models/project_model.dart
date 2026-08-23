@@ -52,7 +52,7 @@ class Project {
        captionsModifiedAt =
            captionsModifiedAt ?? lastModifiedAt ?? DateTime.now();
 
-  /// Whether the source video file still exists on device.
+  /// Whether every visual asset required by the project still exists.
   bool get isVideoAvailable {
     return videoAvailability.allRequiredSourcesAvailable;
   }
@@ -76,7 +76,10 @@ class Project {
     }
     for (final asset in timeline.assets) {
       final sourcePath = asset.sourcePath;
-      if (asset.type == EditorAssetType.video &&
+      if ((asset.type == EditorAssetType.video ||
+              asset.type == EditorAssetType.image ||
+              asset.type == EditorAssetType.gif ||
+              asset.type == EditorAssetType.sticker) &&
           !asset.isNetworkBacked &&
           sourcePath != null &&
           sourcePath.isNotEmpty &&
@@ -120,11 +123,8 @@ class Project {
     required bool Function(String path) pathExists,
   }) {
     final assetsById = {for (final asset in timeline.assets) asset.id: asset};
-    final videoClips = timeline.tracks
-        .expand((track) => track.clips)
-        .where((clip) => clip.type == TimelineTrackType.video)
-        .toList();
-    if (videoClips.isEmpty) {
+    final visualClips = timeline.visualMediaClips.toList();
+    if (visualClips.isEmpty) {
       final available = videoPath.isNotEmpty && pathExists(videoPath);
       return ProjectVideoAvailability(
         allRequiredSourcesAvailable: available,
@@ -133,16 +133,16 @@ class Project {
       );
     }
 
-    final primaryCandidates =
+    final mainCandidates =
         timeline.tracks
             .where((track) => track.section == TimelineTrackSection.baseVideo)
             .expand((track) => track.clips)
-            .where((clip) => clip.type == TimelineTrackType.video)
+            .where((clip) => clip.type.isVisualMedia)
             .toList()
           ..sort((a, b) => a.startTime.compareTo(b.startTime));
-    final primaryClip = primaryCandidates.isNotEmpty
-        ? primaryCandidates.first
-        : (videoClips..sort((a, b) => a.startTime.compareTo(b.startTime)))
+    final primaryClip = mainCandidates.isNotEmpty
+        ? mainCandidates.first
+        : (visualClips..sort((a, b) => a.startTime.compareTo(b.startTime)))
               .first;
 
     bool sourceIsAvailable(TimelineClip clip) {
@@ -154,7 +154,8 @@ class Project {
             sourcePath.isNotEmpty &&
             pathExists(sourcePath);
       }
-      if (clip.assetId == null &&
+      if (clip.type == TimelineTrackType.video &&
+          clip.assetId == null &&
           identical(clip, primaryClip) &&
           videoPath.isNotEmpty) {
         return pathExists(videoPath);
@@ -164,7 +165,7 @@ class Project {
 
     var allAvailable = true;
     var anyAvailable = false;
-    for (final clip in videoClips) {
+    for (final clip in visualClips) {
       final available = sourceIsAvailable(clip);
       allAvailable = allAvailable && available;
       anyAvailable = anyAvailable || available;

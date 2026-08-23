@@ -93,24 +93,7 @@ class SubtitleStylePanel extends ConsumerWidget {
                   ref
                       .read(subtitleProvider.notifier)
                       .updateGlobalStyle(
-                        SubtitleStyleModel(
-                          fontFamily: style.fontFamily,
-                          fontSize: style.fontSize,
-                          textColor: style.textColor,
-                          backgroundType: style.backgroundType,
-                          backgroundColor: style.backgroundColor,
-                          backgroundOpacity: style.backgroundOpacity,
-                          position: style.position,
-                          verticalOffset: style.verticalOffset,
-                          offsetX: style.offsetX,
-                          offsetY: style.offsetY,
-                          maxWidthFactor: style.maxWidthFactor,
-                          textAlignment: style.textAlignment,
-                          isBold: style.isBold,
-                          isItalic: style.isItalic,
-                          isAllCaps: style.isAllCaps,
-                          animationPreset: null,
-                        ),
+                        style.copyWith(clearAnimationPreset: true),
                       );
                 },
                 child: AnimatedContainer(

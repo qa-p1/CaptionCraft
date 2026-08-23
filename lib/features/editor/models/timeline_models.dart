@@ -87,6 +87,14 @@ enum TimelineTrackType {
 
 enum TimelineTrackSection { overlay, baseVideo, textSubtitle, audio }
 
+/// Describes the structural responsibility of a timeline lane.
+///
+/// [sourceVideo] and [sourceAudio] are retained only so older project JSON
+/// remains readable. New projects store the bottom visual lane as [regular]
+/// and keep a video's embedded audio on the video clip unless the user
+/// explicitly extracts it.
+enum TimelineTrackRole { regular, sourceVideo, sourceAudio }
+
 enum TimelineEffectKind { blur, filter }
 
 enum EditorAssetType { video, audio, image, gif, sticker, unknown }
@@ -124,6 +132,11 @@ enum TransitionType {
   slideUp,
   slideDown,
   zoom,
+  zoomOut,
+  pop,
+  spin,
+  slideUpLeft,
+  slideUpRight,
 }
 
 enum TimelineMarkerType { marker, chapter, beat }
@@ -322,10 +335,13 @@ extension TimelineTrackTypeCapabilities on TimelineTrackType {
     return this == TimelineTrackType.video || this == TimelineTrackType.gif;
   }
 
-  bool get supportsVisualEffects => isVisualMedia;
+  bool get supportsVisualEffects =>
+      isVisualMedia || this == TimelineTrackType.effect;
 
   bool get supportsTransform {
-    return isVisualMedia || this == TimelineTrackType.text;
+    return isVisualMedia ||
+        this == TimelineTrackType.text ||
+        this == TimelineTrackType.effect;
   }
 
   /// Generic clip transitions are rendered by the visual-media pipeline.
@@ -339,7 +355,7 @@ extension TimelineTrackTypeCapabilities on TimelineTrackType {
 
 /// A non-destructive crop stored as normalized source-space insets.
 ///
-/// The same model is used for base video and every visual overlay type, which
+/// The same model is used for Base-layer media and every visual overlay type,
 /// keeps crop behavior portable across preview, persistence, and export.
 class ClipCropSettings {
   final double left;
@@ -1283,6 +1299,12 @@ class TimelineClip {
 
 extension TimelineClipCapabilities on TimelineClip {
   bool get supportsVisualEffects => type.supportsVisualEffects;
+  bool get supportsChromaKey =>
+      !isEffect &&
+      (type == TimelineTrackType.video ||
+          type == TimelineTrackType.image ||
+          type == TimelineTrackType.gif ||
+          type == TimelineTrackType.sticker);
   bool get supportsTransform => type.supportsTransform;
   bool get supportsClipAnimation => type.supportsClipAnimation;
   bool get supportsSourceTiming => type.supportsSourceTiming;
@@ -1403,6 +1425,28 @@ extension TimelineClipCapabilities on TimelineClip {
     return supportsTransform && !transform.isIdentity;
   }
 
+  /// Whether placement can expose the canvas around a source-video frame.
+  /// Opacity and flips do not change coverage, while contain, translation,
+  /// down-scaling and rotation can reveal an edge at some point in time.
+  bool get mayRevealCanvasBackground {
+    if (fitMode == ClipFitMode.contain ||
+        transform.offsetX.abs() > 0.0001 ||
+        transform.offsetY.abs() > 0.0001 ||
+        transform.scale < 0.999 ||
+        transform.rotation.abs() > 0.0001) {
+      return true;
+    }
+    return keyframes.any((keyframe) {
+      return switch (keyframe.property) {
+        TimelineKeyframeProperty.positionX ||
+        TimelineKeyframeProperty.positionY => keyframe.value.abs() > 0.0001,
+        TimelineKeyframeProperty.scale => keyframe.value < 0.999,
+        TimelineKeyframeProperty.rotation => keyframe.value.abs() > 0.0001,
+        _ => false,
+      };
+    });
+  }
+
   int get effectiveIntroTransitionMs => math.min(
     introTransition.durationMs.clamp(0, duration.inMilliseconds).toInt(),
     duration.inMilliseconds ~/ 2,
@@ -1519,6 +1563,7 @@ class TimelineTrack {
   final String name;
   final TimelineTrackType type;
   final TimelineTrackSection section;
+  final TimelineTrackRole role;
   final bool isCollapsed;
   final bool isLocked;
   final bool isMuted;
@@ -1531,6 +1576,7 @@ class TimelineTrack {
     required this.name,
     required this.type,
     TimelineTrackSection? section,
+    TimelineTrackRole? role,
     this.isCollapsed = false,
     this.isLocked = false,
     this.isMuted = false,
@@ -1539,6 +1585,7 @@ class TimelineTrack {
     List<TimelineClip>? clips,
   }) : id = id ?? const Uuid().v4(),
        section = section ?? _defaultSectionForType(type),
+       role = role ?? TimelineTrackRole.regular,
        clips = clips ?? const [];
 
   TimelineTrack copyWith({
@@ -1546,6 +1593,7 @@ class TimelineTrack {
     String? name,
     TimelineTrackType? type,
     TimelineTrackSection? section,
+    TimelineTrackRole? role,
     bool? isCollapsed,
     bool? isLocked,
     bool? isMuted,
@@ -1558,6 +1606,7 @@ class TimelineTrack {
       name: name ?? this.name,
       type: type ?? this.type,
       section: section ?? this.section,
+      role: role ?? this.role,
       isCollapsed: isCollapsed ?? this.isCollapsed,
       isLocked: isLocked ?? this.isLocked,
       isMuted: isMuted ?? this.isMuted,
@@ -1573,6 +1622,7 @@ class TimelineTrack {
       'name': name,
       'type': type.name,
       'section': section.name,
+      'role': role.name,
       'isCollapsed': isCollapsed,
       'isLocked': isLocked,
       'isMuted': isMuted,
@@ -1591,6 +1641,17 @@ class TimelineTrack {
         (value) => value.name == json['section'],
         orElse: () => _defaultSectionForType(_trackTypeFromJson(json['type'])),
       ),
+      role: _trackRoleFromJson(
+        json['role'],
+        id: json['id'] as String?,
+        name: json['name'] as String?,
+        type: _trackTypeFromJson(json['type']),
+        section: TimelineTrackSection.values.firstWhere(
+          (value) => value.name == json['section'],
+          orElse: () =>
+              _defaultSectionForType(_trackTypeFromJson(json['type'])),
+        ),
+      ),
       isCollapsed: json['isCollapsed'] as bool? ?? false,
       isLocked: json['isLocked'] as bool? ?? false,
       isMuted: json['isMuted'] as bool? ?? false,
@@ -1602,21 +1663,43 @@ class TimelineTrack {
 }
 
 extension TimelineTrackCompatibility on TimelineTrack {
+  bool get isSourceTrack => role == TimelineTrackRole.sourceAudio;
+
+  /// The fixed, bottom-most visual lane. The persisted section name remains
+  /// `baseVideo` so existing project files stay compatible, but the lane may
+  /// contain video, still images, GIFs, or stickers.
+  bool get isBaseLayer => section == TimelineTrackSection.baseVideo;
+
+  /// Stable user-facing terminology independent of names saved by old builds.
+  String get displayName => isBaseLayer ? 'Base layer' : name;
+
+  bool get isReorderable =>
+      role == TimelineTrackRole.regular &&
+      section != TimelineTrackSection.baseVideo;
+
+  bool get isDuplicable =>
+      role == TimelineTrackRole.regular &&
+      section != TimelineTrackSection.baseVideo &&
+      type != TimelineTrackType.subtitle;
+
+  bool get isVisualLayer =>
+      section == TimelineTrackSection.overlay ||
+      section == TimelineTrackSection.textSubtitle ||
+      section == TimelineTrackSection.baseVideo;
+
   /// Whether this lane can safely contain [clipType].
   ///
-  /// Visual overlay lanes are intentionally media-agnostic so an image, GIF,
-  /// sticker or overlay video can share a lane. Text, subtitle, audio and effect
-  /// lanes stay strict because their preview/export paths are type-specific.
+  /// Visual lanes are intentionally media-agnostic so a video, image, GIF, or
+  /// sticker may act as either the base or an overlay. Text, subtitle, and
+  /// audio lanes stay strict because their preview/export paths are specific.
   bool acceptsClipType(TimelineTrackType clipType) {
     switch (section) {
       case TimelineTrackSection.baseVideo:
-        return type == TimelineTrackType.video &&
-            clipType == TimelineTrackType.video;
+        return clipType.isVisualMedia;
       case TimelineTrackSection.overlay:
-        if (type == TimelineTrackType.effect) {
-          return clipType == TimelineTrackType.effect;
-        }
-        return type.isVisualMedia && clipType.isVisualMedia;
+        // Overlay lanes are deliberately generic. Effects and filters are
+        // visual-layer clips, not a dedicated track architecture.
+        return clipType == TimelineTrackType.effect || clipType.isVisualMedia;
       case TimelineTrackSection.textSubtitle:
         return type == clipType && clipType.isTextContent;
       case TimelineTrackSection.audio:
@@ -1626,6 +1709,125 @@ extension TimelineTrackCompatibility on TimelineTrack {
   }
 
   bool acceptsClip(TimelineClip clip) => acceptsClipType(clip.type);
+
+  /// Whether [clip] can occupy this lane without sharing time with another
+  /// clip. Touching edges are valid cuts; positive-duration intersections are
+  /// not. Disabled clips still reserve their edit, just like hidden tracks do.
+  bool canPlaceClip(TimelineClip clip, {String? ignoringClipId}) {
+    if (!acceptsClip(clip) || clip.endTime <= clip.startTime) return false;
+    return clips.every((candidate) {
+      if (candidate.id == ignoringClipId || candidate.id == clip.id) {
+        return true;
+      }
+      return clip.endTime <= candidate.startTime ||
+          clip.startTime >= candidate.endTime;
+    });
+  }
+
+  bool get hasOverlappingClips {
+    final sorted = [...clips]
+      ..sort((a, b) {
+        final byStart = a.startTime.compareTo(b.startTime);
+        return byStart != 0 ? byStart : a.endTime.compareTo(b.endTime);
+      });
+    for (var index = 1; index < sorted.length; index++) {
+      if (sorted[index].startTime < sorted[index - 1].endTime) return true;
+    }
+    return false;
+  }
+
+  /// Returns the closest non-overlapping start for a clip with [duration].
+  ///
+  /// The search considers every gap in the lane, so dragging against a
+  /// neighbour stops at its edge instead of jumping needlessly to the end.
+  /// When [latestEnd] is omitted the timeline may grow after the last clip.
+  Duration closestAvailableStart({
+    required Duration desiredStart,
+    required Duration duration,
+    String? ignoringClipId,
+    Duration? latestEnd,
+  }) {
+    final durationMs = math.max(1, duration.inMilliseconds);
+    final desiredMs = math.max(0, desiredStart.inMilliseconds);
+    final maximumEndMs = latestEnd?.inMilliseconds;
+    final candidates = <int>[];
+    final occupied = clips.where((clip) => clip.id != ignoringClipId).toList()
+      ..sort((a, b) => a.startTime.compareTo(b.startTime));
+
+    var gapStartMs = 0;
+    for (final clip in occupied) {
+      final gapEndMs = clip.startTime.inMilliseconds;
+      if (gapEndMs - gapStartMs >= durationMs) {
+        candidates.add(
+          desiredMs.clamp(gapStartMs, gapEndMs - durationMs).toInt(),
+        );
+      }
+      gapStartMs = math.max(gapStartMs, clip.endTime.inMilliseconds);
+    }
+
+    if (maximumEndMs == null) {
+      candidates.add(math.max(desiredMs, gapStartMs));
+    } else if (maximumEndMs - gapStartMs >= durationMs) {
+      candidates.add(
+        desiredMs.clamp(gapStartMs, maximumEndMs - durationMs).toInt(),
+      );
+    }
+
+    if (candidates.isEmpty) {
+      // A bounded lane with no fitting gap cannot accept the requested edit.
+      // Returning the current/desired position lets the caller detect that by
+      // running [canPlaceClip] before committing.
+      return Duration(milliseconds: desiredMs);
+    }
+    candidates.sort((a, b) {
+      final byDistance = (a - desiredMs).abs().compareTo((b - desiredMs).abs());
+      return byDistance != 0 ? byDistance : a.compareTo(b);
+    });
+    return Duration(milliseconds: candidates.first);
+  }
+}
+
+/// Finds the nearest legal gap without allocating another lane.
+///
+/// Candidate order is used as the tie-breaker, allowing callers to put the
+/// selected lane first while keeping placement deterministic.
+({TimelineTrack track, Duration start})? resolveClosestReusableTrackPlacement({
+  required Iterable<TimelineTrack> tracks,
+  required TimelineTrackType clipType,
+  required Duration desiredStart,
+  required Duration duration,
+}) {
+  TimelineTrack? bestTrack;
+  Duration? bestStart;
+  var bestDistanceMs = 1 << 62;
+  for (final track in tracks) {
+    if (track.isLocked ||
+        track.isSourceTrack ||
+        !track.acceptsClipType(clipType)) {
+      continue;
+    }
+    final candidateStart = track.closestAvailableStart(
+      desiredStart: desiredStart,
+      duration: duration,
+    );
+    final probe = TimelineClip(
+      trackId: track.id,
+      type: clipType,
+      label: 'Imported media',
+      startTime: candidateStart,
+      endTime: candidateStart + duration,
+    );
+    if (!track.canPlaceClip(probe)) continue;
+    final distanceMs = (candidateStart - desiredStart).inMilliseconds.abs();
+    if (bestTrack == null || distanceMs < bestDistanceMs) {
+      bestTrack = track;
+      bestStart = candidateStart;
+      bestDistanceMs = distanceMs;
+    }
+  }
+  return bestTrack == null || bestStart == null
+      ? null
+      : (track: bestTrack, start: bestStart);
 }
 
 class CanvasSettings {
@@ -1711,7 +1913,7 @@ class EditorTimeline {
   final List<TimelineMarker> markers;
 
   const EditorTimeline({
-    this.schemaVersion = 4,
+    this.schemaVersion = 6,
     this.canvasSettings = const CanvasSettings(),
     this.workspaceSettings = const TimelineWorkspaceSettings(),
     this.subtitleStyle = const SubtitleStyleModel(),
@@ -1738,18 +1940,13 @@ class EditorTimeline {
     required TimelineTrackType clipType,
     String? preferredTrackId,
   }) {
-    // Captions are one system-managed lane. Legacy projects can contain
-    // duplicates, but persistence coalesces them, including their lock state;
-    // never route an edit around a locked duplicate only to relock it on save.
-    if (clipType == TimelineTrackType.subtitle &&
-        tracks.any(
-          (track) => track.type == TimelineTrackType.subtitle && track.isLocked,
-        )) {
-      return null;
-    }
+    // Caption lanes can be source-specific. A locked lane blocks edits to that
+    // lane only; it must not prevent captions for another video from using an
+    // unlocked lane.
     final candidates = tracks.where(
       (track) =>
           track.section == section &&
+          !track.isSourceTrack &&
           !track.isLocked &&
           track.acceptsClipType(clipType),
     );
@@ -1767,7 +1964,7 @@ class EditorTimeline {
       case TimelineTrackSection.overlay:
         return 'Overlay ${sectionTracks.length + 1}';
       case TimelineTrackSection.baseVideo:
-        return 'Video ${sectionTracks.length + 1}';
+        return 'Base layer';
       case TimelineTrackSection.textSubtitle:
         final textTracks = sectionTracks
             .where((track) => track.type == TimelineTrackType.text)
@@ -1778,10 +1975,105 @@ class EditorTimeline {
     }
   }
 
+  /// Track order is stored top-to-bottom, matching the rows the user sees.
+  /// Flutter and FFmpeg paint bottom-to-top, so composition consumes this view.
+  ///
+  /// Older saved projects stored their Base layer first and appended visual
+  /// lanes beneath it. Keep those lanes above the base while they are
+  /// migrated so opening an existing project cannot silently invert its
+  /// composition.
+  List<TimelineTrack> get visualTracksInPaintOrder {
+    return tracks
+        .where((track) => track.isVisualLayer && !track.isHidden)
+        .toList()
+        .reversed
+        .toList(growable: false);
+  }
+
+  /// Inserts a new lane without disturbing the fixed Base layer or any
+  /// preserved legacy source-audio lane.
+  ///
+  /// New overlays sit above existing overlays but below text. Additional audio
+  /// lanes always live beneath the extracted source-audio lane.
+  EditorTimeline insertTrackUsingEditorRules(TimelineTrack track) {
+    final next = [...tracks];
+    switch (track.section) {
+      case TimelineTrackSection.textSubtitle:
+        final firstNonText = next.indexWhere(
+          (candidate) => candidate.section != TimelineTrackSection.textSubtitle,
+        );
+        next.insert(firstNonText < 0 ? next.length : firstNonText, track);
+        break;
+      case TimelineTrackSection.overlay:
+        final mainVideoIndex = next.indexWhere(
+          (candidate) => candidate.section == TimelineTrackSection.baseVideo,
+        );
+        final firstOverlay = next.indexWhere(
+          (candidate) => candidate.section == TimelineTrackSection.overlay,
+        );
+        final afterText =
+            next.lastIndexWhere(
+              (candidate) =>
+                  candidate.section == TimelineTrackSection.textSubtitle,
+            ) +
+            1;
+        final insertionIndex = firstOverlay >= 0
+            ? math.max(afterText, firstOverlay)
+            : mainVideoIndex >= 0
+            ? math.max(afterText, mainVideoIndex)
+            : math.max(afterText, next.length);
+        next.insert(insertionIndex.clamp(0, next.length).toInt(), track);
+        break;
+      case TimelineTrackSection.audio:
+        // Appending places a newly-created lane below older audio content and
+        // beneath any preserved legacy source-audio lane.
+        next.add(track);
+        break;
+      case TimelineTrackSection.baseVideo:
+        final firstAudioIndex = next.indexWhere(
+          (candidate) => candidate.section == TimelineTrackSection.audio,
+        );
+        next.insert(firstAudioIndex < 0 ? next.length : firstAudioIndex, track);
+        break;
+    }
+    return copyWith(tracks: next);
+  }
+
+  bool canReorderTrackTo(String trackId, String targetTrackId) {
+    if (trackId == targetTrackId) return false;
+    final source = tracks.where((track) => track.id == trackId).firstOrNull;
+    final target = tracks
+        .where((track) => track.id == targetTrackId)
+        .firstOrNull;
+    if (source == null || target == null) return false;
+    if (!source.isReorderable || !target.isReorderable) return false;
+    final sourceIsAudio = source.section == TimelineTrackSection.audio;
+    final targetIsAudio = target.section == TimelineTrackSection.audio;
+    // Visual layers may be freely reordered with one another. Audio lanes form
+    // their own ordering group below the fixed source audio lane.
+    return sourceIsAudio == targetIsAudio;
+  }
+
+  EditorTimeline reorderTrackTo(String trackId, String targetTrackId) {
+    if (!canReorderTrackTo(trackId, targetTrackId)) return this;
+    final next = [...tracks];
+    final sourceIndex = next.indexWhere((track) => track.id == trackId);
+    final originalTargetIndex = next.indexWhere(
+      (track) => track.id == targetTrackId,
+    );
+    final moved = next.removeAt(sourceIndex);
+    // Occupy the target row's original slot. When moving down, inserting at
+    // that unadjusted index places the moved row after the target; when moving
+    // up it places it before the target. This makes both drag directions
+    // responsive instead of turning downward moves into a no-op.
+    next.insert(originalTargetIndex.clamp(0, next.length).toInt(), moved);
+    return copyWith(tracks: next);
+  }
+
   List<SubtitleEntry> get subtitleEntries {
-    final track = primarySubtitleTrack;
-    if (track == null) return const [];
-    return track.clips
+    return tracks
+        .where((track) => track.type == TimelineTrackType.subtitle)
+        .expand((track) => track.clips)
         .map((clip) => clip.toSubtitleEntry())
         .whereType<SubtitleEntry>()
         .toList()
@@ -1805,7 +2097,7 @@ class EditorTimeline {
         );
   }
 
-  Duration get baseVideoDuration {
+  Duration get baseLayerDuration {
     return tracks
         .where((track) => track.section == TimelineTrackSection.baseVideo)
         .expand((track) => track.clips)
@@ -1813,6 +2105,64 @@ class EditorTimeline {
           Duration.zero,
           (current, clip) => clip.endTime > current ? clip.endTime : current,
         );
+  }
+
+  /// Backwards-compatible alias for code and files that still use the old
+  /// base-video terminology internally.
+  Duration get baseVideoDuration => baseLayerDuration;
+
+  List<TimelineClip> get visualMediaClips {
+    return tracks
+        .where(
+          (track) =>
+              track.section == TimelineTrackSection.baseVideo ||
+              track.section == TimelineTrackSection.overlay,
+        )
+        .expand(
+          (track) => track.clips.where(
+            (clip) => clip.type.isVisualMedia && track.acceptsClip(clip),
+          ),
+        )
+        .toList(growable: false);
+  }
+
+  bool get hasVisualContent => visualMediaClips.isNotEmpty;
+
+  bool wouldRetainVisualContentAfterRemoving(Iterable<String> clipIds) {
+    final removed = clipIds.toSet();
+    return visualMediaClips.any((clip) => !removed.contains(clip.id));
+  }
+
+  bool get hasTrackOverlaps => tracks.any((track) => track.hasOverlappingClips);
+
+  /// Repairs malformed/legacy timelines by moving colliding clips to the
+  /// earliest free point while preserving clip duration and lane membership.
+  EditorTimeline withoutTrackOverlaps() {
+    if (!hasTrackOverlaps) return this;
+    final nextTracks = tracks.map((track) {
+      if (!track.hasOverlappingClips) return track;
+      final sorted = [...track.clips]
+        ..sort((a, b) {
+          final byStart = a.startTime.compareTo(b.startTime);
+          return byStart != 0 ? byStart : a.endTime.compareTo(b.endTime);
+        });
+      var cursor = Duration.zero;
+      final repaired = <TimelineClip>[];
+      for (final clip in sorted) {
+        final start = clip.startTime < cursor ? cursor : clip.startTime;
+        final duration = clip.duration > Duration.zero
+            ? clip.duration
+            : const Duration(milliseconds: 1);
+        final placed = clip.copyWith(
+          startTime: start,
+          endTime: start + duration,
+        );
+        repaired.add(placed);
+        cursor = placed.endTime;
+      }
+      return track.copyWith(clips: repaired);
+    }).toList();
+    return copyWith(tracks: nextTracks);
   }
 
   EditorAssetReference? assetForClip(TimelineClip clip) {
@@ -1863,10 +2213,16 @@ class EditorTimeline {
   }
 
   EditorTimeline canonicalized() {
-    return copyWith(
-      assets: _canonicalizeAssets(assets),
-      tracks: _canonicalizeTimelineTracks(tracks),
+    final normalizedTracks = _foldRedundantLegacySourceAudio(
+      _canonicalizeTimelineTracks(tracks),
     );
+    return copyWith(
+      schemaVersion: 6,
+      assets: _canonicalizeAssets(assets),
+      tracks: schemaVersion < 5
+          ? _migrateLegacyTrackOrder(normalizedTracks)
+          : normalizedTracks,
+    ).withoutTrackOverlaps();
   }
 
   EditorTimeline syncLegacySubtitles({
@@ -1876,53 +2232,78 @@ class EditorTimeline {
     required int durationMs,
   }) {
     final canonicalTracks = _canonicalizeTimelineTracks(tracks);
-    final subtitleTrack = _mergedSubtitleTrack(
-      canonicalTracks,
-      subtitles: subtitles,
-    );
-    var nextTracks = _replaceTrackGroup(
-      canonicalTracks,
-      matches: (track) => track.type == TimelineTrackType.subtitle,
-      replacement: subtitleTrack,
-    );
+    var nextTracks = canonicalTracks;
+    if (subtitles.isNotEmpty ||
+        canonicalTracks.any(
+          (track) => track.type == TimelineTrackType.subtitle,
+        )) {
+      final subtitleTracks = _mergedSubtitleTracks(
+        canonicalTracks,
+        subtitles: subtitles,
+      );
+      nextTracks = _replaceTrackGroupWithMany(
+        canonicalTracks,
+        matches: (track) => track.type == TimelineTrackType.subtitle,
+        replacements: subtitleTracks,
+      );
+    }
 
-    final canonicalAssets = _canonicalizeAssets(assets);
+    var nextAssets = _canonicalizeAssets(assets);
+    final hasVisualClip = nextTracks.any(
+      (track) =>
+          (track.section == TimelineTrackSection.baseVideo ||
+              track.section == TimelineTrackSection.overlay) &&
+          track.clips.any(
+            (clip) => clip.type.isVisualMedia && track.acceptsClip(clip),
+          ),
+    );
+    final hasUsableLegacyVideo = videoPath.trim().isNotEmpty && durationMs > 0;
     EditorAssetReference? existingSourceAsset;
-    for (final asset in canonicalAssets) {
+    for (final asset in nextAssets) {
       if (asset.type == EditorAssetType.video &&
           asset.sourcePath == videoPath) {
         existingSourceAsset = asset;
         break;
       }
     }
-    final resolvedSourceAsset =
-        existingSourceAsset ??
-        EditorAssetReference(
-          type: EditorAssetType.video,
-          label: 'Source video',
-          sourcePath: videoPath,
-          metadata: {'durationMs': durationMs},
-        );
-    final nextAssets = existingSourceAsset == null
-        ? [resolvedSourceAsset, ...canonicalAssets]
-        : canonicalAssets;
 
     final baseTracks = nextTracks
         .where((track) => track.section == TimelineTrackSection.baseVideo)
         .toList();
+    final baseClipsNeedLegacyAsset = baseTracks.any(
+      (track) => track.clips.any(
+        (clip) => clip.type == TimelineTrackType.video && clip.assetId == null,
+      ),
+    );
+    final shouldSeedLegacyClip = !hasVisualClip && hasUsableLegacyVideo;
+    EditorAssetReference? resolvedSourceAsset = existingSourceAsset;
+    if ((shouldSeedLegacyClip || baseClipsNeedLegacyAsset) &&
+        hasUsableLegacyVideo &&
+        resolvedSourceAsset == null) {
+      resolvedSourceAsset = EditorAssetReference(
+        type: EditorAssetType.video,
+        label: 'Imported video',
+        sourcePath: videoPath,
+        metadata: {'durationMs': durationMs},
+      );
+      nextAssets = [resolvedSourceAsset, ...nextAssets];
+    }
+
+    // A populated overlay lane is a complete visual project. Keep an empty
+    // main lane available for later inserts, but never recreate the old first
+    // video merely because that lane is intentionally empty.
     final baseTrack = _coalesceTrackGroup(
       baseTracks,
       fallback: () => TimelineTrack(
         id: 'track_video_primary',
-        name: 'Video 1',
+        name: 'Base layer',
         type: TimelineTrackType.video,
         section: TimelineTrackSection.baseVideo,
       ),
     );
-    final hasBaseClips = baseTrack.clips.any(
-      (clip) => clip.type == TimelineTrackType.video,
-    );
+    final hasBaseClips = baseTrack.clips.any((clip) => clip.type.isVisualMedia);
     final normalizedBaseTrack = baseTrack.copyWith(
+      name: 'Base layer',
       type: TimelineTrackType.video,
       section: TimelineTrackSection.baseVideo,
       clips: hasBaseClips
@@ -1930,35 +2311,40 @@ class EditorTimeline {
                 .map(
                   (clip) => clip.copyWith(
                     trackId: baseTrack.id,
-                    assetId: clip.assetId ?? resolvedSourceAsset.id,
+                    assetId: clip.assetId ?? resolvedSourceAsset?.id,
                   ),
                 )
                 .toList()
-          : [
+          : shouldSeedLegacyClip && resolvedSourceAsset != null
+          ? [
               TimelineClip(
                 trackId: baseTrack.id,
                 type: TimelineTrackType.video,
-                label: 'Source video',
+                label: resolvedSourceAsset.label,
                 assetId: resolvedSourceAsset.id,
                 startTime: Duration.zero,
                 endTime: Duration(milliseconds: math.max(0, durationMs)),
                 sourceStartTime: Duration.zero,
                 sourceDuration: Duration(milliseconds: math.max(0, durationMs)),
               ),
-            ],
+            ]
+          : const [],
     );
-    nextTracks = _replaceTrackGroup(
-      nextTracks,
-      matches: (track) => track.section == TimelineTrackSection.baseVideo,
-      replacement: normalizedBaseTrack,
-      insertAtStartWhenMissing: true,
-    );
+    nextTracks = baseTracks.isEmpty
+        ? copyWith(
+            tracks: nextTracks,
+          ).insertTrackUsingEditorRules(normalizedBaseTrack).tracks
+        : _replaceTrackGroup(
+            nextTracks,
+            matches: (track) => track.section == TimelineTrackSection.baseVideo,
+            replacement: normalizedBaseTrack,
+          );
 
     return copyWith(
       subtitleStyle: globalStyle,
       assets: nextAssets,
       tracks: _canonicalizeTimelineTracks(nextTracks),
-    );
+    ).withoutTrackOverlaps();
   }
 
   EditorTimeline mergeSubtitleEntries({
@@ -1966,14 +2352,20 @@ class EditorTimeline {
     required SubtitleStyleModel globalStyle,
   }) {
     final canonicalTracks = _canonicalizeTimelineTracks(tracks);
-    final mergedTrack = _mergedSubtitleTrack(
+    if (subtitles.isEmpty &&
+        !canonicalTracks.any(
+          (track) => track.type == TimelineTrackType.subtitle,
+        )) {
+      return copyWith(subtitleStyle: globalStyle, tracks: canonicalTracks);
+    }
+    final mergedTracks = _mergedSubtitleTracks(
       canonicalTracks,
       subtitles: subtitles,
     );
-    final nextTracks = _replaceTrackGroup(
+    final nextTracks = _replaceTrackGroupWithMany(
       canonicalTracks,
       matches: (track) => track.type == TimelineTrackType.subtitle,
-      replacement: mergedTrack,
+      replacements: mergedTracks,
     );
 
     return copyWith(
@@ -2040,49 +2432,110 @@ class EditorTimeline {
   }
 }
 
-TimelineTrack _mergedSubtitleTrack(
+List<TimelineTrack> _mergedSubtitleTracks(
   List<TimelineTrack> tracks, {
   required List<SubtitleEntry> subtitles,
 }) {
   final subtitleTracks = tracks
       .where((track) => track.type == TimelineTrackType.subtitle)
       .toList();
-  final primary = _coalesceTrackGroup(
-    subtitleTracks,
-    fallback: () => TimelineTrack(
+  if (subtitleTracks.isEmpty) {
+    if (subtitles.isEmpty) return const [];
+    final track = TimelineTrack(
       id: 'track_subtitles',
       name: 'Subtitles',
       type: TimelineTrackType.subtitle,
       section: TimelineTrackSection.textSubtitle,
-    ),
-  );
-  final existingById = <String, TimelineClip>{};
-  for (final track in subtitleTracks) {
-    for (final clip in track.clips) {
-      existingById.putIfAbsent(clip.id, () => clip);
-    }
-  }
-  final clips = subtitles.map((entry) {
-    final existing = existingById[entry.id];
-    if (existing == null) {
-      return TimelineClip.fromSubtitleEntry(entry, trackId: primary.id);
-    }
-    return existing.copyWith(
-      trackId: primary.id,
-      type: TimelineTrackType.subtitle,
-      label: entry.text,
-      startTime: entry.startTime,
-      endTime: entry.endTime,
-      text: entry.text,
-      subtitleStyle: entry.styleOverride,
-      clearSubtitleStyle: entry.styleOverride == null,
     );
-  }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
-  return primary.copyWith(
-    type: TimelineTrackType.subtitle,
-    section: TimelineTrackSection.textSubtitle,
-    clips: clips,
-  );
+    return [
+      track.copyWith(
+        clips:
+            subtitles
+                .map(
+                  (entry) =>
+                      TimelineClip.fromSubtitleEntry(entry, trackId: track.id),
+                )
+                .toList()
+              ..sort((a, b) => a.startTime.compareTo(b.startTime)),
+      ),
+    ];
+  }
+
+  final entriesById = {for (final entry in subtitles) entry.id: entry};
+  final assignedEntryIds = <String>{};
+  final merged = <TimelineTrack>[];
+  var generalTrackIndex = -1;
+  for (final track in subtitleTracks) {
+    final hadGeneralCaption = track.clips.any(
+      (clip) => clip.linkedClipId == null,
+    );
+    final clips = <TimelineClip>[];
+    for (final existing in track.clips) {
+      final entry = entriesById[existing.id];
+      if (entry == null || !assignedEntryIds.add(entry.id)) continue;
+      clips.add(
+        existing.copyWith(
+          trackId: track.id,
+          type: TimelineTrackType.subtitle,
+          label: entry.text,
+          startTime: entry.startTime,
+          endTime: entry.endTime,
+          text: entry.text,
+          subtitleStyle: entry.styleOverride,
+          clearSubtitleStyle: entry.styleOverride == null,
+        ),
+      );
+    }
+    clips.sort((a, b) => a.startTime.compareTo(b.startTime));
+    if (generalTrackIndex < 0 && (hadGeneralCaption || track.clips.isEmpty)) {
+      generalTrackIndex = merged.length;
+    }
+    merged.add(
+      track.copyWith(
+        type: TimelineTrackType.subtitle,
+        section: TimelineTrackSection.textSubtitle,
+        clips: clips,
+      ),
+    );
+  }
+
+  final unassigned = subtitles
+      .where((entry) => !assignedEntryIds.contains(entry.id))
+      .toList();
+  if (unassigned.isNotEmpty) {
+    if (generalTrackIndex < 0) {
+      final usedIds = tracks.map((track) => track.id).toSet();
+      var id = 'track_subtitles';
+      var suffix = 2;
+      while (usedIds.contains(id)) {
+        id = 'track_subtitles_${suffix++}';
+      }
+      merged.insert(
+        0,
+        TimelineTrack(
+          id: id,
+          name: 'Subtitles',
+          type: TimelineTrackType.subtitle,
+          section: TimelineTrackSection.textSubtitle,
+        ),
+      );
+      generalTrackIndex = 0;
+    }
+    final general = merged[generalTrackIndex];
+    final clips = [
+      ...general.clips,
+      ...unassigned.map(
+        (entry) => TimelineClip.fromSubtitleEntry(entry, trackId: general.id),
+      ),
+    ]..sort((a, b) => a.startTime.compareTo(b.startTime));
+    merged[generalTrackIndex] = general.copyWith(clips: clips);
+  }
+
+  final populated = merged.where((track) => track.clips.isNotEmpty).toList();
+  if (populated.isNotEmpty) return populated;
+  // Keep one empty lane so deleting the final caption does not also delete the
+  // user's subtitle track controls and lock state.
+  return [merged.first];
 }
 
 TimelineTrack _coalesceTrackGroup(
@@ -2116,7 +2569,6 @@ List<TimelineTrack> _replaceTrackGroup(
   List<TimelineTrack> tracks, {
   required bool Function(TimelineTrack track) matches,
   required TimelineTrack replacement,
-  bool insertAtStartWhenMissing = false,
 }) {
   final next = <TimelineTrack>[];
   var inserted = false;
@@ -2130,13 +2582,28 @@ List<TimelineTrack> _replaceTrackGroup(
       inserted = true;
     }
   }
-  if (!inserted) {
-    if (insertAtStartWhenMissing) {
-      next.insert(0, replacement);
-    } else {
-      next.add(replacement);
+  if (!inserted) next.add(replacement);
+  return next;
+}
+
+List<TimelineTrack> _replaceTrackGroupWithMany(
+  List<TimelineTrack> tracks, {
+  required bool Function(TimelineTrack track) matches,
+  required List<TimelineTrack> replacements,
+}) {
+  final next = <TimelineTrack>[];
+  var inserted = false;
+  for (final track in tracks) {
+    if (!matches(track)) {
+      next.add(track);
+      continue;
+    }
+    if (!inserted) {
+      next.addAll(replacements);
+      inserted = true;
     }
   }
+  if (!inserted) next.addAll(replacements);
   return next;
 }
 
@@ -2173,8 +2640,28 @@ List<TimelineTrack> _canonicalizeTimelineTracks(
         ),
       );
     }
+    // `effect` remains a clip discriminator for backwards-compatible project
+    // files, but effects no longer own a dedicated lane. Migrate old effect
+    // lanes into ordinary overlay lanes as projects are read or saved.
     final normalizedTrack = sourceTrack.copyWith(
       id: trackId,
+      name: sourceTrack.type == TimelineTrackType.effect
+          ? sourceTrack.name.replaceFirst(
+              RegExp(r'^Effects?', caseSensitive: false),
+              'Overlay',
+            )
+          : sourceTrack.section == TimelineTrackSection.baseVideo
+          ? 'Base layer'
+          : sourceTrack.name,
+      type: sourceTrack.type == TimelineTrackType.effect
+          ? TimelineTrackType.video
+          : sourceTrack.type,
+      section: sourceTrack.type == TimelineTrackType.effect
+          ? TimelineTrackSection.overlay
+          : sourceTrack.section,
+      role: sourceTrack.role == TimelineTrackRole.sourceVideo
+          ? TimelineTrackRole.regular
+          : sourceTrack.role,
       clips: normalizedClips,
     );
     final existing = byId[trackId];
@@ -2212,6 +2699,146 @@ List<TimelineTrack> _canonicalizeTimelineTracks(
   }).toList();
 }
 
+/// Collapses the automatic embedded-audio duplication produced by older
+/// builds. Only an exact, one-to-one mirror is folded back into its linked base
+/// video. Any timing/source divergence, ambiguous duplicate, or independently
+/// managed lane remains untouched so a user's audio edit cannot be lost.
+List<TimelineTrack> _foldRedundantLegacySourceAudio(
+  List<TimelineTrack> tracks,
+) {
+  final baseVideosById = <String, TimelineClip>{};
+  for (final track in tracks) {
+    if (track.section != TimelineTrackSection.baseVideo) continue;
+    for (final clip in track.clips) {
+      if (clip.type == TimelineTrackType.video) {
+        baseVideosById[clip.id] = clip;
+      }
+    }
+  }
+  if (baseVideosById.isEmpty) return tracks;
+
+  final candidatesByBaseId =
+      <String, List<({TimelineTrack track, TimelineClip audio})>>{};
+  for (final track in tracks) {
+    if (track.role != TimelineTrackRole.sourceAudio ||
+        track.isHidden ||
+        track.isSolo) {
+      continue;
+    }
+    for (final audio in track.clips) {
+      final linkedId = audio.linkedClipId;
+      final base = linkedId == null ? null : baseVideosById[linkedId];
+      if (base == null || !_isExactLegacyAudioMirror(base, audio)) continue;
+      candidatesByBaseId.putIfAbsent(base.id, () => []).add((
+        track: track,
+        audio: audio,
+      ));
+    }
+  }
+
+  final foldedAudioByBaseId =
+      <String, ({TimelineTrack track, TimelineClip audio})>{};
+  final foldedAudioIds = <String>{};
+  for (final entry in candidatesByBaseId.entries) {
+    // More than one matching clip is ambiguous and therefore preserved.
+    if (entry.value.length != 1) continue;
+    final candidate = entry.value.single;
+    foldedAudioByBaseId[entry.key] = candidate;
+    foldedAudioIds.add(candidate.audio.id);
+  }
+  if (foldedAudioIds.isEmpty) return tracks;
+
+  final next = <TimelineTrack>[];
+  for (final track in tracks) {
+    if (track.section == TimelineTrackSection.baseVideo) {
+      next.add(
+        track.copyWith(
+          clips: track.clips.map((clip) {
+            final folded = foldedAudioByBaseId[clip.id];
+            if (folded == null) return clip;
+            final audio = folded.audio;
+            return clip.copyWith(
+              audioMix: audio.audioMix.copyWith(
+                muted:
+                    audio.audioMix.muted ||
+                    folded.track.isMuted ||
+                    !audio.enabled,
+              ),
+              autoDuck: audio.autoDuck,
+              duckAmount: audio.duckAmount,
+            );
+          }).toList(),
+        ),
+      );
+      continue;
+    }
+    if (track.role == TimelineTrackRole.sourceAudio) {
+      final remaining = track.clips
+          .where((clip) => !foldedAudioIds.contains(clip.id))
+          .toList();
+      if (remaining.isEmpty) continue;
+      next.add(track.copyWith(clips: remaining));
+      continue;
+    }
+    next.add(track);
+  }
+  return next;
+}
+
+bool _isExactLegacyAudioMirror(TimelineClip base, TimelineClip audio) {
+  return base.audioMix.muted &&
+      base.assetId != null &&
+      audio.type == TimelineTrackType.audio &&
+      audio.assetId == base.assetId &&
+      audio.linkedClipId == base.id &&
+      audio.startTime == base.startTime &&
+      audio.endTime == base.endTime &&
+      audio.sourceStartTime == base.sourceStartTime &&
+      audio.sourceDuration == base.sourceDuration &&
+      (audio.playbackRate - base.playbackRate).abs() < 0.0001 &&
+      audio.isReversed == base.isReversed &&
+      audio.freezeFrame == base.freezeFrame &&
+      audio.freezeFrameSourceTime == base.freezeFrameSourceTime &&
+      audio.denoise == base.denoise &&
+      audio.keyframes.isEmpty &&
+      audio.introTransition.type == TransitionType.none &&
+      audio.outroTransition.type == TransitionType.none &&
+      (audio.notes == null || audio.notes!.trim().isEmpty) &&
+      audio.timelineColor.a == 0;
+}
+
+/// Schema 4 and earlier stored the base layer first and appended visual layers.
+/// Schema 5+ stores exactly what the timeline shows: topmost visual lane first,
+/// the main storyline in the middle, and audio beneath it.
+List<TimelineTrack> _migrateLegacyTrackOrder(List<TimelineTrack> tracks) {
+  final text = tracks
+      .where((track) => track.section == TimelineTrackSection.textSubtitle)
+      .toList()
+      .reversed;
+  final overlays = tracks
+      .where((track) => track.section == TimelineTrackSection.overlay)
+      .toList()
+      .reversed;
+  final mainVideo = tracks.where(
+    (track) => track.section == TimelineTrackSection.baseVideo,
+  );
+  final sourceAudio = tracks.where(
+    (track) => track.role == TimelineTrackRole.sourceAudio,
+  );
+  final regularAudio = tracks.where(
+    (track) =>
+        track.section == TimelineTrackSection.audio &&
+        track.role != TimelineTrackRole.sourceAudio,
+  );
+  return List.unmodifiable([
+    ...text,
+    ...overlays,
+    ...mainVideo,
+    ...sourceAudio,
+    ...regularAudio,
+  ]);
+}
+
 TimelineTrackType _trackTypeFromJson(dynamic value) {
   return TimelineTrackType.values.firstWhere(
     (candidate) => candidate.name == value,
@@ -2234,6 +2861,32 @@ TimelineTrackSection _defaultSectionForType(TimelineTrackType type) {
     case TimelineTrackType.effect:
       return TimelineTrackSection.overlay;
   }
+}
+
+TimelineTrackRole _trackRoleFromJson(
+  Object? value, {
+  required String? id,
+  required String? name,
+  required TimelineTrackType type,
+  required TimelineTrackSection section,
+}) {
+  final persisted = TimelineTrackRole.values.where(
+    (candidate) => candidate.name == value,
+  );
+  if (persisted.isNotEmpty) {
+    return persisted.first == TimelineTrackRole.sourceVideo
+        ? TimelineTrackRole.regular
+        : persisted.first;
+  }
+  final normalizedId = id?.trim().toLowerCase() ?? '';
+  final normalizedName = name?.trim().toLowerCase() ?? '';
+  if (type == TimelineTrackType.audio &&
+      (normalizedId == 'track_audio_source' ||
+          normalizedName == 'source audio' ||
+          normalizedName == 'source video audio')) {
+    return TimelineTrackRole.sourceAudio;
+  }
+  return TimelineTrackRole.regular;
 }
 
 int _colorToInt(Color color) {

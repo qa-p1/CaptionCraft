@@ -34,11 +34,28 @@ void main() {
       expect(project.durationMs, 4250);
       expect(project.thumbnailBase64, isNull);
       expect(project.timeline.assets, hasLength(2));
-      expect(project.timeline.tracks, hasLength(2));
+      expect(project.timeline.tracks, hasLength(3));
       expect(project.timeline.tracks.map((track) => track.type), [
+        TimelineTrackType.text,
         TimelineTrackType.video,
-        TimelineTrackType.subtitle,
+        TimelineTrackType.video,
       ]);
+      expect(project.timeline.tracks.map((track) => track.section), [
+        TimelineTrackSection.textSubtitle,
+        TimelineTrackSection.overlay,
+        TimelineTrackSection.baseVideo,
+      ]);
+      expect(project.timeline.tracks.map((track) => track.role), [
+        TimelineTrackRole.regular,
+        TimelineTrackRole.regular,
+        TimelineTrackRole.regular,
+      ]);
+      expect(
+        project.timeline.tracks.any(
+          (track) => track.type == TimelineTrackType.subtitle,
+        ),
+        isFalse,
+      );
       final clips = project.timeline.tracks
           .firstWhere(
             (track) => track.section == TimelineTrackSection.baseVideo,
@@ -49,10 +66,63 @@ void main() {
       expect(clips.first.endTime, const Duration(milliseconds: 2500));
       expect(clips.last.startTime, const Duration(milliseconds: 2500));
       expect(clips.last.endTime, const Duration(milliseconds: 4250));
+      expect(clips.every((clip) => !clip.audioMix.muted), isTrue);
+      expect(
+        project.timeline.tracks.any(
+          (track) => track.role == TimelineTrackRole.sourceAudio,
+        ),
+        isFalse,
+      );
 
       final restored = Project.fromJson(project.toJson());
       expect(restored.timeline.videoClips, hasLength(2));
+      expect(
+        restored.timeline.tracks.any(
+          (track) => track.role == TimelineTrackRole.sourceAudio,
+        ),
+        isFalse,
+      );
       expect(restored.durationMs, project.durationMs);
+    });
+
+    test('accepts image and GIF clips on the base layer', () async {
+      final project = await ProjectCreationService.createProjectFromMedia(
+        ownerUid: 'user-a',
+        sources: const [
+          ImportedMediaSource(
+            filePath: '/media/cover.png',
+            displayName: 'cover.png',
+          ),
+          ImportedMediaSource(
+            filePath: '/media/loop.gif',
+            displayName: 'loop.gif',
+          ),
+        ],
+        generateThumbnail: false,
+        mediaInfoLoader: (filePath) async => {
+          'durationMs': filePath.endsWith('.gif') ? 2200 : 0,
+          'width': 1080,
+          'height': 1080,
+          'hasAudio': false,
+        },
+      );
+
+      final baseTrack = project.timeline.tracks.singleWhere(
+        (track) => track.section == TimelineTrackSection.baseVideo,
+      );
+      expect(baseTrack.name, 'Base layer');
+      expect(baseTrack.clips.map((clip) => clip.type), [
+        TimelineTrackType.image,
+        TimelineTrackType.gif,
+      ]);
+      expect(baseTrack.clips.first.duration, const Duration(seconds: 4));
+      expect(baseTrack.clips.last.duration, const Duration(milliseconds: 2200));
+      expect(
+        project.timeline.tracks.any(
+          (track) => track.section == TimelineTrackSection.audio,
+        ),
+        isFalse,
+      );
     });
 
     test('rejects media that has no readable duration', () async {

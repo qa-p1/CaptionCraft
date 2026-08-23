@@ -62,6 +62,34 @@ void main() {
     expect(await managedDirectory.list().length, 1);
   });
 
+  test('stable cache keys reuse one project-owned copy', () async {
+    final source = File(p.join(temporaryDirectory.path, 'pack clip.mp4'));
+    await source.writeAsBytes(const [4, 3, 2, 1]);
+
+    Future<String> persist() => MediaImportService.persistFile(
+      source.path,
+      forceCopy: true,
+      stableCacheKey: 'background-videos/v1/clip-42',
+      documentsDirectoryOverride: documentsDirectory,
+    );
+
+    final first = await persist();
+    final second = await persist();
+
+    expect(second, first);
+    expect(await File(first).readAsBytes(), const [4, 3, 2, 1]);
+    final managedDirectory = Directory(
+      p.join(documentsDirectory.path, 'CaptionCraft', 'media'),
+    );
+    expect(
+      await managedDirectory
+          .list()
+          .where((entry) => entry is File && !entry.path.endsWith('.part'))
+          .length,
+      1,
+    );
+  });
+
   test('missing and empty files are rejected', () async {
     await expectLater(
       MediaImportService.persistFile(

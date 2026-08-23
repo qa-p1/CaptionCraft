@@ -40,13 +40,13 @@ void main() {
       ..selectTrack('video_track')
       ..selectClip('video_clip');
     await tester.pump();
-    await _runEditorTool(tester, 'Copy clip attributes');
+    await _runAttributeTool(tester, 'copy_attrs');
 
     container.read(editorProvider.notifier)
       ..selectTrack('audio_track')
       ..selectClip('audio_clip');
     await tester.pump();
-    await _runEditorTool(tester, 'Paste clip attributes');
+    await _runAttributeTool(tester, 'paste_attrs');
 
     final pasted = container
         .read(editorProvider)
@@ -67,19 +67,23 @@ void main() {
   });
 }
 
-Future<void> _runEditorTool(WidgetTester tester, String label) async {
-  await tester.tap(find.byTooltip('Editor tools'));
-  await tester.pumpAndSettle();
-  final tool = find.text(label);
-  for (var attempt = 0; attempt < 20; attempt++) {
-    if (tool.evaluate().isNotEmpty) {
-      final center = tester.getCenter(tool);
-      if (center.dy >= 100 && center.dy <= 740) break;
-    }
-    await tester.dragFrom(const Offset(590, 700), const Offset(0, -280));
-    await tester.pumpAndSettle();
+Future<void> _runAttributeTool(WidgetTester tester, String toolName) async {
+  final toolKey = ValueKey('dock_tool_edit_editDetails_$toolName');
+  if (find.byKey(toolKey).evaluate().isEmpty) {
+    final category = find.byKey(const ValueKey('dock_category_edit'));
+    await tester.ensureVisible(category);
+    await tester.tap(category);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 260));
+    final subgroup = find.byKey(const ValueKey('dock_subgroup_editDetails'));
+    await tester.ensureVisible(subgroup);
+    await tester.tap(subgroup);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 260));
   }
+  final tool = find.byKey(toolKey);
   expect(tool, findsOneWidget);
+  await tester.ensureVisible(tool);
   await tester.tap(tool);
   await tester.pumpAndSettle();
 }

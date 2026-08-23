@@ -1777,7 +1777,7 @@ _RenderPlan _plan({
     section: TimelineTrackSection.baseVideo,
     clips: [clip],
   );
-  final tracks = <TimelineTrack>[baseTrack, ...additionalTracks];
+  final tracks = <TimelineTrack>[...additionalTracks];
   if (effects.isNotEmpty) {
     tracks.add(
       TimelineTrack(
@@ -1789,6 +1789,10 @@ _RenderPlan _plan({
       ),
     );
   }
+  // Timeline rows are stored top-to-bottom. Overlay/effect lanes therefore
+  // precede the main lane so paint order remains bottom-to-top without a
+  // special source-video exception.
+  tracks.add(baseTrack);
   final timeline = EditorTimeline(
     assets: [sourceAsset],
     tracks: tracks,

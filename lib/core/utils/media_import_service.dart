@@ -16,11 +16,15 @@ class MediaImportService {
   ///
   /// Android and iOS picker results are copied into application Documents.
   /// Desktop picker paths already point at user-managed files and pass through.
+  /// Set [forceCopy] for app-owned temporary/download files whose source may be
+  /// deleted independently after the project references them.
   /// Supplying [documentsDirectoryOverride] enables the mobile copy behavior in
   /// tests without invoking the path-provider platform channel.
   static Future<String> persistFile(
     String sourcePath, {
     String? originalFileName,
+    bool forceCopy = false,
+    String? stableCacheKey,
     @visibleForTesting Directory? documentsDirectoryOverride,
   }) async {
     if (sourcePath.trim().isEmpty) {
@@ -41,6 +45,7 @@ class MediaImportService {
     }
 
     final shouldPersist =
+        forceCopy ||
         documentsDirectoryOverride != null ||
         Platform.isAndroid ||
         Platform.isIOS;
@@ -72,13 +77,23 @@ class MediaImportService {
     );
     final extension = p.extension(safeFileName);
     final stem = p.basenameWithoutExtension(safeFileName);
-    final uniqueSuffix = DateTime.now().microsecondsSinceEpoch;
+    final normalizedStableKey = stableCacheKey?.trim();
+    final uniqueSuffix = normalizedStableKey?.isNotEmpty == true
+        ? _safeCacheKey(normalizedStableKey!)
+        : DateTime.now().microsecondsSinceEpoch.toString();
     var destinationPath = p.join(
       normalizedMediaDirectory,
       '${stem}_$uniqueSuffix$extension',
     );
+    if (normalizedStableKey?.isNotEmpty == true) {
+      final existing = File(destinationPath);
+      if (await existing.exists() && await existing.length() == sourceLength) {
+        return destinationPath;
+      }
+    }
     var collisionIndex = 1;
-    while (await File(destinationPath).exists()) {
+    while (normalizedStableKey?.isNotEmpty != true &&
+        await File(destinationPath).exists()) {
       destinationPath = p.join(
         normalizedMediaDirectory,
         '${stem}_${uniqueSuffix}_$collisionIndex$extension',
@@ -86,13 +101,22 @@ class MediaImportService {
       collisionIndex++;
     }
 
-    final partialPath = '$destinationPath.part';
+    final partialPath =
+        '$destinationPath.${DateTime.now().microsecondsSinceEpoch}.part';
     try {
       await source.copy(partialPath);
       final partialFile = File(partialPath);
       if (!await partialFile.exists() ||
           await partialFile.length() != sourceLength) {
         throw const FileSystemException('Could not copy the selected media.');
+      }
+      final existing = File(destinationPath);
+      if (await existing.exists()) {
+        if (await existing.length() == sourceLength) {
+          await partialFile.delete();
+          return destinationPath;
+        }
+        await existing.delete();
       }
       await partialFile.rename(destinationPath);
       return destinationPath;
@@ -120,5 +144,11 @@ class MediaImportService {
     if (stem.isEmpty) stem = 'media';
     if (stem.length > 80) stem = stem.substring(0, 80).trim();
     return '$stem$extension';
+  }
+
+  static String _safeCacheKey(String value) {
+    var safe = value.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
+    if (safe.length > 96) safe = safe.substring(0, 96);
+    return safe.isEmpty ? 'cached' : safe;
   }
 }

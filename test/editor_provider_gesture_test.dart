@@ -198,6 +198,71 @@ void main() {
     expect(container.read(editorProvider).canUndo, isFalse);
   });
 
+  test('caption selection follows the source-specific subtitle lane', () {
+    final first = SubtitleEntry(
+      id: 'main-caption',
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 1),
+      text: 'Main',
+    );
+    final second = SubtitleEntry(
+      id: 'overlay-caption',
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 1),
+      text: 'Overlay',
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    container
+        .read(subtitleProvider.notifier)
+        .initializeFromProject(
+          entries: [first, second],
+          globalStyle: const SubtitleStyleModel(),
+        );
+    container
+        .read(editorProvider.notifier)
+        .loadProject(
+          videoPath: 'source.mp4',
+          projectId: 'project',
+          projectName: 'Project',
+          timeline: EditorTimeline(
+            tracks: [
+              TimelineTrack(
+                id: 'captions-main',
+                name: 'Captions · Main',
+                type: TimelineTrackType.subtitle,
+                section: TimelineTrackSection.textSubtitle,
+                clips: [
+                  TimelineClip.fromSubtitleEntry(
+                    first,
+                    trackId: 'captions-main',
+                    linkedClipId: 'main-video',
+                  ),
+                ],
+              ),
+              TimelineTrack(
+                id: 'captions-overlay',
+                name: 'Captions · Overlay',
+                type: TimelineTrackType.subtitle,
+                section: TimelineTrackSection.textSubtitle,
+                clips: [
+                  TimelineClip.fromSubtitleEntry(
+                    second,
+                    trackId: 'captions-overlay',
+                    linkedClipId: 'overlay-video',
+                  ),
+                ],
+              ),
+            ],
+          ),
+        );
+
+    container.read(subtitleProvider.notifier).selectEntry(second.id);
+
+    expect(container.read(editorProvider).selectedTrackId, 'captions-overlay');
+    expect(container.read(editorProvider).selectedClipId, second.id);
+  });
+
   test('equivalent timeline caption sync is a no-op', () {
     final entry = SubtitleEntry(
       id: 'caption',
@@ -322,9 +387,7 @@ void main() {
       timeline: const EditorTimeline(),
     );
     editorNotifier.setTimeline(
-      const EditorTimeline(
-        canvasSettings: CanvasSettings(showGrid: true),
-      ),
+      const EditorTimeline(canvasSettings: CanvasSettings(showGrid: true)),
     );
     editorNotifier.undo();
     expect(container.read(editorProvider).canRedo, isTrue);

@@ -152,11 +152,20 @@ class EditorNotifier extends StateNotifier<EditorState> {
     _redoStack.clear();
     _isTimelineGestureEditing = false;
     _timelineChangedDuringGesture = false;
+    final currentSubtitles = _ref.read(subtitleProvider);
+    final normalizedTimeline =
+        (currentSubtitles.entries.isEmpty
+                ? timeline
+                : timeline.mergeSubtitleEntries(
+                    subtitles: currentSubtitles.entries,
+                    globalStyle: currentSubtitles.globalStyle,
+                  ))
+            .withoutTrackOverlaps();
     state = state.copyWith(
       videoPath: videoPath,
       projectId: projectId,
       projectName: projectName,
-      timeline: timeline,
+      timeline: normalizedTimeline,
       canUndo: false,
       canRedo: false,
       editRevision: 0,
@@ -164,6 +173,14 @@ class EditorNotifier extends StateNotifier<EditorState> {
       clearClipSelection: true,
       selectedClipIds: const <String>{},
     );
+    _isRestoringEditorSubtitleState = true;
+    try {
+      _ref
+          .read(subtitleProvider.notifier)
+          .syncFromTimeline(normalizedTimeline.subtitleEntries);
+    } finally {
+      _isRestoringEditorSubtitleState = false;
+    }
   }
 
   void setProcessing(bool processing) {
@@ -175,7 +192,8 @@ class EditorNotifier extends StateNotifier<EditorState> {
   }
 
   void setTimeline(EditorTimeline timeline, {bool recordHistory = true}) {
-    if (identical(state.timeline, timeline)) return;
+    final normalizedTimeline = timeline.withoutTrackOverlaps();
+    if (identical(state.timeline, normalizedTimeline)) return;
     if (_isTimelineGestureEditing) {
       // Gesture callers pass recordHistory:false for their live intermediate
       // values. The first actual change still needs one baseline snapshot so
@@ -186,7 +204,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
       _pushUndoSnapshot();
     }
     state = state.copyWith(
-      timeline: timeline,
+      timeline: normalizedTimeline,
       canUndo: canUndo,
       canRedo: canRedo,
       // Preview widgets still rebuild from the live timeline during a gesture,
@@ -236,6 +254,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
     final sortedEntries = List<SubtitleEntry>.from(entries)
       ..sort((a, b) => a.startTime.compareTo(b.startTime));
     final selectedEntryId = subtitleState.selectedEntryId;
+    final normalizedTimeline = timeline.withoutTrackOverlaps();
 
     _pushUndoSnapshot();
     _restoreEditorSubtitleState(
@@ -243,8 +262,16 @@ class EditorNotifier extends StateNotifier<EditorState> {
       globalStyle: subtitleState.globalStyle,
       selectedEntryId: selectedEntryId,
     );
+    _isRestoringEditorSubtitleState = true;
+    try {
+      _ref
+          .read(subtitleProvider.notifier)
+          .syncFromTimeline(normalizedTimeline.subtitleEntries);
+    } finally {
+      _isRestoringEditorSubtitleState = false;
+    }
     state = state.copyWith(
-      timeline: timeline,
+      timeline: normalizedTimeline,
       canUndo: canUndo,
       canRedo: canRedo,
       editRevision: state.editRevision + 1,
@@ -503,7 +530,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
     final source = state.timeline.tracks
         .where((candidate) => candidate.id == trackId)
         .firstOrNull;
-    if (source == null || source.isLocked) return false;
+    if (source == null || source.isLocked || !source.isDuplicable) return false;
     final duplicateId = 'track_${DateTime.now().microsecondsSinceEpoch}';
     final duplicate = TimelineTrack(
       id: duplicateId,
@@ -528,14 +555,28 @@ class EditorNotifier extends StateNotifier<EditorState> {
 
   bool reorderTrack(String trackId, int direction) {
     if (direction == 0) return false;
-    final tracks = [...state.timeline.tracks];
-    final index = tracks.indexWhere((track) => track.id == trackId);
-    if (index < 0) return false;
+    final source = state.timeline.tracks
+        .where((track) => track.id == trackId)
+        .firstOrNull;
+    if (source == null || !source.isReorderable) return false;
+    final sourceIsAudio = source.section == TimelineTrackSection.audio;
+    final candidates = state.timeline.tracks
+        .where(
+          (track) =>
+              track.isReorderable &&
+              (track.section == TimelineTrackSection.audio) == sourceIsAudio,
+        )
+        .toList();
+    final index = candidates.indexWhere((track) => track.id == trackId);
     final target = index + direction.sign;
-    if (target < 0 || target >= tracks.length) return false;
-    final moved = tracks.removeAt(index);
-    tracks.insert(target, moved);
-    setTimeline(state.timeline.copyWith(tracks: tracks));
+    if (index < 0 || target < 0 || target >= candidates.length) return false;
+    return reorderTrackTo(trackId, candidates[target].id);
+  }
+
+  bool reorderTrackTo(String trackId, String targetTrackId) {
+    final next = state.timeline.reorderTrackTo(trackId, targetTrackId);
+    if (identical(next, state.timeline)) return false;
+    setTimeline(next);
     return true;
   }
 
@@ -654,14 +695,45 @@ class EditorNotifier extends StateNotifier<EditorState> {
       state.timeline,
       subtitles,
     );
-    final nextTimeline = matchesTimeline
+    var nextTimeline = matchesTimeline
         ? state.timeline
         : state.timeline.mergeSubtitleEntries(
             subtitles: subtitles.entries,
             globalStyle: subtitles.globalStyle,
           );
+    if (!matchesTimeline) {
+      nextTimeline = nextTimeline.withoutTrackOverlaps();
+      final repairedEntries = nextTimeline.subtitleEntries;
+      final repairedById = {
+        for (final entry in repairedEntries) entry.id: entry,
+      };
+      final timingsWereRepaired = subtitles.entries.any((entry) {
+        final repaired = repairedById[entry.id];
+        return repaired != null &&
+            (repaired.startTime != entry.startTime ||
+                repaired.endTime != entry.endTime);
+      });
+      if (timingsWereRepaired) {
+        _isRestoringEditorSubtitleState = true;
+        try {
+          _ref
+              .read(subtitleProvider.notifier)
+              .syncFromTimeline(repairedEntries);
+        } finally {
+          _isRestoringEditorSubtitleState = false;
+        }
+      }
+    }
     final selectedSubtitleId = subtitles.selectedEntryId;
-    final subtitleTrack = nextTimeline.primarySubtitleTrack;
+    final subtitleTrack = selectedSubtitleId == null
+        ? null
+        : nextTimeline.tracks
+              .where(
+                (track) =>
+                    track.type == TimelineTrackType.subtitle &&
+                    track.clips.any((clip) => clip.id == selectedSubtitleId),
+              )
+              .firstOrNull;
     final canSelectSubtitle =
         selectedSubtitleId != null &&
         subtitleTrack != null &&

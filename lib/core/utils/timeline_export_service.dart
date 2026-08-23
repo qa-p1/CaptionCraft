@@ -76,9 +76,9 @@ class TimelineExportService {
     void Function(double progress)? onProgress,
     void Function(String stage)? onStage,
   }) async {
-    final baseClips = _visibleBaseClips(timeline);
-    if (baseClips.isEmpty) {
-      throw Exception('The timeline has no visible base video clips.');
+    final visualClips = _visibleVisualClips(timeline);
+    if (visualClips.isEmpty) {
+      throw Exception('The timeline has no visible image or video clips.');
     }
 
     final timelineDuration = timeline.duration;
@@ -127,14 +127,15 @@ class TimelineExportService {
         );
       }
 
-      final firstSourcePath = await resolveSourcePath(baseClips.first.$2);
+      final firstSourcePath = await resolveSourcePath(visualClips.first.$2);
       final firstMediaInfo = await probeMedia(firstSourcePath);
       final canvasSize = resolveCanvasSize(
         timeline.canvasSettings,
         settings,
         sourceWidth: (firstMediaInfo['width'] as int?) ?? 1920,
         sourceHeight: (firstMediaInfo['height'] as int?) ?? 1080,
-        sourceFrameRate: (firstMediaInfo['frameRate'] as double?) ?? 30,
+        sourceFrameRate:
+            (firstMediaInfo['frameRate'] as num?)?.toDouble() ?? 30,
       );
 
       final renderInputs = <TimelineRenderInput>[];
@@ -184,14 +185,8 @@ class TimelineExportService {
         }
       }
 
-      if (renderInputs
-          .where(
-            (input) =>
-                input.track.section == TimelineTrackSection.baseVideo &&
-                input.isVisual,
-          )
-          .isEmpty) {
-        throw Exception('No readable base video clips were found.');
+      if (!renderInputs.any((input) => input.isVisual)) {
+        throw Exception('No readable visual clips were found.');
       }
 
       onProgress?.call(0.08);
@@ -450,6 +445,25 @@ class TimelineExportService {
     return clips;
   }
 
+  static List<(TimelineTrack, TimelineClip)> _visibleVisualClips(
+    EditorTimeline timeline,
+  ) {
+    final clips = <(TimelineTrack, TimelineClip)>[];
+    for (final track in timeline.tracks) {
+      if (!track.isVisualLayer || track.isHidden) continue;
+      for (final clip in track.clips) {
+        if (clip.enabled &&
+            track.acceptsClip(clip) &&
+            clip.type.isVisualMedia &&
+            clip.endTime > clip.startTime) {
+          clips.add((track, clip));
+        }
+      }
+    }
+    clips.sort((a, b) => a.$2.startTime.compareTo(b.$2.startTime));
+    return clips;
+  }
+
   static String _sourceCacheKey(TimelineClip clip) {
     final normalizedAssetId = clip.assetId?.trim();
     return normalizedAssetId == null || normalizedAssetId.isEmpty
@@ -692,20 +706,36 @@ class TimelineExportService {
     required String? captionFontDirectory,
   }) {
     final filters = <String>[];
-    final background = _ffmpegColor(timeline.canvasSettings.backgroundColor);
+    final needsBlackSourceBackdrop = timeline.tracks.any(
+      (track) =>
+          track.section == TimelineTrackSection.baseVideo &&
+          !track.isHidden &&
+          track.clips.any(
+            (clip) => clip.enabled && clip.mayRevealCanvasBackground,
+          ),
+    );
+    final background = _ffmpegColor(
+      needsBlackSourceBackdrop
+          ? Colors.black
+          : timeline.canvasSettings.backgroundColor,
+    );
     final durationSeconds = _seconds(timelineDuration);
     filters.add(
       'color=c=$background:s=${canvasSize.width}x${canvasSize.height}:'
       'r=${canvasSize.framesPerSecond}:d=$durationSeconds[canvas0]',
     );
 
+    final visualPaintTracks = timeline.visualTracksInPaintOrder;
+    final paintRankByTrackId = <String, int>{
+      for (final entry in visualPaintTracks.indexed) entry.$2.id: entry.$1,
+    };
+    final timelineIndexByTrackId = <String, int>{
+      for (final entry in timeline.tracks.indexed) entry.$2.id: entry.$1,
+    };
     final visualInputs = inputs.where((input) => input.isVisual).toList()
       ..sort((a, b) {
-        final sectionCompare = _sectionLayer(
-          a.track.section,
-        ).compareTo(_sectionLayer(b.track.section));
-        if (sectionCompare != 0) return sectionCompare;
-        final trackCompare = a.trackIndex.compareTo(b.trackIndex);
+        final trackCompare = (paintRankByTrackId[a.track.id] ?? a.trackIndex)
+            .compareTo(paintRankByTrackId[b.track.id] ?? b.trackIndex);
         if (trackCompare != 0) return trackCompare;
         final layerCompare = a.clip.layer.compareTo(b.clip.layer);
         if (layerCompare != 0) return layerCompare;
@@ -713,12 +743,41 @@ class TimelineExportService {
       });
 
     var canvasIndex = 0;
+    var currentCanvasLabel = 'canvas0';
+    var nextTimelineEffectIndex = 0;
+    var nextPaintRankToFinish = 0;
+
+    void applyEffectsThrough(int inclusivePaintRank) {
+      final lastRank = math.min(
+        inclusivePaintRank,
+        visualPaintTracks.length - 1,
+      );
+      while (nextPaintRankToFinish <= lastRank) {
+        final track = visualPaintTracks[nextPaintRankToFinish];
+        final trackIndex = timelineIndexByTrackId[track.id];
+        if (trackIndex != null) {
+          final result = _appendTimelineEffects(
+            filters: filters,
+            timeline: timeline,
+            sourceLabel: currentCanvasLabel,
+            onlyTrackIndex: trackIndex,
+            startingEffectIndex: nextTimelineEffectIndex,
+          );
+          currentCanvasLabel = result.sourceLabel;
+          nextTimelineEffectIndex = result.nextEffectIndex;
+        }
+        nextPaintRankToFinish++;
+      }
+    }
+
     for (
       var visualIndex = 0;
       visualIndex < visualInputs.length;
       visualIndex++
     ) {
       final input = visualInputs[visualIndex];
+      final inputPaintRank = paintRankByTrackId[input.track.id] ?? 0;
+      applyEffectsThrough(inputPaintRank - 1);
       final clip = input.clip;
       final clipDuration = clip.duration;
       final playbackRate = clip.playbackRate.clamp(0.25, 4).toDouble();
@@ -729,19 +788,13 @@ class TimelineExportService {
           ? frozenVisualInputIndices[input.index]!
           : input.index;
       final scaleExpression = _visualScaleExpression(clip);
-      final rotationExpression = _keyframedValueExpression(
-        clip,
-        TimelineKeyframeProperty.rotation,
-        fallback: clip.transform.rotation,
-        variable: 't',
-      );
+      final rotationExpression = _visualRotationExpression(clip);
       final hasScaleAnimation =
           _hasKeyframes(clip, TimelineKeyframeProperty.scale) ||
-          _hasZoomTransition(clip);
-      final hasRotationAnimation = _hasKeyframes(
-        clip,
-        TimelineKeyframeProperty.rotation,
-      );
+          _hasScaleTransition(clip);
+      final hasRotationAnimation =
+          _hasKeyframes(clip, TimelineKeyframeProperty.rotation) ||
+          _hasSpinTransition(clip);
       final hasOpacityAnimation = _hasKeyframes(
         clip,
         TimelineKeyframeProperty.opacity,
@@ -839,19 +892,23 @@ class TimelineExportService {
       final nextCanvas = 'canvas${canvasIndex + 1}';
       final position = _overlayPosition(clip, canvasSize: canvasSize);
       filters.add(
-        '[canvas$canvasIndex][$visualLabel]'
+        '[$currentCanvasLabel][$visualLabel]'
         "overlay=x='${position.$1}':y='${position.$2}':"
         'eof_action=pass:shortest=0:format=auto[$nextCanvas]',
       );
       canvasIndex++;
-    }
+      currentCanvasLabel = nextCanvas;
 
-    var videoSource = 'canvas$canvasIndex';
-    videoSource = _appendTimelineEffects(
-      filters: filters,
-      timeline: timeline,
-      sourceLabel: videoSource,
-    );
+      final nextInputPaintRank = visualIndex + 1 < visualInputs.length
+          ? paintRankByTrackId[visualInputs[visualIndex + 1].track.id]
+          : null;
+      if (nextInputPaintRank != inputPaintRank) {
+        applyEffectsThrough(inputPaintRank);
+      }
+    }
+    applyEffectsThrough(visualPaintTracks.length - 1);
+
+    var videoSource = currentCanvasLabel;
     if (assPath != null) {
       const assOutput = 'captioned';
       final fontsDirectoryOption =
@@ -940,13 +997,16 @@ class TimelineExportService {
     return filters.join(';');
   }
 
-  static String _appendTimelineEffects({
+  static ({String sourceLabel, int nextEffectIndex}) _appendTimelineEffects({
     required List<String> filters,
     required EditorTimeline timeline,
     required String sourceLabel,
+    int? onlyTrackIndex,
+    int startingEffectIndex = 0,
   }) {
     final effectClips = <(int, TimelineClip)>[];
     for (final trackEntry in timeline.tracks.asMap().entries) {
+      if (onlyTrackIndex != null && trackEntry.key != onlyTrackIndex) continue;
       final track = trackEntry.value;
       if (track.isHidden) continue;
       for (final clip in track.clips) {
@@ -964,7 +1024,7 @@ class TimelineExportService {
     });
 
     var currentSource = sourceLabel;
-    var appliedEffectIndex = 0;
+    var appliedEffectIndex = startingEffectIndex;
     for (final effectEntry in effectClips) {
       final clip = effectEntry.$2;
       final enableExpression =
@@ -980,22 +1040,53 @@ class TimelineExportService {
             final cleanLabel = 'effectClean$appliedEffectIndex';
             final blurSourceLabel = 'effectBlurSource$appliedEffectIndex';
             final blurredRegionLabel = 'effectBlurRegion$appliedEffectIndex';
+            final transformedRegionLabel =
+                'effectTransformedRegion$appliedEffectIndex';
+            final transform = clip.transform;
+            final regionScale = transform.scale.clamp(0.2, 4.0).toDouble();
+            final regionWidth = (blur.safeRegionWidth * regionScale)
+                .clamp(0.02, 1.0)
+                .toDouble();
+            final regionHeight = (blur.safeRegionHeight * regionScale)
+                .clamp(0.02, 1.0)
+                .toDouble();
+            final centerX =
+                blur.safeRegionX +
+                blur.safeRegionWidth / 2 +
+                transform.offsetX / kTimelineDesignWidth;
+            final centerY =
+                blur.safeRegionY +
+                blur.safeRegionHeight / 2 +
+                transform.offsetY / kTimelineDesignHeight;
             filters.add(
               '[$currentSource]split=2[$cleanLabel][$blurSourceLabel]',
             );
             filters.add(
               '[$blurSourceLabel]'
-              'crop=w=iw*${_number(blur.safeRegionWidth)}:'
-              'h=ih*${_number(blur.safeRegionHeight)}:'
-              'x=iw*${_number(blur.safeRegionX)}:'
-              'y=ih*${_number(blur.safeRegionY)},'
+              'crop=w=iw*${_number(regionWidth)}:'
+              'h=ih*${_number(regionHeight)}:'
+              "x='max(0,min(iw-ow,iw*${_number(centerX)}-ow/2))':"
+              "y='max(0,min(ih-oh,ih*${_number(centerY)}-oh/2))',"
+              'format=rgba,'
               '${_blurFilterChain(clip, target: 'effectRegionBlur$appliedEffectIndex', timelineOffset: clip.startTime, enableExpression: enableExpression).join(',')}'
               '[$blurredRegionLabel]',
             );
+            final overlayRegionLabel = transform.rotation.abs() > 0.0001
+                ? transformedRegionLabel
+                : blurredRegionLabel;
+            if (transform.rotation.abs() > 0.0001) {
+              filters.add(
+                '[$blurredRegionLabel]'
+                "rotate=angle='${_number(transform.rotation)}':"
+                "ow='ceil(hypot(iw,ih)/2)*2':"
+                "oh='ceil(hypot(iw,ih)/2)*2':c=none"
+                '[$transformedRegionLabel]',
+              );
+            }
             filters.add(
-              '[$cleanLabel][$blurredRegionLabel]'
-              'overlay=x=main_w*${_number(blur.safeRegionX)}:'
-              'y=main_h*${_number(blur.safeRegionY)}:'
+              '[$cleanLabel][$overlayRegionLabel]'
+              "overlay=x='main_w*${_number(centerX)}-overlay_w/2':"
+              "y='main_h*${_number(centerY)}-overlay_h/2':"
               "enable='$enableExpression':"
               'eof_action=pass:shortest=0:format=auto'
               '[$outputLabel]',
@@ -1021,7 +1112,7 @@ class TimelineExportService {
       currentSource = outputLabel;
       appliedEffectIndex++;
     }
-    return currentSource;
+    return (sourceLabel: currentSource, nextEffectIndex: appliedEffectIndex);
   }
 
   static bool _hasKeyframes(
@@ -1157,11 +1248,45 @@ class TimelineExportService {
     return expression;
   }
 
-  static bool _hasZoomTransition(TimelineClip clip) {
-    return (clip.introTransition.type == TransitionType.zoom &&
+  static bool _transitionChangesScale(TransitionType type) {
+    return type == TransitionType.zoom ||
+        type == TransitionType.zoomOut ||
+        type == TransitionType.pop ||
+        type == TransitionType.spin;
+  }
+
+  static bool _hasScaleTransition(TimelineClip clip) {
+    return (_transitionChangesScale(clip.introTransition.type) &&
             clip.effectiveIntroTransitionMs > 0) ||
-        (clip.outroTransition.type == TransitionType.zoom &&
+        (_transitionChangesScale(clip.outroTransition.type) &&
             clip.effectiveOutroTransitionMs > 0);
+  }
+
+  static bool _hasSpinTransition(TimelineClip clip) {
+    return (clip.introTransition.type == TransitionType.spin &&
+            clip.effectiveIntroTransitionMs > 0) ||
+        (clip.outroTransition.type == TransitionType.spin &&
+            clip.effectiveOutroTransitionMs > 0);
+  }
+
+  static String? _transitionScaleExpression(
+    TransitionType type,
+    String visibleProgress,
+  ) {
+    final eased = _smoothstepExpression(visibleProgress);
+    return switch (type) {
+      TransitionType.zoom => '0.82+0.18*($eased)',
+      TransitionType.zoomOut => '1.18-0.18*($eased)',
+      TransitionType.spin => '0.86+0.14*($eased)',
+      TransitionType.pop => () {
+        final shifted = '(($visibleProgress)-1)';
+        final back =
+            '1+2.70158*($shifted)*($shifted)*($shifted)'
+            '+1.70158*($shifted)*($shifted)';
+        return '0.68+0.32*($back)';
+      }(),
+      _ => null,
+    };
   }
 
   static String _visualScaleExpression(TimelineClip clip) {
@@ -1175,19 +1300,56 @@ class TimelineExportService {
     );
     final factors = <String>[];
     final introSeconds = clip.effectiveIntroTransitionMs / 1000;
-    if (clip.introTransition.type == TransitionType.zoom && introSeconds > 0) {
-      factors.add('0.85+0.15*clip(t/${_number(introSeconds)},0,1)');
+    if (introSeconds > 0) {
+      final progress = 'clip(t/${_number(introSeconds)},0,1)';
+      final factor = _transitionScaleExpression(
+        clip.introTransition.type,
+        progress,
+      );
+      if (factor != null) factors.add(factor);
     }
     final outroSeconds = clip.effectiveOutroTransitionMs / 1000;
-    if (clip.outroTransition.type == TransitionType.zoom && outroSeconds > 0) {
+    if (outroSeconds > 0) {
       final outroStart = clip.duration.inMilliseconds / 1000 - outroSeconds;
-      factors.add(
-        '1-0.15*clip((t-${_number(outroStart)})/'
-        '${_number(outroSeconds)},0,1)',
+      final visible =
+          '1-clip((t-${_number(outroStart)})/'
+          '${_number(outroSeconds)},0,1)';
+      final factor = _transitionScaleExpression(
+        clip.outroTransition.type,
+        visible,
       );
+      if (factor != null) factors.add(factor);
     }
     if (factors.isEmpty) return baseScale;
     return 'clip(($baseScale)*(${factors.join(')*(')}),0.2,4)';
+  }
+
+  static String _visualRotationExpression(TimelineClip clip) {
+    final baseRotation = _keyframedValueExpression(
+      clip,
+      TimelineKeyframeProperty.rotation,
+      fallback: clip.transform.rotation,
+      variable: 't',
+    );
+    final additions = <String>[];
+    final introSeconds = clip.effectiveIntroTransitionMs / 1000;
+    if (clip.introTransition.type == TransitionType.spin && introSeconds > 0) {
+      final progress = 'clip(t/${_number(introSeconds)},0,1)';
+      additions.add(
+        '-${_number(math.pi / 2)}*(1-${_smoothstepExpression(progress)})',
+      );
+    }
+    final outroSeconds = clip.effectiveOutroTransitionMs / 1000;
+    if (clip.outroTransition.type == TransitionType.spin && outroSeconds > 0) {
+      final outroStart = clip.duration.inMilliseconds / 1000 - outroSeconds;
+      final hidden =
+          'clip((t-${_number(outroStart)})/${_number(outroSeconds)},0,1)';
+      additions.add(
+        '${_number(math.pi / 2)}*(${_smoothstepExpression(hidden)})',
+      );
+    }
+    if (additions.isEmpty) return baseRotation;
+    return '($baseRotation)+(${additions.join(')+(')})';
   }
 
   static List<String> _alphaEnvelopeFilters(TimelineClip clip) {
@@ -1202,9 +1364,9 @@ class TimelineExportService {
     final introSeconds = clip.effectiveIntroTransitionMs / 1000;
     if (_transitionUsesAlpha(clip.introTransition.type) && introSeconds > 0) {
       final progress = 'clip(T/${_number(introSeconds)},0,1)';
-      final envelope = clip.introTransition.type == TransitionType.dissolve
-          ? _smoothstepExpression(progress)
-          : progress;
+      final envelope = clip.introTransition.type == TransitionType.fade
+          ? progress
+          : _smoothstepExpression(progress);
       alpha = '($alpha)*($envelope)';
     }
     final outroSeconds = clip.effectiveOutroTransitionMs / 1000;
@@ -1214,9 +1376,9 @@ class TimelineExportService {
           outroSeconds;
       final remaining =
           '1-clip((T-${_number(outroStart)})/${_number(outroSeconds)},0,1)';
-      final envelope = clip.outroTransition.type == TransitionType.dissolve
-          ? _smoothstepExpression(remaining)
-          : remaining;
+      final envelope = clip.outroTransition.type == TransitionType.fade
+          ? remaining
+          : _smoothstepExpression(remaining);
       alpha = '($alpha)*($envelope)';
     }
     return [
@@ -1527,8 +1689,9 @@ class TimelineExportService {
     String x = baseX;
     String y = baseY;
     if (introDuration > 0) {
-      final progress =
+      final linearProgress =
           'min(max((t-${_number(start)})/${_number(introDuration)},0),1)';
+      final progress = _smoothstepExpression(linearProgress);
       if (intro.type == TransitionType.slideLeft) {
         x = '$baseX-W*(1-$progress)';
       } else if (intro.type == TransitionType.slideRight) {
@@ -1537,12 +1700,19 @@ class TimelineExportService {
         y = '$baseY-H*(1-$progress)';
       } else if (intro.type == TransitionType.slideDown) {
         y = '$baseY+H*(1-$progress)';
+      } else if (intro.type == TransitionType.slideUpLeft) {
+        x = '$baseX-W*(1-$progress)';
+        y = '$baseY-H*(1-$progress)';
+      } else if (intro.type == TransitionType.slideUpRight) {
+        x = '$baseX+W*(1-$progress)';
+        y = '$baseY-H*(1-$progress)';
       }
     }
     if (outroDuration > 0) {
-      final hidden =
+      final linearHidden =
           'min(max((t-${_number(end - outroDuration)})/'
           '${_number(outroDuration)},0),1)';
+      final hidden = _smoothstepExpression(linearHidden);
       if (outro.type == TransitionType.slideLeft) {
         x = '($x)-W*$hidden';
       } else if (outro.type == TransitionType.slideRight) {
@@ -1551,6 +1721,12 @@ class TimelineExportService {
         y = '($y)-H*$hidden';
       } else if (outro.type == TransitionType.slideDown) {
         y = '($y)+H*$hidden';
+      } else if (outro.type == TransitionType.slideUpLeft) {
+        x = '($x)-W*$hidden';
+        y = '($y)-H*$hidden';
+      } else if (outro.type == TransitionType.slideUpRight) {
+        x = '($x)+W*$hidden';
+        y = '($y)-H*$hidden';
       }
     }
 
@@ -1722,19 +1898,6 @@ class TimelineExportService {
         .toList();
     if (lines.isEmpty) return '';
     return lines.skip(math.max(0, lines.length - 8)).join('\n');
-  }
-
-  static int _sectionLayer(TimelineTrackSection section) {
-    switch (section) {
-      case TimelineTrackSection.baseVideo:
-        return 0;
-      case TimelineTrackSection.overlay:
-        return 1;
-      case TimelineTrackSection.textSubtitle:
-        return 2;
-      case TimelineTrackSection.audio:
-        return 3;
-    }
   }
 
   static int _makeEven(int value) => value.isEven ? value : value + 1;

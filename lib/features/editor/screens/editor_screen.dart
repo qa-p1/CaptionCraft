@@ -3,19 +3,24 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
+import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_colorpicker/flutter_colorpicker.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/utils/editor_change_log_service.dart';
+import '../../../core/utils/discover_media_import_service.dart';
 import '../../../core/utils/ffmpeg_service.dart';
 import '../../../core/utils/firebase_service.dart';
 import '../../../core/utils/giphy_service.dart';
 import '../../../core/utils/media_import_service.dart';
+import '../../../core/utils/remote_audio_import_service.dart';
+import '../../../core/utils/remote_media_import_service.dart';
 import '../../../core/utils/subtitle_export_service.dart';
 import '../../../core/utils/subtitle_quality_service.dart';
 import '../../../shared/models/project_model.dart';
@@ -29,16 +34,352 @@ import '../models/subtitle_entry.dart';
 import '../models/subtitle_style_model.dart';
 import '../models/timeline_models.dart';
 import '../models/export_settings.dart';
+import '../models/asset_pack_models.dart';
+import '../models/element_library_asset.dart';
+import '../models/discover_models.dart';
+import '../models/sound_effect_library_asset.dart';
 import '../providers/editor_provider.dart';
 import '../providers/playback_provider.dart';
 import '../providers/subtitle_provider.dart';
 import 'creator_lab_screen.dart';
 import 'export_video_screen.dart';
 import '../widgets/export_dialog.dart';
+import '../widgets/element_library_sheet.dart';
+import '../widgets/discover_sheet.dart';
 import '../widgets/subtitle_edit_modal.dart';
 import '../widgets/subtitle_style_panel.dart';
 import '../widgets/timeline_panel.dart';
+import '../widgets/text_clip_editor_sheet.dart';
 import '../widgets/video_preview_panel.dart';
+import '../widgets/resizable_editor_sheet.dart';
+import '../widgets/sfx_library_sheet.dart';
+
+/// Resolves the default mix for media inserted into a visual timeline lane.
+///
+/// Video keeps its embedded audio attached when probing reports an audio
+/// stream. Creating an independent audio lane is reserved for the editor's
+/// explicit "Separate audio" action.
+AudioMixSettings resolveTimelineInsertionAudioMix({
+  required EditorAssetType assetType,
+  required TimelineTrackSection section,
+  required Map<String, dynamic> metadata,
+  bool enableEmbeddedAudio = false,
+}) {
+  final isVisualVideo =
+      assetType == EditorAssetType.video &&
+      (section == TimelineTrackSection.overlay ||
+          section == TimelineTrackSection.baseVideo);
+  if (!isVisualVideo) return const AudioMixSettings();
+  final hasEmbeddedAudio = metadata['hasAudio'] == true;
+  return AudioMixSettings(
+    muted: !(enableEmbeddedAudio || hasEmbeddedAudio),
+    volume: 1,
+  );
+}
+
+/// True when a separated audio clip still shares the video's transport and
+/// source window. Only these exact links follow destructive timing changes;
+/// independently moved or trimmed audio is preserved as its own edit.
+bool isExactSeparatedAudioTransportMirror({
+  required TimelineClip video,
+  required TimelineClip audio,
+}) {
+  return video.type == TimelineTrackType.video &&
+      audio.type == TimelineTrackType.audio &&
+      audio.linkedClipId == video.id &&
+      audio.assetId == video.assetId &&
+      audio.startTime == video.startTime &&
+      audio.endTime == video.endTime &&
+      audio.sourceStartTime == video.sourceStartTime &&
+      audio.sourceDuration == video.sourceDuration &&
+      (audio.playbackRate - video.playbackRate).abs() < 0.0001 &&
+      audio.isReversed == video.isReversed;
+}
+
+({TimelineTrack track, TimelineClip clip})? resolveEffectiveAudioOwner({
+  required EditorTimeline timeline,
+  required TimelineClip clip,
+}) {
+  if (clip.type == TimelineTrackType.video) {
+    for (final track in timeline.tracks) {
+      for (final candidate in track.clips) {
+        if (candidate.type == TimelineTrackType.audio &&
+            candidate.linkedClipId == clip.id) {
+          return (track: track, clip: candidate);
+        }
+      }
+    }
+  }
+  for (final track in timeline.tracks) {
+    final live = track.clips.where((candidate) => candidate.id == clip.id);
+    if (live.isNotEmpty) return (track: track, clip: live.first);
+  }
+  return null;
+}
+
+TimelineClip syncSeparatedAudioTransport({
+  required TimelineClip audio,
+  required TimelineClip updatedVideo,
+  String? linkedClipId,
+}) {
+  return audio.copyWith(
+    linkedClipId: linkedClipId ?? updatedVideo.id,
+    startTime: updatedVideo.startTime,
+    endTime: updatedVideo.endTime,
+    sourceStartTime: updatedVideo.sourceStartTime,
+    sourceDuration: updatedVideo.sourceDuration,
+    playbackRate: updatedVideo.playbackRate,
+    isReversed: updatedVideo.isReversed,
+  );
+}
+
+TimelineClip restoreAttachedAudioForDuplicate({
+  required TimelineClip duplicateVideo,
+  required TimelineClip separatedAudio,
+}) {
+  return duplicateVideo.copyWith(
+    audioMix: separatedAudio.audioMix,
+    autoDuck: separatedAudio.autoDuck,
+    duckAmount: separatedAudio.duckAmount,
+    denoise: separatedAudio.denoise,
+  );
+}
+
+({TimelineClip left, TimelineClip right}) splitExactSeparatedAudioMirror({
+  required TimelineClip originalVideo,
+  required TimelineClip leftVideo,
+  required TimelineClip rightVideo,
+  required TimelineClip audio,
+  required String rightAudioId,
+  required Duration splitAt,
+}) {
+  if (!isExactSeparatedAudioTransportMirror(
+    video: originalVideo,
+    audio: audio,
+  )) {
+    throw ArgumentError('Audio is not an exact transport mirror of the video.');
+  }
+
+  final splitOffset = splitAt - originalVideo.startTime;
+  final leftKeyframes = <TimelineKeyframe>[];
+  final rightKeyframes = <TimelineKeyframe>[];
+  for (final property in TimelineKeyframeProperty.values) {
+    final propertyFrames =
+        audio.keyframes.where((frame) => frame.property == property).toList()
+          ..sort((a, b) => a.time.compareTo(b.time));
+    if (propertyFrames.isEmpty) continue;
+    final boundaryValue = audio.keyframedValue(
+      property,
+      splitAt,
+      fallback: propertyFrames.first.value,
+    );
+    leftKeyframes.addAll(
+      propertyFrames.where((frame) => frame.time <= splitOffset),
+    );
+    if (!leftKeyframes.any(
+      (frame) => frame.property == property && frame.time == splitOffset,
+    )) {
+      leftKeyframes.add(
+        TimelineKeyframe(
+          time: splitOffset,
+          property: property,
+          value: boundaryValue,
+        ),
+      );
+    }
+    rightKeyframes.add(
+      TimelineKeyframe(
+        time: Duration.zero,
+        property: property,
+        value: boundaryValue,
+      ),
+    );
+    rightKeyframes.addAll(
+      propertyFrames
+          .where((frame) => frame.time > splitOffset)
+          .map(
+            (frame) => TimelineKeyframe(
+              time: frame.time - splitOffset,
+              property: property,
+              value: frame.value,
+            ),
+          ),
+    );
+  }
+  leftKeyframes.sort((a, b) => a.time.compareTo(b.time));
+  rightKeyframes.sort((a, b) => a.time.compareTo(b.time));
+
+  final left =
+      syncSeparatedAudioTransport(
+        audio: audio,
+        updatedVideo: leftVideo,
+        linkedClipId: leftVideo.id,
+      ).copyWith(
+        keyframes: leftKeyframes,
+        outroTransition: const ClipTransition(),
+        audioMix: audio.audioMix.copyWith(fadeOutMs: 0),
+      );
+  final right =
+      syncSeparatedAudioTransport(
+        audio: audio.copyWith(id: rightAudioId),
+        updatedVideo: rightVideo,
+        linkedClipId: rightVideo.id,
+      ).copyWith(
+        keyframes: rightKeyframes,
+        introTransition: const ClipTransition(),
+        audioMix: audio.audioMix.copyWith(fadeInMs: 0),
+      );
+  return (left: left, right: right);
+}
+
+/// A source-specific caption lane decision.
+///
+/// Caption generation never shares a lane with another source. Legacy mixed
+/// lanes are repaired when the generated captions are committed. A locked lane
+/// that already contains captions for this source blocks replacement so lock
+/// semantics are never bypassed.
+class CaptionTrackRouting {
+  const CaptionTrackRouting({this.destination, this.blockingTrack});
+
+  final TimelineTrack? destination;
+  final TimelineTrack? blockingTrack;
+
+  bool get isBlocked => blockingTrack != null;
+}
+
+CaptionTrackRouting resolveCaptionTrackRouting({
+  required EditorTimeline timeline,
+  required TimelineClip sourceClip,
+}) {
+  final captionTracks = timeline.tracks
+      .where(
+        (track) =>
+            track.type == TimelineTrackType.subtitle &&
+            track.section == TimelineTrackSection.textSubtitle,
+      )
+      .toList(growable: false);
+  final sourceTracks = captionTracks
+      .where(
+        (track) =>
+            track.clips.any((clip) => clip.linkedClipId == sourceClip.id),
+      )
+      .toList(growable: false);
+  final blockingTrack = sourceTracks
+      .where((track) => track.isLocked)
+      .firstOrNull;
+  if (blockingTrack != null) {
+    return CaptionTrackRouting(blockingTrack: blockingTrack);
+  }
+
+  final dedicatedTrack = sourceTracks
+      .where(
+        (track) =>
+            !track.isLocked &&
+            track.clips.isNotEmpty &&
+            track.clips.every((clip) => clip.linkedClipId == sourceClip.id),
+      )
+      .firstOrNull;
+  if (dedicatedTrack != null) {
+    return CaptionTrackRouting(destination: dedicatedTrack);
+  }
+
+  final emptyTrack = captionTracks
+      .where(
+        (track) =>
+            !track.isLocked &&
+            track.clips.isEmpty &&
+            track.acceptsClipType(TimelineTrackType.subtitle),
+      )
+      .firstOrNull;
+  if (emptyTrack != null) {
+    return CaptionTrackRouting(destination: emptyTrack);
+  }
+
+  return CaptionTrackRouting(
+    destination: TimelineTrack(
+      name: captionTrackNameForSource(sourceClip.label),
+      type: TimelineTrackType.subtitle,
+      section: TimelineTrackSection.textSubtitle,
+    ),
+  );
+}
+
+String captionTrackNameForSource(String sourceLabel) {
+  final trimmed = sourceLabel.trim();
+  final safe = trimmed.isEmpty ? 'media' : trimmed;
+  final compact = safe.length > 28 ? '${safe.substring(0, 27)}…' : safe;
+  return 'Captions · $compact';
+}
+
+/// Resolves the exact local media used for source-specific transcription.
+/// Only legacy base-video clips may use the project-level compatibility path;
+/// an overlay must never silently transcribe the base layer instead.
+String resolveCaptionMediaPath({
+  required EditorTimeline timeline,
+  required TimelineClip sourceClip,
+  required String legacyBaseVideoPath,
+}) {
+  final assetPath = timeline.assetForClip(sourceClip)?.sourcePath?.trim();
+  if (assetPath != null && assetPath.isNotEmpty) return assetPath;
+  final sourceTrack = timeline.tracks
+      .where((track) => track.clips.any((clip) => clip.id == sourceClip.id))
+      .firstOrNull;
+  if (sourceTrack?.section == TimelineTrackSection.baseVideo &&
+      sourceClip.type == TimelineTrackType.video) {
+    return legacyBaseVideoPath.trim();
+  }
+  return '';
+}
+
+/// Replaces captions for exactly one media source while preserving every
+/// other source's lane and link identity.
+EditorTimeline replaceGeneratedCaptionsForSource({
+  required EditorTimeline timeline,
+  required TimelineClip sourceClip,
+  required TimelineTrack destinationTrack,
+  required List<SubtitleEntry> generatedEntries,
+}) {
+  final generatedClips = generatedEntries
+      .map(
+        (entry) => TimelineClip.fromSubtitleEntry(
+          entry,
+          trackId: destinationTrack.id,
+          linkedClipId: sourceClip.id,
+        ),
+      )
+      .toList(growable: false);
+  var foundDestination = false;
+  final nextTracks = timeline.tracks.map((track) {
+    if (track.type != TimelineTrackType.subtitle) return track;
+    final clipsWithoutSource = track.clips
+        .where((clip) => clip.linkedClipId != sourceClip.id)
+        .toList();
+    if (track.id != destinationTrack.id) {
+      return track.copyWith(clips: clipsWithoutSource);
+    }
+    foundDestination = true;
+    return track.copyWith(
+      name: captionTrackNameForSource(sourceClip.label),
+      type: TimelineTrackType.subtitle,
+      section: TimelineTrackSection.textSubtitle,
+      clips: [...clipsWithoutSource, ...generatedClips]
+        ..sort((a, b) => a.startTime.compareTo(b.startTime)),
+    );
+  }).toList();
+
+  var nextTimeline = timeline.copyWith(tracks: nextTracks);
+  if (!foundDestination) {
+    nextTimeline = nextTimeline.insertTrackUsingEditorRules(
+      destinationTrack.copyWith(
+        name: captionTrackNameForSource(sourceClip.label),
+        type: TimelineTrackType.subtitle,
+        section: TimelineTrackSection.textSubtitle,
+        clips: generatedClips,
+      ),
+    );
+  }
+  return nextTimeline;
+}
 
 /// Main editor screen with 3-panel layout:
 /// Video Preview (top-left), Style Panel (top-right), Timeline (bottom).
@@ -53,28 +394,50 @@ class EditorScreen extends ConsumerStatefulWidget {
 
 enum _CanvasAspectRatio { original, ratio16x9, ratio9x16, ratio1x1, ratio4x5 }
 
-enum _BottomActionCategory { add, edit, effects, audio, canvas }
+enum _OverlayAddOption { photos, videos, elements }
+
+enum _TextAddOption { addText, subtitles }
+
+enum _AudioAddOption { localTrack, sfx, music }
+
+enum _LastVisualAction { cancel, replace }
+
+enum _BottomActionCategory {
+  edit,
+  effects,
+  audio,
+  text,
+  timeline,
+  canvas,
+  studio,
+  discover,
+}
 
 enum _BottomActionSubgroup {
-  addMedia,
-  addText,
-  addTracks,
   editTiming,
   editTransform,
-  editArrange,
-  effectsLooks,
+  editDetails,
+  effectsColor,
   effectsBlur,
   effectsMotion,
+  effectsKeyframes,
+  effectsEnhance,
   audioMix,
-  audioFades,
-  audioEnhance,
-  canvasFormat,
-  canvasGuides,
-  canvasStudio,
+  audioCleanup,
+  audioAutomation,
+  textObjects,
+  textCaptions,
+  textFiles,
+  timelineSelection,
+  timelineTracks,
+  timelineMarkers,
+  timelineProject,
 }
 
 class _EditorScreenState extends ConsumerState<EditorScreen>
     with WidgetsBindingObserver {
+  static const double _editorDockContentHeight = 72;
+
   Timer? _saveDebounce;
   Timer? _remoteSaveDebounce;
   bool _isSavingProject = false;
@@ -96,6 +459,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   _BottomActionCategory? _activeBottomCategory;
   _BottomActionSubgroup? _activeBottomSubgroup;
   final GlobalKey _previewKey = GlobalKey(debugLabel: 'editor-video-preview');
+  final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
+  PersistentBottomSheetController? _textEditorSheetController;
   bool _isPreviewFullscreen = false;
   bool _isGeneratingSubtitles = false;
   TimelineClip? _clipAttributeClipboard;
@@ -253,7 +618,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         }
       },
       child: Scaffold(
+        key: _scaffoldKey,
         backgroundColor: kBackground,
+        // Text editing manages the keyboard inside its bottom sheet. Keeping
+        // the canvas at its normal size prevents the video preview collapsing
+        // to a thumbnail while the user types.
+        resizeToAvoidBottomInset: false,
         appBar: _isPreviewFullscreen ? null : _buildEditorToolbar(context),
         body: _isPreviewFullscreen
             ? _buildFullscreenPreview()
@@ -348,7 +718,6 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final width = MediaQuery.sizeOf(context).width;
     final compact = width < 560;
     final phoneToolbar = width < 480;
-    final showAspect = width >= 640;
 
     return AppBar(
       toolbarHeight: 62,
@@ -443,633 +812,22 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         ],
       ),
       actions: [
-        if (showAspect) ...[
-          const SizedBox(width: 8),
-          _buildAspectRatioPicker(),
-        ],
-        if (phoneToolbar)
-          _compactToolbarButton(
-            tooltip: 'Subtitle import and sidecar export',
-            icon: Icons.more_horiz_rounded,
-            onTap: _showExportActions,
-          )
-        else
-          IconButton(
-            tooltip: 'Subtitle import and sidecar export',
-            onPressed: _showExportActions,
-            icon: const Icon(Icons.more_horiz_rounded, size: 21),
-          ),
-        if (!phoneToolbar)
-          IconButton(
-            tooltip: 'Editor tools',
-            onPressed: _showEditorToolsSheet,
-            icon: const Icon(Icons.auto_awesome_mosaic_outlined, size: 20),
-          ),
-        if (phoneToolbar)
-          _compactToolbarButton(
-            tooltip: 'Editor tools',
-            icon: Icons.auto_awesome_mosaic_outlined,
-            onTap: _showEditorToolsSheet,
-          ),
-        if (phoneToolbar)
-          Padding(
-            padding: const EdgeInsets.only(right: 4),
-            child: _compactToolbarButton(
-              tooltip: 'Export video',
-              icon: Icons.file_upload_outlined,
-              onTap: _showExportDialog,
-            ),
-          )
-        else
-          Padding(
-            padding: EdgeInsets.fromLTRB(0, 10, compact ? 8 : 12, 10),
-            child: FilledButton.icon(
-              onPressed: _showExportDialog,
-              style: FilledButton.styleFrom(
-                padding: EdgeInsets.symmetric(horizontal: compact ? 11 : 15),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(10),
-                ),
+        Padding(
+          padding: EdgeInsets.fromLTRB(8, 10, compact ? 8 : 12, 10),
+          child: FilledButton.icon(
+            key: const ValueKey('editor_export_button'),
+            onPressed: _showExportDialog,
+            style: FilledButton.styleFrom(
+              padding: EdgeInsets.symmetric(horizontal: compact ? 11 : 15),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
               ),
-              icon: const Icon(Icons.file_upload_outlined, size: 17),
-              label: Text(compact ? 'Export' : 'Export master'),
             ),
+            icon: const Icon(Icons.file_upload_outlined, size: 17),
+            label: const Text('Export'),
           ),
+        ),
       ],
-    );
-  }
-
-  Widget _compactToolbarButton({
-    required String tooltip,
-    required IconData icon,
-    required VoidCallback onTap,
-    bool enabled = true,
-  }) {
-    return IconButton(
-      tooltip: tooltip,
-      onPressed: enabled ? onTap : null,
-      visualDensity: VisualDensity.compact,
-      constraints: const BoxConstraints.tightFor(width: 38, height: 44),
-      padding: EdgeInsets.zero,
-      icon: Icon(icon, size: 19),
-    );
-  }
-
-  void _showExportActions() {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      constraints: BoxConstraints(
-        maxHeight: MediaQuery.sizeOf(context).height * 0.40,
-      ),
-      backgroundColor: kSurface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (_) {
-        final state = ref.read(subtitleProvider);
-        return SafeArea(
-          child: ListView(
-            shrinkWrap: true,
-            children: [
-              ListTile(
-                leading: const Icon(
-                  Icons.movie_creation_outlined,
-                  color: kAccent,
-                ),
-                title: const Text('Export video'),
-                subtitle: const Text('Burn subtitles into video'),
-                onTap: () {
-                  Navigator.pop(context);
-                  _showExportDialog();
-                },
-              ),
-              ListTile(
-                leading: const Icon(
-                  Icons.subtitles_rounded,
-                  color: kTextPrimary,
-                ),
-                title: const Text('Export SRT'),
-                onTap: () async {
-                  Navigator.pop(context);
-                  if (state.entries.isEmpty) {
-                    SnackBarHelper.showInfo(context, 'No subtitles to export');
-                    return;
-                  }
-                  await _exportSubtitleFile('srt');
-                },
-              ),
-              ListTile(
-                leading: const Icon(
-                  Icons.subtitles_outlined,
-                  color: kTextPrimary,
-                ),
-                title: const Text('Export VTT'),
-                onTap: () async {
-                  Navigator.pop(context);
-                  if (state.entries.isEmpty) {
-                    SnackBarHelper.showInfo(context, 'No subtitles to export');
-                    return;
-                  }
-                  await _exportSubtitleFile('vtt');
-                },
-              ),
-              ListTile(
-                leading: const Icon(
-                  Icons.file_upload_rounded,
-                  color: kTextPrimary,
-                ),
-                title: const Text('Import SRT / VTT'),
-                onTap: () async {
-                  Navigator.pop(context);
-                  await _importSubtitleFile();
-                },
-              ),
-              const SizedBox(height: 6),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  Future<void> _showEditorToolsSheet() async {
-    await showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: kSurface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (sheetContext) {
-        return SafeArea(
-          child: FractionallySizedBox(
-            heightFactor: 0.88,
-            child: ListView(
-              padding: const EdgeInsets.fromLTRB(14, 12, 14, 24),
-              children: [
-                Center(
-                  child: Container(
-                    width: 42,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: kBorder,
-                      borderRadius: BorderRadius.circular(99),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 14),
-                const Text(
-                  'Editor tools',
-                  style: TextStyle(
-                    color: kTextPrimary,
-                    fontSize: 18,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                const Text(
-                  'Non-destructive tools for animation, finishing, and a faster timeline workflow.',
-                  style: TextStyle(color: kTextSecondary, fontSize: 12),
-                ),
-                _toolSectionTitle('New editing features'),
-                _toolTile(
-                  sheetContext,
-                  Icons.key_rounded,
-                  'Keyframe opacity',
-                  'Animate clip opacity at the playhead',
-                  () => _addSelectedKeyframe(TimelineKeyframeProperty.opacity),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.zoom_in_rounded,
-                  'Keyframe scale',
-                  'Animate zooms and punch-ins',
-                  () => _addSelectedKeyframe(TimelineKeyframeProperty.scale),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.open_with_rounded,
-                  'Keyframe X position',
-                  'Animate horizontal movement at the playhead',
-                  () =>
-                      _addSelectedKeyframe(TimelineKeyframeProperty.positionX),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.height_rounded,
-                  'Keyframe Y position',
-                  'Animate vertical movement at the playhead',
-                  () =>
-                      _addSelectedKeyframe(TimelineKeyframeProperty.positionY),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.rotate_right_rounded,
-                  'Keyframe rotation',
-                  'Animate rotation over time',
-                  () => _addSelectedKeyframe(TimelineKeyframeProperty.rotation),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.volume_up_rounded,
-                  'Keyframe volume',
-                  'Create a volume automation point',
-                  () => _addSelectedKeyframe(TimelineKeyframeProperty.volume),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.blur_on_rounded,
-                  'Keyframe blur strength',
-                  'Animate an enabled blur at the playhead',
-                  () => _addSelectedKeyframe(
-                    TimelineKeyframeProperty.blurStrength,
-                  ),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.delete_sweep_rounded,
-                  'Clear clip keyframes',
-                  'Remove all animation points from the selected clip',
-                  _clearSelectedKeyframes,
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.pause_circle_outline_rounded,
-                  'Toggle freeze frame',
-                  'Hold the selected visual clip on its current frame',
-                  _toggleSelectedFreezeFrame,
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.vibration_rounded,
-                  'Toggle stabilisation',
-                  'Stabilise a video during final rendering',
-                  () => _toggleSelectedClipFlag(
-                    (clip) => clip.copyWith(stabilize: !clip.stabilize),
-                    supports: (clip, _) => clip.type == TimelineTrackType.video,
-                    unsupportedMessage: 'Stabilisation requires a video clip.',
-                  ),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.noise_aware_rounded,
-                  'Toggle noise reduction',
-                  'Clean picture and/or sound during final rendering',
-                  () => _toggleSelectedClipFlag(
-                    (clip) => clip.copyWith(denoise: !clip.denoise),
-                    supports: (clip, timeline) =>
-                        clip.type == TimelineTrackType.video ||
-                        timeline.clipHasAudio(clip),
-                    unsupportedMessage:
-                        'Noise reduction requires video or audio media.',
-                  ),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.colorize_rounded,
-                  'Chroma key settings',
-                  'Remove a selected screen colour from visual media',
-                  _openSelectedChromaKeySheet,
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.record_voice_over_rounded,
-                  'Toggle auto ducking',
-                  'Lower music under captions and voice clips',
-                  () => _toggleSelectedClipFlag(
-                    (clip) => clip.copyWith(autoDuck: !clip.autoDuck),
-                    supports: (clip, timeline) => timeline.clipHasAudio(clip),
-                    unsupportedMessage: 'Auto ducking requires an audio clip.',
-                  ),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.sticky_note_2_outlined,
-                  'Add clip note',
-                  'Keep an edit note attached to the clip',
-                  _setSelectedClipNote,
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.palette_outlined,
-                  'Cycle clip colour',
-                  'Colour-code clips for fast scanning',
-                  _cycleSelectedClipColor,
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.copy_all_rounded,
-                  'Copy clip attributes',
-                  'Copy transform, timing, audio, and effect settings',
-                  _copyClipAttributes,
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.content_paste_go_rounded,
-                  'Paste clip attributes',
-                  'Apply copied settings to the selected clips',
-                  _pasteClipAttributes,
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.call_split_rounded,
-                  'Split every track',
-                  'Cut all clips crossing the playhead together',
-                  _splitEveryTrackAtPlayhead,
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.music_note_rounded,
-                  'Generate beat markers',
-                  'Add a half-second beat grid across the composition',
-                  _generateBeatMarkers,
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.bookmark_add_outlined,
-                  'Add chapter marker',
-                  'Mark the current playhead as a chapter',
-                  _addChapterMarker,
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.tune_rounded,
-                  'Set project frame rate',
-                  'Choose 24, 25, 30, 50, or 60 fps snapping',
-                  _chooseProjectFrameRate,
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.clear_all_rounded,
-                  'Clear all markers',
-                  'Remove marker, beat, and chapter guides',
-                  _clearAllMarkers,
-                ),
-                _toolSectionTitle('Editor workflow improvements'),
-                _toolTile(
-                  sheetContext,
-                  Icons.select_all_rounded,
-                  'Select all clips',
-                  'Select every clip for batch actions',
-                  _selectAllClips,
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.deselect_rounded,
-                  'Clear multi-selection',
-                  'Return to a single-clip selection',
-                  () {
-                    final primaryClipId = ref
-                        .read(editorProvider)
-                        .selectedClipId;
-                    final notifier = ref.read(editorProvider.notifier);
-                    notifier.clearClipSelection();
-                    if (primaryClipId != null) {
-                      notifier.selectClip(primaryClipId);
-                    }
-                  },
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.keyboard_double_arrow_left_rounded,
-                  'Nudge selection one frame left',
-                  'Precision alignment without dragging',
-                  () => _nudgeSelectedClips(-1),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.keyboard_double_arrow_right_rounded,
-                  'Nudge selection one frame right',
-                  'Precision alignment without dragging',
-                  () => _nudgeSelectedClips(1),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.edit_outlined,
-                  'Rename selected track',
-                  'Give a lane a useful production name',
-                  _renameSelectedTrack,
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.library_add_outlined,
-                  'Duplicate selected track',
-                  'Clone a lane and all of its clip settings',
-                  _duplicateSelectedTrack,
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.arrow_upward_rounded,
-                  'Move selected track up',
-                  'Reorder the layer stack one row',
-                  () => _moveSelectedTrack(-1),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.arrow_downward_rounded,
-                  'Move selected track down',
-                  'Reorder the layer stack one row',
-                  () => _moveSelectedTrack(1),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.unfold_less_rounded,
-                  'Collapse all tracks',
-                  'Make dense projects easier to scan',
-                  () => ref
-                      .read(editorProvider.notifier)
-                      .setAllTracks(collapsed: true),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.unfold_more_rounded,
-                  'Expand all tracks',
-                  'Restore full-height lanes',
-                  () => ref
-                      .read(editorProvider.notifier)
-                      .setAllTracks(collapsed: false),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.lock_rounded,
-                  'Lock all tracks',
-                  'Protect the current layout before polishing',
-                  () => ref
-                      .read(editorProvider.notifier)
-                      .setAllTracks(locked: true),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.lock_open_rounded,
-                  'Unlock all tracks',
-                  'Resume editing every lane',
-                  () => ref
-                      .read(editorProvider.notifier)
-                      .setAllTracks(locked: false),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.volume_off_rounded,
-                  'Mute all tracks',
-                  'Silence every audio-capable lane',
-                  () => ref
-                      .read(editorProvider.notifier)
-                      .setAllTracks(muted: true),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.volume_up_rounded,
-                  'Unmute all tracks',
-                  'Restore every lane’s monitor audio',
-                  () => ref
-                      .read(editorProvider.notifier)
-                      .setAllTracks(muted: false),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.access_time_rounded,
-                  'Toggle timecode ruler',
-                  'Switch between frame-aware and seconds labels',
-                  () => _toggleWorkspace(
-                    (settings) =>
-                        settings.copyWith(showTimecode: !settings.showTimecode),
-                  ),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.photo_library_outlined,
-                  'Toggle thumbnails',
-                  'Reduce visual noise on compact timelines',
-                  () => _toggleWorkspace(
-                    (settings) => settings.copyWith(
-                      showThumbnails: !settings.showThumbnails,
-                    ),
-                  ),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.graphic_eq_rounded,
-                  'Toggle waveforms',
-                  'Show or hide audio amplitude guides',
-                  () => _toggleWorkspace(
-                    (settings) => settings.copyWith(
-                      showWaveforms: !settings.showWaveforms,
-                    ),
-                  ),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.key_rounded,
-                  'Toggle keyframe guides',
-                  'Show or hide animation diamonds in clips',
-                  () => _toggleWorkspace(
-                    (settings) => settings.copyWith(
-                      showKeyframes: !settings.showKeyframes,
-                    ),
-                  ),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.follow_the_signs_rounded,
-                  'Toggle playhead follow',
-                  'Keep the timeline centered during playback',
-                  () => _toggleWorkspace(
-                    (settings) => settings.copyWith(
-                      autoFollowPlayhead: !settings.autoFollowPlayhead,
-                    ),
-                  ),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.text_fields_rounded,
-                  'Toggle clip labels',
-                  'Use a clean icon-and-envelope timeline view',
-                  () => _toggleWorkspace(
-                    (settings) => settings.copyWith(
-                      showClipLabels: !settings.showClipLabels,
-                    ),
-                  ),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.grid_4x4_rounded,
-                  'Toggle canvas grid',
-                  'Use guides for consistent framing',
-                  () => _updateCanvasSettings(
-                    (settings) =>
-                        settings.copyWith(showGrid: !settings.showGrid),
-                  ),
-                ),
-                _toolTile(
-                  sheetContext,
-                  Icons.crop_free_rounded,
-                  'Toggle safe areas',
-                  'Preview social-platform title-safe margins',
-                  () => _updateCanvasSettings(
-                    (settings) => settings.copyWith(
-                      showSafeAreas: !settings.showSafeAreas,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _toolSectionTitle(String title) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(4, 18, 4, 4),
-      child: Text(
-        title.toUpperCase(),
-        style: const TextStyle(
-          color: kAccent,
-          fontSize: 10,
-          fontWeight: FontWeight.w900,
-          letterSpacing: 1.1,
-        ),
-      ),
-    );
-  }
-
-  Widget _toolTile(
-    BuildContext sheetContext,
-    IconData icon,
-    String title,
-    String subtitle,
-    VoidCallback onTap,
-  ) {
-    return ListTile(
-      dense: true,
-      contentPadding: const EdgeInsets.symmetric(horizontal: 4),
-      leading: Container(
-        width: 34,
-        height: 34,
-        decoration: BoxDecoration(
-          color: kAccent.withValues(alpha: 0.11),
-          borderRadius: BorderRadius.circular(9),
-        ),
-        child: Icon(icon, color: kAccent, size: 18),
-      ),
-      title: Text(
-        title,
-        style: const TextStyle(
-          color: kTextPrimary,
-          fontSize: 13,
-          fontWeight: FontWeight.w700,
-        ),
-      ),
-      subtitle: Text(
-        subtitle,
-        style: const TextStyle(color: kTextSecondary, fontSize: 11),
-      ),
-      onTap: () {
-        Navigator.pop(sheetContext);
-        onTap();
-      },
     );
   }
 
@@ -1170,8 +928,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
 
   Future<void> _openSelectedChromaKeySheet() async {
     final clip = _toolSelectedClip();
-    if (clip == null || !clip.supportsVisualEffects) {
-      SnackBarHelper.showInfo(context, 'Select visual media first.');
+    if (clip == null || !clip.supportsChromaKey) {
+      SnackBarHelper.showInfo(
+        context,
+        'Select an image, GIF, or video layer first.',
+      );
       return;
     }
     final track = _trackForClip(clip, ref.read(editorProvider));
@@ -1267,6 +1028,46 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                     );
                   }).toList(),
                 ),
+                const SizedBox(height: 12),
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    var draftColor = liveClip.chromaKeyColor;
+                    final picked = await showDialog<Color>(
+                      context: context,
+                      builder: (dialogContext) => AlertDialog(
+                        title: const Text('Custom key color'),
+                        content: SingleChildScrollView(
+                          child: ColorPicker(
+                            pickerColor: draftColor,
+                            enableAlpha: false,
+                            hexInputBar: true,
+                            onColorChanged: (color) => draftColor = color,
+                          ),
+                        ),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.pop(dialogContext),
+                            child: const Text('Cancel'),
+                          ),
+                          FilledButton(
+                            onPressed: () =>
+                                Navigator.pop(dialogContext, draftColor),
+                            child: const Text('Use color'),
+                          ),
+                        ],
+                      ),
+                    );
+                    if (picked == null) return;
+                    update(
+                      (current) => current.copyWith(
+                        chromaKeyEnabled: true,
+                        chromaKeyColor: picked,
+                      ),
+                    );
+                  },
+                  icon: const Icon(Icons.color_lens_outlined),
+                  label: const Text('Choose custom color'),
+                ),
                 const SizedBox(height: 18),
                 _sheetSliderHeader(
                   'Similarity',
@@ -1305,8 +1106,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     return '#${value.toRadixString(16).padLeft(6, '0').toUpperCase()}';
   }
 
-  Future<void> _addSelectedKeyframe(TimelineKeyframeProperty property) async {
-    final clip = _toolSelectedClip();
+  Future<void> _addSelectedKeyframe(
+    TimelineKeyframeProperty property, {
+    TimelineClip? targetClip,
+  }) async {
+    final clip = targetClip ?? _toolSelectedClip();
     if (clip == null) {
       SnackBarHelper.showInfo(context, 'Select a clip first.');
       return;
@@ -1445,10 +1249,22 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     }
   }
 
-  void _clearSelectedKeyframes() {
-    final clip = _toolSelectedClip();
+  void _clearSelectedKeyframes(
+    Set<TimelineKeyframeProperty> properties, {
+    TimelineClip? targetClip,
+  }) {
+    final clip = targetClip ?? _toolSelectedClip();
     if (clip == null) return;
-    ref.read(editorProvider.notifier).removeKeyframes(clip.id);
+    ref
+        .read(editorProvider.notifier)
+        .updateClip(
+          clip.id,
+          (current) => current.copyWith(
+            keyframes: current.keyframes
+                .where((keyframe) => !properties.contains(keyframe.property))
+                .toList(),
+          ),
+        );
   }
 
   Future<void> _setSelectedClipNote() async {
@@ -1518,7 +1334,6 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final clip = _toolSelectedClip();
     if (clip == null) return;
     setState(() => _clipAttributeClipboard = clip);
-    SnackBarHelper.showInfo(context, 'Clip attributes copied.');
   }
 
   void _pasteClipAttributes() {
@@ -1561,6 +1376,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               (source.supportsVisualEffects || sourceIsBlurEffect) &&
               (clip.supportsVisualEffects || targetIsBlurEffect);
           final copyAudio = sourceHasAudio && targetHasAudio;
+          final ownsAudioOnLinkedLane =
+              clip.type == TimelineTrackType.video &&
+              _separatedAudioForVideo(timeline, clip.id) != null;
           final copySourceTiming =
               source.supportsSourceTiming && clip.supportsSourceTiming;
           final copyTransitions =
@@ -1655,7 +1473,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
 
           return clip.copyWith(
             transform: nextTransform,
-            audioMix: copyAudio ? source.audioMix : clip.audioMix,
+            audioMix: (copyAudio ? source.audioMix : clip.audioMix).copyWith(
+              // Attribute paste must not reactivate the embedded stream after
+              // ownership has moved to a separated audio clip.
+              muted: ownsAudioOnLinkedLane
+                  ? true
+                  : (copyAudio ? source.audioMix.muted : clip.audioMix.muted),
+            ),
             fitMode: copyVisualSettings ? source.fitMode : clip.fitMode,
             playbackRate: copySourceTiming
                 ? source.playbackRate
@@ -1865,6 +1689,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       );
     }).toList();
     final nextTimeline = editorState.timeline.copyWith(tracks: nextTracks);
+    if (nextTimeline.hasTrackOverlaps) {
+      SnackBarHelper.showInfo(
+        context,
+        'The selection cannot move through another clip on the same track.',
+      );
+      return;
+    }
     ref.read(editorProvider.notifier).setTimeline(nextTimeline);
     ref
         .read(subtitleProvider.notifier)
@@ -2043,10 +1874,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       }
 
       final editorState = ref.read(editorProvider);
-      final compositionDuration =
-          editorState.timeline.baseVideoDuration > Duration.zero
-          ? editorState.timeline.baseVideoDuration
-          : _projectSnapshot.duration;
+      final compositionDuration = editorState.timeline.duration;
       final entries = SubtitleExportService.clampEntriesToDuration(
         parsedEntries,
         compositionDuration,
@@ -2266,25 +2094,19 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     TimelineClip targetClip,
     EditorTimeline timeline,
   ) async {
-    final existingSubtitleTrack = _resolveInsertionTrack(
-      timeline,
-      TimelineTrackSection.textSubtitle,
-      TimelineTrackType.subtitle,
+    final captionRouting = resolveCaptionTrackRouting(
+      timeline: timeline,
+      sourceClip: targetClip,
     );
-    final hasExistingSubtitleTrack = timeline.tracks.any(
-      (track) => track.type == TimelineTrackType.subtitle,
-    );
-    final subtitleTrack =
-        existingSubtitleTrack ??
-        (hasExistingSubtitleTrack
-            ? null
-            : _createOptionalTrack(
-                timeline,
-                TimelineTrackSection.textSubtitle,
-                TimelineTrackType.subtitle,
-              ));
+    if (captionRouting.isBlocked) {
+      SnackBarHelper.showInfo(
+        context,
+        'Unlock ${captionRouting.blockingTrack!.name} before replacing these captions.',
+      );
+      return;
+    }
+    final subtitleTrack = captionRouting.destination;
     if (subtitleTrack == null ||
-        subtitleTrack.isLocked ||
         !subtitleTrack.acceptsClipType(TimelineTrackType.subtitle)) {
       SnackBarHelper.showInfo(
         context,
@@ -2299,18 +2121,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       return;
     }
 
-    EditorAssetReference? sourceAsset;
-    for (final asset in timeline.assets) {
-      if (asset.id == targetClip.assetId) {
-        sourceAsset = asset;
-        break;
-      }
-    }
-    final mediaPath =
-        sourceAsset?.sourcePath ??
-        (targetClip.type == TimelineTrackType.video
-            ? widget.project.videoPath
-            : '');
+    final mediaPath = resolveCaptionMediaPath(
+      timeline: timeline,
+      sourceClip: targetClip,
+      legacyBaseVideoPath: widget.project.videoPath,
+    );
     if (mediaPath.isEmpty) {
       SnackBarHelper.showError(
         context,
@@ -2388,7 +2203,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         generatedEntries,
       );
 
-      final existingLinkedSubtitleIds = subtitleTrack.clips
+      final existingLinkedSubtitleIds = timeline.tracks
+          .where((track) => track.type == TimelineTrackType.subtitle)
+          .expand((track) => track.clips)
           .where((clip) => clip.linkedClipId == targetClip.id)
           .map((clip) => clip.id)
           .toSet();
@@ -2448,40 +2265,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     required TimelineTrack subtitleTrack,
     required List<SubtitleEntry> generatedEntries,
   }) {
-    final subtitleTrackId = subtitleTrack.id;
-    final existingSubtitleClips = subtitleTrack.clips
-        .where((clip) => clip.linkedClipId != targetClip.id)
-        .toList();
-
-    final generatedSubtitleClips = generatedEntries
-        .map(
-          (entry) => TimelineClip.fromSubtitleEntry(
-            entry,
-            trackId: subtitleTrackId,
-            linkedClipId: targetClip.id,
-          ),
-        )
-        .toList();
-
-    final mergedTrack = subtitleTrack.copyWith(
-      type: TimelineTrackType.subtitle,
-      section: TimelineTrackSection.textSubtitle,
-      clips: [...existingSubtitleClips, ...generatedSubtitleClips]
-        ..sort((a, b) => a.startTime.compareTo(b.startTime)),
-    );
-
-    final trackExists = timeline.tracks.any(
-      (track) => track.id == subtitleTrackId,
-    );
-
-    return timeline.copyWith(
-      tracks: trackExists
-          ? timeline.tracks
-                .map(
-                  (track) => track.id == subtitleTrackId ? mergedTrack : track,
-                )
-                .toList()
-          : [...timeline.tracks, mergedTrack],
+    return replaceGeneratedCaptionsForSource(
+      timeline: timeline,
+      sourceClip: targetClip,
+      destinationTrack: subtitleTrack,
+      generatedEntries: generatedEntries,
     );
   }
 
@@ -2567,6 +2355,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       subtitles: entries,
       globalStyle: subtitleState.globalStyle,
       timeline: mergedTimeline,
+      durationMs: mergedTimeline.duration.inMilliseconds,
       lastModifiedAt: now,
       captionsModifiedAt: captionsChanged
           ? now
@@ -2756,14 +2545,28 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final isBase = track.section == TimelineTrackSection.baseVideo;
     final oldEnd = liveTarget.endTime;
     final oldDurationMs = math.max(1, liveTarget.duration.inMilliseconds);
+    final updatedTarget = liveTarget.copyWith(
+      playbackRate: safeRate,
+      endTime: nextEnd,
+    );
 
     final retimedTracks = timeline.tracks.map((timelineTrack) {
-      if (timelineTrack.id != track.id && timelineTrack.isLocked) {
-        return timelineTrack;
-      }
       final clips = timelineTrack.clips.map((clip) {
         if (clip.id == liveTarget.id) {
-          return clip.copyWith(playbackRate: safeRate, endTime: nextEnd);
+          return updatedTarget;
+        }
+
+        if (clip.type == TimelineTrackType.audio &&
+            clip.linkedClipId == liveTarget.id) {
+          return isExactSeparatedAudioTransportMirror(
+                video: liveTarget,
+                audio: clip,
+              )
+              ? syncSeparatedAudioTransport(
+                  audio: clip,
+                  updatedVideo: updatedTarget,
+                )
+              : clip;
         }
 
         final isSubtitleClip =
@@ -2772,7 +2575,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         final intersectsChangedClip =
             clip.startTime < oldEnd && clip.endTime > liveTarget.startTime;
         final belongsToChangedClip =
-            clip.linkedClipId == liveTarget.id ||
+            (isSubtitleClip && clip.linkedClipId == liveTarget.id) ||
             (isBase &&
                 isSubtitleClip &&
                 clip.linkedClipId == null &&
@@ -2838,6 +2641,15 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       tracks: nextTracks,
       markers: markers,
     );
+    if (nextTimeline.hasTrackOverlaps) {
+      if (mounted && recordHistory) {
+        SnackBarHelper.showInfo(
+          context,
+          'That speed would overlap another clip on this track.',
+        );
+      }
+      return;
+    }
     ref
         .read(editorProvider.notifier)
         .setTimeline(nextTimeline, recordHistory: recordHistory);
@@ -2873,10 +2685,32 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
 
   void _toggleClipReverse(TimelineClip clip) {
     if (!_canReverseClip(clip)) return;
-    _updateTimelineClip(
-      clip,
-      (current) => current.copyWith(isReversed: !current.isReversed),
-    );
+    final editorState = ref.read(editorProvider);
+    final liveClip = _clipById(clip.id, editorState) ?? clip;
+    final track = _trackForClip(liveClip, editorState);
+    if (track == null || track.isLocked) return;
+    final updatedVideo = liveClip.copyWith(isReversed: !liveClip.isReversed);
+    final tracks = editorState.timeline.tracks.map((candidateTrack) {
+      return candidateTrack.copyWith(
+        clips: candidateTrack.clips.map((candidate) {
+          if (candidate.id == liveClip.id) return updatedVideo;
+          if (candidate.type == TimelineTrackType.audio &&
+              isExactSeparatedAudioTransportMirror(
+                video: liveClip,
+                audio: candidate,
+              )) {
+            return syncSeparatedAudioTransport(
+              audio: candidate,
+              updatedVideo: updatedVideo,
+            );
+          }
+          return candidate;
+        }).toList(),
+      );
+    }).toList();
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(editorState.timeline.copyWith(tracks: tracks));
   }
 
   void _setClipFit(TimelineClip clip, ClipFitMode fitMode) {
@@ -2916,10 +2750,60 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         !track.isLocked &&
         track.section == TimelineTrackSection.overlay;
     if (!supportsLayering) return;
-    _updateTimelineClip(
-      clip,
-      (current) => current.copyWith(layer: math.max(0, current.layer + delta)),
+    final timeline = editorState.timeline;
+    final overlayTracks = timeline.tracks
+        .where(
+          (candidate) =>
+              candidate.section == TimelineTrackSection.overlay &&
+              !candidate.isLocked &&
+              candidate.acceptsClip(clip),
+        )
+        .toList();
+    final sourceIndex = overlayTracks.indexWhere(
+      (candidate) => candidate.id == track.id,
     );
+    if (sourceIndex < 0) return;
+    final step = delta > 0 ? -1 : 1;
+    TimelineTrack? target;
+    for (
+      var index = sourceIndex + step;
+      index >= 0 && index < overlayTracks.length;
+      index += step
+    ) {
+      final candidate = overlayTracks[index];
+      if (candidate.canPlaceClip(clip.copyWith(trackId: candidate.id))) {
+        target = candidate;
+        break;
+      }
+    }
+    var tracks = [...timeline.tracks];
+    if (target == null) {
+      target = TimelineTrack(
+        name: timeline.nextTrackNameForSection(TimelineTrackSection.overlay),
+        type: TimelineTrackType.video,
+        section: TimelineTrackSection.overlay,
+      );
+      final sourceTimelineIndex = tracks.indexWhere(
+        (candidate) => candidate.id == track.id,
+      );
+      final insertionIndex = delta > 0
+          ? sourceTimelineIndex
+          : sourceTimelineIndex + 1;
+      tracks.insert(insertionIndex.clamp(0, tracks.length), target);
+    }
+    final moved = clip.copyWith(trackId: target.id, layer: 0);
+    tracks = tracks.map((candidate) {
+      final clips = candidate.clips
+          .where((item) => item.id != clip.id)
+          .toList();
+      if (candidate.id == target!.id) clips.add(moved);
+      clips.sort((a, b) => a.startTime.compareTo(b.startTime));
+      return candidate.copyWith(clips: clips);
+    }).toList();
+    ref.read(editorProvider.notifier)
+      ..setTimeline(timeline.copyWith(tracks: tracks))
+      ..selectTrack(target.id)
+      ..selectClip(clip.id);
   }
 
   void _toggleClipEnabled(TimelineClip clip) {
@@ -2944,27 +2828,63 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   void _addEffectOverlay({
-    required TimelineClip anchor,
+    TimelineClip? anchor,
     required TimelineEffectKind kind,
     required String label,
     ClipBlurSettings blur = const ClipBlurSettings(),
     ClipColorAdjustments colorAdjustments = const ClipColorAdjustments(),
   }) {
     final editorState = ref.read(editorProvider);
-    final liveAnchor = _clipById(anchor.id, editorState);
+    final liveAnchor = anchor == null
+        ? null
+        : _clipById(anchor.id, editorState);
     final anchorTrack = _trackForClip(liveAnchor, editorState);
-    if (liveAnchor == null ||
-        anchorTrack == null ||
-        anchorTrack.isLocked ||
-        !liveAnchor.supportsVisualEffects) {
+    final timeline = editorState.timeline;
+    final playhead = ref.read(playbackProvider).position;
+    final compositionEnd = _currentCompositionDuration(timeline);
+    final startTime =
+        liveAnchor != null &&
+            anchorTrack != null &&
+            !anchorTrack.isLocked &&
+            liveAnchor.supportsVisualEffects
+        ? liveAnchor.startTime
+        : playhead;
+    final requestedEnd =
+        liveAnchor != null &&
+            anchorTrack != null &&
+            !anchorTrack.isLocked &&
+            liveAnchor.supportsVisualEffects
+        ? liveAnchor.endTime
+        : playhead + const Duration(seconds: 4);
+    final endTime = requestedEnd > compositionEnd
+        ? compositionEnd
+        : requestedEnd;
+    if (endTime <= startTime) {
+      SnackBarHelper.showInfo(
+        context,
+        'Move the playhead earlier to add this overlay.',
+      );
       return;
     }
-    final timeline = editorState.timeline;
-    final existingEffectTrack = _resolveInsertionTrack(
-      timeline,
-      TimelineTrackSection.overlay,
-      TimelineTrackType.effect,
-    );
+    final existingEffectTrack = timeline.tracks
+        .where(
+          (track) =>
+              track.section == TimelineTrackSection.overlay &&
+              !track.isLocked &&
+              track.acceptsClipType(TimelineTrackType.effect),
+        )
+        .where(
+          (track) => track.canPlaceClip(
+            TimelineClip.effect(
+              trackId: track.id,
+              effectKind: kind,
+              label: label,
+              startTime: startTime,
+              endTime: endTime,
+            ),
+          ),
+        )
+        .firstOrNull;
     final effectTrack =
         existingEffectTrack ??
         _createOptionalTrack(
@@ -2976,7 +2896,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         !effectTrack.acceptsClipType(TimelineTrackType.effect)) {
       SnackBarHelper.showInfo(
         context,
-        'Add or unlock an effects track before applying this effect.',
+        'Add or unlock an overlay track before applying this effect.',
       );
       return;
     }
@@ -2984,8 +2904,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       trackId: effectTrack.id,
       effectKind: kind,
       label: label,
-      startTime: liveAnchor.startTime,
-      endTime: liveAnchor.endTime,
+      startTime: startTime,
+      endTime: endTime,
       blur: blur,
       colorAdjustments: colorAdjustments,
       layer: effectTrack.clips.length,
@@ -3000,7 +2920,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                     track.id == effectTrack.id ? updatedEffectTrack : track,
               )
               .toList()
-        : [...timeline.tracks, updatedEffectTrack];
+        : timeline.insertTrackUsingEditorRules(updatedEffectTrack).tracks;
     ref
         .read(editorProvider.notifier)
         .setTimeline(timeline.copyWith(tracks: nextTracks));
@@ -3101,6 +3021,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           return _buildEditorSheet(
             title: 'Blur',
             subtitle: 'Rendered in preview and final export',
+            resizable: true,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -3210,19 +3131,130 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   void _toggleClipMute(TimelineClip clip) {
     final timeline = ref.read(editorProvider).timeline;
     if (!timeline.clipHasAudio(clip)) return;
+    final owner = _audioOwnerForClip(timeline, clip);
+    if (owner == null || owner.track.isLocked) return;
     _updateTimelineClip(
-      clip,
+      owner.clip,
       (current) => current.copyWith(
         audioMix: current.audioMix.copyWith(muted: !current.audioMix.muted),
       ),
     );
   }
 
+  bool _separateVideoAudio(TimelineClip videoClip) {
+    final editorState = ref.read(editorProvider);
+    final timeline = editorState.timeline;
+    final liveVideo = _clipById(videoClip.id, editorState);
+    final videoTrack = _trackForClip(liveVideo, editorState);
+    if (liveVideo == null ||
+        videoTrack == null ||
+        videoTrack.isLocked ||
+        liveVideo.type != TimelineTrackType.video ||
+        !timeline.clipHasAudio(liveVideo)) {
+      return false;
+    }
+
+    for (final track in timeline.tracks) {
+      final existing = track.clips
+          .where(
+            (candidate) =>
+                candidate.type == TimelineTrackType.audio &&
+                candidate.linkedClipId == liveVideo.id,
+          )
+          .firstOrNull;
+      if (existing != null) {
+        ref.read(editorProvider.notifier)
+          ..selectTrack(track.id)
+          ..selectClip(existing.id);
+        SnackBarHelper.showInfo(
+          context,
+          'This video audio is already separate.',
+        );
+        return false;
+      }
+    }
+
+    final audioProbe = TimelineClip(
+      trackId: '',
+      type: TimelineTrackType.audio,
+      label: '${liveVideo.label} audio',
+      assetId: liveVideo.assetId,
+      linkedClipId: liveVideo.id,
+      startTime: liveVideo.startTime,
+      endTime: liveVideo.endTime,
+      sourceStartTime: liveVideo.sourceStartTime,
+      sourceDuration: liveVideo.sourceDuration,
+      playbackRate: liveVideo.playbackRate,
+      isReversed: liveVideo.isReversed,
+      // Transfer the current mix exactly. A video that the user muted before
+      // separating should not unexpectedly become audible again.
+      audioMix: liveVideo.audioMix,
+      autoDuck: liveVideo.autoDuck,
+      duckAmount: liveVideo.duckAmount,
+      denoise: liveVideo.denoise,
+    );
+    var audioTrack = timeline.tracks
+        .where(
+          (track) =>
+              track.section == TimelineTrackSection.audio &&
+              track.role == TimelineTrackRole.regular &&
+              !track.isLocked &&
+              track.acceptsClipType(TimelineTrackType.audio) &&
+              track.canPlaceClip(audioProbe.copyWith(trackId: track.id)),
+        )
+        .firstOrNull;
+    audioTrack ??= TimelineTrack(
+      name: timeline.nextTrackNameForSection(TimelineTrackSection.audio),
+      type: TimelineTrackType.audio,
+      section: TimelineTrackSection.audio,
+    );
+
+    var workingTimeline = timeline;
+    if (!timeline.tracks.any((track) => track.id == audioTrack!.id)) {
+      workingTimeline = timeline.insertTrackUsingEditorRules(audioTrack);
+    }
+    final separatedAudio = audioProbe.copyWith(trackId: audioTrack.id);
+    final nextTracks = workingTimeline.tracks.map((track) {
+      if (track.id == liveVideo.trackId) {
+        return track.copyWith(
+          clips: track.clips
+              .map(
+                (candidate) => candidate.id == liveVideo.id
+                    ? candidate.copyWith(
+                        audioMix: candidate.audioMix.copyWith(muted: true),
+                      )
+                    : candidate,
+              )
+              .toList(),
+        );
+      }
+      if (track.id == audioTrack!.id) {
+        final clips = [...track.clips, separatedAudio]
+          ..sort((a, b) => a.startTime.compareTo(b.startTime));
+        return track.copyWith(clips: clips);
+      }
+      return track;
+    }).toList();
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(workingTimeline.copyWith(tracks: nextTracks));
+    ref.read(editorProvider.notifier)
+      ..selectTrack(audioTrack.id)
+      ..selectClip(separatedAudio.id);
+    SnackBarHelper.showSuccess(
+      context,
+      'Video audio moved to a separate track.',
+    );
+    return true;
+  }
+
   void _toggleClipNormalize(TimelineClip clip) {
     final timeline = ref.read(editorProvider).timeline;
     if (!timeline.clipHasAudio(clip)) return;
+    final owner = _audioOwnerForClip(timeline, clip);
+    if (owner == null || owner.track.isLocked) return;
     _updateTimelineClip(
-      clip,
+      owner.clip,
       (current) => current.copyWith(
         audioMix: current.audioMix.copyWith(
           normalize: !current.audioMix.normalize,
@@ -3234,7 +3266,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   void _toggleQuickFade(TimelineClip clip, {required bool fadeIn}) {
     final timeline = ref.read(editorProvider).timeline;
     if (!timeline.clipHasAudio(clip)) return;
-    _updateTimelineClip(clip, (current) {
+    final owner = _audioOwnerForClip(timeline, clip);
+    if (owner == null || owner.track.isLocked) return;
+    _updateTimelineClip(owner.clip, (current) {
       final mix = current.audioMix;
       return current.copyWith(
         audioMix: fadeIn
@@ -3252,15 +3286,34 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       return;
     }
     final timeline = editorState.timeline;
-    final newStart = track.section == TimelineTrackSection.baseVideo
-        ? timeline.duration
+    final desiredStart = track.section == TimelineTrackSection.baseVideo
+        ? track.clips.fold<Duration>(
+            Duration.zero,
+            (latest, candidate) =>
+                candidate.endTime > latest ? candidate.endTime : latest,
+          )
         : clip.endTime;
-    final duplicate = clip.copyWith(
+    final newStart = track.closestAvailableStart(
+      desiredStart: desiredStart,
+      duration: clip.duration,
+    );
+    final separatedAudio = clip.type == TimelineTrackType.video
+        ? _separatedAudioForVideo(timeline, clip.id)
+        : null;
+    var duplicate = clip.copyWith(
       id: const Uuid().v4(),
       startTime: newStart,
       endTime: newStart + clip.duration,
       clearLinkedClipId: true,
     );
+    if (separatedAudio != null) {
+      // A duplicate starts with attached audio again; it must not become
+      // mysteriously silent just because the original owns a separated lane.
+      duplicate = restoreAttachedAudioForDuplicate(
+        duplicateVideo: duplicate,
+        separatedAudio: separatedAudio.clip,
+      );
+    }
     final nextTracks = timeline.tracks.map((candidate) {
       if (candidate.id != track.id) return candidate;
       final clips = [...candidate.clips, duplicate]
@@ -3275,23 +3328,53 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       ..selectClip(duplicate.id);
   }
 
-  void _deleteClip(TimelineClip clip) {
+  Future<void> _deleteClip(TimelineClip clip) async {
     final editorState = ref.read(editorProvider);
     final track = _trackForClip(clip, editorState);
     if (track == null || track.isLocked) {
       SnackBarHelper.showInfo(context, 'Unlock the track to delete clips.');
       return;
     }
-    if (track.section == TimelineTrackSection.baseVideo &&
-        track.clips.where((candidate) => candidate.enabled).length <= 1) {
-      SnackBarHelper.showInfo(
-        context,
-        'Keep at least one base video clip in the timeline.',
+    final timeline = editorState.timeline;
+    if (clip.type.isVisualMedia &&
+        !timeline.wouldRetainVisualContentAfterRemoving([clip.id])) {
+      final action = await showDialog<_LastVisualAction>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('Keep one visual'),
+          content: const Text(
+            'A project needs at least one image, GIF, sticker, or video. '
+            'Replace this clip before removing it.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () =>
+                  Navigator.pop(dialogContext, _LastVisualAction.cancel),
+              child: const Text('Cancel'),
+            ),
+            FilledButton.icon(
+              onPressed: () =>
+                  Navigator.pop(dialogContext, _LastVisualAction.replace),
+              icon: const Icon(Icons.swap_horiz_rounded),
+              label: const Text('Replace'),
+            ),
+          ],
+        ),
       );
+      if (action == _LastVisualAction.replace && mounted) {
+        await _relinkClipMedia(clip);
+      }
       return;
     }
-    final nextTracks = editorState.timeline.tracks.map((candidate) {
-      if (candidate.id != track.id && candidate.isLocked) return candidate;
+    final nextTracks = timeline.tracks.map((candidate) {
+      if (candidate.id != track.id && candidate.isLocked) {
+        final dependentClips = candidate.clips
+            .where((item) => item.linkedClipId != clip.id)
+            .toList();
+        return dependentClips.length == candidate.clips.length
+            ? candidate
+            : candidate.copyWith(clips: dependentClips);
+      }
       final clips = candidate.clips
           .where(
             (item) =>
@@ -3301,7 +3384,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           .toList();
       return candidate.copyWith(clips: clips);
     }).toList();
-    final nextTimeline = editorState.timeline.copyWith(tracks: nextTracks);
+    final nextTimeline = timeline.copyWith(tracks: nextTracks);
     ref.read(editorProvider.notifier)
       ..setTimeline(nextTimeline)
       ..selectClip(null);
@@ -3434,11 +3517,31 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         nextTracks.add(candidateTrack.copyWith(clips: clips));
         continue;
       }
-      if (candidateTrack.type != TimelineTrackType.subtitle) {
-        nextTracks.add(candidateTrack);
+      if (candidateTrack.type == TimelineTrackType.audio) {
+        final audioClips = <TimelineClip>[];
+        for (final audio in candidateTrack.clips) {
+          if (!isExactSeparatedAudioTransportMirror(
+            video: clip,
+            audio: audio,
+          )) {
+            audioClips.add(audio);
+            continue;
+          }
+          final splitAudio = splitExactSeparatedAudioMirror(
+            originalVideo: clip,
+            leftVideo: left,
+            rightVideo: right,
+            audio: audio,
+            rightAudioId: const Uuid().v4(),
+            splitAt: splitPoint,
+          );
+          audioClips.addAll([splitAudio.left, splitAudio.right]);
+        }
+        audioClips.sort((a, b) => a.startTime.compareTo(b.startTime));
+        nextTracks.add(candidateTrack.copyWith(clips: audioClips));
         continue;
       }
-      if (candidateTrack.isLocked) {
+      if (candidateTrack.type != TimelineTrackType.subtitle) {
         nextTracks.add(candidateTrack);
         continue;
       }
@@ -3510,20 +3613,31 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final oldEnd = target.endTime;
     final rippleDelta = nextEnd - oldEnd;
     final isBase = track.section == TimelineTrackSection.baseVideo;
+    final updatedTarget = target.copyWith(
+      sourceStartTime: Duration(milliseconds: safeStart),
+      sourceDuration: sourceDuration,
+      endTime: nextEnd,
+    );
 
     final nextTracks = timeline.tracks.map((candidateTrack) {
-      if (candidateTrack.id != track.id && candidateTrack.isLocked) {
-        return candidateTrack;
-      }
       final clips = candidateTrack.clips.map((clip) {
         if (clip.id == target.id) {
-          return clip.copyWith(
-            sourceStartTime: Duration(milliseconds: safeStart),
-            sourceDuration: sourceDuration,
-            endTime: nextEnd,
-          );
+          return updatedTarget;
         }
-        if (clip.linkedClipId == target.id) {
+        if (clip.type == TimelineTrackType.audio &&
+            clip.linkedClipId == target.id) {
+          return isExactSeparatedAudioTransportMirror(
+                video: target,
+                audio: clip,
+              )
+              ? syncSeparatedAudioTransport(
+                  audio: clip,
+                  updatedVideo: updatedTarget,
+                )
+              : clip;
+        }
+        if (candidateTrack.type == TimelineTrackType.subtitle &&
+            clip.linkedClipId == target.id) {
           final oldDurationMs = math.max(1, target.duration.inMilliseconds);
           final startRatio =
               (clip.startTime - target.startTime).inMilliseconds /
@@ -3565,6 +3679,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       tracks: nextTracks,
       markers: markers,
     );
+    if (nextTimeline.hasTrackOverlaps) {
+      SnackBarHelper.showInfo(
+        context,
+        'That trim would overlap another clip on this track.',
+      );
+      return;
+    }
     ref.read(editorProvider.notifier).setTimeline(nextTimeline);
     ref
         .read(subtitleProvider.notifier)
@@ -3619,6 +3740,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           return _buildEditorSheet(
             title: 'Clip inspector',
             subtitle: clip.label,
+            resizable: true,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -3876,6 +3998,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             subtitle: canReverse
                 ? 'Trim, speed, split and reverse'
                 : 'Trim, speed and split',
+            resizable: true,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -4099,6 +4222,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           return _buildEditorSheet(
             title: 'Crop',
             subtitle: 'Non-destructive and reusable on any visual clip',
+            resizable: true,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -4166,15 +4290,16 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     );
   }
 
-  Future<void> _openFilterSheet(TimelineClip initialClip) async {
+  Future<void> _openFilterSheet(TimelineClip? initialClip) async {
     final isExistingFilter =
-        initialClip.type == TimelineTrackType.effect &&
-        initialClip.effectKind == TimelineEffectKind.filter;
+        initialClip?.type == TimelineTrackType.effect &&
+        initialClip?.effectKind == TimelineEffectKind.filter;
     final editorState = ref.read(editorProvider);
     final track = _trackForClip(initialClip, editorState);
-    if (track == null ||
-        track.isLocked ||
-        (!isExistingFilter && !initialClip.supportsVisualEffects)) {
+    if (initialClip != null &&
+        (track == null ||
+            track.isLocked ||
+            (!isExistingFilter && !initialClip.supportsVisualEffects))) {
       return;
     }
     await showModalBottomSheet<void>(
@@ -4199,7 +4324,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   label: Text(_filterPresetLabel(preset)),
                   onPressed: () {
                     if (isExistingFilter) {
-                      _replaceFilterEffect(initialClip, preset);
+                      _replaceFilterEffect(initialClip!, preset);
                     } else {
                       final adjustments = ClipColorAdjustments.forPreset(
                         preset,
@@ -4292,6 +4417,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             title: 'Color correction',
             subtitle:
                 'Color and vignette preview live; spatial sharpening is finalized on export',
+            resizable: true,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -4384,6 +4510,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           return _buildEditorSheet(
             title: 'Canvas',
             subtitle: 'Format, background and guides',
+            resizable: true,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -4534,8 +4661,14 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       );
       return;
     }
+    Map<String, String> captionLaneMap() => {
+      for (final track in ref.read(editorProvider).timeline.tracks)
+        if (track.type == TimelineTrackType.subtitle)
+          for (final clip in track.clips) clip.id: track.id,
+    };
     var report = SubtitleQualityService.analyze(
       ref.read(subtitleProvider).entries,
+      laneByEntryId: captionLaneMap(),
     );
     await showModalBottomSheet<void>(
       context: context,
@@ -4547,6 +4680,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             setSheetState(() {
               report = SubtitleQualityService.analyze(
                 ref.read(subtitleProvider).entries,
+                laneByEntryId: captionLaneMap(),
               );
             });
           }
@@ -4556,6 +4690,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             subtitle:
                 '${report.cueCount} cues • '
                 '${report.averageCharactersPerSecond.toStringAsFixed(1)} avg CPS',
+            resizable: true,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -4649,7 +4784,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   title: 'Resolve overlaps',
                   subtitle: 'Insert an 80ms gap where cues collide',
                   onTap: () {
-                    ref.read(subtitleProvider.notifier).fixOverlaps();
+                    ref
+                        .read(subtitleProvider.notifier)
+                        .fixOverlaps(laneByEntryId: captionLaneMap());
                     refreshReport();
                   },
                 ),
@@ -4815,29 +4952,118 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         selectedPath,
         originalFileName: file!.name,
       );
-      final mediaInfo =
-          clip.type == TimelineTrackType.image ||
-              clip.type == TimelineTrackType.gif ||
-              clip.type == TimelineTrackType.sticker
-          ? <String, dynamic>{}
-          : await FFmpegService.getMediaInfo(sourcePath);
+      final shouldProbe =
+          clip.type == TimelineTrackType.video ||
+          clip.type == TimelineTrackType.audio ||
+          clip.type == TimelineTrackType.gif;
+      final mediaInfo = shouldProbe
+          ? await FFmpegService.getMediaInfo(sourcePath)
+          : <String, dynamic>{};
       if (!mounted) return;
       final editorState = ref.read(editorProvider);
       final timeline = editorState.timeline;
-      final assets = timeline.assets.map((asset) {
-        if (asset.id != clip.assetId) return asset;
-        return asset.copyWith(
-          label: file.name,
-          sourcePath: sourcePath,
-          clearRemoteUrl: true,
-          isNetworkBacked: false,
-          metadata: {...asset.metadata, ...mediaInfo},
-        );
+      final oldAsset = timeline.assetForClip(clip);
+      final assetType = switch (clip.type) {
+        TimelineTrackType.video => EditorAssetType.video,
+        TimelineTrackType.audio => EditorAssetType.audio,
+        TimelineTrackType.gif => EditorAssetType.gif,
+        TimelineTrackType.sticker => EditorAssetType.sticker,
+        _ => EditorAssetType.image,
+      };
+      final replacementAsset = EditorAssetReference(
+        type: assetType,
+        label: file.name,
+        sourcePath: sourcePath,
+        metadata: {...?oldAsset?.metadata, ...mediaInfo},
+      );
+      final probedDurationMs = (mediaInfo['durationMs'] as num?)?.toInt();
+      final replacementSourceDuration =
+          probedDurationMs != null && probedDurationMs > 0
+          ? Duration(milliseconds: probedDurationMs)
+          : clip.sourceDuration;
+      final maximumTimelineDuration = Duration(
+        milliseconds: math.max(
+          100,
+          (replacementSourceDuration.inMilliseconds /
+                  clip.playbackRate.clamp(0.25, 4))
+              .round(),
+        ),
+      );
+      final replacementEnd = clip.type.supportsSourceTiming
+          ? clip.startTime +
+                (maximumTimelineDuration < clip.duration
+                    ? maximumTimelineDuration
+                    : clip.duration)
+          : clip.endTime;
+      final replacementHasAudio = mediaInfo['hasAudio'] == true;
+      final nextTracks = timeline.tracks.map((track) {
+        final clips = <TimelineClip>[];
+        for (final candidate in track.clips) {
+          if (candidate.id == clip.id) {
+            clips.add(
+              candidate.copyWith(
+                label: file.name,
+                assetId: replacementAsset.id,
+                sourceStartTime: Duration.zero,
+                sourceDuration: replacementSourceDuration,
+                endTime: replacementEnd,
+              ),
+            );
+            continue;
+          }
+          if (candidate.linkedClipId == clip.id) {
+            if (candidate.type == TimelineTrackType.audio) {
+              if (clip.type == TimelineTrackType.video &&
+                  !replacementHasAudio) {
+                continue;
+              }
+              clips.add(
+                candidate.copyWith(
+                  assetId: replacementAsset.id,
+                  startTime: clip.startTime,
+                  endTime: replacementEnd,
+                  sourceStartTime: Duration.zero,
+                  sourceDuration: replacementSourceDuration,
+                ),
+              );
+              continue;
+            }
+
+            // Captions and other linked annotations keep their own media/text
+            // identity. Only trim or drop the portion that no longer fits
+            // when a shorter replacement shortens the parent clip.
+            if (candidate.startTime >= replacementEnd) continue;
+            clips.add(
+              candidate.endTime > replacementEnd
+                  ? candidate.copyWith(endTime: replacementEnd)
+                  : candidate,
+            );
+            continue;
+          }
+          clips.add(candidate);
+        }
+        return track.copyWith(clips: clips);
       }).toList();
+      final referencedAssetIds = nextTracks
+          .expand((track) => track.clips)
+          .map((candidate) => candidate.assetId)
+          .whereType<String>()
+          .toSet();
+      final assets = [
+        for (final asset in timeline.assets)
+          if (asset.id != oldAsset?.id || referencedAssetIds.contains(asset.id))
+            asset,
+        replacementAsset,
+      ];
+      final nextTimeline = timeline.copyWith(
+        assets: assets,
+        tracks: nextTracks,
+      );
+      ref.read(editorProvider.notifier).setTimeline(nextTimeline);
       ref
-          .read(editorProvider.notifier)
-          .setTimeline(timeline.copyWith(assets: assets));
-      SnackBarHelper.showSuccess(context, 'Media relinked');
+          .read(subtitleProvider.notifier)
+          .syncFromTimeline(nextTimeline.subtitleEntries);
+      SnackBarHelper.showSuccess(context, 'Clip media replaced');
     } catch (error) {
       if (mounted) {
         SnackBarHelper.showError(
@@ -4852,71 +5078,22 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     required String title,
     required String subtitle,
     required Widget child,
+    bool resizable = false,
   }) {
-    return SafeArea(
-      top: false,
-      child: Container(
-        constraints: BoxConstraints(
-          maxHeight: MediaQuery.of(context).size.height * 0.40,
-        ),
-        decoration: const BoxDecoration(
-          color: kSurface,
-          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-        ),
-        child: Column(
-          children: [
-            const SizedBox(height: 10),
-            Container(
-              width: 42,
-              height: 4,
-              decoration: BoxDecoration(
-                color: kBorder,
-                borderRadius: BorderRadius.circular(999),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(18, 14, 18, 12),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          title,
-                          style: TextStyle(
-                            color: kTextPrimary,
-                            fontSize: 18,
-                            fontWeight: FontWeight.w800,
-                          ),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          subtitle,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(color: kTextSecondary, fontSize: 12),
-                        ),
-                      ],
-                    ),
-                  ),
-                  IconButton(
-                    onPressed: () => Navigator.pop(context),
-                    icon: const Icon(Icons.close_rounded),
-                  ),
-                ],
-              ),
-            ),
-            const Divider(height: 1),
-            Expanded(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.fromLTRB(18, 18, 18, 28),
-                child: child,
-              ),
-            ),
-          ],
-        ),
-      ),
+    if (resizable) {
+      return ResizableEditorSheet(
+        title: title,
+        subtitle: subtitle,
+        onClose: () => Navigator.pop(context),
+        child: child,
+      );
+    }
+    return FixedEditorSheet(
+      title: title,
+      subtitle: subtitle,
+      heightFactor: 0.52,
+      onClose: () => Navigator.pop(context),
+      child: child,
     );
   }
 
@@ -5042,7 +5219,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   Widget _buildPortrait(BuildContext context, TimelineClip? selectedClip) {
     return LayoutBuilder(
       builder: (context, constraints) {
-        const actionBarHeight = 64.0;
+        final actionBarHeight = _editorDockHeightFor(context);
         final workspaceHeight = math.max(
           0.0,
           constraints.maxHeight - actionBarHeight,
@@ -5072,7 +5249,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   Widget _buildLandscape(BuildContext context, TimelineClip? selectedClip) {
     return LayoutBuilder(
       builder: (context, constraints) {
-        const actionBarHeight = 64.0;
+        final actionBarHeight = _editorDockHeightFor(context);
         final workspaceHeight = math.max(
           0.0,
           constraints.maxHeight - actionBarHeight,
@@ -5133,7 +5310,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       onEditRequested: _openSubtitleTextEditor,
       onTextClipEditRequested: _editTextClip,
       onTransitionRequested: _openTransitionSheet,
-      onOverlayAddRequested: _pickOverlayMediaForTrack,
+      onOverlayAddRequested: _openOverlayAddSheet,
+      onTextAddRequested: _openTextAddSheet,
+      onAudioAddRequested: _openAudioAddSheet,
+      onMainVideoAddRequested: _pickBaseMedia,
+      onReplaceMediaRequested: _relinkClipMedia,
     );
   }
 
@@ -5162,90 +5343,6 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     );
   }
 
-  PopupMenuButton<_CanvasAspectRatio> _buildAspectRatioPicker() {
-    return PopupMenuButton<_CanvasAspectRatio>(
-      tooltip: 'Aspect ratio',
-      color: kSurface,
-      onSelected: (value) {
-        setState(() => _canvasAspectRatio = value);
-        final editorState = ref.read(editorProvider);
-        ref
-            .read(editorProvider.notifier)
-            .setTimeline(
-              editorState.timeline.copyWith(
-                canvasSettings: editorState.timeline.canvasSettings.copyWith(
-                  aspectRatioPreset: _canvasPresetFromRatio(value),
-                ),
-              ),
-            );
-      },
-      itemBuilder: (_) => [
-        _aspectMenuItem(_CanvasAspectRatio.original, 'Original'),
-        _aspectMenuItem(_CanvasAspectRatio.ratio16x9, '16:9'),
-        _aspectMenuItem(_CanvasAspectRatio.ratio9x16, '9:16'),
-        _aspectMenuItem(_CanvasAspectRatio.ratio1x1, '1:1'),
-        _aspectMenuItem(_CanvasAspectRatio.ratio4x5, '4:5'),
-      ],
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 8),
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-        decoration: BoxDecoration(
-          color: kSurface,
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: kBorder),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.crop_rounded, size: 16, color: kTextSecondary),
-            const SizedBox(width: 6),
-            Text(
-              _aspectRatioLabel(_canvasAspectRatio),
-              style: TextStyle(
-                color: kTextSecondary,
-                fontSize: 12,
-                fontWeight: FontWeight.w500,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  PopupMenuItem<_CanvasAspectRatio> _aspectMenuItem(
-    _CanvasAspectRatio ratio,
-    String label,
-  ) {
-    return PopupMenuItem(
-      value: ratio,
-      child: Row(
-        children: [
-          if (_canvasAspectRatio == ratio) ...[
-            const Icon(Icons.check_rounded, size: 16, color: kAccent),
-            const SizedBox(width: 8),
-          ],
-          Text(label, style: TextStyle(color: kTextPrimary)),
-        ],
-      ),
-    );
-  }
-
-  String _aspectRatioLabel(_CanvasAspectRatio ratio) {
-    switch (ratio) {
-      case _CanvasAspectRatio.original:
-        return 'Original';
-      case _CanvasAspectRatio.ratio16x9:
-        return '16:9';
-      case _CanvasAspectRatio.ratio9x16:
-        return '9:16';
-      case _CanvasAspectRatio.ratio1x1:
-        return '1:1';
-      case _CanvasAspectRatio.ratio4x5:
-        return '4:5';
-    }
-  }
-
   _CanvasAspectRatio _canvasAspectRatioFromPreset(
     CanvasAspectRatioPreset preset,
   ) {
@@ -5255,16 +5352,6 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       CanvasAspectRatioPreset.ratio9x16 => _CanvasAspectRatio.ratio9x16,
       CanvasAspectRatioPreset.ratio1x1 => _CanvasAspectRatio.ratio1x1,
       CanvasAspectRatioPreset.ratio4x5 => _CanvasAspectRatio.ratio4x5,
-    };
-  }
-
-  CanvasAspectRatioPreset _canvasPresetFromRatio(_CanvasAspectRatio ratio) {
-    return switch (ratio) {
-      _CanvasAspectRatio.original => CanvasAspectRatioPreset.original,
-      _CanvasAspectRatio.ratio16x9 => CanvasAspectRatioPreset.ratio16x9,
-      _CanvasAspectRatio.ratio9x16 => CanvasAspectRatioPreset.ratio9x16,
-      _CanvasAspectRatio.ratio1x1 => CanvasAspectRatioPreset.ratio1x1,
-      _CanvasAspectRatio.ratio4x5 => CanvasAspectRatioPreset.ratio4x5,
     };
   }
 
@@ -5296,12 +5383,255 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     );
   }
 
-  Future<void> _pickOverlayMedia() async {
+  Future<void> _openOverlayAddSheet(TimelineTrack preferredTrack) async {
+    final option = await showFixedEditorSheet<_OverlayAddOption>(
+      context: context,
+      title: 'Add overlay',
+      subtitle: 'Add a visual layer at the current playhead',
+      heightFactor: 0.48,
+      builder: (sheetContext) => Column(
+        children: [
+          _buildAddOptionTile(
+            icon: Icons.photo_library_outlined,
+            title: 'Photos',
+            subtitle: 'Choose an image from this device',
+            onTap: () => Navigator.pop(sheetContext, _OverlayAddOption.photos),
+          ),
+          _buildAddOptionTile(
+            icon: Icons.video_library_outlined,
+            title: 'Videos',
+            subtitle: 'Add a video layer with full visual tools',
+            onTap: () => Navigator.pop(sheetContext, _OverlayAddOption.videos),
+          ),
+          _buildAddOptionTile(
+            icon: Icons.category_outlined,
+            title: 'Elements',
+            subtitle: 'GIPHY, stock media, backgrounds and overlays',
+            onTap: () =>
+                Navigator.pop(sheetContext, _OverlayAddOption.elements),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || option == null) return;
+    ref.read(editorProvider.notifier).selectTrack(preferredTrack.id);
+    switch (option) {
+      case _OverlayAddOption.photos:
+        await _pickOverlayMedia(photosOnly: true);
+        break;
+      case _OverlayAddOption.videos:
+        await _pickOverlayMedia(videosOnly: true);
+        break;
+      case _OverlayAddOption.elements:
+        await _openElementsLibrarySheet();
+        break;
+    }
+  }
+
+  Future<void> _openTextAddSheet(TimelineTrack preferredTrack) async {
+    final option = await showFixedEditorSheet<_TextAddOption>(
+      context: context,
+      title: 'Add text',
+      subtitle: 'Create a title or work with timed subtitles',
+      heightFactor: 0.36,
+      builder: (sheetContext) => Column(
+        children: [
+          _buildAddOptionTile(
+            icon: Icons.title_rounded,
+            title: 'Add Text',
+            subtitle: 'Type and style text directly on the canvas',
+            onTap: () => Navigator.pop(sheetContext, _TextAddOption.addText),
+          ),
+          _buildAddOptionTile(
+            icon: Icons.closed_caption_outlined,
+            title: 'Subtitles',
+            subtitle: 'Generate or edit timed subtitles',
+            onTap: () => Navigator.pop(sheetContext, _TextAddOption.subtitles),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || option == null) return;
+    ref.read(editorProvider.notifier).selectTrack(preferredTrack.id);
+    switch (option) {
+      case _TextAddOption.addText:
+        await _addTextClipAtPlayhead(preferredTrackId: preferredTrack.id);
+        break;
+      case _TextAddOption.subtitles:
+        await _handleGenerateSubtitles();
+        break;
+    }
+  }
+
+  Future<void> _openAudioAddSheet(TimelineTrack preferredTrack) async {
+    final option = await showFixedEditorSheet<_AudioAddOption>(
+      context: context,
+      title: 'Add audio',
+      subtitle: 'Add a local sound or open an editor library',
+      heightFactor: 0.48,
+      builder: (sheetContext) => Column(
+        children: [
+          _buildAddOptionTile(
+            icon: Icons.audio_file_outlined,
+            title: 'Select a local track',
+            subtitle: 'Import audio stored on this device',
+            onTap: () =>
+                Navigator.pop(sheetContext, _AudioAddOption.localTrack),
+          ),
+          _buildAddOptionTile(
+            icon: Icons.graphic_eq_rounded,
+            title: 'SFX',
+            subtitle: 'Openverse and optional local sound effects',
+            onTap: () => Navigator.pop(sheetContext, _AudioAddOption.sfx),
+          ),
+          _buildAddOptionTile(
+            icon: Icons.library_music_outlined,
+            title: 'Music',
+            subtitle: 'CaptionCraft music library',
+            badge: 'Soon',
+            onTap: () => Navigator.pop(sheetContext, _AudioAddOption.music),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || option == null) return;
+    ref.read(editorProvider.notifier).selectTrack(preferredTrack.id);
+    switch (option) {
+      case _AudioAddOption.localTrack:
+        await _pickAudioMedia(forceNewTrack: true);
+        break;
+      case _AudioAddOption.sfx:
+        await _openSfxLibrarySheet();
+        break;
+      case _AudioAddOption.music:
+        await _openLibraryPlaceholderSheet(
+          title: 'Music',
+          icon: Icons.library_music_outlined,
+        );
+        break;
+    }
+  }
+
+  Widget _buildAddOptionTile({
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required VoidCallback onTap,
+    String? badge,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Material(
+        color: kSurfaceElevated,
+        borderRadius: BorderRadius.circular(16),
+        child: InkWell(
+          key: ValueKey(
+            'add_option_${title.toLowerCase().replaceAll(' ', '_')}',
+          ),
+          borderRadius: BorderRadius.circular(16),
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+            child: Row(
+              children: [
+                Container(
+                  width: 44,
+                  height: 44,
+                  decoration: BoxDecoration(
+                    color: kAccent.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: kAccent.withValues(alpha: 0.24)),
+                  ),
+                  child: Icon(icon, color: kAccent, size: 22),
+                ),
+                const SizedBox(width: 13),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        style: const TextStyle(
+                          color: kTextPrimary,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        subtitle,
+                        style: const TextStyle(
+                          color: kTextSecondary,
+                          fontSize: 11,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                if (badge != null)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 7,
+                      vertical: 3,
+                    ),
+                    decoration: BoxDecoration(
+                      color: kAccent.withValues(alpha: 0.10),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: Text(
+                      badge,
+                      style: const TextStyle(
+                        color: kAccent,
+                        fontSize: 9,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                const SizedBox(width: 6),
+                const Icon(Icons.chevron_right_rounded, color: kTextSecondary),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openLibraryPlaceholderSheet({
+    required String title,
+    required IconData icon,
+  }) {
+    return showResizableEditorSheet<void>(
+      context: context,
+      title: title,
+      subtitle: 'Library placeholder',
+      initialHeightFactor: 0.32,
+      builder: (_) => SizedBox(
+        height: 120,
+        child: Center(
+          child: Icon(
+            icon,
+            size: 38,
+            color: kTextSecondary.withValues(alpha: 0.38),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _pickOverlayMedia({
+    bool photosOnly = false,
+    bool videosOnly = false,
+  }) async {
     try {
       final result = await FilePicker.platform.pickFiles(
         allowMultiple: false,
         type: FileType.custom,
-        allowedExtensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'mp4', 'mov'],
+        allowedExtensions: photosOnly
+            ? ['png', 'jpg', 'jpeg', 'webp']
+            : videosOnly
+            ? ['mp4', 'mov']
+            : ['png', 'jpg', 'jpeg', 'webp', 'gif', 'mp4', 'mov'],
       );
       if (result == null || result.files.isEmpty) return;
 
@@ -5361,6 +5691,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         label: file.name,
         sourceDuration: sourceDuration,
         metadata: metadata,
+        enableEmbeddedAudio:
+            assetType == EditorAssetType.video && metadata['hasAudio'] == true,
       );
     } catch (error) {
       if (mounted) {
@@ -5372,12 +5704,101 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     }
   }
 
-  Future<void> _pickOverlayMediaForTrack(TimelineTrack track) async {
-    ref.read(editorProvider.notifier).selectTrack(track.id);
-    await _pickOverlayMedia();
+  Future<void> _pickBaseMedia(TimelineTrack targetTrack) async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        allowMultiple: false,
+        type: FileType.custom,
+        allowedExtensions: const [
+          'mp4',
+          'mov',
+          'm4v',
+          'webm',
+          'mkv',
+          'png',
+          'jpg',
+          'jpeg',
+          'webp',
+          'gif',
+        ],
+      );
+      final file = result?.files.firstOrNull;
+      final selectedPath = file?.path;
+      if (file == null || selectedPath == null) return;
+      final filePath = await MediaImportService.persistFile(
+        selectedPath,
+        originalFileName: file.name,
+      );
+      final extension = path.extension(filePath).toLowerCase();
+      final assetType = switch (extension) {
+        '.png' || '.jpg' || '.jpeg' || '.webp' => EditorAssetType.image,
+        '.gif' => EditorAssetType.gif,
+        '.mp4' ||
+        '.mov' ||
+        '.m4v' ||
+        '.webm' ||
+        '.mkv' => EditorAssetType.video,
+        _ => EditorAssetType.unknown,
+      };
+      if (assetType == EditorAssetType.unknown) {
+        throw Exception('This file cannot be used as base-layer media.');
+      }
+      final clipType = switch (assetType) {
+        EditorAssetType.image => TimelineTrackType.image,
+        EditorAssetType.gif => TimelineTrackType.gif,
+        _ => TimelineTrackType.video,
+      };
+      Map<String, dynamic> mediaInfo = const {};
+      if (assetType != EditorAssetType.image) {
+        mediaInfo = await FFmpegService.getMediaInfo(filePath);
+      } else {
+        try {
+          mediaInfo = await FFmpegService.getMediaInfo(filePath);
+        } catch (_) {
+          // Static images have a predictable editable duration even on
+          // platforms where ffprobe does not return stream timing.
+        }
+      }
+      var sourceDuration = Duration(
+        milliseconds: (mediaInfo['durationMs'] as int?) ?? 0,
+      );
+      if (assetType == EditorAssetType.video &&
+          sourceDuration <= Duration.zero) {
+        throw Exception('Could not read the selected video duration.');
+      }
+      if (sourceDuration <= Duration.zero) {
+        sourceDuration = const Duration(seconds: 4);
+      }
+      if (!mounted) return;
+      _insertClipIntoTimeline(
+        section: TimelineTrackSection.baseVideo,
+        assetType: assetType,
+        clipType: clipType,
+        sourcePath: filePath,
+        label: file.name,
+        sourceDuration: sourceDuration,
+        appendToMainTrack: true,
+        preferredTrackId: targetTrack.id,
+        metadata: {
+          'durationMs': mediaInfo['durationMs'],
+          'width': mediaInfo['width'],
+          'height': mediaInfo['height'],
+          'hasAudio': mediaInfo['hasAudio'],
+          'frameRate': mediaInfo['frameRate'],
+        },
+        enableEmbeddedAudio:
+            assetType == EditorAssetType.video && mediaInfo['hasAudio'] == true,
+      );
+    } catch (error) {
+      if (!mounted) return;
+      SnackBarHelper.showError(
+        context,
+        'Could not add base media: ${error.toString().replaceFirst('Exception: ', '')}',
+      );
+    }
   }
 
-  Future<void> _pickAudioMedia() async {
+  Future<void> _pickAudioMedia({bool forceNewTrack = false}) async {
     try {
       final result = await FilePicker.platform.pickFiles(
         allowMultiple: false,
@@ -5414,6 +5835,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           'durationMs': mediaInfo['durationMs'],
           'hasAudio': mediaInfo['hasAudio'],
         },
+        forceNewTrack: forceNewTrack,
       );
     } catch (error) {
       if (mounted) {
@@ -5426,12 +5848,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   Duration _currentCompositionDuration(EditorTimeline timeline) {
-    return timeline.baseVideoDuration > Duration.zero
-        ? timeline.baseVideoDuration
-        : timeline.duration;
+    return timeline.duration;
   }
 
-  void _insertClipIntoTimeline({
+  bool _insertClipIntoTimeline({
     required TimelineTrackSection section,
     required EditorAssetType assetType,
     required TimelineTrackType clipType,
@@ -5441,40 +5861,24 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     required String label,
     required Duration? sourceDuration,
     Map<String, dynamic> metadata = const {},
+    bool forceNewTrack = false,
+    bool reuseExistingTrackIfPresent = false,
+    Duration? requestedStart,
+    bool appendToMainTrack = false,
+    String? preferredTrackId,
+    bool enableEmbeddedAudio = false,
+    ClipFitMode? fitMode,
+    bool chromaKeyEnabled = false,
+    Color chromaKeyColor = const Color(0xFF00FF00),
+    double chromaKeySimilarity = 0.25,
   }) {
     final editorState = ref.read(editorProvider);
     final timeline = editorState.timeline;
-    final existingTrack = _resolveInsertionTrack(timeline, section, clipType);
-    final targetTrack =
-        existingTrack ?? _createOptionalTrack(timeline, section, clipType);
-    if (targetTrack == null) return;
-    if (!targetTrack.acceptsClipType(clipType)) {
-      SnackBarHelper.showInfo(
-        context,
-        'Add or unlock a compatible track before inserting this clip.',
-      );
-      return;
-    }
-    final workingTracks = existingTrack == null
-        ? [...timeline.tracks, targetTrack]
-        : timeline.tracks;
-
-    final playhead = ref.read(playbackProvider).position;
-    final maxDuration = _currentCompositionDuration(timeline);
-    final defaultDuration =
+    final clipDuration =
         sourceDuration == null || sourceDuration == Duration.zero
         ? const Duration(seconds: 4)
         : sourceDuration;
-    final endTime = playhead + defaultDuration > maxDuration
-        ? maxDuration
-        : playhead + defaultDuration;
-    if (endTime <= playhead) {
-      SnackBarHelper.showInfo(
-        context,
-        'Move the playhead earlier to add media.',
-      );
-      return;
-    }
+    final desiredStart = requestedStart ?? ref.read(playbackProvider).position;
 
     final asset = EditorAssetReference(
       type: assetType,
@@ -5484,88 +5888,621 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       isNetworkBacked: isNetworkBacked,
       metadata: metadata,
     );
-    final audioMix =
-        assetType == EditorAssetType.video &&
-            section == TimelineTrackSection.overlay
-        ? const AudioMixSettings(muted: true, volume: 1)
-        : const AudioMixSettings();
+    final compatibleTracks = timeline.tracks
+        .where(
+          (track) =>
+              track.section == section &&
+              !track.isSourceTrack &&
+              !track.isLocked &&
+              track.acceptsClipType(clipType),
+        )
+        .toList();
+    final resolvedPreferredTrackId =
+        preferredTrackId ?? editorState.selectedTrackId;
+    compatibleTracks.sort((a, b) {
+      if (a.id == resolvedPreferredTrackId) return -1;
+      if (b.id == resolvedPreferredTrackId) return 1;
+      return timeline.tracks.indexOf(a).compareTo(timeline.tracks.indexOf(b));
+    });
+
+    TimelineTrack? targetTrack;
+    Duration placementStart = desiredStart < Duration.zero
+        ? Duration.zero
+        : desiredStart;
+    if (!forceNewTrack) {
+      for (final candidate in compatibleTracks) {
+        final candidateStart = appendToMainTrack
+            ? candidate.clips.fold<Duration>(
+                Duration.zero,
+                (latest, clip) => clip.endTime > latest ? clip.endTime : latest,
+              )
+            : placementStart;
+        final probe = TimelineClip(
+          trackId: candidate.id,
+          type: clipType,
+          label: label,
+          startTime: candidateStart,
+          endTime: candidateStart + clipDuration,
+        );
+        if (candidate.canPlaceClip(probe)) {
+          targetTrack = candidate;
+          placementStart = candidateStart;
+          break;
+        }
+      }
+    }
+
+    // Downloads should reuse the editor's existing lane instead of creating a
+    // fresh overlay for every item. If the playhead is occupied, choose the
+    // nearest valid gap in one of the existing compatible lanes.
+    if (targetTrack == null &&
+        reuseExistingTrackIfPresent &&
+        compatibleTracks.isNotEmpty) {
+      final placement = resolveClosestReusableTrackPlacement(
+        tracks: compatibleTracks,
+        clipType: clipType,
+        desiredStart: placementStart,
+        duration: clipDuration,
+      );
+      targetTrack = placement?.track;
+      placementStart = placement?.start ?? placementStart;
+    }
+
+    targetTrack ??= _createOptionalTrack(timeline, section, clipType);
+    if (targetTrack == null) {
+      SnackBarHelper.showInfo(
+        context,
+        'Add or unlock a compatible track before inserting this clip.',
+      );
+      return false;
+    }
+    final resolvedTargetTrack = targetTrack;
+    final isNewTrack = !timeline.tracks.any(
+      (track) => track.id == resolvedTargetTrack.id,
+    );
+    if (appendToMainTrack && resolvedTargetTrack.clips.isNotEmpty) {
+      placementStart = resolvedTargetTrack.clips.fold<Duration>(
+        Duration.zero,
+        (latest, clip) => clip.endTime > latest ? clip.endTime : latest,
+      );
+    }
+    var workingTimeline = isNewTrack
+        ? timeline.insertTrackUsingEditorRules(resolvedTargetTrack)
+        : timeline;
+
+    final audioMix = resolveTimelineInsertionAudioMix(
+      assetType: assetType,
+      section: section,
+      metadata: metadata,
+      enableEmbeddedAudio: enableEmbeddedAudio,
+    );
     final clip = TimelineClip(
-      trackId: targetTrack.id,
+      trackId: resolvedTargetTrack.id,
       type: clipType,
       label: label,
       assetId: asset.id,
-      startTime: playhead,
-      endTime: endTime,
+      startTime: placementStart,
+      endTime: placementStart + clipDuration,
       sourceStartTime: Duration.zero,
-      sourceDuration: sourceDuration ?? (endTime - playhead),
-      fitMode: section == TimelineTrackSection.overlay
-          ? ClipFitMode.contain
-          : ClipFitMode.cover,
+      sourceDuration: sourceDuration ?? clipDuration,
+      fitMode:
+          fitMode ??
+          (section == TimelineTrackSection.overlay
+              ? ClipFitMode.contain
+              : ClipFitMode.cover),
+      chromaKeyEnabled: chromaKeyEnabled,
+      chromaKeyColor: chromaKeyColor,
+      chromaKeySimilarity: chromaKeySimilarity,
       audioMix: audioMix,
+      layer:
+          resolvedTargetTrack.clips.fold<int>(
+            -1,
+            (highest, candidate) => math.max(highest, candidate.layer),
+          ) +
+          1,
     );
 
-    final nextTracks = workingTracks.map((track) {
-      if (track.id != targetTrack.id) return track;
-      return track.copyWith(clips: [...track.clips, clip]);
+    var nextTracks = workingTimeline.tracks.map((track) {
+      if (track.id != resolvedTargetTrack.id) return track;
+      final clips = [...track.clips, clip]
+        ..sort((a, b) => a.startTime.compareTo(b.startTime));
+      return track.copyWith(clips: clips);
     }).toList();
-    final nextTimeline = timeline.copyWith(
+    workingTimeline = workingTimeline.copyWith(
       assets: [...timeline.assets, asset],
       tracks: nextTracks,
     );
 
-    ref.read(editorProvider.notifier).setTimeline(nextTimeline);
-    ref.read(editorProvider.notifier).selectTrack(targetTrack.id);
+    ref.read(editorProvider.notifier).setTimeline(workingTimeline);
+    ref.read(editorProvider.notifier).selectTrack(resolvedTargetTrack.id);
     ref.read(editorProvider.notifier).selectClip(clip.id);
-    SnackBarHelper.showSuccess(context, '$label added at playhead');
+    SnackBarHelper.showSuccess(
+      context,
+      appendToMainTrack ? '$label added to the base layer' : '$label added',
+    );
+    return true;
   }
 
-  Future<void> _openGiphyPickerSheet() async {
-    await showModalBottomSheet(
+  Future<void> _openDiscoverSheet() {
+    return showDiscoverSheet<void>(
+      context: context,
+      onAddToTimeline: _insertDiscoverDownload,
+    );
+  }
+
+  Future<void> _insertDiscoverDownload(DiscoverDownloadItem item) async {
+    final localPath = item.localPath;
+    if (!item.canImport || localPath == null || localPath.trim().isEmpty) {
+      throw StateError(
+        'Finish this download before adding it to the timeline.',
+      );
+    }
+
+    final importer = DiscoverMediaImportService();
+    try {
+      final imported = await importer.importDownload(item, jobId: item.id);
+      if (!mounted) return;
+
+      final playhead = ref.read(playbackProvider).position;
+      final sourceDuration = imported.duration;
+      final section = imported.clipType == TimelineTrackType.audio
+          ? TimelineTrackSection.audio
+          : TimelineTrackSection.overlay;
+
+      final inserted = _insertClipIntoTimeline(
+        section: section,
+        assetType: imported.assetType,
+        clipType: imported.clipType,
+        sourcePath: imported.path,
+        label: imported.label,
+        sourceDuration: sourceDuration,
+        requestedStart: playhead,
+        reuseExistingTrackIfPresent: true,
+        // The video's own audio remains attached to this clip. A separate
+        // audio lane is created only through the explicit editor command.
+        enableEmbeddedAudio:
+            imported.assetType == EditorAssetType.video && imported.hasAudio,
+        metadata: {
+          ...imported.metadata,
+          'discoverDownloadId': item.id,
+          'discoverSource': item.source.name,
+          'discoverSourceUrl': item.sourceUrl,
+          if (item.pageUrl != null) 'discoverPageUrl': item.pageUrl,
+          'downloadMimeType': item.mimeType,
+          'wasTranscoded': imported.wasTranscoded,
+        },
+      );
+      if (!inserted) {
+        throw StateError(
+          'No compatible free timeline lane is available at the playhead.',
+        );
+      }
+    } finally {
+      importer.dispose();
+    }
+  }
+
+  Future<void> _openElementsLibrarySheet() async {
+    await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
-      constraints: BoxConstraints(
-        maxHeight: MediaQuery.sizeOf(context).height * 0.40,
-      ),
       backgroundColor: Colors.transparent,
       barrierColor: Colors.black.withValues(alpha: 0.4),
-      builder: (_) => _GiphyPickerSheet(onSelected: _insertGiphyAsset),
+      builder: (sheetContext) => ElementLibrarySheet(
+        onOnlineAssetSelected: _insertOnlineElementAsset,
+        onPackAssetSelected: _insertPackElementAsset,
+        onClose: () => Navigator.of(sheetContext).pop(),
+      ),
     );
   }
 
-  Future<void> _insertGiphyAsset(GiphyAssetResult result) async {
-    _insertClipIntoTimeline(
-      section: TimelineTrackSection.overlay,
-      assetType: result.isSticker
-          ? EditorAssetType.sticker
-          : EditorAssetType.gif,
-      clipType: result.isSticker
-          ? TimelineTrackType.sticker
-          : TimelineTrackType.gif,
-      label: result.title,
-      sourceDuration: const Duration(seconds: 4),
-      remoteUrl: result.originalUrl,
-      isNetworkBacked: true,
-      metadata: {
-        'previewUrl': result.previewUrl,
-        'giphyId': result.id,
-        'width': result.width,
-        'height': result.height,
-        'provider': 'giphy',
+  Future<void> _openSfxLibrarySheet() async {
+    final downloadCancellation = CancelToken();
+    try {
+      await showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        backgroundColor: Colors.transparent,
+        barrierColor: Colors.black.withValues(alpha: 0.4),
+        builder: (sheetContext) => SfxLibrarySheet(
+          onOnlineAssetSelected: (result) => _insertOnlineSoundEffect(
+            result,
+            cancelToken: downloadCancellation,
+          ),
+          onPackAssetSelected: _insertPackSoundEffect,
+          onClose: () => Navigator.of(sheetContext).pop(),
+        ),
+      );
+    } finally {
+      if (!downloadCancellation.isCancelled) {
+        downloadCancellation.cancel('Sound-effects library closed.');
+      }
+    }
+  }
+
+  Future<void> _insertOnlineSoundEffect(
+    SoundEffectLibraryAsset result, {
+    CancelToken? cancelToken,
+  }) async {
+    Map<String, dynamic>? validatedMediaInfo;
+    final localPath = await RemoteAudioImportService.download(
+      url: result.downloadUrl,
+      provider: result.provider.name,
+      assetId: result.id,
+      suggestedFileName: '${result.id}.${result.fileExtension}',
+      cancelToken: cancelToken,
+      validator: (candidatePath) async {
+        try {
+          final info = await FFmpegService.getMediaInfo(candidatePath);
+          final durationMs = (info['durationMs'] as int?) ?? 0;
+          final valid = durationMs > 0 && info['hasAudio'] == true;
+          if (valid) validatedMediaInfo = info;
+          return valid;
+        } catch (_) {
+          return false;
+        }
       },
     );
+    if (!mounted || cancelToken?.isCancelled == true) return;
+    final mediaInfo = validatedMediaInfo;
+    if (mediaInfo == null) {
+      throw Exception('Could not validate the selected sound effect.');
+    }
+    final probedDuration = Duration(
+      milliseconds: (mediaInfo['durationMs'] as int?) ?? 0,
+    );
+    final sourceDuration = probedDuration > Duration.zero
+        ? probedDuration
+        : result.duration;
+    if (sourceDuration == null ||
+        sourceDuration <= Duration.zero ||
+        mediaInfo['hasAudio'] != true) {
+      throw Exception('Could not read the selected sound-effect duration.');
+    }
+    if (!mounted || cancelToken?.isCancelled == true) return;
+
+    final inserted = _insertClipIntoTimeline(
+      section: TimelineTrackSection.audio,
+      assetType: EditorAssetType.audio,
+      clipType: TimelineTrackType.audio,
+      label: result.title,
+      sourcePath: localPath,
+      sourceDuration: sourceDuration,
+      forceNewTrack: true,
+      metadata: {
+        'durationMs': sourceDuration.inMilliseconds,
+        'hasAudio': true,
+        'provider': result.provider.name,
+        'providerAssetId': result.id,
+        'sourceName': result.sourceName,
+        'sourcePageUrl': result.sourcePageUrl,
+        'creatorName': result.creatorName,
+        'creatorPageUrl': result.creatorPageUrl,
+        'license': result.licenseCode,
+        'licenseVersion': result.licenseVersion,
+        'licenseUrl': result.licenseUrl,
+        'attribution': result.attribution,
+        'tags': result.tags,
+      },
+    );
+    if (!inserted) {
+      throw Exception(
+        'Could not place this sound effect at the current playhead.',
+      );
+    }
   }
 
-  Future<void> _addTextClipAtPlayhead() async {
-    final enteredText = await _showTextClipDialog();
-    if (enteredText == null || enteredText.trim().isEmpty) return;
+  Future<void> _insertPackSoundEffect(AssetPackCatalogItem result) async {
+    if (result.mediaKind != AssetPackMediaKind.audio) {
+      throw Exception('This local library item is not an audio file.');
+    }
+    final mediaFile = File(result.localPath);
+    if (!await mediaFile.exists()) {
+      throw Exception(
+        'This downloaded sound effect is missing. Download the pack again.',
+      );
+    }
 
+    var sourceDuration = result.duration;
+    var hasAudio = result.hasAudio;
+    if (sourceDuration == null || sourceDuration <= Duration.zero) {
+      final mediaInfo = await FFmpegService.getMediaInfo(result.localPath);
+      sourceDuration = Duration(
+        milliseconds: (mediaInfo['durationMs'] as int?) ?? 0,
+      );
+      hasAudio = mediaInfo['hasAudio'] == true;
+    }
+    if (sourceDuration <= Duration.zero) {
+      throw Exception('Could not read this sound-effect duration.');
+    }
+    final projectMediaPath = await MediaImportService.persistFile(
+      result.localPath,
+      originalFileName: path.basename(result.localPath),
+      forceCopy: true,
+      stableCacheKey:
+          'pack_${result.packId}_${result.packVersion}_${result.id}',
+    );
+
+    final inserted = _insertClipIntoTimeline(
+      section: TimelineTrackSection.audio,
+      assetType: EditorAssetType.audio,
+      clipType: TimelineTrackType.audio,
+      label: result.title,
+      sourcePath: projectMediaPath,
+      sourceDuration: sourceDuration,
+      forceNewTrack: true,
+      metadata: {
+        ...result.metadata,
+        'provider': 'captionCraft',
+        'packId': result.packId,
+        'packVersion': result.packVersion,
+        'libraryAssetId': result.id,
+        'relativePath': result.relativePath,
+        'categoryId': result.categoryId,
+        'categoryName': result.categoryName,
+        'durationMs': sourceDuration.inMilliseconds,
+        'hasAudio': hasAudio,
+        'tags': result.tags,
+      },
+    );
+    if (!inserted) {
+      throw Exception(
+        'Could not place this sound effect at the current playhead.',
+      );
+    }
+  }
+
+  Future<void> _insertOnlineElementAsset(ElementLibraryAsset result) async {
+    final isGiphy = result.provider == ElementLibraryProvider.giphy;
+    final isSticker = result.subtype == ElementLibraryAssetSubtype.sticker;
+    if (isGiphy) {
+      final localPath = await RemoteMediaImportService.download(
+        url: result.downloadUrl,
+        provider: result.provider.name,
+        assetId: result.id,
+        isVideo: false,
+        suggestedFileName: Uri.tryParse(result.downloadUrl)?.path,
+      );
+      var animationDuration = const Duration(seconds: 4);
+      try {
+        final mediaInfo = await FFmpegService.getMediaInfo(localPath);
+        final durationMs = mediaInfo['durationMs'] as int?;
+        if (durationMs != null && durationMs > 0) {
+          animationDuration = Duration(milliseconds: durationMs);
+        }
+      } catch (_) {
+        // Some animated image decoders do not expose a duration. A four-second
+        // editable placement remains a predictable fallback.
+      }
+      final inserted = _insertClipIntoTimeline(
+        section: TimelineTrackSection.overlay,
+        assetType: isSticker ? EditorAssetType.sticker : EditorAssetType.gif,
+        clipType: isSticker ? TimelineTrackType.sticker : TimelineTrackType.gif,
+        label: result.title,
+        sourceDuration: animationDuration,
+        sourcePath: localPath,
+        metadata: {
+          'previewUrl': result.previewUrl,
+          'providerOriginalUrl': result.downloadUrl,
+          'providerAssetId': result.id,
+          'width': result.width,
+          'height': result.height,
+          'durationMs': animationDuration.inMilliseconds,
+          'provider': result.provider.name,
+          'subtype': result.subtype.name,
+          'attribution': result.attribution,
+          'sourcePageUrl': result.sourcePageUrl,
+        },
+      );
+      if (!inserted) {
+        throw Exception(
+          'Could not place this element at the current playhead.',
+        );
+      }
+      return;
+    }
+
+    final isVideo = result.mediaKind == ElementLibraryMediaKind.video;
+    final localPath = await RemoteMediaImportService.download(
+      url: result.downloadUrl,
+      provider: result.provider.name,
+      assetId: result.id,
+      isVideo: isVideo,
+    );
+    var sourceDuration = result.duration;
+    var width = result.width;
+    var height = result.height;
+    var hasAudio = false;
+    if (isVideo) {
+      final mediaInfo = await FFmpegService.getMediaInfo(localPath);
+      if (sourceDuration == null || sourceDuration <= Duration.zero) {
+        sourceDuration = Duration(
+          milliseconds: (mediaInfo['durationMs'] as int?) ?? 0,
+        );
+      }
+      width ??= mediaInfo['width'] as int?;
+      height ??= mediaInfo['height'] as int?;
+      hasAudio = mediaInfo['hasAudio'] == true;
+    }
+    if (isVideo &&
+        (sourceDuration == null || sourceDuration <= Duration.zero)) {
+      throw Exception('Could not read the selected video duration.');
+    }
+    final inserted = _insertClipIntoTimeline(
+      section: TimelineTrackSection.overlay,
+      assetType: isVideo ? EditorAssetType.video : EditorAssetType.image,
+      clipType: isVideo ? TimelineTrackType.video : TimelineTrackType.image,
+      label: result.title,
+      sourcePath: localPath,
+      sourceDuration: sourceDuration,
+      metadata: {
+        'previewUrl': result.previewUrl,
+        'providerAssetId': result.id,
+        'width': width,
+        'height': height,
+        'durationMs': sourceDuration?.inMilliseconds,
+        'hasAudio': hasAudio,
+        'provider': result.provider.name,
+        'subtype': result.subtype.name,
+        'attribution': result.attribution,
+        'sourcePageUrl': result.sourcePageUrl,
+        'creatorId': result.creatorId,
+        'creatorName': result.creatorName,
+        'creatorPageUrl': result.creatorPageUrl,
+      },
+      enableEmbeddedAudio: isVideo && hasAudio,
+    );
+    if (!inserted) {
+      throw Exception('Could not place this element at the current playhead.');
+    }
+  }
+
+  Future<void> _insertPackElementAsset(AssetPackCatalogItem result) async {
+    final mediaFile = File(result.localPath);
+    if (!await mediaFile.exists()) {
+      throw Exception(
+        'This downloaded pack item is missing. Download it again.',
+      );
+    }
+    final isVideo = result.mediaKind == AssetPackMediaKind.video;
+    var sourceDuration = result.duration;
+    var width = result.width;
+    var height = result.height;
+    var hasAudio = result.hasAudio;
+    if (isVideo &&
+        (sourceDuration == null || sourceDuration <= Duration.zero)) {
+      final mediaInfo = await FFmpegService.getMediaInfo(result.localPath);
+      sourceDuration = Duration(
+        milliseconds: (mediaInfo['durationMs'] as int?) ?? 0,
+      );
+      width ??= mediaInfo['width'] as int?;
+      height ??= mediaInfo['height'] as int?;
+      hasAudio = mediaInfo['hasAudio'] == true;
+    }
+    if (isVideo &&
+        (sourceDuration == null || sourceDuration <= Duration.zero)) {
+      throw Exception('Could not read this pack video duration.');
+    }
+    final projectMediaPath = await MediaImportService.persistFile(
+      result.localPath,
+      originalFileName: path.basename(result.localPath),
+      forceCopy: true,
+      stableCacheKey:
+          'pack_${result.packId}_${result.packVersion}_${result.id}',
+    );
+
+    final compositing = result.metadata['compositing'];
+    final compositingMap = compositing is Map
+        ? Map<String, dynamic>.from(compositing)
+        : const <String, dynamic>{};
+    final chromaValue = compositingMap['chromaKey'];
+    final chromaMap = chromaValue is Map
+        ? Map<String, dynamic>.from(chromaValue)
+        : const <String, dynamic>{};
+    final compositingMode = compositingMap['mode'];
+    final chromaKeyEnabled =
+        compositingMode == 'chromaKey' ||
+        compositingMode == 'screen' ||
+        result.relativePath.toLowerCase().contains('green-screen');
+    final similarity =
+        (chromaMap['similarity'] as num?)?.toDouble() ??
+        (compositingMap['similarity'] as num?)?.toDouble();
+    final defaultKeyColor = compositingMode == 'screen'
+        ? const Color(0xFF000000)
+        : const Color(0xFF00FF00);
+    final fitMode = result.packId == 'background-videos'
+        ? ClipFitMode.cover
+        : ClipFitMode.contain;
+    final inserted = _insertClipIntoTimeline(
+      section: TimelineTrackSection.overlay,
+      assetType: isVideo ? EditorAssetType.video : EditorAssetType.image,
+      clipType: isVideo ? TimelineTrackType.video : TimelineTrackType.image,
+      label: result.title,
+      sourcePath: projectMediaPath,
+      sourceDuration: sourceDuration,
+      fitMode: fitMode,
+      chromaKeyEnabled: chromaKeyEnabled,
+      chromaKeyColor: _parseCatalogColor(
+        chromaMap['color'] ?? compositingMap['keyColor'],
+        fallback: defaultKeyColor,
+      ),
+      chromaKeySimilarity:
+          (similarity ?? (compositingMode == 'screen' ? 0.12 : 0.25))
+              .clamp(0.01, 1)
+              .toDouble(),
+      metadata: {
+        ...result.metadata,
+        'provider': 'captionCraft',
+        'packId': result.packId,
+        'packVersion': result.packVersion,
+        'libraryAssetId': result.id,
+        'relativePath': result.relativePath,
+        'previewPath': result.previewRelativePath,
+        'categoryId': result.categoryId,
+        'categoryName': result.categoryName,
+        'width': width,
+        'height': height,
+        'durationMs': sourceDuration?.inMilliseconds,
+        'hasAudio': hasAudio,
+      },
+      enableEmbeddedAudio: isVideo && hasAudio,
+    );
+    if (!inserted) {
+      throw Exception('Could not place this element at the current playhead.');
+    }
+  }
+
+  Color _parseCatalogColor(dynamic value, {required Color fallback}) {
+    if (value is int) return Color(value);
+    if (value is! String) return fallback;
+    final normalized = value.trim().replaceFirst('#', '');
+    final parsed = int.tryParse(normalized, radix: 16);
+    if (parsed == null) return fallback;
+    return Color(normalized.length <= 6 ? 0xFF000000 | parsed : parsed);
+  }
+
+  Future<void> _addTextClipAtPlayhead({String? preferredTrackId}) async {
     final editorState = ref.read(editorProvider);
     final timeline = editorState.timeline;
-    final existingTrack = _resolveInsertionTrack(
-      timeline,
-      TimelineTrackSection.textSubtitle,
-      TimelineTrackType.text,
+    final playhead = ref.read(playbackProvider).position;
+    final maxDuration = _currentCompositionDuration(timeline);
+    final endTime = (playhead + const Duration(seconds: 4)) > maxDuration
+        ? maxDuration
+        : playhead + const Duration(seconds: 4);
+    if (endTime <= playhead) {
+      SnackBarHelper.showInfo(
+        context,
+        'Add an image or video before adding text here.',
+      );
+      return;
+    }
+    final preferredId = preferredTrackId ?? editorState.selectedTrackId;
+    final candidates =
+        timeline.tracks
+            .where(
+              (track) =>
+                  track.section == TimelineTrackSection.textSubtitle &&
+                  !track.isLocked &&
+                  track.acceptsClipType(TimelineTrackType.text),
+            )
+            .toList()
+          ..sort((a, b) {
+            if (a.id == preferredId) return -1;
+            if (b.id == preferredId) return 1;
+            return timeline.tracks
+                .indexOf(a)
+                .compareTo(timeline.tracks.indexOf(b));
+          });
+    final probe = TimelineClip(
+      trackId: '',
+      type: TimelineTrackType.text,
+      label: 'Text',
+      startTime: playhead,
+      endTime: endTime,
     );
+    final existingTrack = candidates
+        .where((track) => track.canPlaceClip(probe.copyWith(trackId: track.id)))
+        .firstOrNull;
     final targetTrack =
         existingTrack ??
         _createOptionalTrack(
@@ -5582,27 +6519,14 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       return;
     }
     final workingTracks = existingTrack == null
-        ? [...timeline.tracks, targetTrack]
+        ? timeline.insertTrackUsingEditorRules(targetTrack).tracks
         : timeline.tracks;
-
-    final playhead = ref.read(playbackProvider).position;
-    final maxDuration = _currentCompositionDuration(timeline);
-    final endTime = (playhead + const Duration(seconds: 4)) > maxDuration
-        ? maxDuration
-        : playhead + const Duration(seconds: 4);
-    if (endTime <= playhead) {
-      SnackBarHelper.showInfo(
-        context,
-        'Move the playhead earlier to add text.',
-      );
-      return;
-    }
 
     final clip = TimelineClip(
       trackId: targetTrack.id,
       type: TimelineTrackType.text,
-      label: enteredText.trim(),
-      text: enteredText.trim(),
+      label: 'Text',
+      text: 'Text',
       startTime: playhead,
       endTime: endTime,
       subtitleStyle: const SubtitleStyleModel(
@@ -5611,6 +6535,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         maxWidthFactor: 0.75,
       ),
       fitMode: ClipFitMode.contain,
+      layer:
+          targetTrack.clips.fold<int>(
+            -1,
+            (highest, candidate) => math.max(highest, candidate.layer),
+          ) +
+          1,
     );
 
     final nextTracks = workingTracks.map((track) {
@@ -5623,7 +6553,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         .setTimeline(timeline.copyWith(tracks: nextTracks));
     ref.read(editorProvider.notifier).selectTrack(targetTrack.id);
     ref.read(editorProvider.notifier).selectClip(clip.id);
-    SnackBarHelper.showSuccess(context, 'Text clip added at playhead');
+    await _openTextClipEditor(clip, isNew: true);
   }
 
   Future<void> _editTextClip(TimelineClip clip) async {
@@ -5631,21 +6561,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final currentState = ref.read(editorProvider);
     final currentTrack = _trackForClip(clip, currentState);
     if (currentTrack == null || currentTrack.isLocked) return;
-    final enteredText = await _showTextClipDialog(
-      initialValue: clip.text ?? '',
-    );
-    if (enteredText == null || enteredText.trim().isEmpty) return;
-
-    final editorState = ref.read(editorProvider);
-    final liveClip = _clipById(clip.id, editorState);
-    final liveTrack = _trackForClip(liveClip, editorState);
-    if (liveClip == null || liveTrack == null || liveTrack.isLocked) return;
-    _updateTimelineClip(
-      liveClip,
-      (current) =>
-          current.copyWith(label: enteredText.trim(), text: enteredText.trim()),
-    );
-    SnackBarHelper.showSuccess(context, 'Text updated');
+    await _openTextClipEditor(clip);
   }
 
   Future<void> _openClipAnimationSheetForSelection(TimelineClip clip) async {
@@ -5655,109 +6571,123 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     await _openClipAnimationSheet(clip, track);
   }
 
-  Future<String?> _showTextClipDialog({String initialValue = ''}) async {
-    final controller = TextEditingController(text: initialValue);
+  Future<void> _openTextClipEditor(
+    TimelineClip originalClip, {
+    bool isNew = false,
+  }) async {
+    final scaffold = _scaffoldKey.currentState;
+    if (scaffold == null) return;
+    final previousSheet = _textEditorSheetController;
+    if (previousSheet != null) {
+      previousSheet.close();
+      await previousSheet.closed;
+      if (!mounted) return;
+    }
+
+    final controller = TextEditingController(
+      text: originalClip.text ?? originalClip.label,
+    );
+    if (isNew) {
+      controller.selection = TextSelection(
+        baseOffset: 0,
+        extentOffset: controller.text.length,
+      );
+    }
     final focusNode = FocusNode();
-    final result = await showModalBottomSheet<String>(
-      context: context,
-      isScrollControlled: true,
-      constraints: BoxConstraints(
-        maxHeight: MediaQuery.sizeOf(context).height * 0.40,
+    var liveStyle =
+        originalClip.subtitleStyle ??
+        const SubtitleStyleModel(
+          position: SubtitlePosition.center,
+          fontSize: 32,
+          maxWidthFactor: 0.75,
+        );
+    var keepChanges = true;
+    var gestureOpen = true;
+    var isClosing = false;
+    final editorNotifier = ref.read(editorProvider.notifier);
+    editorNotifier.beginTimelineGestureEdit();
+
+    void updateClip({String? text, SubtitleStyleModel? style}) {
+      final liveClip = _clipById(originalClip.id, ref.read(editorProvider));
+      if (liveClip == null) return;
+      final nextText = text ?? liveClip.text ?? liveClip.label;
+      _updateTimelineClip(
+        liveClip,
+        (current) => current.copyWith(
+          label: nextText.trim().isEmpty ? 'Text' : nextText.trim(),
+          text: nextText,
+          subtitleStyle: style ?? current.subtitleStyle ?? liveStyle,
+        ),
+        recordHistory: false,
+      );
+    }
+
+    late PersistentBottomSheetController sheetController;
+    void closeSheet() {
+      if (isClosing) return;
+      isClosing = true;
+      focusNode.unfocus();
+      sheetController.close();
+    }
+
+    sheetController = scaffold.showBottomSheet(
+      (sheetContext) => TextClipEditorSheet(
+        key: ValueKey('text_editor_sheet_${originalClip.id}'),
+        title: isNew ? 'Add text' : 'Edit text',
+        controller: controller,
+        focusNode: focusNode,
+        initialStyle: liveStyle,
+        autofocus: isNew,
+        onTextChanged: (value) => updateClip(text: value),
+        onStyleChanged: (style) {
+          liveStyle = style;
+          updateClip(style: style);
+        },
+        onDone: closeSheet,
+        onCancel: () {
+          keepChanges = false;
+          closeSheet();
+        },
       ),
       backgroundColor: Colors.transparent,
-      builder: (sheetContext) {
-        final viewInsets = MediaQuery.of(sheetContext).viewInsets;
-        return Padding(
-          padding: EdgeInsets.only(bottom: viewInsets.bottom),
-          child: Container(
-            decoration: const BoxDecoration(
-              color: kSurface,
-              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-            ),
-            padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Center(
-                  child: Container(
-                    width: 44,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: kBorder,
-                      borderRadius: BorderRadius.circular(999),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 14),
-                Text(
-                  initialValue.isEmpty ? 'Add Text Clip' : 'Edit Text Clip',
-                  style: TextStyle(
-                    color: kTextPrimary,
-                    fontSize: 18,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: controller,
-                  focusNode: focusNode,
-                  autofocus: true,
-                  maxLines: 5,
-                  minLines: 3,
-                  style: TextStyle(color: kTextPrimary),
-                  decoration: InputDecoration(
-                    hintText: 'Type your text',
-                    hintStyle: TextStyle(color: kTextSecondary),
-                    filled: true,
-                    fillColor: kSurfaceElevated,
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: const BorderSide(color: kBorder),
-                    ),
-                    enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: const BorderSide(color: kBorder),
-                    ),
-                    focusedBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: const BorderSide(color: kAccent),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 14),
-                Row(
-                  children: [
-                    Expanded(
-                      child: OutlinedButton(
-                        onPressed: () {
-                          focusNode.unfocus();
-                          Navigator.of(sheetContext).pop();
-                        },
-                        child: const Text('Cancel'),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: ElevatedButton(
-                        onPressed: () {
-                          focusNode.unfocus();
-                          Navigator.of(sheetContext).pop(controller.text);
-                        },
-                        child: const Text('Save'),
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        );
-      },
+      elevation: 0,
+      enableDrag: false,
     );
-    focusNode.dispose();
-    controller.dispose();
-    return result;
+    _textEditorSheetController = sheetController;
+    await sheetController.closed;
+    if (identical(_textEditorSheetController, sheetController)) {
+      _textEditorSheetController = null;
+    }
+
+    if (!keepChanges || controller.text.trim().isEmpty) {
+      final liveClip = _clipById(originalClip.id, ref.read(editorProvider));
+      if (liveClip != null) {
+        if (isNew) {
+          _deleteClip(liveClip);
+        } else {
+          _updateTimelineClip(
+            liveClip,
+            (_) => originalClip,
+            recordHistory: false,
+          );
+        }
+      }
+    }
+    if (gestureOpen) {
+      gestureOpen = false;
+      editorNotifier.endTimelineGestureEdit();
+    }
+    // `PersistentBottomSheetController.closed` can complete during the same
+    // frame in which the route removes its TextField. Dispose input objects on
+    // the next frame so the departing focus/animation widgets never observe a
+    // disposed notifier.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      focusNode.dispose();
+      controller.dispose();
+    });
+    if (mounted && keepChanges && !isNew) {
+      SnackBarHelper.showSuccess(context, 'Text updated');
+    }
   }
 
   void _updateSelectedClipTransition({
@@ -5805,16 +6735,15 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     bool? normalize,
   }) {
     final editorState = ref.read(editorProvider);
-    final track = _trackForClip(clip, editorState);
-    if (track == null ||
-        track.isLocked ||
-        !editorState.timeline.clipHasAudio(clip)) {
+    if (!editorState.timeline.clipHasAudio(clip)) {
       return;
     }
+    final owner = _audioOwnerForClip(editorState.timeline, clip);
+    if (owner == null || owner.track.isLocked) return;
     final nextTracks = editorState.timeline.tracks.map((track) {
       final nextClips = track.clips
           .map(
-            (candidate) => candidate.id == clip.id
+            (candidate) => candidate.id == owner.clip.id
                 ? candidate.copyWith(
                     audioMix: candidate.audioMix.copyWith(
                       muted: muted ?? candidate.audioMix.muted,
@@ -5836,19 +6765,6 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         .setTimeline(editorState.timeline.copyWith(tracks: nextTracks));
   }
 
-  TimelineTrack? _resolveInsertionTrack(
-    EditorTimeline timeline,
-    TimelineTrackSection section,
-    TimelineTrackType clipType,
-  ) {
-    final editorState = ref.read(editorProvider);
-    return timeline.insertionTrackFor(
-      section: section,
-      clipType: clipType,
-      preferredTrackId: editorState.selectedTrackId,
-    );
-  }
-
   TimelineTrack? _createOptionalTrack(
     EditorTimeline timeline,
     TimelineTrackSection section,
@@ -5861,18 +6777,31 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         clipType == TimelineTrackType.text ||
             clipType == TimelineTrackType.subtitle,
       TimelineTrackSection.audio => clipType == TimelineTrackType.audio,
-      TimelineTrackSection.baseVideo => false,
+      TimelineTrackSection.baseVideo => clipType.isVisualMedia,
     };
     if (!isCompatibleType) return null;
 
     final name = switch (clipType) {
-      TimelineTrackType.effect =>
-        'Effects ${timeline.tracks.where((track) => track.type == clipType).length + 1}',
+      TimelineTrackType.effect => timeline.nextTrackNameForSection(
+        TimelineTrackSection.overlay,
+      ),
       TimelineTrackType.subtitle =>
         'Subtitles ${timeline.tracks.where((track) => track.type == clipType).length + 1}',
+      TimelineTrackType.video ||
+      TimelineTrackType.image ||
+      TimelineTrackType.gif ||
+      TimelineTrackType.sticker
+          when section == TimelineTrackSection.baseVideo =>
+        'Base layer',
       _ => timeline.nextTrackNameForSection(section),
     };
-    return TimelineTrack(name: name, type: clipType, section: section);
+    return TimelineTrack(
+      name: name,
+      type: clipType == TimelineTrackType.effect
+          ? TimelineTrackType.video
+          : clipType,
+      section: section,
+    );
   }
 
   _SelectionCapabilities _selectionCapabilitiesFor(
@@ -5885,7 +6814,6 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         selectedTrack != null &&
         !selectedTrack.isLocked;
     final canVisualEffects = canEdit && selectedClip.supportsVisualEffects;
-    final canTransform = canEdit && selectedClip.supportsVisualEffects;
     final canAnimate = canEdit && selectedClip.supportsClipAnimation;
     final canTransition =
         canEdit &&
@@ -5907,11 +6835,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         selectedClip.effectKind == TimelineEffectKind.blur;
 
     return _SelectionCapabilities(
-      hasSelection: selectedClip != null,
       canEdit: canEdit,
       canAdjustAudio: canAdjustAudio,
       canVisualEffects: canVisualEffects,
-      canTransform: canTransform,
       canAnimate: canAnimate,
       canTransition: canTransition,
       canArrange: canArrange,
@@ -5921,66 +6847,28 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     );
   }
 
-  bool _isCategoryAvailable(
-    _BottomActionCategory category,
-    _SelectionCapabilities capabilities,
-  ) {
-    if (!capabilities.hasSelection) return true;
-    return switch (category) {
-      _BottomActionCategory.add || _BottomActionCategory.canvas => true,
-      _BottomActionCategory.edit => capabilities.canEdit,
-      _BottomActionCategory.effects => capabilities.canUseEffects,
-      _BottomActionCategory.audio => capabilities.canAdjustAudio,
-    };
-  }
-
-  bool _isSubgroupAvailable(
-    _BottomActionSubgroup subgroup,
-    _SelectionCapabilities capabilities,
-  ) {
-    if (!capabilities.hasSelection) return true;
-    return switch (subgroup) {
-      _BottomActionSubgroup.addMedia ||
-      _BottomActionSubgroup.addText ||
-      _BottomActionSubgroup.addTracks ||
-      _BottomActionSubgroup.canvasFormat ||
-      _BottomActionSubgroup.canvasGuides ||
-      _BottomActionSubgroup.canvasStudio => true,
-      _BottomActionSubgroup.editTiming => capabilities.canEdit,
-      _BottomActionSubgroup.editTransform => capabilities.canVisualEffects,
-      _BottomActionSubgroup.editArrange => capabilities.canArrange,
-      _BottomActionSubgroup.effectsLooks => capabilities.canUseLooks,
-      _BottomActionSubgroup.effectsBlur => capabilities.canUseBlur,
-      _BottomActionSubgroup.effectsMotion => capabilities.canUseMotion,
-      _BottomActionSubgroup.audioMix ||
-      _BottomActionSubgroup.audioFades ||
-      _BottomActionSubgroup.audioEnhance => capabilities.canAdjustAudio,
-    };
-  }
-
   Widget _buildBottomQuickActions(
     BuildContext context,
     TimelineClip? selectedClip,
   ) {
+    final bottomInset = MediaQuery.viewPaddingOf(context).bottom;
     final editorState = ref.read(editorProvider);
     final capabilities = _selectionCapabilitiesFor(editorState, selectedClip);
-    final requestedCategory = _activeBottomCategory;
-    final activeCategory =
-        requestedCategory != null &&
-            _isCategoryAvailable(requestedCategory, capabilities)
-        ? requestedCategory
-        : null;
+    final activeCategory = _activeBottomCategory;
     final requestedSubgroup = _activeBottomSubgroup;
     final activeSubgroup =
         activeCategory != null &&
             requestedSubgroup != null &&
-            _isSubgroupAvailable(requestedSubgroup, capabilities)
+            _subgroupsFor(
+              activeCategory,
+            ).any((subgroup) => subgroup.$1 == requestedSubgroup)
         ? requestedSubgroup
         : null;
 
     return Container(
-      height: 64,
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      key: const ValueKey('editor_tool_dock'),
+      height: _editorDockContentHeight + bottomInset,
+      padding: EdgeInsets.fromLTRB(8, 8, 8, 8 + bottomInset),
       decoration: const BoxDecoration(
         color: kSurface,
         border: Border(top: BorderSide(color: kBorder)),
@@ -5990,11 +6878,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         switchInCurve: Curves.easeOutCubic,
         switchOutCurve: Curves.easeInCubic,
         transitionBuilder: (child, animation) {
-          final isCategoryRow = child.key == const ValueKey('categories');
+          final returningHome = child.key == const ValueKey('categories');
           final offset = Tween<Offset>(
-            begin: isCategoryRow
-                ? const Offset(-0.18, 0)
-                : const Offset(0.18, 0),
+            begin: returningHome
+                ? const Offset(-0.16, 0)
+                : const Offset(0.16, 0),
             end: Offset.zero,
           ).animate(animation);
           return FadeTransition(
@@ -6003,135 +6891,137 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           );
         },
         child: activeCategory == null
-            ? _buildCategoryRow(capabilities)
+            ? _buildDockCategoryRow()
             : activeSubgroup == null
-            ? _buildSubgroupRow(activeCategory, capabilities)
-            : _buildToolRow(
-                subgroup: activeSubgroup,
-                selectedClip: selectedClip,
-                capabilities: capabilities,
+            ? _buildDockSubgroupRow(activeCategory, selectedClip, capabilities)
+            : _buildDockToolRow(
+                activeSubgroup,
+                editorState,
+                selectedClip,
+                capabilities,
               ),
       ),
     );
   }
 
-  Widget _buildCategoryRow(_SelectionCapabilities capabilities) {
-    final categories = [
-      _ActionSpec(
-        label: 'Add',
-        tooltip: 'Add media, text and tracks',
-        icon: Icons.add_circle_outline_rounded,
-        onTap: () => setState(() {
-          _activeBottomCategory = _BottomActionCategory.add;
-          _activeBottomSubgroup = null;
-        }),
+  double _editorDockHeightFor(BuildContext context) {
+    return _editorDockContentHeight + MediaQuery.viewPaddingOf(context).bottom;
+  }
+
+  Widget _buildDockCategoryRow() {
+    const categories = [
+      (
+        _BottomActionCategory.edit,
+        'Edit',
+        'Timing, transform and clip details',
+        Icons.content_cut_rounded,
       ),
-      _ActionSpec(
-        label: 'Edit',
-        tooltip: 'Timing, transform and arrange',
-        icon: Icons.content_cut_rounded,
-        onTap: _isCategoryAvailable(_BottomActionCategory.edit, capabilities)
-            ? () => setState(() {
-                _activeBottomCategory = _BottomActionCategory.edit;
-                _activeBottomSubgroup = null;
-              })
-            : null,
+      (
+        _BottomActionCategory.effects,
+        'Effects',
+        'Color, blur, motion and keyframes',
+        Icons.auto_fix_high_rounded,
       ),
-      _ActionSpec(
-        label: 'Effects',
-        tooltip: 'Looks, blur and motion',
-        icon: Icons.auto_fix_high_rounded,
-        onTap: _isCategoryAvailable(_BottomActionCategory.effects, capabilities)
-            ? () => setState(() {
-                _activeBottomCategory = _BottomActionCategory.effects;
-                _activeBottomSubgroup = null;
-              })
-            : null,
+      (
+        _BottomActionCategory.audio,
+        'Audio',
+        'Mix, cleanup and automation',
+        Icons.graphic_eq_rounded,
       ),
-      _ActionSpec(
-        label: 'Audio',
-        tooltip: 'Mix, fades and enhancement',
-        icon: Icons.graphic_eq_rounded,
-        onTap: _isCategoryAvailable(_BottomActionCategory.audio, capabilities)
-            ? () => setState(() {
-                _activeBottomCategory = _BottomActionCategory.audio;
-                _activeBottomSubgroup = null;
-              })
-            : null,
+      (
+        _BottomActionCategory.text,
+        'Text',
+        'Text objects and captions',
+        Icons.title_rounded,
       ),
-      _ActionSpec(
-        label: 'Canvas',
-        tooltip: 'Format, guides and studio tools',
-        icon: Icons.aspect_ratio_rounded,
-        onTap: () => setState(() {
-          _activeBottomCategory = _BottomActionCategory.canvas;
-          _activeBottomSubgroup = null;
-        }),
+      (
+        _BottomActionCategory.timeline,
+        'Timeline',
+        'Selection, tracks, markers and project setup',
+        Icons.view_timeline_rounded,
+      ),
+      (
+        _BottomActionCategory.canvas,
+        'Canvas',
+        'Open canvas format, background and guides',
+        Icons.aspect_ratio_rounded,
+      ),
+      (
+        _BottomActionCategory.studio,
+        'Studio',
+        'Open Creator Lab publishing workflows',
+        Icons.auto_awesome_rounded,
+      ),
+      (
+        _BottomActionCategory.discover,
+        'Discover',
+        'Find and download media without leaving the editor',
+        Icons.travel_explore_rounded,
       ),
     ];
     return _buildActionScroller(
       key: const ValueKey('categories'),
-      actions: categories,
-      spread: true,
+      // Keep comfortable touch targets and let the existing horizontal
+      // scroller reveal the remaining categories on narrow screens.
+      actions: [
+        for (final category in categories)
+          _ActionSpec(
+            key: ValueKey('dock_category_${category.$1.name}'),
+            width: 72,
+            group: 'Categories',
+            label: category.$2,
+            tooltip: category.$3,
+            icon: category.$4,
+            onTap: category.$1 == _BottomActionCategory.canvas
+                ? _openCanvasSettingsSheet
+                : category.$1 == _BottomActionCategory.studio
+                ? _openCreatorLab
+                : category.$1 == _BottomActionCategory.discover
+                ? _openDiscoverSheet
+                : () => setState(() {
+                    _activeBottomCategory = category.$1;
+                    _activeBottomSubgroup = null;
+                  }),
+          ),
+      ],
     );
   }
 
-  Widget _buildSubgroupRow(
+  List<(_BottomActionSubgroup, String, String, IconData)> _subgroupsFor(
     _BottomActionCategory category,
-    _SelectionCapabilities capabilities,
   ) {
-    final subgroups = switch (category) {
-      _BottomActionCategory.add => [
-        (
-          _BottomActionSubgroup.addMedia,
-          'Media',
-          'Add visual and audio media',
-          Icons.perm_media_rounded,
-        ),
-        (
-          _BottomActionSubgroup.addText,
-          'Text',
-          'Text and captions',
-          Icons.title_rounded,
-        ),
-        (
-          _BottomActionSubgroup.addTracks,
-          'Tracks',
-          'Add timeline lanes',
-          Icons.view_timeline_outlined,
-        ),
-      ],
-      _BottomActionCategory.edit => [
+    return switch (category) {
+      _BottomActionCategory.edit => const [
         (
           _BottomActionSubgroup.editTiming,
           'Timing',
-          'Trim, speed, split and reverse',
+          'Trim, speed, reverse and freeze',
           Icons.av_timer_rounded,
         ),
         (
           _BottomActionSubgroup.editTransform,
           'Transform',
-          'Crop, fit, rotate and flip',
+          'Layout, crop, rotation and opacity',
           Icons.crop_rotate_rounded,
         ),
         (
-          _BottomActionSubgroup.editArrange,
-          'Arrange',
-          'Layer, duplicate and visibility',
-          Icons.layers_rounded,
+          _BottomActionSubgroup.editDetails,
+          'Details',
+          'Attributes, notes and frame nudging',
+          Icons.tune_rounded,
         ),
       ],
-      _BottomActionCategory.effects => [
+      _BottomActionCategory.effects => const [
         (
-          _BottomActionSubgroup.effectsLooks,
-          'Looks',
-          'Filters and color correction',
+          _BottomActionSubgroup.effectsColor,
+          'Color',
+          'Chroma key, filters and adjustments',
           Icons.tonality_rounded,
         ),
         (
           _BottomActionSubgroup.effectsBlur,
           'Blur',
-          'Whole and privacy-region blur',
+          'Whole-frame and privacy-region blur',
           Icons.blur_on_rounded,
         ),
         (
@@ -6140,651 +7030,1204 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           'Animations and transitions',
           Icons.auto_awesome_motion_rounded,
         ),
+        (
+          _BottomActionSubgroup.effectsKeyframes,
+          'Keyframes',
+          'Animate visual properties at the playhead',
+          Icons.key_rounded,
+        ),
+        (
+          _BottomActionSubgroup.effectsEnhance,
+          'Enhance',
+          'Stabilization and noise reduction',
+          Icons.high_quality_rounded,
+        ),
       ],
-      _BottomActionCategory.audio => [
+      _BottomActionCategory.audio => const [
         (
           _BottomActionSubgroup.audioMix,
-          'Mix',
-          'Volume, mute and pan',
+          'Mixer',
+          'Volume, pan, fades and normalization',
           Icons.tune_rounded,
         ),
         (
-          _BottomActionSubgroup.audioFades,
-          'Fades',
-          'Audio fade controls',
+          _BottomActionSubgroup.audioCleanup,
+          'Cleanup',
+          'Denoise and automatic ducking',
+          Icons.noise_control_off_rounded,
+        ),
+        (
+          _BottomActionSubgroup.audioAutomation,
+          'Automation',
+          'Volume keyframes',
           Icons.multiline_chart_rounded,
         ),
+      ],
+      _BottomActionCategory.text => const [
         (
-          _BottomActionSubgroup.audioEnhance,
-          'Enhance',
-          'Normalize and reset',
-          Icons.hearing_rounded,
+          _BottomActionSubgroup.textObjects,
+          'Text',
+          'Edit the selected text object',
+          Icons.edit_rounded,
+        ),
+        (
+          _BottomActionSubgroup.textCaptions,
+          'Captions',
+          'Subtitle styling and cleanup',
+          Icons.closed_caption_rounded,
+        ),
+        (
+          _BottomActionSubgroup.textFiles,
+          'Files',
+          'Import and export subtitle files',
+          Icons.file_open_outlined,
         ),
       ],
-      _BottomActionCategory.canvas => [
+      _BottomActionCategory.timeline => const [
         (
-          _BottomActionSubgroup.canvasFormat,
-          'Format',
-          'Aspect and background',
-          Icons.aspect_ratio_rounded,
+          _BottomActionSubgroup.timelineSelection,
+          'Selection',
+          'Batch selection and splitting',
+          Icons.select_all_rounded,
         ),
         (
-          _BottomActionSubgroup.canvasGuides,
-          'Guides',
-          'Grid, safe areas and snapping',
-          Icons.grid_4x4_rounded,
+          _BottomActionSubgroup.timelineTracks,
+          'Tracks',
+          'Rename, duplicate and manage all tracks',
+          Icons.layers_rounded,
         ),
         (
-          _BottomActionSubgroup.canvasStudio,
-          'Studio',
-          'Captions and creator tools',
-          Icons.auto_awesome_rounded,
+          _BottomActionSubgroup.timelineMarkers,
+          'Markers',
+          'Beat grids and chapter markers',
+          Icons.bookmarks_outlined,
+        ),
+        (
+          _BottomActionSubgroup.timelineProject,
+          'Project',
+          'Frame rate, timecode and clip labels',
+          Icons.settings_suggest_outlined,
         ),
       ],
+      _BottomActionCategory.canvas ||
+      _BottomActionCategory.studio ||
+      _BottomActionCategory.discover => const [],
     };
+  }
 
+  Widget _buildDockSubgroupRow(
+    _BottomActionCategory category,
+    TimelineClip? selectedClip,
+    _SelectionCapabilities capabilities,
+  ) {
+    final subgroups = _subgroupsFor(category);
     return _buildActionScroller(
       key: ValueKey('subgroups_${category.name}'),
       spread: true,
       actions: [
-        for (final subgroup in subgroups)
-          _ActionSpec(
-            label: subgroup.$2,
-            tooltip: subgroup.$3,
-            icon: subgroup.$4,
-            onTap: _isSubgroupAvailable(subgroup.$1, capabilities)
-                ? () => setState(() => _activeBottomSubgroup = subgroup.$1)
-                : null,
-          ),
-        _ActionSpec(
-          label: 'Back',
-          tooltip: 'Back to editor groups',
-          icon: Icons.arrow_back_rounded,
+        _dockBackAction(
+          tooltip: 'Back to tool categories',
           onTap: () => setState(() {
             _activeBottomCategory = null;
             _activeBottomSubgroup = null;
           }),
         ),
+        for (final subgroup in subgroups)
+          _ActionSpec(
+            key: ValueKey('dock_subgroup_${subgroup.$1.name}'),
+            group: category.name,
+            label: subgroup.$2,
+            tooltip: subgroup.$3,
+            icon: subgroup.$4,
+            onTap: _isDirectBottomSubgroup(subgroup.$1)
+                ? _directBottomSubgroupAction(
+                    subgroup.$1,
+                    selectedClip,
+                    capabilities,
+                  )
+                : () => setState(() => _activeBottomSubgroup = subgroup.$1),
+          ),
       ],
     );
   }
 
-  Widget _buildToolRow({
-    required _BottomActionSubgroup subgroup,
-    required TimelineClip? selectedClip,
-    required _SelectionCapabilities capabilities,
-  }) {
-    final isVisual = capabilities.canVisualEffects;
-    final isFilterEffect = capabilities.isFilterEffect;
-    final isBlurEffect = capabilities.isBlurEffect;
-    final actions = switch (subgroup) {
-      _BottomActionSubgroup.addMedia => [
-        _ActionSpec(
-          label: 'Overlay',
-          tooltip: 'Add image or video overlay',
-          icon: Icons.perm_media_rounded,
-          onTap: _pickOverlayMedia,
-        ),
-        _ActionSpec(
-          label: 'GIFs',
-          tooltip: 'Add GIF or sticker',
-          icon: Icons.emoji_emotions_outlined,
-          onTap: _openGiphyPickerSheet,
-        ),
-        _ActionSpec(
-          label: 'Audio',
-          tooltip: 'Add music or voice audio',
-          icon: Icons.music_note_rounded,
-          onTap: _pickAudioMedia,
-        ),
-      ],
-      _BottomActionSubgroup.addText => [
-        _ActionSpec(
-          label: 'Text',
-          tooltip: 'Add text',
-          icon: Icons.title_rounded,
-          onTap: _addTextClipAtPlayhead,
-        ),
-        _ActionSpec(
-          label: 'Edit',
-          tooltip: 'Edit selected text',
-          icon: Icons.edit_rounded,
-          onTap:
-              capabilities.canEdit &&
-                  selectedClip?.type == TimelineTrackType.text
-              ? () => _editTextClip(selectedClip!)
-              : capabilities.canEdit &&
-                    selectedClip?.type == TimelineTrackType.subtitle
-              ? () {
-                  final entry = selectedClip!.toSubtitleEntry();
-                  if (entry != null) _openSubtitleTextEditor(entry);
-                }
-              : null,
-        ),
-        _ActionSpec(
-          label: 'Captions',
-          tooltip: 'Generate captions',
-          icon: Icons.closed_caption_rounded,
-          onTap:
-              !_isGeneratingSubtitles &&
-                  ref
-                      .read(editorProvider)
-                      .timeline
-                      .tracks
-                      .expand((track) => track.clips)
-                      .any(ref.read(editorProvider).timeline.clipHasAudio)
-              ? _handleGenerateSubtitles
-              : null,
-        ),
-      ],
-      _BottomActionSubgroup.addTracks => [
-        _ActionSpec(
-          label: 'Overlay',
-          tooltip: 'Add overlay lane',
-          icon: Icons.layers_rounded,
-          onTap: () => _addTimelineTrack(
-            TimelineTrackSection.overlay,
-            TimelineTrackType.video,
-          ),
-        ),
-        _ActionSpec(
-          label: 'Text',
-          tooltip: 'Add text lane',
-          icon: Icons.title_rounded,
-          onTap: () => _addTimelineTrack(
-            TimelineTrackSection.textSubtitle,
-            TimelineTrackType.text,
-          ),
-        ),
-        _ActionSpec(
-          label: 'Audio',
-          tooltip: 'Add audio lane',
-          icon: Icons.graphic_eq_rounded,
-          onTap: () => _addTimelineTrack(
-            TimelineTrackSection.audio,
-            TimelineTrackType.audio,
-          ),
-        ),
-        _ActionSpec(
-          label: 'Effects',
-          tooltip: 'Add effects lane',
-          icon: Icons.auto_fix_high_rounded,
-          onTap: () => _addTimelineTrack(
-            TimelineTrackSection.overlay,
-            TimelineTrackType.effect,
-          ),
-        ),
-      ],
-      _BottomActionSubgroup.editTiming => [
-        _ActionSpec(
-          label: 'Trim/Speed',
-          tooltip: selectedClip?.supportsReversePlayback == true
-              ? 'Trim source, change speed and reverse'
-              : 'Trim source and change speed',
-          icon: Icons.av_timer_rounded,
-          onTap:
-              selectedClip != null &&
-                  capabilities.canEdit &&
-                  selectedClip.supportsSourceTiming
-              ? () => _openTimingSheet(selectedClip)
-              : null,
-        ),
-        _ActionSpec(
-          label: 'Split',
-          tooltip: 'Split selected clip at playhead',
-          icon: Icons.content_cut_rounded,
-          onTap: selectedClip == null || !capabilities.canEdit
-              ? null
-              : () => _splitClipAtPlayhead(selectedClip),
-        ),
-      ],
-      _BottomActionSubgroup.editTransform => [
-        _ActionSpec(
-          label: 'Crop',
-          tooltip: 'Crop with presets or free insets',
-          icon: Icons.crop_rounded,
-          onTap: isVisual ? () => _openCropSheet(selectedClip!) : null,
-        ),
-        _ActionSpec(
-          label: 'Fill',
-          tooltip: 'Fill the frame',
-          icon: Icons.fullscreen_rounded,
-          onTap: isVisual
-              ? () => _setClipFit(selectedClip!, ClipFitMode.cover)
-              : null,
-        ),
-        _ActionSpec(
-          label: 'Fit',
-          tooltip: 'Fit inside the frame',
-          icon: Icons.fit_screen_rounded,
-          onTap: isVisual
-              ? () => _setClipFit(selectedClip!, ClipFitMode.contain)
-              : null,
-        ),
-        _ActionSpec(
-          label: 'Stretch',
-          tooltip: 'Stretch to the frame',
-          icon: Icons.open_in_full_rounded,
-          onTap: isVisual
-              ? () => _setClipFit(selectedClip!, ClipFitMode.stretch)
-              : null,
-        ),
-        _ActionSpec(
-          label: 'Rotate L',
-          tooltip: 'Rotate left 90 degrees',
-          icon: Icons.rotate_left_rounded,
-          onTap: isVisual
-              ? () => _rotateClip(selectedClip!, -math.pi / 2)
-              : null,
-        ),
-        _ActionSpec(
-          label: 'Rotate R',
-          tooltip: 'Rotate right 90 degrees',
-          icon: Icons.rotate_right_rounded,
-          onTap: isVisual
-              ? () => _rotateClip(selectedClip!, math.pi / 2)
-              : null,
-        ),
-        _ActionSpec(
-          label: 'Mirror',
-          tooltip: 'Mirror horizontally',
-          icon: Icons.flip_rounded,
-          onTap: isVisual
-              ? () => _toggleClipFlip(selectedClip!, horizontal: true)
-              : null,
-        ),
-        _ActionSpec(
-          label: 'Flip V',
-          tooltip: 'Flip vertically',
-          icon: Icons.flip_camera_android_rounded,
-          onTap: isVisual
-              ? () => _toggleClipFlip(selectedClip!, horizontal: false)
-              : null,
-        ),
-        _ActionSpec(
-          label: 'Reset',
-          tooltip: 'Reset transform and crop',
-          icon: Icons.restart_alt_rounded,
-          onTap: isVisual ? () => _resetClipTransform(selectedClip!) : null,
-        ),
-      ],
-      _BottomActionSubgroup.editArrange => [
-        _ActionSpec(
-          label: 'Inspector',
-          tooltip: 'Opacity, layer and transform controls',
-          icon: Icons.tune_rounded,
-          onTap: selectedClip == null || !capabilities.canTransform
-              ? null
-              : () => _openClipInspectorSheet(selectedClip),
-        ),
-        _ActionSpec(
-          label: 'Forward',
-          tooltip: 'Bring clip forward one layer',
-          icon: Icons.move_up_rounded,
-          onTap: selectedClip == null || !capabilities.canChangeLayer
-              ? null
-              : () => _changeClipLayer(selectedClip, 1),
-        ),
-        _ActionSpec(
-          label: 'Backward',
-          tooltip: 'Send clip backward one layer',
-          icon: Icons.move_down_rounded,
-          onTap: selectedClip == null || !capabilities.canChangeLayer
-              ? null
-              : () => _changeClipLayer(selectedClip, -1),
-        ),
-        _ActionSpec(
-          label: 'Duplicate',
-          tooltip: 'Duplicate selected clip',
-          icon: Icons.content_copy_rounded,
-          onTap: selectedClip == null || !capabilities.canArrange
-              ? null
-              : () => _duplicateClip(selectedClip),
-        ),
-        _ActionSpec(
-          label: selectedClip?.enabled == false ? 'Enable' : 'Disable',
-          tooltip: 'Toggle clip visibility in preview and export',
-          icon: selectedClip?.enabled == false
-              ? Icons.visibility_rounded
-              : Icons.visibility_off_rounded,
-          onTap: selectedClip == null || !capabilities.canArrange
-              ? null
-              : () => _toggleClipEnabled(selectedClip),
-        ),
-        _ActionSpec(
-          label: 'Delete',
-          tooltip: 'Delete selected clip',
-          icon: Icons.delete_outline_rounded,
-          onTap: selectedClip == null || !capabilities.canEdit
-              ? null
-              : () => _deleteClip(selectedClip),
-        ),
-      ],
-      _BottomActionSubgroup.effectsLooks => [
-        _ActionSpec(
-          label: 'Filters',
-          tooltip: 'Add a prebuilt filter as a timeline overlay',
-          icon: Icons.tonality_rounded,
-          onTap: isVisual || isFilterEffect
-              ? () => _openFilterSheet(selectedClip!)
-              : null,
-        ),
-        _ActionSpec(
-          label: 'Adjust',
-          tooltip: 'Brightness, contrast, saturation, temperature and finish',
-          icon: Icons.tune_rounded,
-          onTap: isVisual || isFilterEffect
-              ? () => _openColorAdjustmentsSheet(selectedClip!)
-              : null,
-        ),
-        _ActionSpec(
-          label: 'Remove',
-          tooltip: 'Remove the selected filter overlay',
-          icon: Icons.layers_clear_rounded,
-          onTap: isFilterEffect ? () => _deleteClip(selectedClip!) : null,
-        ),
-      ],
-      _BottomActionSubgroup.effectsBlur => [
-        _ActionSpec(
-          label: 'Whole',
-          tooltip: isBlurEffect
-              ? 'Change the selected blur to whole-frame'
-              : 'Add whole-frame blur as a timeline overlay',
-          icon: Icons.blur_circular_rounded,
-          onTap: isBlurEffect
-              ? () {
-                  _setBlurMode(selectedClip!, ClipBlurMode.full);
-                  unawaited(_openBlurSheet(selectedClip));
-                }
-              : isVisual
-              ? () => _addEffectOverlay(
-                  anchor: selectedClip!,
-                  kind: TimelineEffectKind.blur,
-                  label: 'Whole blur',
-                  blur: const ClipBlurSettings(
-                    mode: ClipBlurMode.full,
-                    strength: 12,
-                  ),
-                )
-              : null,
-        ),
-        _ActionSpec(
-          label: 'Region',
-          tooltip: isBlurEffect
-              ? 'Change the selected blur to a movable privacy region'
-              : 'Add a blur region you can move on the preview',
-          icon: Icons.center_focus_strong_rounded,
-          onTap: isBlurEffect
-              ? () {
-                  _setBlurMode(selectedClip!, ClipBlurMode.region);
-                  unawaited(_openBlurSheet(selectedClip));
-                }
-              : isVisual
-              ? () => _addEffectOverlay(
-                  anchor: selectedClip!,
-                  kind: TimelineEffectKind.blur,
-                  label: 'Region blur',
-                  blur: const ClipBlurSettings(
-                    mode: ClipBlurMode.region,
-                    strength: 12,
-                  ),
-                )
-              : null,
-        ),
-        _ActionSpec(
-          label: 'Adjust',
-          tooltip: 'Adjust blur mode, strength, and privacy region',
-          icon: Icons.tune_rounded,
-          onTap: isBlurEffect ? () => _openBlurSheet(selectedClip!) : null,
-        ),
-        _ActionSpec(
-          label: 'Remove',
-          tooltip: 'Remove the selected blur overlay',
-          icon: Icons.layers_clear_rounded,
-          onTap: isBlurEffect ? () => _deleteClip(selectedClip!) : null,
-        ),
-      ],
-      _BottomActionSubgroup.effectsMotion => [
-        _ActionSpec(
-          label: 'Animate',
-          tooltip: 'Clip animation',
-          icon: Icons.auto_awesome_motion_rounded,
-          onTap: capabilities.canAnimate
-              ? () => _openClipAnimationSheetForSelection(selectedClip!)
-              : null,
-        ),
-        _ActionSpec(
-          label: 'Transition',
-          tooltip: 'Base clip transition',
-          icon: Icons.join_inner_rounded,
-          onTap: capabilities.canTransition
-              ? () => _openTransitionSheet(selectedClip!)
-              : null,
-        ),
-      ],
-      _BottomActionSubgroup.audioMix => [
-        _ActionSpec(
-          label: 'Mixer',
-          tooltip: 'Volume, pan, fades and normalize',
-          icon: Icons.tune_rounded,
-          onTap: capabilities.canAdjustAudio
-              ? () => _openAudioControlsSheet(selectedClip!)
-              : null,
-        ),
-        _ActionSpec(
-          label: selectedClip?.audioMix.muted == true ? 'Unmute' : 'Mute',
-          tooltip: 'Toggle selected clip audio',
-          icon: selectedClip?.audioMix.muted == true
-              ? Icons.volume_up_rounded
-              : Icons.volume_off_rounded,
-          onTap: capabilities.canAdjustAudio
-              ? () => _toggleClipMute(selectedClip!)
-              : null,
-        ),
-      ],
-      _BottomActionSubgroup.audioFades => [
-        _ActionSpec(
-          label: 'Fade In',
-          tooltip: 'Toggle a 500ms audio fade in',
-          icon: Icons.trending_up_rounded,
-          onTap: capabilities.canAdjustAudio
-              ? () => _toggleQuickFade(selectedClip!, fadeIn: true)
-              : null,
-        ),
-        _ActionSpec(
-          label: 'Fade Out',
-          tooltip: 'Toggle a 500ms audio fade out',
-          icon: Icons.trending_down_rounded,
-          onTap: capabilities.canAdjustAudio
-              ? () => _toggleQuickFade(selectedClip!, fadeIn: false)
-              : null,
-        ),
-        _ActionSpec(
-          label: 'Clear',
-          tooltip: 'Clear both audio fades',
-          icon: Icons.restart_alt_rounded,
-          onTap: capabilities.canAdjustAudio
-              ? () => _updateTimelineClip(
-                  selectedClip!,
-                  (current) => current.copyWith(
-                    audioMix: current.audioMix.copyWith(
-                      fadeInMs: 0,
-                      fadeOutMs: 0,
-                    ),
-                  ),
-                )
-              : null,
-        ),
-      ],
-      _BottomActionSubgroup.audioEnhance => [
-        _ActionSpec(
-          label: selectedClip?.audioMix.normalize == true
-              ? 'Raw level'
-              : 'Normalize',
-          tooltip: 'Toggle loudness normalization',
-          icon: Icons.hearing_rounded,
-          onTap: capabilities.canAdjustAudio
-              ? () => _toggleClipNormalize(selectedClip!)
-              : null,
-        ),
-        _ActionSpec(
-          label: 'Center Pan',
-          tooltip: 'Center the stereo pan',
-          icon: Icons.swap_horiz_rounded,
-          onTap: capabilities.canAdjustAudio
-              ? () => _updateTimelineClip(
-                  selectedClip!,
-                  (current) => current.copyWith(
-                    audioMix: current.audioMix.copyWith(pan: 0),
-                  ),
-                )
-              : null,
-        ),
-        _ActionSpec(
-          label: 'Reset Mix',
-          tooltip: 'Reset volume, pan, fades and normalize',
-          icon: Icons.restart_alt_rounded,
-          onTap: capabilities.canAdjustAudio
-              ? () => _updateTimelineClip(
-                  selectedClip!,
-                  (current) =>
-                      current.copyWith(audioMix: const AudioMixSettings()),
-                )
-              : null,
-        ),
-      ],
-      _BottomActionSubgroup.canvasFormat => [
-        _ActionSpec(
-          label: 'Canvas',
-          tooltip: 'Format and background settings',
-          icon: Icons.aspect_ratio_rounded,
-          onTap: _openCanvasSettingsSheet,
-        ),
-        _ActionSpec(
-          label: '16:9',
-          tooltip: 'Set landscape canvas',
-          icon: Icons.crop_16_9_rounded,
-          onTap: () {
-            _updateCanvasSettings(
-              (canvas) => canvas.copyWith(
-                aspectRatioPreset: CanvasAspectRatioPreset.ratio16x9,
-              ),
-            );
-            setState(() => _canvasAspectRatio = _CanvasAspectRatio.ratio16x9);
-          },
-        ),
-        _ActionSpec(
-          label: '9:16',
-          tooltip: 'Set portrait canvas',
-          icon: Icons.stay_current_portrait_rounded,
-          onTap: () {
-            _updateCanvasSettings(
-              (canvas) => canvas.copyWith(
-                aspectRatioPreset: CanvasAspectRatioPreset.ratio9x16,
-              ),
-            );
-            setState(() => _canvasAspectRatio = _CanvasAspectRatio.ratio9x16);
-          },
-        ),
-        _ActionSpec(
-          label: '1:1',
-          tooltip: 'Set square canvas',
-          icon: Icons.crop_square_rounded,
-          onTap: () {
-            _updateCanvasSettings(
-              (canvas) => canvas.copyWith(
-                aspectRatioPreset: CanvasAspectRatioPreset.ratio1x1,
-              ),
-            );
-            setState(() => _canvasAspectRatio = _CanvasAspectRatio.ratio1x1);
-          },
-        ),
-      ],
-      _BottomActionSubgroup.canvasGuides => [
-        _ActionSpec(
-          label: 'Grid',
-          tooltip: 'Toggle composition grid',
-          icon: Icons.grid_4x4_rounded,
-          onTap: () => _updateCanvasSettings(
-            (canvas) => canvas.copyWith(showGrid: !canvas.showGrid),
-          ),
-        ),
-        _ActionSpec(
-          label: 'Safe Area',
-          tooltip: 'Toggle title and action safe areas',
-          icon: Icons.border_style_rounded,
-          onTap: () => _updateCanvasSettings(
-            (canvas) => canvas.copyWith(showSafeAreas: !canvas.showSafeAreas),
-          ),
-        ),
-        _ActionSpec(
-          label: 'Snap',
-          tooltip: 'Toggle snapping to guides',
-          icon: Icons.grid_goldenratio_rounded,
-          onTap: () => _updateCanvasSettings(
-            (canvas) => canvas.copyWith(snapToGuides: !canvas.snapToGuides),
-          ),
-        ),
-        _ActionSpec(
-          label: 'Grid Size',
-          tooltip: 'Cycle composition grid divisions',
-          icon: Icons.grid_on_rounded,
-          onTap: () => _updateCanvasSettings(
-            (canvas) => canvas.copyWith(
-              showGrid: true,
-              gridDivisions: canvas.gridDivisions >= 6
-                  ? 2
-                  : canvas.gridDivisions + 1,
-            ),
-          ),
-        ),
-        _ActionSpec(
-          label: 'Clear',
-          tooltip: 'Hide guides and turn guide snapping off',
-          icon: Icons.layers_clear_rounded,
-          onTap: () => _updateCanvasSettings(
-            (canvas) => canvas.copyWith(
-              showGrid: false,
-              showSafeAreas: false,
-              snapToGuides: false,
-            ),
-          ),
-        ),
-      ],
-      _BottomActionSubgroup.canvasStudio => [
-        _ActionSpec(
-          label: 'Style',
-          tooltip: 'Subtitle style',
-          icon: Icons.palette_outlined,
-          onTap: () => _openStylePanelSheet(context),
-        ),
-        _ActionSpec(
-          label: 'Captions',
-          tooltip: 'Find, shift and quality-check captions',
-          icon: Icons.fact_check_outlined,
-          onTap: _openSubtitleToolsSheet,
-        ),
-        _ActionSpec(
-          label: 'Creator Lab',
-          tooltip: 'Open grouped caption and publishing workflows',
-          icon: Icons.auto_awesome_rounded,
-          onTap: _openCreatorLab,
-        ),
-      ],
-    };
+  bool _isDirectBottomSubgroup(_BottomActionSubgroup subgroup) {
+    return subgroup == _BottomActionSubgroup.audioMix ||
+        subgroup == _BottomActionSubgroup.textObjects;
+  }
 
+  VoidCallback? _directBottomSubgroupAction(
+    _BottomActionSubgroup subgroup,
+    TimelineClip? selectedClip,
+    _SelectionCapabilities capabilities,
+  ) {
+    return switch (subgroup) {
+      _BottomActionSubgroup.audioMix =>
+        selectedClip != null && capabilities.canAdjustAudio
+            ? () => _openAudioControlsSheet(selectedClip)
+            : null,
+      _BottomActionSubgroup.textObjects =>
+        selectedClip?.type == TimelineTrackType.text && capabilities.canEdit
+            ? () => _editTextClip(selectedClip!)
+            : null,
+      _ => null,
+    };
+  }
+
+  Widget _buildDockToolRow(
+    _BottomActionSubgroup subgroup,
+    EditorState editorState,
+    TimelineClip? selectedClip,
+    _SelectionCapabilities capabilities,
+  ) {
+    final actions = _bottomActionsForSubgroup(
+      subgroup,
+      editorState,
+      selectedClip,
+      capabilities,
+    );
     return _buildActionScroller(
       key: ValueKey('tools_${subgroup.name}'),
       actions: [
-        ...actions,
-        _ActionSpec(
-          label: 'Back',
-          tooltip: 'Back to subgroups',
-          icon: Icons.arrow_back_rounded,
+        _dockBackAction(
+          tooltip:
+              'Back to ${_bottomCategoryLabel(_activeBottomCategory!)} tools',
           onTap: () => setState(() => _activeBottomSubgroup = null),
         ),
+        ...actions,
       ],
     );
+  }
+
+  _ActionSpec _dockBackAction({
+    required String tooltip,
+    required VoidCallback onTap,
+  }) {
+    return _ActionSpec(
+      key: const ValueKey('dock_back_button'),
+      group: 'Navigation',
+      label: 'Back',
+      tooltip: tooltip,
+      icon: Icons.arrow_back_rounded,
+      onTap: onTap,
+    );
+  }
+
+  String _bottomCategoryLabel(_BottomActionCategory category) {
+    return switch (category) {
+      _BottomActionCategory.edit => 'Edit',
+      _BottomActionCategory.effects => 'Effects',
+      _BottomActionCategory.audio => 'Audio',
+      _BottomActionCategory.text => 'Text',
+      _BottomActionCategory.timeline => 'Timeline',
+      _BottomActionCategory.canvas => 'Canvas',
+      _BottomActionCategory.studio => 'Studio',
+      _BottomActionCategory.discover => 'Discover',
+    };
+  }
+
+  List<_ActionSpec> _bottomActionsForSubgroup(
+    _BottomActionSubgroup subgroup,
+    EditorState editorState,
+    TimelineClip? selectedClip,
+    _SelectionCapabilities capabilities,
+  ) {
+    final clipActions = _clipDockActions(selectedClip, capabilities);
+    final effectActions = _visualDockActions(selectedClip, capabilities);
+    final audioActions = _audioDockActions(selectedClip, capabilities);
+    final textActions = _textDockActions(selectedClip, capabilities);
+    final timelineActions = _timelineDockActions(
+      editorState,
+      selectedClip,
+      capabilities,
+    );
+
+    return switch (subgroup) {
+      _BottomActionSubgroup.editTiming =>
+        clipActions
+            .where(
+              (action) =>
+                  action.group == 'Timing' &&
+                  (action.label == 'Timing' ||
+                      action.label == 'Freeze' ||
+                      action.label == 'Unfreeze'),
+            )
+            .toList(),
+      _BottomActionSubgroup.editTransform =>
+        clipActions
+            .where(
+              (action) =>
+                  action.group == 'Transform' &&
+                  (action.label == 'Inspector' || action.label == 'Crop'),
+            )
+            .toList(),
+      _BottomActionSubgroup.editDetails =>
+        clipActions
+            .where(
+              (action) =>
+                  action.group == 'Attributes' ||
+                  action.group == 'Precision' ||
+                  (!capabilities.canVisualEffects &&
+                      action.group == 'Arrange' &&
+                      (action.label == 'Enable' || action.label == 'Disable')),
+            )
+            .toList(),
+      _BottomActionSubgroup.effectsColor =>
+        effectActions
+            .where(
+              (action) =>
+                  (action.group == 'Keying' || action.group == 'Color') &&
+                  action.label != 'Remove',
+            )
+            .toList(),
+      _BottomActionSubgroup.effectsBlur =>
+        effectActions
+            .where(
+              (action) => action.group == 'Blur' && action.label != 'Remove',
+            )
+            .toList(),
+      _BottomActionSubgroup.effectsMotion =>
+        effectActions.where((action) => action.group == 'Motion').toList(),
+      _BottomActionSubgroup.effectsKeyframes =>
+        effectActions.where((action) => action.group == 'Keyframes').toList(),
+      _BottomActionSubgroup.effectsEnhance =>
+        effectActions
+            .where(
+              (action) =>
+                  action.group == 'Enhance' &&
+                  (action.label == 'Stabilize' ||
+                      action.label == 'Stabilized' ||
+                      action.label == 'Denoise' ||
+                      action.label == 'Denoised'),
+            )
+            .toList(),
+      _BottomActionSubgroup.audioMix =>
+        audioActions
+            .where((action) => action.group == 'Mix' && action.label == 'Mixer')
+            .toList(),
+      _BottomActionSubgroup.audioCleanup =>
+        audioActions
+            .where(
+              (action) =>
+                  action.group == 'Enhance' &&
+                  ((action.label == 'Denoise' || action.label == 'Denoised') ||
+                      action.label == 'Auto Duck' ||
+                      action.label == 'Ducking On'),
+            )
+            .toList(),
+      _BottomActionSubgroup.audioAutomation =>
+        audioActions.where((action) => action.group == 'Automation').toList(),
+      _BottomActionSubgroup.textObjects =>
+        textActions.where((action) => action.label == 'Edit Text').toList(),
+      _BottomActionSubgroup.textCaptions =>
+        textActions.where((action) => action.group == 'Captions').toList(),
+      _BottomActionSubgroup.textFiles =>
+        textActions.where((action) => action.group == 'Caption Files').toList(),
+      _BottomActionSubgroup.timelineSelection =>
+        timelineActions.where((action) => action.group == 'Selection').toList(),
+      _BottomActionSubgroup.timelineTracks =>
+        timelineActions
+            .where(
+              (action) =>
+                  action.group == 'Tracks' &&
+                  action.label != 'Move Up' &&
+                  action.label != 'Move Down',
+            )
+            .toList(),
+      _BottomActionSubgroup.timelineMarkers =>
+        timelineActions.where((action) => action.group == 'Markers').toList(),
+      _BottomActionSubgroup.timelineProject =>
+        timelineActions
+            .where(
+              (action) =>
+                  action.group == 'Workspace' &&
+                  (action.label == 'Frame Rate' ||
+                      action.label == 'Timecode' ||
+                      action.label == 'Labels'),
+            )
+            .toList(),
+    };
+  }
+
+  List<_ActionSpec> _clipDockActions(
+    TimelineClip? clip,
+    _SelectionCapabilities capabilities,
+  ) {
+    final editable = clip != null && capabilities.canEdit;
+    final visual = clip != null && capabilities.canVisualEffects;
+    return [
+      _ActionSpec(
+        group: 'Timing',
+        label: 'Timing',
+        tooltip: 'Trim source, change speed and reverse',
+        icon: Icons.av_timer_rounded,
+        onTap: editable && clip.supportsSourceTiming
+            ? () => _openTimingSheet(clip)
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Timing',
+        label: 'Split',
+        tooltip: 'Split the selected clip at the playhead',
+        icon: Icons.content_cut_rounded,
+        onTap: editable ? () => _splitClipAtPlayhead(clip) : null,
+      ),
+      _ActionSpec(
+        group: 'Timing',
+        label: clip?.isReversed == true ? 'Forward' : 'Reverse',
+        tooltip: 'Reverse the selected media',
+        icon: Icons.replay_rounded,
+        active: clip?.isReversed == true,
+        onTap: editable && clip.supportsReversePlayback
+            ? () => _toggleClipReverse(clip)
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Timing',
+        label: clip?.freezeFrame == true ? 'Unfreeze' : 'Freeze',
+        tooltip: 'Hold the selected video or GIF frame',
+        icon: Icons.pause_circle_outline_rounded,
+        active: clip?.freezeFrame == true,
+        onTap: editable ? _toggleSelectedFreezeFrame : null,
+      ),
+      _ActionSpec(
+        group: 'Transform',
+        label: 'Inspector',
+        tooltip: 'Position, scale, rotation, opacity and layer',
+        icon: Icons.tune_rounded,
+        onTap: visual ? () => _openClipInspectorSheet(clip) : null,
+      ),
+      _ActionSpec(
+        group: 'Transform',
+        label: 'Crop',
+        tooltip: 'Crop with presets or free insets',
+        icon: Icons.crop_rounded,
+        onTap: visual ? () => _openCropSheet(clip) : null,
+      ),
+      _ActionSpec(
+        group: 'Transform',
+        label: 'Fill',
+        tooltip: 'Fill the canvas',
+        icon: Icons.fullscreen_rounded,
+        active: clip?.fitMode == ClipFitMode.cover,
+        onTap: visual ? () => _setClipFit(clip, ClipFitMode.cover) : null,
+      ),
+      _ActionSpec(
+        group: 'Transform',
+        label: 'Fit',
+        tooltip: 'Fit inside the canvas',
+        icon: Icons.fit_screen_rounded,
+        active: clip?.fitMode == ClipFitMode.contain,
+        onTap: visual ? () => _setClipFit(clip, ClipFitMode.contain) : null,
+      ),
+      _ActionSpec(
+        group: 'Transform',
+        label: 'Stretch',
+        tooltip: 'Stretch to the canvas',
+        icon: Icons.open_in_full_rounded,
+        active: clip?.fitMode == ClipFitMode.stretch,
+        onTap: visual ? () => _setClipFit(clip, ClipFitMode.stretch) : null,
+      ),
+      _ActionSpec(
+        group: 'Transform',
+        label: 'Rotate L',
+        tooltip: 'Rotate left 90 degrees',
+        icon: Icons.rotate_left_rounded,
+        onTap: visual ? () => _rotateClip(clip, -math.pi / 2) : null,
+      ),
+      _ActionSpec(
+        group: 'Transform',
+        label: 'Rotate R',
+        tooltip: 'Rotate right 90 degrees',
+        icon: Icons.rotate_right_rounded,
+        onTap: visual ? () => _rotateClip(clip, math.pi / 2) : null,
+      ),
+      _ActionSpec(
+        group: 'Transform',
+        label: 'Mirror',
+        tooltip: 'Mirror horizontally',
+        icon: Icons.flip_rounded,
+        active: clip?.transform.flipX == true,
+        onTap: visual ? () => _toggleClipFlip(clip, horizontal: true) : null,
+      ),
+      _ActionSpec(
+        group: 'Transform',
+        label: 'Flip V',
+        tooltip: 'Flip vertically',
+        icon: Icons.flip_camera_android_rounded,
+        active: clip?.transform.flipY == true,
+        onTap: visual ? () => _toggleClipFlip(clip, horizontal: false) : null,
+      ),
+      _ActionSpec(
+        group: 'Transform',
+        label: 'Reset',
+        tooltip: 'Reset transform and crop',
+        icon: Icons.restart_alt_rounded,
+        onTap: visual ? () => _resetClipTransform(clip) : null,
+      ),
+      _ActionSpec(
+        group: 'Arrange',
+        label: 'Forward',
+        tooltip: 'Bring the overlay forward one layer',
+        icon: Icons.move_up_rounded,
+        onTap: clip != null && capabilities.canChangeLayer
+            ? () => _changeClipLayer(clip, 1)
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Arrange',
+        label: 'Backward',
+        tooltip: 'Send the overlay backward one layer',
+        icon: Icons.move_down_rounded,
+        onTap: clip != null && capabilities.canChangeLayer
+            ? () => _changeClipLayer(clip, -1)
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Arrange',
+        label: 'Duplicate',
+        tooltip: 'Duplicate the selected clip',
+        icon: Icons.content_copy_rounded,
+        onTap: editable && capabilities.canArrange
+            ? () => _duplicateClip(clip)
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Arrange',
+        label: clip?.enabled == false ? 'Enable' : 'Disable',
+        tooltip: 'Toggle clip visibility in preview and export',
+        icon: clip?.enabled == false
+            ? Icons.visibility_rounded
+            : Icons.visibility_off_rounded,
+        active: clip?.enabled == false,
+        onTap: editable && capabilities.canArrange
+            ? () => _toggleClipEnabled(clip)
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Arrange',
+        label: 'Delete',
+        tooltip: 'Delete the selected clip',
+        icon: Icons.delete_outline_rounded,
+        onTap: editable ? () => _deleteClip(clip) : null,
+      ),
+      _ActionSpec(
+        group: 'Attributes',
+        label: 'Copy attrs',
+        tooltip: 'Copy timing, visual and audio attributes',
+        icon: Icons.copy_all_rounded,
+        active: clip != null && _clipAttributeClipboard?.id == clip.id,
+        onTap: editable ? _copyClipAttributes : null,
+      ),
+      _ActionSpec(
+        group: 'Attributes',
+        label: 'Paste attrs',
+        tooltip: 'Paste copied attributes to the selection',
+        icon: Icons.content_paste_go_rounded,
+        active: _clipAttributeClipboard != null,
+        onTap: editable && _clipAttributeClipboard != null
+            ? _pasteClipAttributes
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Attributes',
+        label: 'Note',
+        tooltip: 'Attach an edit note to the clip',
+        icon: Icons.sticky_note_2_outlined,
+        active: clip?.notes?.trim().isNotEmpty == true,
+        onTap: editable ? _setSelectedClipNote : null,
+      ),
+      _ActionSpec(
+        group: 'Attributes',
+        label: 'Color',
+        tooltip: 'Cycle the timeline clip color',
+        icon: Icons.palette_outlined,
+        onTap: editable ? _cycleSelectedClipColor : null,
+      ),
+      _ActionSpec(
+        group: 'Precision',
+        label: 'Frame −',
+        tooltip: 'Nudge selection one frame left',
+        icon: Icons.keyboard_double_arrow_left_rounded,
+        onTap: editable ? () => _nudgeSelectedClips(-1) : null,
+      ),
+      _ActionSpec(
+        group: 'Precision',
+        label: 'Frame +',
+        tooltip: 'Nudge selection one frame right',
+        icon: Icons.keyboard_double_arrow_right_rounded,
+        onTap: editable ? () => _nudgeSelectedClips(1) : null,
+      ),
+    ];
+  }
+
+  List<_ActionSpec> _visualDockActions(
+    TimelineClip? clip,
+    _SelectionCapabilities capabilities,
+  ) {
+    final visual = clip != null && capabilities.canVisualEffects;
+    final filter = clip != null && capabilities.isFilterEffect;
+    final blur = clip != null && capabilities.isBlurEffect;
+    final canKey =
+        clip != null && capabilities.canEdit && clip.supportsChromaKey;
+    return [
+      _ActionSpec(
+        group: 'Keying',
+        label: 'Chroma Key',
+        tooltip: 'Remove a screen color from an image or video layer',
+        icon: Icons.colorize_rounded,
+        active: clip?.chromaKeyEnabled == true,
+        onTap: canKey ? _openSelectedChromaKeySheet : null,
+      ),
+      _ActionSpec(
+        group: 'Color',
+        label: 'Filters',
+        tooltip: 'Add or change a filter overlay',
+        icon: Icons.tonality_rounded,
+        active: filter,
+        onTap: () => _openFilterSheet(visual || filter ? clip : null),
+      ),
+      _ActionSpec(
+        group: 'Color',
+        label: 'Adjust',
+        tooltip: 'Brightness, contrast, saturation and temperature',
+        icon: Icons.tune_rounded,
+        active: clip?.colorAdjustments.isNeutral == false,
+        onTap: visual || filter ? () => _openColorAdjustmentsSheet(clip) : null,
+      ),
+      _ActionSpec(
+        group: 'Color',
+        label: 'Remove',
+        tooltip: 'Remove the selected filter overlay',
+        icon: Icons.layers_clear_rounded,
+        onTap: filter ? () => _deleteClip(clip) : null,
+      ),
+      _ActionSpec(
+        group: 'Blur',
+        label: 'Whole',
+        tooltip: 'Add whole-frame blur as an overlay',
+        icon: Icons.blur_circular_rounded,
+        active: blur && clip.blur.mode == ClipBlurMode.full,
+        onTap: blur
+            ? () {
+                _setBlurMode(clip, ClipBlurMode.full);
+                unawaited(_openBlurSheet(clip));
+              }
+            : () => _addEffectOverlay(
+                anchor: visual ? clip : null,
+                kind: TimelineEffectKind.blur,
+                label: 'Whole blur',
+                blur: const ClipBlurSettings(
+                  mode: ClipBlurMode.full,
+                  strength: 12,
+                ),
+              ),
+      ),
+      _ActionSpec(
+        group: 'Blur',
+        label: 'Region',
+        tooltip: 'Add a movable privacy blur region',
+        icon: Icons.center_focus_strong_rounded,
+        active: blur && clip.blur.mode == ClipBlurMode.region,
+        onTap: blur
+            ? () {
+                _setBlurMode(clip, ClipBlurMode.region);
+                unawaited(_openBlurSheet(clip));
+              }
+            : () => _addEffectOverlay(
+                anchor: visual ? clip : null,
+                kind: TimelineEffectKind.blur,
+                label: 'Region blur',
+                blur: const ClipBlurSettings(
+                  mode: ClipBlurMode.region,
+                  strength: 12,
+                ),
+              ),
+      ),
+      _ActionSpec(
+        group: 'Blur',
+        label: 'Settings',
+        tooltip: 'Adjust blur mode, strength and region',
+        icon: Icons.tune_rounded,
+        onTap: blur ? () => _openBlurSheet(clip) : null,
+      ),
+      _ActionSpec(
+        group: 'Blur',
+        label: 'Remove',
+        tooltip: 'Remove the selected blur overlay',
+        icon: Icons.layers_clear_rounded,
+        onTap: blur ? () => _deleteClip(clip) : null,
+      ),
+      _ActionSpec(
+        group: 'Motion',
+        label: 'Animate',
+        tooltip: 'Apply clip entrance and exit animation',
+        icon: Icons.auto_awesome_motion_rounded,
+        onTap: clip != null && capabilities.canAnimate
+            ? () => _openClipAnimationSheetForSelection(clip)
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Motion',
+        label: 'Transition',
+        tooltip: 'Edit the source-clip transition',
+        icon: Icons.join_inner_rounded,
+        onTap: clip != null && capabilities.canTransition
+            ? () => _openTransitionSheet(clip)
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Keyframes',
+        label: 'Opacity',
+        tooltip: 'Add an opacity keyframe at the playhead',
+        icon: Icons.opacity_rounded,
+        onTap: visual
+            ? () => _addSelectedKeyframe(TimelineKeyframeProperty.opacity)
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Keyframes',
+        label: 'Scale',
+        tooltip: 'Add a scale keyframe at the playhead',
+        icon: Icons.zoom_in_rounded,
+        onTap: visual
+            ? () => _addSelectedKeyframe(TimelineKeyframeProperty.scale)
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Keyframes',
+        label: 'Move X',
+        tooltip: 'Add a horizontal-position keyframe',
+        icon: Icons.open_with_rounded,
+        onTap: visual
+            ? () => _addSelectedKeyframe(TimelineKeyframeProperty.positionX)
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Keyframes',
+        label: 'Move Y',
+        tooltip: 'Add a vertical-position keyframe',
+        icon: Icons.height_rounded,
+        onTap: visual
+            ? () => _addSelectedKeyframe(TimelineKeyframeProperty.positionY)
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Keyframes',
+        label: 'Rotation',
+        tooltip: 'Add a rotation keyframe',
+        icon: Icons.rotate_right_rounded,
+        onTap: visual
+            ? () => _addSelectedKeyframe(TimelineKeyframeProperty.rotation)
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Keyframes',
+        label: 'Blur',
+        tooltip: 'Add a blur-strength keyframe',
+        icon: Icons.blur_on_rounded,
+        onTap: blur
+            ? () => _addSelectedKeyframe(TimelineKeyframeProperty.blurStrength)
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Keyframes',
+        label: 'Clear visual',
+        tooltip: 'Clear visual keyframes from the selected clip',
+        icon: Icons.delete_sweep_rounded,
+        onTap:
+            clip?.keyframes.any(
+                  (keyframe) =>
+                      keyframe.property != TimelineKeyframeProperty.volume,
+                ) ==
+                true
+            ? () => _clearSelectedKeyframes(const {
+                TimelineKeyframeProperty.opacity,
+                TimelineKeyframeProperty.scale,
+                TimelineKeyframeProperty.rotation,
+                TimelineKeyframeProperty.positionX,
+                TimelineKeyframeProperty.positionY,
+                TimelineKeyframeProperty.blurStrength,
+              })
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Enhance',
+        label: clip?.stabilize == true ? 'Stabilized' : 'Stabilize',
+        tooltip: 'Stabilize video during final rendering',
+        icon: Icons.vibration_rounded,
+        active: clip?.stabilize == true,
+        onTap: visual && clip.type == TimelineTrackType.video
+            ? () => _toggleSelectedClipFlag(
+                (current) => current.copyWith(stabilize: !current.stabilize),
+                supports: (candidate, _) =>
+                    candidate.type == TimelineTrackType.video,
+                unsupportedMessage: 'Stabilization requires a video clip.',
+              )
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Enhance',
+        label: clip?.denoise == true ? 'Denoised' : 'Denoise',
+        tooltip: 'Reduce visual noise during final rendering',
+        icon: Icons.noise_aware_rounded,
+        active: clip?.denoise == true,
+        onTap: visual
+            ? () => _toggleSelectedClipFlag(
+                (current) => current.copyWith(denoise: !current.denoise),
+                supports: (candidate, _) =>
+                    candidate.type == TimelineTrackType.video,
+                unsupportedMessage: 'Visual denoise requires a video clip.',
+              )
+            : null,
+      ),
+    ];
+  }
+
+  List<_ActionSpec> _audioDockActions(
+    TimelineClip? clip,
+    _SelectionCapabilities capabilities,
+  ) {
+    final timeline = ref.read(editorProvider).timeline;
+    final owner = clip == null ? null : _audioOwnerForClip(timeline, clip);
+    final audioClip = owner?.clip;
+    final audio =
+        audioClip != null &&
+        owner != null &&
+        !owner.track.isLocked &&
+        timeline.clipHasAudio(audioClip) &&
+        (audioClip.id != clip?.id || capabilities.canAdjustAudio);
+    return [
+      _ActionSpec(
+        group: 'Mix',
+        label: 'Mixer',
+        tooltip: 'Volume, pan, fades and normalization',
+        icon: Icons.tune_rounded,
+        onTap: audio ? () => _openAudioControlsSheet(audioClip) : null,
+      ),
+      _ActionSpec(
+        group: 'Mix',
+        label: audioClip?.audioMix.muted == true ? 'Unmute' : 'Mute',
+        tooltip: 'Toggle selected clip audio',
+        icon: audioClip?.audioMix.muted == true
+            ? Icons.volume_up_rounded
+            : Icons.volume_off_rounded,
+        active: audioClip?.audioMix.muted == true,
+        onTap: audio ? () => _toggleClipMute(audioClip) : null,
+      ),
+      _ActionSpec(
+        group: 'Fades',
+        label: 'Fade In',
+        tooltip: 'Toggle a 500ms fade in',
+        icon: Icons.trending_up_rounded,
+        active: (audioClip?.audioMix.fadeInMs ?? 0) > 0,
+        onTap: audio ? () => _toggleQuickFade(audioClip, fadeIn: true) : null,
+      ),
+      _ActionSpec(
+        group: 'Fades',
+        label: 'Fade Out',
+        tooltip: 'Toggle a 500ms fade out',
+        icon: Icons.trending_down_rounded,
+        active: (audioClip?.audioMix.fadeOutMs ?? 0) > 0,
+        onTap: audio ? () => _toggleQuickFade(audioClip, fadeIn: false) : null,
+      ),
+      _ActionSpec(
+        group: 'Fades',
+        label: 'Clear',
+        tooltip: 'Clear both audio fades',
+        icon: Icons.restart_alt_rounded,
+        onTap: audio
+            ? () => _updateSelectedClipAudioMix(
+                audioClip,
+                fadeInMs: 0,
+                fadeOutMs: 0,
+              )
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Enhance',
+        label: audioClip?.audioMix.normalize == true
+            ? 'Raw Level'
+            : 'Normalize',
+        tooltip: 'Toggle loudness normalization',
+        icon: Icons.hearing_rounded,
+        active: audioClip?.audioMix.normalize == true,
+        onTap: audio ? () => _toggleClipNormalize(audioClip) : null,
+      ),
+      _ActionSpec(
+        group: 'Enhance',
+        label: 'Center Pan',
+        tooltip: 'Center the stereo pan',
+        icon: Icons.swap_horiz_rounded,
+        onTap: audio
+            ? () => _updateSelectedClipAudioMix(audioClip, pan: 0)
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Enhance',
+        label: audioClip?.denoise == true ? 'Denoised' : 'Denoise',
+        tooltip: 'Reduce audio noise during export',
+        icon: Icons.noise_aware_rounded,
+        active: audioClip?.denoise == true,
+        onTap: audio
+            ? () => _updateTimelineClip(
+                audioClip,
+                (current) => current.copyWith(denoise: !current.denoise),
+              )
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Enhance',
+        label: audioClip?.autoDuck == true ? 'Ducking On' : 'Auto Duck',
+        tooltip: 'Lower this clip beneath captions and voice',
+        icon: Icons.record_voice_over_rounded,
+        active: audioClip?.autoDuck == true,
+        onTap: audio
+            ? () => _updateTimelineClip(
+                audioClip,
+                (current) => current.copyWith(autoDuck: !current.autoDuck),
+              )
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Enhance',
+        label: 'Reset Mix',
+        tooltip: 'Reset volume, pan, fades and normalization',
+        icon: Icons.restart_alt_rounded,
+        onTap: audio
+            ? () => _updateSelectedClipAudioMix(
+                audioClip,
+                muted: false,
+                volume: 1,
+                fadeInMs: 0,
+                fadeOutMs: 0,
+                pan: 0,
+                normalize: false,
+              )
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Automation',
+        label: 'Volume Key',
+        tooltip: 'Add a volume keyframe at the playhead',
+        icon: Icons.key_rounded,
+        onTap: audio
+            ? () => _addSelectedKeyframe(
+                TimelineKeyframeProperty.volume,
+                targetClip: audioClip,
+              )
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Automation',
+        label: 'Clear volume',
+        tooltip: 'Clear volume automation from the selected clip',
+        icon: Icons.delete_sweep_rounded,
+        onTap:
+            audioClip?.keyframes.any(
+                  (keyframe) =>
+                      keyframe.property == TimelineKeyframeProperty.volume,
+                ) ==
+                true
+            ? () => _clearSelectedKeyframes(const {
+                TimelineKeyframeProperty.volume,
+              }, targetClip: audioClip)
+            : null,
+      ),
+    ];
+  }
+
+  List<_ActionSpec> _textDockActions(
+    TimelineClip? clip,
+    _SelectionCapabilities capabilities,
+  ) {
+    final textClip = clip?.type == TimelineTrackType.text;
+    return [
+      _ActionSpec(
+        group: 'Create',
+        label: 'Add Text',
+        tooltip: 'Add and edit a text object on the canvas',
+        icon: Icons.title_rounded,
+        onTap: _addTextClipAtPlayhead,
+      ),
+      _ActionSpec(
+        group: 'Create',
+        label: 'Subtitles',
+        tooltip: 'Generate timed subtitles from a video or audio clip',
+        icon: Icons.closed_caption_outlined,
+        onTap: _handleGenerateSubtitles,
+      ),
+      _ActionSpec(
+        group: 'Create',
+        label: 'Edit Text',
+        tooltip: 'Edit the selected text object',
+        icon: Icons.edit_rounded,
+        onTap: textClip && capabilities.canEdit
+            ? () => _editTextClip(clip!)
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Captions',
+        label: 'Style',
+        tooltip: 'Typography, placement and subtitle animation',
+        icon: Icons.palette_outlined,
+        onTap: () => _openStylePanelSheet(context),
+      ),
+      _ActionSpec(
+        group: 'Captions',
+        label: 'Workshop',
+        tooltip: 'Find, retime, clean and quality-check captions',
+        icon: Icons.fact_check_outlined,
+        onTap: _openSubtitleToolsSheet,
+      ),
+      _ActionSpec(
+        group: 'Caption Files',
+        label: 'Import',
+        tooltip: 'Import an SRT or VTT subtitle file',
+        icon: Icons.file_upload_rounded,
+        onTap: _importSubtitleFile,
+      ),
+      _ActionSpec(
+        group: 'Caption Files',
+        label: 'Export SRT',
+        tooltip: 'Export subtitles as SRT',
+        icon: Icons.subtitles_rounded,
+        onTap: () => _exportCaptionSidecar('srt'),
+      ),
+      _ActionSpec(
+        group: 'Caption Files',
+        label: 'Export VTT',
+        tooltip: 'Export subtitles as VTT',
+        icon: Icons.subtitles_outlined,
+        onTap: () => _exportCaptionSidecar('vtt'),
+      ),
+    ];
+  }
+
+  List<_ActionSpec> _timelineDockActions(
+    EditorState editorState,
+    TimelineClip? clip,
+    _SelectionCapabilities capabilities,
+  ) {
+    final timeline = editorState.timeline;
+    final workspace = timeline.workspaceSettings;
+    final selectedTrack = timeline.tracks
+        .where((track) => track.id == editorState.selectedTrackId)
+        .firstOrNull;
+    final hasTrack = selectedTrack != null;
+    final canReorderTrack = selectedTrack?.isReorderable == true;
+    final canDuplicateTrack =
+        selectedTrack?.isDuplicable == true && !selectedTrack!.isLocked;
+    return [
+      _ActionSpec(
+        group: 'Selection',
+        label: 'Select All',
+        tooltip: 'Select every clip',
+        icon: Icons.select_all_rounded,
+        onTap: _selectAllClips,
+      ),
+      _ActionSpec(
+        group: 'Selection',
+        label: 'Clear multi',
+        tooltip: 'Clear the current multi-selection',
+        icon: Icons.deselect_rounded,
+        onTap: editorState.selectedClipIds.isNotEmpty
+            ? _clearClipMultiSelection
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Selection',
+        label: 'Split All',
+        tooltip: 'Split every clip crossing the playhead',
+        icon: Icons.call_split_rounded,
+        onTap: _splitEveryTrackAtPlayhead,
+      ),
+      _ActionSpec(
+        group: 'Tracks',
+        label: 'Rename',
+        tooltip: 'Rename the selected track',
+        icon: Icons.edit_outlined,
+        onTap: hasTrack ? _renameSelectedTrack : null,
+      ),
+      _ActionSpec(
+        group: 'Tracks',
+        label: 'Duplicate',
+        tooltip: 'Duplicate the selected track and its clips',
+        icon: Icons.library_add_outlined,
+        onTap: canDuplicateTrack ? _duplicateSelectedTrack : null,
+      ),
+      _ActionSpec(
+        group: 'Tracks',
+        label: 'Move Up',
+        tooltip: 'Move the selected layer up',
+        icon: Icons.arrow_upward_rounded,
+        onTap: canReorderTrack ? () => _moveSelectedTrack(-1) : null,
+      ),
+      _ActionSpec(
+        group: 'Tracks',
+        label: 'Move Down',
+        tooltip: 'Move the selected layer down',
+        icon: Icons.arrow_downward_rounded,
+        onTap: canReorderTrack ? () => _moveSelectedTrack(1) : null,
+      ),
+      _ActionSpec(
+        group: 'Tracks',
+        label: 'Collapse',
+        tooltip: 'Collapse every track',
+        icon: Icons.unfold_less_rounded,
+        onTap: () =>
+            ref.read(editorProvider.notifier).setAllTracks(collapsed: true),
+      ),
+      _ActionSpec(
+        group: 'Tracks',
+        label: 'Expand',
+        tooltip: 'Expand every track',
+        icon: Icons.unfold_more_rounded,
+        onTap: () =>
+            ref.read(editorProvider.notifier).setAllTracks(collapsed: false),
+      ),
+      _ActionSpec(
+        group: 'Tracks',
+        label: 'Lock All',
+        tooltip: 'Lock every editable track',
+        icon: Icons.lock_rounded,
+        onTap: () =>
+            ref.read(editorProvider.notifier).setAllTracks(locked: true),
+      ),
+      _ActionSpec(
+        group: 'Tracks',
+        label: 'Unlock All',
+        tooltip: 'Unlock every track',
+        icon: Icons.lock_open_rounded,
+        onTap: () =>
+            ref.read(editorProvider.notifier).setAllTracks(locked: false),
+      ),
+      _ActionSpec(
+        group: 'Tracks',
+        label: 'Mute All',
+        tooltip: 'Mute all audio-capable tracks',
+        icon: Icons.volume_off_rounded,
+        onTap: () =>
+            ref.read(editorProvider.notifier).setAllTracks(muted: true),
+      ),
+      _ActionSpec(
+        group: 'Tracks',
+        label: 'Unmute All',
+        tooltip: 'Restore track audio',
+        icon: Icons.volume_up_rounded,
+        onTap: () =>
+            ref.read(editorProvider.notifier).setAllTracks(muted: false),
+      ),
+      _ActionSpec(
+        group: 'Markers',
+        label: 'Beats',
+        tooltip: 'Generate a half-second beat grid',
+        icon: Icons.music_note_rounded,
+        onTap: _generateBeatMarkers,
+      ),
+      _ActionSpec(
+        group: 'Markers',
+        label: 'Chapter',
+        tooltip: 'Add a chapter marker at the playhead',
+        icon: Icons.bookmark_add_outlined,
+        onTap: _addChapterMarker,
+      ),
+      _ActionSpec(
+        group: 'Markers',
+        label: 'Clear',
+        tooltip: 'Remove every marker, beat and chapter',
+        icon: Icons.clear_all_rounded,
+        onTap: timeline.markers.isNotEmpty ? _clearAllMarkers : null,
+      ),
+      _ActionSpec(
+        group: 'Workspace',
+        label: 'Frame Rate',
+        tooltip: 'Choose timeline frame rate and snapping',
+        icon: Icons.tune_rounded,
+        onTap: _chooseProjectFrameRate,
+      ),
+      _ActionSpec(
+        group: 'Workspace',
+        label: 'Timecode',
+        tooltip: 'Toggle frame-aware ruler labels',
+        icon: Icons.access_time_rounded,
+        active: workspace.showTimecode,
+        onTap: () => _toggleWorkspace(
+          (settings) => settings.copyWith(showTimecode: !settings.showTimecode),
+        ),
+      ),
+      _ActionSpec(
+        group: 'Workspace',
+        label: 'Labels',
+        tooltip: 'Toggle clip labels',
+        icon: Icons.text_fields_rounded,
+        active: workspace.showClipLabels,
+        onTap: () => _toggleWorkspace(
+          (settings) =>
+              settings.copyWith(showClipLabels: !settings.showClipLabels),
+        ),
+      ),
+      _ActionSpec(
+        group: 'Workspace',
+        label: 'Thumbnails',
+        tooltip: 'Toggle timeline thumbnails',
+        icon: Icons.photo_library_outlined,
+        active: workspace.showThumbnails,
+        onTap: () => _toggleWorkspace(
+          (settings) =>
+              settings.copyWith(showThumbnails: !settings.showThumbnails),
+        ),
+      ),
+      _ActionSpec(
+        group: 'Workspace',
+        label: 'Waveforms',
+        tooltip: 'Toggle audio waveforms',
+        icon: Icons.graphic_eq_rounded,
+        active: workspace.showWaveforms,
+        onTap: () => _toggleWorkspace(
+          (settings) =>
+              settings.copyWith(showWaveforms: !settings.showWaveforms),
+        ),
+      ),
+      _ActionSpec(
+        group: 'Workspace',
+        label: 'Keyframes',
+        tooltip: 'Toggle keyframe guides',
+        icon: Icons.key_rounded,
+        active: workspace.showKeyframes,
+        onTap: () => _toggleWorkspace(
+          (settings) =>
+              settings.copyWith(showKeyframes: !settings.showKeyframes),
+        ),
+      ),
+      _ActionSpec(
+        group: 'Workspace',
+        label: 'Follow',
+        tooltip: 'Keep the playhead centered during playback',
+        icon: Icons.follow_the_signs_rounded,
+        active: workspace.autoFollowPlayhead,
+        onTap: () => _toggleWorkspace(
+          (settings) => settings.copyWith(
+            autoFollowPlayhead: !settings.autoFollowPlayhead,
+          ),
+        ),
+      ),
+    ];
+  }
+
+  void _clearClipMultiSelection() {
+    final primaryClipId = ref.read(editorProvider).selectedClipId;
+    final notifier = ref.read(editorProvider.notifier);
+    notifier.clearClipSelection();
+    if (primaryClipId != null) notifier.selectClip(primaryClipId);
+  }
+
+  Future<void> _exportCaptionSidecar(String format) async {
+    if (ref.read(subtitleProvider).entries.isEmpty) {
+      SnackBarHelper.showInfo(context, 'No subtitles to export');
+      return;
+    }
+    await _exportSubtitleFile(format);
   }
 
   Widget _buildActionScroller({
@@ -6804,14 +8247,18 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   ? MainAxisAlignment.spaceAround
                   : MainAxisAlignment.start,
               children: [
-                for (final action in actions) ...[
+                for (var index = 0; index < actions.length; index++) ...[
                   _buildQuickActionButton(
-                    tooltip: action.tooltip,
-                    icon: action.icon,
-                    label: action.label,
-                    onTap: action.onTap,
+                    key: actions[index].key ?? _dockToolKey(actions, index),
+                    width: actions[index].width ?? 70,
+                    tooltip: actions[index].tooltip,
+                    icon: actions[index].icon,
+                    label: actions[index].label,
+                    active: actions[index].active,
+                    onTap: actions[index].onTap,
                   ),
-                  if (!spread) const SizedBox(width: 8),
+                  if (!spread && index != actions.length - 1)
+                    const SizedBox(width: 8),
                 ],
               ],
             ),
@@ -6821,41 +8268,43 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     );
   }
 
-  void _addTimelineTrack(
-    TimelineTrackSection section,
-    TimelineTrackType trackType,
-  ) {
-    final timeline = ref.read(editorProvider).timeline;
-    final nextTrack = _createOptionalTrack(timeline, section, trackType);
-    if (nextTrack == null) return;
-    ref
-        .read(editorProvider.notifier)
-        .setTimeline(
-          timeline.copyWith(tracks: [...timeline.tracks, nextTrack]),
-        );
-    ref.read(editorProvider.notifier).selectTrack(nextTrack.id);
+  ValueKey<String> _dockToolKey(List<_ActionSpec> actions, int index) {
+    final action = actions[index];
+    final normalizedLabel = action.label.toLowerCase().replaceAll(' ', '_');
+    final duplicateLabel =
+        actions.where((candidate) => candidate.label == action.label).length >
+        1;
+    final qualifier = duplicateLabel
+        ? '${action.group.toLowerCase().replaceAll(' ', '_')}_'
+        : '';
+    final category = _activeBottomCategory?.name ?? 'root';
+    final subgroup = _activeBottomSubgroup?.name;
+    final path = subgroup == null ? category : '${category}_$subgroup';
+    return ValueKey('dock_tool_${path}_$qualifier$normalizedLabel');
   }
 
   Future<void> _openAudioControlsSheet(TimelineClip clip) async {
     final editorState = ref.read(editorProvider);
     final liveClip = _clipById(clip.id, editorState) ?? clip;
-    final track = _trackForClip(liveClip, editorState);
-    if (track == null ||
-        track.isLocked ||
-        !editorState.timeline.clipHasAudio(liveClip)) {
+    final owner = _audioOwnerForClip(editorState.timeline, liveClip);
+    if (owner == null ||
+        owner.track.isLocked ||
+        !editorState.timeline.clipHasAudio(owner.clip)) {
       return;
     }
+    final audioTarget = owner.clip;
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       constraints: BoxConstraints(
-        maxHeight: MediaQuery.sizeOf(context).height * 0.40,
+        maxHeight: MediaQuery.sizeOf(context).height * 0.64,
       ),
       backgroundColor: Colors.transparent,
       builder: (_) => Consumer(
         builder: (context, ref, _) {
           final editorState = ref.watch(editorProvider);
-          final liveClip = _clipById(clip.id, editorState) ?? clip;
+          final liveClip =
+              _clipById(audioTarget.id, editorState) ?? audioTarget;
           return SingleChildScrollView(child: _buildAudioControls(liveClip));
         },
       ),
@@ -6863,25 +8312,33 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   Widget _buildQuickActionButton({
+    required Key key,
+    required double width,
     required String tooltip,
     required IconData icon,
     required String label,
     required VoidCallback? onTap,
+    bool active = false,
   }) {
     final isEnabled = onTap != null;
     return Tooltip(
+      key: key,
       message: tooltip,
       child: InkWell(
         borderRadius: BorderRadius.circular(16),
         onTap: onTap,
         child: Ink(
-          width: 70,
-          height: 44,
+          width: width,
+          height: 48,
           decoration: BoxDecoration(
-            color: kSurfaceElevated,
+            color: active ? kAccent.withValues(alpha: 0.13) : kSurfaceElevated,
             borderRadius: BorderRadius.circular(16),
             border: Border.all(
-              color: isEnabled ? kBorder : kBorder.withValues(alpha: 0.45),
+              color: active
+                  ? kAccent.withValues(alpha: 0.65)
+                  : isEnabled
+                  ? kBorder
+                  : kBorder.withValues(alpha: 0.45),
             ),
           ),
           child: Column(
@@ -6890,10 +8347,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             children: [
               Icon(
                 icon,
-                color: isEnabled
+                color: active
+                    ? kAccent
+                    : isEnabled
                     ? kTextPrimary
                     : kTextPrimary.withValues(alpha: 0.32),
-                size: 18,
+                size: 22,
               ),
               const SizedBox(height: 2),
               Text(
@@ -6901,7 +8360,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
-                  color: isEnabled
+                  color: active
+                      ? kAccent
+                      : isEnabled
                       ? kTextPrimary
                       : kTextPrimary.withValues(alpha: 0.32),
                   fontSize: 10,
@@ -6917,6 +8378,23 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
 
   Widget _buildAudioControls(TimelineClip clip) {
     final isVideoClip = clip.type == TimelineTrackType.video;
+    final timeline = ref.read(editorProvider).timeline;
+    final asset = timeline.assetForClip(clip);
+    final separatedAudio = _separatedAudioForVideo(timeline, clip.id);
+    final hasSeparatedAudio = separatedAudio != null;
+    final provenance = asset?.metadata['provenance'];
+    final rawAttribution =
+        asset?.metadata['attribution'] ??
+        (provenance is Map ? provenance['attribution'] : null);
+    final attribution = rawAttribution is String ? rawAttribution.trim() : null;
+    final license = (asset?.metadata['license'] as String?)?.trim();
+    final hasCustomMix =
+        clip.audioMix.muted ||
+        (clip.audioMix.volume - 1).abs() > 0.001 ||
+        clip.audioMix.fadeInMs != 0 ||
+        clip.audioMix.fadeOutMs != 0 ||
+        clip.audioMix.pan.abs() > 0.001 ||
+        clip.audioMix.normalize;
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
@@ -6947,147 +8425,294 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               fontWeight: FontWeight.w600,
             ),
           ),
-          const SizedBox(height: 10),
-          Row(
-            children: [
-              TextButton.icon(
-                onPressed: () => _updateSelectedClipAudioMix(
-                  clip,
-                  muted: !clip.audioMix.muted,
-                ),
-                icon: Icon(
-                  clip.audioMix.muted
-                      ? Icons.volume_off_rounded
-                      : Icons.volume_up_rounded,
-                  size: 16,
-                ),
-                label: Text(clip.audioMix.muted ? 'Unmute' : 'Mute'),
+          if (attribution != null && attribution.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Container(
+              key: const ValueKey('audio-clip-attribution'),
+              width: double.infinity,
+              padding: const EdgeInsets.fromLTRB(12, 10, 8, 8),
+              decoration: BoxDecoration(
+                color: kAccent.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: kAccent.withValues(alpha: 0.22)),
               ),
-              const SizedBox(width: 8),
-              Text(
-                clip.audioMix.muted
-                    ? 'Muted'
-                    : '${(clip.audioMix.volume * 100).round()}%',
-                style: TextStyle(color: kTextSecondary, fontSize: 12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    license == null || license.isEmpty
+                        ? 'Sound attribution'
+                        : 'Sound attribution • ${license.toUpperCase()}',
+                    style: const TextStyle(
+                      color: kTextPrimary,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 5),
+                  SelectableText(
+                    attribution,
+                    style: const TextStyle(
+                      color: kTextSecondary,
+                      fontSize: 10,
+                      height: 1.35,
+                    ),
+                  ),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton.icon(
+                      key: const ValueKey('copy-audio-attribution'),
+                      onPressed: () async {
+                        await Clipboard.setData(
+                          ClipboardData(text: attribution),
+                        );
+                        if (!mounted) return;
+                        SnackBarHelper.showSuccess(
+                          context,
+                          'Sound attribution copied',
+                        );
+                      },
+                      icon: const Icon(Icons.copy_rounded, size: 15),
+                      label: const Text('Copy credit'),
+                    ),
+                  ),
+                ],
               ),
-            ],
-          ),
-          SliderTheme(
-            data: SliderThemeData(
-              activeTrackColor: kAccent,
-              inactiveTrackColor: kBorder,
-              thumbColor: kAccent,
-              overlayColor: kAccent.withValues(alpha: 0.14),
             ),
-            child: Slider(
-              value: clip.audioMix.volume.clamp(0.0, 1.0),
-              min: 0,
+          ],
+          const SizedBox(height: 10),
+          if (isVideoClip) ...[
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                key: ValueKey(
+                  hasSeparatedAudio
+                      ? 'edit-separated-video-audio'
+                      : 'separate-video-audio',
+                ),
+                onPressed: hasSeparatedAudio
+                    ? () {
+                        ref.read(editorProvider.notifier)
+                          ..selectTrack(separatedAudio.track.id)
+                          ..selectClip(separatedAudio.clip.id);
+                        Navigator.of(context).maybePop();
+                      }
+                    : () => _separateVideoAudio(clip),
+                icon: Icon(
+                  hasSeparatedAudio
+                      ? Icons.graphic_eq_rounded
+                      : Icons.call_split_rounded,
+                  size: 18,
+                ),
+                label: Text(
+                  hasSeparatedAudio
+                      ? 'Edit separated audio'
+                      : 'Separate audio to its own track',
+                ),
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              hasSeparatedAudio
+                  ? 'This video is muted to prevent duplicate playback. Volume, fades, pan, and mute now belong to the linked audio clip.'
+                  : 'Video audio stays attached by default. Separate it only when you need independent timeline controls.',
+              style: TextStyle(
+                color: kTextSecondary,
+                fontSize: 10,
+                height: 1.35,
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
+          if (!isVideoClip || !hasSeparatedAudio) ...[
+            Row(
+              children: [
+                TextButton.icon(
+                  onPressed: () => _updateSelectedClipAudioMix(
+                    clip,
+                    muted: !clip.audioMix.muted,
+                  ),
+                  icon: Icon(
+                    clip.audioMix.muted
+                        ? Icons.volume_off_rounded
+                        : Icons.volume_up_rounded,
+                    size: 16,
+                  ),
+                  label: Text(clip.audioMix.muted ? 'Unmute' : 'Mute'),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  clip.audioMix.muted
+                      ? 'Muted'
+                      : '${(clip.audioMix.volume * 100).round()}%',
+                  style: TextStyle(color: kTextSecondary, fontSize: 12),
+                ),
+              ],
+            ),
+            SliderTheme(
+              data: SliderThemeData(
+                activeTrackColor: kAccent,
+                inactiveTrackColor: kBorder,
+                thumbColor: kAccent,
+                overlayColor: kAccent.withValues(alpha: 0.14),
+              ),
+              child: Slider(
+                value: clip.audioMix.volume.clamp(0.0, 1.0),
+                min: 0,
+                max: 1,
+                divisions: 20,
+                onChangeStart: (_) => ref
+                    .read(editorProvider.notifier)
+                    .beginTimelineGestureEdit(),
+                onChanged: (value) => _updateSelectedClipAudioMix(
+                  clip,
+                  volume: value,
+                  muted: value == 0 ? true : false,
+                ),
+                onChangeEnd: (_) =>
+                    ref.read(editorProvider.notifier).endTimelineGestureEdit(),
+              ),
+            ),
+            Text(
+              'Stereo Pan',
+              style: TextStyle(color: kTextSecondary, fontSize: 12),
+            ),
+            Slider(
+              value: clip.audioMix.pan.clamp(-1.0, 1.0),
+              min: -1,
               max: 1,
               divisions: 20,
+              label: clip.audioMix.pan.abs() < 0.05
+                  ? 'Center'
+                  : clip.audioMix.pan < 0
+                  ? 'L ${(clip.audioMix.pan.abs() * 100).round()}'
+                  : 'R ${(clip.audioMix.pan * 100).round()}',
               onChangeStart: (_) =>
                   ref.read(editorProvider.notifier).beginTimelineGestureEdit(),
-              onChanged: (value) => _updateSelectedClipAudioMix(
-                clip,
-                volume: value,
-                muted: value == 0 ? true : false,
+              onChanged: (value) =>
+                  _updateSelectedClipAudioMix(clip, pan: value),
+              onChangeEnd: (_) =>
+                  ref.read(editorProvider.notifier).endTimelineGestureEdit(),
+            ),
+            const Text(
+              'Left/right routing is rendered in the export; device preview monitors centered audio.',
+              style: TextStyle(color: kTextSecondary, fontSize: 10),
+            ),
+            SwitchListTile.adaptive(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Normalize loudness'),
+              subtitle: const Text('Target a consistent −16 LUFS on export'),
+              value: clip.audioMix.normalize,
+              onChanged: (value) =>
+                  _updateSelectedClipAudioMix(clip, normalize: value),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'Fade In',
+              style: TextStyle(color: kTextSecondary, fontSize: 12),
+            ),
+            SliderTheme(
+              data: SliderThemeData(
+                activeTrackColor: kAccent,
+                inactiveTrackColor: kBorder,
+                thumbColor: kAccent,
+                overlayColor: kAccent.withValues(alpha: 0.14),
               ),
-              onChangeEnd: (_) =>
-                  ref.read(editorProvider.notifier).endTimelineGestureEdit(),
+              child: Slider(
+                value: clip.audioMix.fadeInMs.toDouble().clamp(0, 1500),
+                min: 0,
+                max: 1500,
+                divisions: 15,
+                label: '${clip.audioMix.fadeInMs}ms',
+                onChangeStart: (_) => ref
+                    .read(editorProvider.notifier)
+                    .beginTimelineGestureEdit(),
+                onChanged: (value) =>
+                    _updateSelectedClipAudioMix(clip, fadeInMs: value.round()),
+                onChangeEnd: (_) =>
+                    ref.read(editorProvider.notifier).endTimelineGestureEdit(),
+              ),
             ),
-          ),
-          Text(
-            'Stereo Pan',
-            style: TextStyle(color: kTextSecondary, fontSize: 12),
-          ),
-          Slider(
-            value: clip.audioMix.pan.clamp(-1.0, 1.0),
-            min: -1,
-            max: 1,
-            divisions: 20,
-            label: clip.audioMix.pan.abs() < 0.05
-                ? 'Center'
-                : clip.audioMix.pan < 0
-                ? 'L ${(clip.audioMix.pan.abs() * 100).round()}'
-                : 'R ${(clip.audioMix.pan * 100).round()}',
-            onChangeStart: (_) =>
-                ref.read(editorProvider.notifier).beginTimelineGestureEdit(),
-            onChanged: (value) => _updateSelectedClipAudioMix(clip, pan: value),
-            onChangeEnd: (_) =>
-                ref.read(editorProvider.notifier).endTimelineGestureEdit(),
-          ),
-          const Text(
-            'Left/right routing is rendered in the export; device preview monitors centered audio.',
-            style: TextStyle(color: kTextSecondary, fontSize: 10),
-          ),
-          SwitchListTile.adaptive(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Normalize loudness'),
-            subtitle: const Text('Target a consistent −16 LUFS on export'),
-            value: clip.audioMix.normalize,
-            onChanged: (value) =>
-                _updateSelectedClipAudioMix(clip, normalize: value),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            'Fade In',
-            style: TextStyle(color: kTextSecondary, fontSize: 12),
-          ),
-          SliderTheme(
-            data: SliderThemeData(
-              activeTrackColor: kAccent,
-              inactiveTrackColor: kBorder,
-              thumbColor: kAccent,
-              overlayColor: kAccent.withValues(alpha: 0.14),
+            Text(
+              'Fade Out',
+              style: TextStyle(color: kTextSecondary, fontSize: 12),
             ),
-            child: Slider(
-              value: clip.audioMix.fadeInMs.toDouble().clamp(0, 1500),
-              min: 0,
-              max: 1500,
-              divisions: 15,
-              label: '${clip.audioMix.fadeInMs}ms',
-              onChangeStart: (_) =>
-                  ref.read(editorProvider.notifier).beginTimelineGestureEdit(),
-              onChanged: (value) =>
-                  _updateSelectedClipAudioMix(clip, fadeInMs: value.round()),
-              onChangeEnd: (_) =>
-                  ref.read(editorProvider.notifier).endTimelineGestureEdit(),
+            SliderTheme(
+              data: SliderThemeData(
+                activeTrackColor: kAccent,
+                inactiveTrackColor: kBorder,
+                thumbColor: kAccent,
+                overlayColor: kAccent.withValues(alpha: 0.14),
+              ),
+              child: Slider(
+                value: clip.audioMix.fadeOutMs.toDouble().clamp(0, 1500),
+                min: 0,
+                max: 1500,
+                divisions: 15,
+                label: '${clip.audioMix.fadeOutMs}ms',
+                onChangeStart: (_) => ref
+                    .read(editorProvider.notifier)
+                    .beginTimelineGestureEdit(),
+                onChanged: (value) =>
+                    _updateSelectedClipAudioMix(clip, fadeOutMs: value.round()),
+                onChangeEnd: (_) =>
+                    ref.read(editorProvider.notifier).endTimelineGestureEdit(),
+              ),
             ),
-          ),
-          Text(
-            'Fade Out',
-            style: TextStyle(color: kTextSecondary, fontSize: 12),
-          ),
-          SliderTheme(
-            data: SliderThemeData(
-              activeTrackColor: kAccent,
-              inactiveTrackColor: kBorder,
-              thumbColor: kAccent,
-              overlayColor: kAccent.withValues(alpha: 0.14),
+            Text(
+              isVideoClip
+                  ? 'Attached video audio can be mixed here without creating another timeline lane.'
+                  : 'Audio clips now support volume plus simple fade in and fade out.',
+              style: TextStyle(
+                color: kTextSecondary,
+                fontSize: 12,
+                height: 1.35,
+              ),
             ),
-            child: Slider(
-              value: clip.audioMix.fadeOutMs.toDouble().clamp(0, 1500),
-              min: 0,
-              max: 1500,
-              divisions: 15,
-              label: '${clip.audioMix.fadeOutMs}ms',
-              onChangeStart: (_) =>
-                  ref.read(editorProvider.notifier).beginTimelineGestureEdit(),
-              onChanged: (value) =>
-                  _updateSelectedClipAudioMix(clip, fadeOutMs: value.round()),
-              onChangeEnd: (_) =>
-                  ref.read(editorProvider.notifier).endTimelineGestureEdit(),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: hasCustomMix
+                    ? () => _updateSelectedClipAudioMix(
+                        clip,
+                        muted: false,
+                        volume: 1,
+                        fadeInMs: 0,
+                        fadeOutMs: 0,
+                        pan: 0,
+                        normalize: false,
+                      )
+                    : null,
+                icon: const Icon(Icons.restart_alt_rounded),
+                label: const Text('Reset mix'),
+              ),
             ),
-          ),
-          Text(
-            isVideoClip
-                ? 'Overlay video audio can be faded in and out here.'
-                : 'Audio clips now support volume plus simple fade in and fade out.',
-            style: TextStyle(color: kTextSecondary, fontSize: 12, height: 1.35),
-          ),
+          ],
         ],
       ),
     );
   }
+
+  ({TimelineTrack track, TimelineClip clip})? _separatedAudioForVideo(
+    EditorTimeline timeline,
+    String videoClipId,
+  ) {
+    for (final track in timeline.tracks) {
+      for (final clip in track.clips) {
+        if (clip.type == TimelineTrackType.audio &&
+            clip.linkedClipId == videoClipId) {
+          return (track: track, clip: clip);
+        }
+      }
+    }
+    return null;
+  }
+
+  ({TimelineTrack track, TimelineClip clip})? _audioOwnerForClip(
+    EditorTimeline timeline,
+    TimelineClip clip,
+  ) => resolveEffectiveAudioOwner(timeline: timeline, clip: clip);
 
   Future<void> _openTransitionSheet(TimelineClip clip) async {
     final editorState = ref.read(editorProvider);
@@ -7102,7 +8727,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       context: context,
       isScrollControlled: true,
       constraints: BoxConstraints(
-        maxHeight: MediaQuery.sizeOf(context).height * 0.40,
+        maxHeight: MediaQuery.sizeOf(context).height * 0.68,
       ),
       backgroundColor: Colors.transparent,
       barrierColor: Colors.black.withValues(alpha: 0.35),
@@ -7125,7 +8750,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       context: context,
       isScrollControlled: true,
       constraints: BoxConstraints(
-        maxHeight: MediaQuery.sizeOf(context).height * 0.40,
+        maxHeight: MediaQuery.sizeOf(context).height * 0.68,
       ),
       backgroundColor: Colors.transparent,
       barrierColor: Colors.black.withValues(alpha: 0.35),
@@ -7143,6 +8768,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   Widget _buildTransitionEditor(TimelineClip clip) {
+    final isCut =
+        clip.outroTransition.type == TransitionType.none ||
+        clip.outroTransition.type == TransitionType.cut;
     const transitionOptions = [
       (TransitionType.cut, 'Cut'),
       (TransitionType.fade, 'Fade'),
@@ -7152,6 +8780,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       (TransitionType.slideUp, 'Up'),
       (TransitionType.slideDown, 'Down'),
       (TransitionType.zoom, 'Zoom'),
+      (TransitionType.zoomOut, 'Zoom out'),
+      (TransitionType.pop, 'Pop'),
+      (TransitionType.spin, 'Spin'),
+      (TransitionType.slideUpLeft, 'Up-left'),
+      (TransitionType.slideUpRight, 'Up-right'),
     ];
 
     return Container(
@@ -7209,7 +8842,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   durationMs: option.$1 == TransitionType.cut
                       ? 0
                       : (clip.outroTransition.durationMs == 0
-                            ? 400
+                            ? 450
                             : clip.outroTransition.durationMs),
                 ),
               );
@@ -7228,24 +8861,29 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               overlayColor: kAccent.withValues(alpha: 0.14),
             ),
             child: Slider(
-              value: clip.outroTransition.type == TransitionType.cut
+              value: isCut
                   ? 0
-                  : clip.outroTransition.durationMs.toDouble().clamp(100, 1200),
+                  : clip.outroTransition.durationMs.toDouble().clamp(100, 2000),
               min: 0,
-              max: 1200,
-              divisions: 12,
-              label:
-                  '${clip.outroTransition.type == TransitionType.cut ? 0 : clip.outroTransition.durationMs}ms',
-              onChangeStart: (_) =>
-                  ref.read(editorProvider.notifier).beginTimelineGestureEdit(),
-              onChanged: (value) => _updateSelectedClipTransition(
-                clip: clip,
-                durationMs: clip.outroTransition.type == TransitionType.cut
-                    ? 0
-                    : value.round(),
-              ),
-              onChangeEnd: (_) =>
-                  ref.read(editorProvider.notifier).endTimelineGestureEdit(),
+              max: 2000,
+              divisions: 20,
+              label: '${isCut ? 0 : clip.outroTransition.durationMs}ms',
+              onChangeStart: isCut
+                  ? null
+                  : (_) => ref
+                        .read(editorProvider.notifier)
+                        .beginTimelineGestureEdit(),
+              onChanged: isCut
+                  ? null
+                  : (value) => _updateSelectedClipTransition(
+                      clip: clip,
+                      durationMs: value.round(),
+                    ),
+              onChangeEnd: isCut
+                  ? null
+                  : (_) => ref
+                        .read(editorProvider.notifier)
+                        .endTimelineGestureEdit(),
             ),
           ),
         ],
@@ -7262,6 +8900,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       (TransitionType.slideUp, 'Slide Up'),
       (TransitionType.slideDown, 'Slide Down'),
       (TransitionType.zoom, 'Zoom'),
+      (TransitionType.zoomOut, 'Zoom out'),
+      (TransitionType.pop, 'Pop'),
+      (TransitionType.spin, 'Spin'),
+      (TransitionType.slideUpLeft, 'Up-left'),
+      (TransitionType.slideUpRight, 'Up-right'),
     ];
     final isAudioTrack = track.section == TimelineTrackSection.audio;
     final sheetTitle = isAudioTrack
@@ -7327,7 +8970,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                     updateIntro: true,
                     updateOutro: false,
                     type: option.$1,
-                    durationMs: option.$1 == TransitionType.none ? 0 : 350,
+                    durationMs: option.$1 == TransitionType.none
+                        ? 0
+                        : math.max(350, clip.introTransition.durationMs),
                   ),
                 );
               }).toList(),
@@ -7358,7 +9003,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                     updateIntro: false,
                     updateOutro: true,
                     type: option.$1,
-                    durationMs: option.$1 == TransitionType.none ? 0 : 350,
+                    durationMs: option.$1 == TransitionType.none
+                        ? 0
+                        : math.max(350, clip.outroTransition.durationMs),
                   ),
                 );
               }).toList(),
@@ -7381,10 +9028,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                             ? clip.outroTransition.durationMs
                             : clip.introTransition.durationMs)
                         .toDouble()
-                        .clamp(150, 1200),
+                        .clamp(150, 2000),
                 min: 150,
-                max: 1200,
-                divisions: 7,
+                max: 2000,
+                divisions: 37,
                 label:
                     '${(clip.introTransition.durationMs == 0 ? clip.outroTransition.durationMs : clip.introTransition.durationMs)}ms',
                 onChangeStart: (_) => ref
@@ -7476,58 +9123,25 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       isScrollControlled: true,
       barrierColor: Colors.black.withValues(alpha: 0.2),
       backgroundColor: Colors.transparent,
-      builder: (_) => DraggableScrollableSheet(
-        initialChildSize: 0.38,
-        maxChildSize: 0.40,
-        minChildSize: 0.22,
-        expand: false,
-        builder: (_, controller) {
-          return Container(
-            decoration: const BoxDecoration(
-              color: kSurface,
-              borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-            ),
-            child: Column(
-              children: [
-                const SizedBox(height: 12),
-                Container(
-                  width: 40,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: kBorder,
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  'Subtitle Style',
-                  style: TextStyle(
-                    color: kTextPrimary,
-                    fontSize: 16,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                Text(
-                  'Keep sheet lower to preview changes on video',
-                  style: TextStyle(color: kTextSecondary, fontSize: 11),
-                ),
-                const SizedBox(height: 8),
-                const Expanded(child: SubtitleStylePanel()),
-              ],
-            ),
-          );
-        },
+      builder: (sheetContext) => ResizableEditorSheet(
+        title: 'Subtitle style',
+        subtitle: 'Resize the sheet to balance the preview and controls',
+        initialHeightFactor: 0.38,
+        minHeightFactor: 0.24,
+        maxHeightFactor: 0.88,
+        scrollable: false,
+        contentPadding: EdgeInsets.zero,
+        onClose: () => Navigator.pop(sheetContext),
+        child: const SubtitleStylePanel(),
       ),
     );
   }
 }
 
 class _SelectionCapabilities {
-  final bool hasSelection;
   final bool canEdit;
   final bool canAdjustAudio;
   final bool canVisualEffects;
-  final bool canTransform;
   final bool canAnimate;
   final bool canTransition;
   final bool canArrange;
@@ -7536,11 +9150,9 @@ class _SelectionCapabilities {
   final bool isBlurEffect;
 
   const _SelectionCapabilities({
-    required this.hasSelection,
     required this.canEdit,
     required this.canAdjustAudio,
     required this.canVisualEffects,
-    required this.canTransform,
     required this.canAnimate,
     required this.canTransition,
     required this.canArrange,
@@ -7548,24 +9160,27 @@ class _SelectionCapabilities {
     required this.isFilterEffect,
     required this.isBlurEffect,
   });
-
-  bool get canUseLooks => canVisualEffects || isFilterEffect;
-  bool get canUseBlur => canVisualEffects || isBlurEffect;
-  bool get canUseMotion => canAnimate || canTransition;
-  bool get canUseEffects => canUseLooks || canUseBlur || canUseMotion;
 }
 
 class _ActionSpec {
+  final Key? key;
+  final double? width;
+  final String group;
   final String label;
   final String tooltip;
   final IconData icon;
   final VoidCallback? onTap;
+  final bool active;
 
   const _ActionSpec({
+    this.key,
+    this.width,
+    required this.group,
     required this.label,
     required this.tooltip,
     required this.icon,
     required this.onTap,
+    this.active = false,
   });
 }
 
@@ -7622,7 +9237,10 @@ class _GiphyPickerSheetState extends State<_GiphyPickerSheet> {
     });
 
     try {
-      final results = await GiphyService.search(query: query, kind: searchKind);
+      final results = await GiphyService.shared.search(
+        query: query,
+        kind: searchKind,
+      );
       if (!mounted || requestGeneration != _requestGeneration) return;
       setState(() {
         _results = results;
@@ -7656,237 +9274,210 @@ class _GiphyPickerSheetState extends State<_GiphyPickerSheet> {
 
   @override
   Widget build(BuildContext context) {
-    return DraggableScrollableSheet(
-      initialChildSize: 0.72,
-      minChildSize: 0.48,
-      maxChildSize: 0.82,
-      expand: false,
-      builder: (_, scrollController) {
-        return Container(
-          decoration: const BoxDecoration(
-            color: kSurface,
-            borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
-          ),
-          child: Column(
-            children: [
-              const SizedBox(height: 12),
-              Container(
-                width: 44,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: kBorder,
-                  borderRadius: BorderRadius.circular(999),
+    return ResizableEditorSheet(
+      title: 'GIFs & stickers',
+      subtitle: 'Search animated overlays from GIPHY',
+      initialHeightFactor: 0.72,
+      minHeightFactor: 0.48,
+      maxHeightFactor: 0.90,
+      scrollable: false,
+      contentPadding: EdgeInsets.zero,
+      onClose: () => Navigator.of(context).pop(),
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _searchController,
+                    onChanged: _onQueryChanged,
+                    style: TextStyle(color: kTextPrimary),
+                    decoration: InputDecoration(
+                      hintText: 'Search GIFs and stickers',
+                      prefixIcon: const Icon(Icons.search_rounded, size: 20),
+                      suffixIcon: _searchController.text.isEmpty
+                          ? null
+                          : IconButton(
+                              onPressed: () {
+                                _searchController.clear();
+                                _refreshResults();
+                              },
+                              icon: const Icon(Icons.close_rounded, size: 18),
+                            ),
+                      filled: true,
+                      fillColor: kSurfaceElevated,
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 14,
+                      ),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(18),
+                        borderSide: const BorderSide(color: kBorder),
+                      ),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(18),
+                        borderSide: const BorderSide(color: kBorder),
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(18),
+                        borderSide: const BorderSide(color: kAccent),
+                      ),
+                    ),
+                  ),
                 ),
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-                child: Row(
+                const SizedBox(width: 10),
+                InkWell(
+                  borderRadius: BorderRadius.circular(16),
+                  onTap: _isLoading ? null : _refreshResults,
+                  child: Ink(
+                    width: 48,
+                    height: 48,
+                    decoration: BoxDecoration(
+                      color: kSurfaceElevated,
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(color: kBorder),
+                    ),
+                    child: const Icon(
+                      Icons.refresh_rounded,
+                      color: kTextPrimary,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
                   children: [
-                    Expanded(
-                      child: TextField(
-                        controller: _searchController,
-                        onChanged: _onQueryChanged,
-                        style: TextStyle(color: kTextPrimary),
-                        decoration: InputDecoration(
-                          hintText: 'Search GIFs and stickers',
-                          prefixIcon: const Icon(
-                            Icons.search_rounded,
-                            size: 20,
+                    _buildKindChip(label: 'All', kind: GiphySearchKind.both),
+                    const SizedBox(width: 8),
+                    _buildKindChip(label: 'GIFs', kind: GiphySearchKind.gifs),
+                    const SizedBox(width: 8),
+                    _buildKindChip(
+                      label: 'Stickers',
+                      kind: GiphySearchKind.stickers,
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 7),
+                const Text(
+                  'Powered by GIPHY',
+                  style: TextStyle(
+                    color: kTextSecondary,
+                    fontSize: 9,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.5,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: Builder(
+              builder: (context) {
+                if (_isLoading) {
+                  return const Center(
+                    child: CircularProgressIndicator(
+                      color: kAccent,
+                      strokeWidth: 2,
+                    ),
+                  );
+                }
+
+                if (_error != null) {
+                  return _buildSheetMessage(
+                    icon: Icons.key_off_rounded,
+                    message: _error!,
+                  );
+                }
+
+                if (_results.isEmpty) {
+                  return _buildSheetMessage(
+                    icon: Icons.gif_box_outlined,
+                    message: _searchController.text.trim().isEmpty
+                        ? 'No trending results right now.'
+                        : 'No results for this search.',
+                  );
+                }
+
+                return GridView.builder(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
+                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 3,
+                    mainAxisSpacing: 10,
+                    crossAxisSpacing: 10,
+                    childAspectRatio: 0.82,
+                  ),
+                  itemCount: _results.length,
+                  itemBuilder: (_, index) {
+                    final result = _results[index];
+                    return Material(
+                      color: Colors.transparent,
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(22),
+                        onTap: () => _selectResult(result),
+                        child: Ink(
+                          decoration: BoxDecoration(
+                            color: kSurfaceElevated,
+                            borderRadius: BorderRadius.circular(22),
+                            border: Border.all(color: kBorder),
                           ),
-                          suffixIcon: _searchController.text.isEmpty
-                              ? null
-                              : IconButton(
-                                  onPressed: () {
-                                    _searchController.clear();
-                                    _refreshResults();
-                                  },
-                                  icon: const Icon(
-                                    Icons.close_rounded,
-                                    size: 18,
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(22),
+                            child: Stack(
+                              fit: StackFit.expand,
+                              children: [
+                                Image.network(
+                                  result.previewUrl,
+                                  fit: BoxFit.cover,
+                                  filterQuality: FilterQuality.low,
+                                  errorBuilder: (_, _, _) => Container(
+                                    color: kSurfaceElevated,
+                                    alignment: Alignment.center,
+                                    child: const Icon(
+                                      Icons.broken_image_outlined,
+                                      color: kTextSecondary,
+                                    ),
                                   ),
                                 ),
-                          filled: true,
-                          fillColor: kSurfaceElevated,
-                          contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 14,
-                            vertical: 14,
-                          ),
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(18),
-                            borderSide: const BorderSide(color: kBorder),
-                          ),
-                          enabledBorder: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(18),
-                            borderSide: const BorderSide(color: kBorder),
-                          ),
-                          focusedBorder: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(18),
-                            borderSide: const BorderSide(color: kAccent),
-                          ),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    InkWell(
-                      borderRadius: BorderRadius.circular(16),
-                      onTap: _isLoading ? null : _refreshResults,
-                      child: Ink(
-                        width: 48,
-                        height: 48,
-                        decoration: BoxDecoration(
-                          color: kSurfaceElevated,
-                          borderRadius: BorderRadius.circular(16),
-                          border: Border.all(color: kBorder),
-                        ),
-                        child: const Icon(
-                          Icons.refresh_rounded,
-                          color: kTextPrimary,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        _buildKindChip(
-                          label: 'All',
-                          kind: GiphySearchKind.both,
-                        ),
-                        const SizedBox(width: 8),
-                        _buildKindChip(
-                          label: 'GIFs',
-                          kind: GiphySearchKind.gifs,
-                        ),
-                        const SizedBox(width: 8),
-                        _buildKindChip(
-                          label: 'Stickers',
-                          kind: GiphySearchKind.stickers,
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 7),
-                    const Text(
-                      'Powered by GIPHY',
-                      style: TextStyle(
-                        color: kTextSecondary,
-                        fontSize: 9,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: 0.5,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              Expanded(
-                child: Builder(
-                  builder: (context) {
-                    if (_isLoading) {
-                      return const Center(
-                        child: CircularProgressIndicator(
-                          color: kAccent,
-                          strokeWidth: 2,
-                        ),
-                      );
-                    }
-
-                    if (_error != null) {
-                      return _buildSheetMessage(
-                        icon: Icons.key_off_rounded,
-                        message: _error!,
-                      );
-                    }
-
-                    if (_results.isEmpty) {
-                      return _buildSheetMessage(
-                        icon: Icons.gif_box_outlined,
-                        message: _searchController.text.trim().isEmpty
-                            ? 'No trending results right now.'
-                            : 'No results for this search.',
-                      );
-                    }
-
-                    return GridView.builder(
-                      controller: scrollController,
-                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
-                      gridDelegate:
-                          const SliverGridDelegateWithFixedCrossAxisCount(
-                            crossAxisCount: 3,
-                            mainAxisSpacing: 10,
-                            crossAxisSpacing: 10,
-                            childAspectRatio: 0.82,
-                          ),
-                      itemCount: _results.length,
-                      itemBuilder: (_, index) {
-                        final result = _results[index];
-                        return Material(
-                          color: Colors.transparent,
-                          child: InkWell(
-                            borderRadius: BorderRadius.circular(22),
-                            onTap: () => _selectResult(result),
-                            child: Ink(
-                              decoration: BoxDecoration(
-                                color: kSurfaceElevated,
-                                borderRadius: BorderRadius.circular(22),
-                                border: Border.all(color: kBorder),
-                              ),
-                              child: ClipRRect(
-                                borderRadius: BorderRadius.circular(22),
-                                child: Stack(
-                                  fit: StackFit.expand,
-                                  children: [
-                                    Image.network(
-                                      result.previewUrl,
-                                      fit: BoxFit.cover,
-                                      filterQuality: FilterQuality.low,
-                                      errorBuilder: (_, _, _) => Container(
-                                        color: kSurfaceElevated,
-                                        alignment: Alignment.center,
-                                        child: const Icon(
-                                          Icons.broken_image_outlined,
-                                          color: kTextSecondary,
-                                        ),
+                                Positioned(
+                                  right: 10,
+                                  bottom: 10,
+                                  child: Container(
+                                    width: 30,
+                                    height: 30,
+                                    decoration: BoxDecoration(
+                                      color: Colors.black.withValues(
+                                        alpha: 0.45,
                                       ),
+                                      shape: BoxShape.circle,
                                     ),
-                                    Positioned(
-                                      right: 10,
-                                      bottom: 10,
-                                      child: Container(
-                                        width: 30,
-                                        height: 30,
-                                        decoration: BoxDecoration(
-                                          color: Colors.black.withValues(
-                                            alpha: 0.45,
-                                          ),
-                                          shape: BoxShape.circle,
-                                        ),
-                                        child: const Icon(
-                                          Icons.add_rounded,
-                                          color: Colors.white,
-                                          size: 18,
-                                        ),
-                                      ),
+                                    child: const Icon(
+                                      Icons.add_rounded,
+                                      color: Colors.white,
+                                      size: 18,
                                     ),
-                                  ],
+                                  ),
                                 ),
-                              ),
+                              ],
                             ),
                           ),
-                        );
-                      },
+                        ),
+                      ),
                     );
                   },
-                ),
-              ),
-            ],
+                );
+              },
+            ),
           ),
-        );
-      },
+        ],
+      ),
     );
   }
 
