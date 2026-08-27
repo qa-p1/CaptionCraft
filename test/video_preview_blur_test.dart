@@ -103,6 +103,104 @@ void main() {
     );
   });
 
+  test('indexed preview lookup stays correct on a long timeline lane', () {
+    final clips = List<TimelineClip>.generate(10000, (index) {
+      final start = Duration(milliseconds: index * 100);
+      return TimelineClip(
+        id: 'clip_$index',
+        trackId: 'long-track',
+        type: TimelineTrackType.video,
+        label: 'Clip $index',
+        startTime: start,
+        endTime: start + const Duration(milliseconds: 100),
+      );
+    }, growable: false);
+    const position = Duration(milliseconds: 777750);
+
+    expect(previewClipStartUpperBoundForTesting(clips, position), 7778);
+    expect(
+      resolveIndexedPreviewClipForTesting(
+        sortedClips: clips,
+        position: position,
+      )?.id,
+      'clip_7777',
+    );
+    expect(
+      indexedPreviewClipsStartingInWindowForTesting(
+        sortedClips: clips,
+        position: position,
+        window: const Duration(milliseconds: 250),
+      ).map((clip) => clip.id),
+      ['clip_7778', 'clip_7779', 'clip_7780'],
+    );
+  });
+
+  test(
+    'indexed lookup handles gaps and an explicitly included final frame',
+    () {
+      final clips = [
+        TimelineClip(
+          id: 'first',
+          trackId: 'video',
+          type: TimelineTrackType.video,
+          label: 'First',
+          startTime: Duration.zero,
+          endTime: const Duration(seconds: 1),
+        ),
+        TimelineClip(
+          id: 'second',
+          trackId: 'video',
+          type: TimelineTrackType.video,
+          label: 'Second',
+          startTime: const Duration(seconds: 2),
+          endTime: const Duration(seconds: 3),
+        ),
+      ];
+
+      expect(
+        resolveIndexedPreviewClipForTesting(
+          sortedClips: clips,
+          position: const Duration(milliseconds: 1500),
+        ),
+        isNull,
+      );
+      expect(
+        resolveIndexedPreviewClipForTesting(
+          sortedClips: clips,
+          position: const Duration(seconds: 3),
+          includeEnd: true,
+        )?.id,
+        'second',
+      );
+    },
+  );
+
+  test('caption interval index finds overlaps deep in a large caption set', () {
+    final entries = <SubtitleEntry>[
+      SubtitleEntry(
+        id: 'long-caption',
+        startTime: Duration.zero,
+        endTime: const Duration(seconds: 1000),
+        text: 'Persistent title',
+      ),
+      ...List<SubtitleEntry>.generate(10000, (index) {
+        final start = Duration(milliseconds: index * 100);
+        return SubtitleEntry(
+          id: 'caption_$index',
+          startTime: start,
+          endTime: start + const Duration(milliseconds: 100),
+          text: 'Caption $index',
+        );
+      }, growable: false),
+    ];
+
+    final active = resolveIndexedPreviewSubtitlesForTesting(
+      entries: entries,
+      position: const Duration(milliseconds: 777750),
+    );
+    expect(active.map((entry) => entry.id), ['long-caption', 'caption_7777']);
+  });
+
   test(
     'referenced missing media never falls back to the first project video',
     () {
@@ -174,6 +272,40 @@ void main() {
     );
     expect(clamped.start, const Duration(seconds: 2));
     expect(clamped.end, const Duration(seconds: 5));
+  });
+
+  testWidgets('preview diagnostics can be shown, reset, and hidden', (
+    tester,
+  ) async {
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    container
+        .read(editorProvider.notifier)
+        .loadProject(
+          videoPath: '',
+          projectId: 'diagnostics-preview',
+          projectName: 'Diagnostics preview',
+        );
+
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(
+          home: Scaffold(body: VideoPreviewPanel(videoPath: '')),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    await tester.tap(find.byTooltip('Show preview diagnostics'));
+    await tester.pump();
+    expect(find.text('PREVIEW DIAGNOSTICS'), findsOneWidget);
+    await tester.tap(find.text('RESET'));
+    await tester.pump();
+
+    await tester.tap(find.byTooltip('Hide preview diagnostics'));
+    await tester.pump();
+    expect(find.text('PREVIEW DIAGNOSTICS'), findsNothing);
   });
 
   testWidgets('gap playback excludes time spent in the background', (

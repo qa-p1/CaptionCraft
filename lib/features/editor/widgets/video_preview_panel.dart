@@ -15,6 +15,7 @@ import '../providers/editor_provider.dart';
 import '../providers/playback_provider.dart';
 import '../providers/subtitle_provider.dart';
 import '../widgets/animated_subtitle_overlay.dart';
+import '../widgets/preview_performance_monitor.dart';
 import '../widgets/preview_playback_clock.dart';
 
 double _previewAudioVolume({
@@ -104,6 +105,72 @@ const int _maxUpcomingAudioPreviewControllers = 3;
 const Duration _baseVideoPreloadWindow = Duration(milliseconds: 3500);
 
 typedef PreviewDuckingInterval = ({int startMs, int endMs});
+
+/// Returns the first index whose clip starts strictly after [position].
+///
+/// Preview lanes are normalized so clips do not overlap. Keeping their starts
+/// sorted lets the 30 Hz playback path resolve the active clip in O(log n)
+/// instead of walking every clip in a long project on every tick.
+@visibleForTesting
+int previewClipStartUpperBoundForTesting(
+  List<TimelineClip> sortedClips,
+  Duration position,
+) {
+  var lower = 0;
+  var upper = sortedClips.length;
+  while (lower < upper) {
+    final middle = lower + ((upper - lower) >> 1);
+    if (sortedClips[middle].startTime <= position) {
+      lower = middle + 1;
+    } else {
+      upper = middle;
+    }
+  }
+  return lower;
+}
+
+/// Resolves one active clip from a sorted, non-overlapping preview lane.
+@visibleForTesting
+TimelineClip? resolveIndexedPreviewClipForTesting({
+  required List<TimelineClip> sortedClips,
+  required Duration position,
+  bool includeEnd = false,
+}) {
+  final index = previewClipStartUpperBoundForTesting(sortedClips, position) - 1;
+  if (index < 0) return null;
+  final clip = sortedClips[index];
+  final inside = position >= clip.startTime && position < clip.endTime;
+  final onIncludedEnd =
+      includeEnd && position == clip.endTime && position >= clip.startTime;
+  return inside || onIncludedEnd ? clip : null;
+}
+
+/// Returns only future clips whose starts fall inside a bounded warm window.
+@visibleForTesting
+List<TimelineClip> indexedPreviewClipsStartingInWindowForTesting({
+  required List<TimelineClip> sortedClips,
+  required Duration position,
+  required Duration window,
+}) {
+  final safeWindow = window < Duration.zero ? Duration.zero : window;
+  final maximumStart = position + safeWindow;
+  final first = previewClipStartUpperBoundForTesting(sortedClips, position);
+  final result = <TimelineClip>[];
+  for (var index = first; index < sortedClips.length; index++) {
+    final clip = sortedClips[index];
+    if (clip.startTime > maximumStart) break;
+    result.add(clip);
+  }
+  return result;
+}
+
+@visibleForTesting
+List<SubtitleEntry> resolveIndexedPreviewSubtitlesForTesting({
+  required List<SubtitleEntry> entries,
+  required Duration position,
+}) {
+  return _PreviewCaptionIndex(entries).activeAt(position);
+}
 
 @visibleForTesting
 bool previewHasSoloMediaTrackForTesting(EditorTimeline timeline) {
@@ -684,12 +751,20 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   double? _lastBaseVolume;
   double? _lastBasePlaybackSpeed;
   bool _isSeekingReverseFrame = false;
+  final PreviewPerformanceMonitor _performanceMonitor =
+      PreviewPerformanceMonitor(enabled: false);
+  bool _showPerformanceDiagnostics = false;
   EditorTimeline? _cachedCaptionTimeline;
   List<SubtitleEntry>? _cachedCaptionEntries;
   List<SubtitleEntry> _effectiveCaptionCache = const [];
+  _PreviewCaptionIndex _effectiveCaptionIndex = _PreviewCaptionIndex.empty();
   EditorTimeline? _cachedPreviewTimeline;
   int? _cachedPreviewEditRevision;
   Map<String, EditorAssetReference> _cachedAssetsById = const {};
+  List<_PreviewTrackLane> _cachedBaseVideoLanes = const [];
+  List<_PreviewTrackLane> _cachedOverlayLanes = const [];
+  List<_PreviewTrackLane> _cachedTextLanes = const [];
+  List<_PreviewTrackLane> _cachedAudioLanes = const [];
   final Map<String, bool> _cachedFileAvailability = {};
   final Map<String, List<PreviewDuckingInterval>> _cachedDuckingIntervals = {};
   bool _cachedHasSoloMediaTrack = false;
@@ -708,6 +783,44 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     _cachedPreviewTimeline = timeline;
     _cachedPreviewEditRevision = editRevision;
     _cachedAssetsById = {for (final asset in timeline.assets) asset.id: asset};
+    final baseVideoLanes = <_PreviewTrackLane>[];
+    final overlayLanes = <_PreviewTrackLane>[];
+    final textLanes = <_PreviewTrackLane>[];
+    final audioLanes = <_PreviewTrackLane>[];
+    for (
+      var trackIndex = 0;
+      trackIndex < timeline.tracks.length;
+      trackIndex++
+    ) {
+      final track = timeline.tracks[trackIndex];
+      final clips =
+          track.clips
+              .where((clip) => clip.enabled && clip.endTime > clip.startTime)
+              .toList(growable: false)
+            ..sort((a, b) => a.startTime.compareTo(b.startTime));
+      if (clips.isEmpty) continue;
+      final lane = _PreviewTrackLane(
+        trackIndex: trackIndex,
+        track: track,
+        clips: clips,
+      );
+      if (track.section == TimelineTrackSection.baseVideo && !track.isHidden) {
+        baseVideoLanes.add(lane);
+      }
+      if (track.section == TimelineTrackSection.overlay && !track.isHidden) {
+        overlayLanes.add(lane);
+      }
+      if (track.type == TimelineTrackType.text && !track.isHidden) {
+        textLanes.add(lane);
+      }
+      if (track.section == TimelineTrackSection.audio) {
+        audioLanes.add(lane);
+      }
+    }
+    _cachedBaseVideoLanes = baseVideoLanes;
+    _cachedOverlayLanes = overlayLanes;
+    _cachedTextLanes = textLanes;
+    _cachedAudioLanes = audioLanes;
     _cachedHasSoloMediaTrack = previewHasSoloMediaTrackForTesting(timeline);
     _cachedFileAvailability.clear();
     _cachedDuckingIntervals.clear();
@@ -879,8 +992,12 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     if (!_timelineClockAnchored) {
       _anchorTimelineClock(ref.read(playbackProvider).position);
     }
+    _performanceMonitor.beginTickSession();
     _playbackTicker = Timer.periodic(const Duration(milliseconds: 33), (_) {
       if (!_initialized || !mounted || _playbackSuspendedByLifecycle) return;
+      if (_performanceMonitor.isEnabled) {
+        _performanceMonitor.recordTick(DateTime.now());
+      }
       if (!_playRequested) {
         _stopPlaybackTicker();
         return;
@@ -957,6 +1074,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
             : now.difference(lastCorrection),
       );
       if (decision == PreviewMediaSyncDecision.seek) {
+        _performanceMonitor.recordHardSeek();
         await controller.seekTo(target);
         _lastBaseDriftCorrectionAt = now;
       }
@@ -1005,6 +1123,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     if (preparedController != null) {
       unawaited(preparedController.dispose());
     }
+    _performanceMonitor.clear();
     super.dispose();
   }
 
@@ -1069,20 +1188,12 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     EditorTimeline timeline,
     Duration position,
   ) {
-    for (final track in timeline.tracks) {
-      if (track.section != TimelineTrackSection.baseVideo || track.isHidden) {
-        continue;
-      }
-      final clips = [...track.clips]
-        ..sort((a, b) => a.startTime.compareTo(b.startTime));
-      for (final clip in clips) {
-        if (!clip.enabled || !isPreviewBaseLayerClipForTesting(clip)) continue;
-        final isLastFrame =
-            position == timeline.duration && position == clip.endTime;
-        if (position >= clip.startTime &&
-            (position < clip.endTime || isLastFrame)) {
-          return (track, clip);
-        }
+    _ensurePreviewCaches(timeline);
+    final includeEnd = position == timeline.duration;
+    for (final lane in _cachedBaseVideoLanes) {
+      final clip = lane.activeAt(position, includeEnd: includeEnd);
+      if (clip != null && isPreviewBaseLayerClipForTesting(clip)) {
+        return (lane.track, clip);
       }
     }
     return null;
@@ -1092,14 +1203,16 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     EditorTimeline timeline,
     Duration position,
   ) {
+    _ensurePreviewCaches(timeline);
     final candidates = <(TimelineTrack, TimelineClip)>[];
-    for (final track in timeline.tracks) {
-      if (track.section != TimelineTrackSection.baseVideo || track.isHidden) {
-        continue;
-      }
-      for (final clip in track.clips) {
+    final maximumStart = position + _baseVideoPreloadWindow;
+    for (final lane in _cachedBaseVideoLanes) {
+      final first = lane.firstStartingAfter(position);
+      for (var index = first; index < lane.clips.length; index++) {
+        final clip = lane.clips[index];
+        if (clip.startTime > maximumStart) break;
         if (shouldPreloadBaseVideoForTesting(clip: clip, position: position)) {
-          candidates.add((track, clip));
+          candidates.add((lane.track, clip));
         }
       }
     }
@@ -1419,6 +1532,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
             : now.difference(lastCorrection),
       );
       if (decision == PreviewMediaSyncDecision.seek) {
+        if (!forceSeek) _performanceMonitor.recordHardSeek();
         await currentController.seekTo(sourceTarget);
         _lastBaseDriftCorrectionAt = now;
       }
@@ -1659,6 +1773,47 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     _stopPlaybackTicker();
   }
 
+  void _updateOwnedDecoderDiagnostics(Duration position) {
+    if (!_performanceMonitor.isEnabled) return;
+    final controller = _controller;
+    final clip = _controllerClip;
+    if (controller == null || !controller.value.isInitialized) {
+      _performanceMonitor.removeDecoder('base');
+    } else {
+      final target = clip == null
+          ? controller.value.position
+          : _sourceTargetForClip(clip, position);
+      _performanceMonitor.updateDecoder(
+        id: 'base',
+        label: clip?.label ?? 'Detached base decoder',
+        kind: PreviewDecoderKind.baseVideo,
+        initialized: true,
+        buffering: controller.value.isBuffering,
+        audible: (_lastBaseVolume ?? 0) > 0.001,
+        playing: controller.value.isPlaying,
+        warm: false,
+        drift: target - controller.value.position,
+      );
+    }
+
+    final prepared = _preparedBaseController;
+    if (prepared == null || !prepared.value.isInitialized) {
+      _performanceMonitor.removeDecoder('prepared');
+    } else {
+      _performanceMonitor.updateDecoder(
+        id: 'prepared',
+        label: _preparedBaseClipId ?? 'Prepared base decoder',
+        kind: PreviewDecoderKind.preparedVideo,
+        initialized: true,
+        buffering: prepared.value.isBuffering,
+        audible: false,
+        playing: false,
+        warm: true,
+        drift: Duration.zero,
+      );
+    }
+  }
+
   Future<void> _applyBaseAudioVolume(Duration position) async {
     final controller = _controller;
     final clip = _controllerClip;
@@ -1889,33 +2044,21 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     EditorTimeline timeline,
     Duration position,
   ) {
+    _ensurePreviewCaches(timeline);
     final items = <_OverlayCanvasItem>[];
-    for (
-      var trackIndex = 0;
-      trackIndex < timeline.tracks.length;
-      trackIndex++
-    ) {
-      final track = timeline.tracks[trackIndex];
-      if (track.section != TimelineTrackSection.overlay || track.isHidden) {
-        continue;
-      }
-      for (final clip in track.clips) {
-        if (!clip.enabled ||
-            position < clip.startTime ||
-            position >= clip.endTime) {
-          continue;
-        }
-        final asset = _cachedAssetForClip(timeline, clip);
-        if (asset == null) continue;
-        items.add(
-          _OverlayCanvasItem(
-            trackIndex: trackIndex,
-            track: track,
-            clip: clip,
-            asset: asset,
-          ),
-        );
-      }
+    for (final lane in _cachedOverlayLanes) {
+      final clip = lane.activeAt(position);
+      if (clip == null) continue;
+      final asset = _cachedAssetForClip(timeline, clip);
+      if (asset == null) continue;
+      items.add(
+        _OverlayCanvasItem(
+          trackIndex: lane.trackIndex,
+          track: lane.track,
+          clip: clip,
+          asset: asset,
+        ),
+      );
     }
 
     items.sort((a, b) {
@@ -1932,31 +2075,18 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     EditorTimeline timeline,
     Duration position,
   ) {
+    _ensurePreviewCaches(timeline);
     final items = <_EffectCanvasItem>[];
-    for (
-      var trackIndex = 0;
-      trackIndex < timeline.tracks.length;
-      trackIndex++
-    ) {
-      final track = timeline.tracks[trackIndex];
-      if (track.section != TimelineTrackSection.overlay || track.isHidden) {
-        continue;
-      }
-      for (final clip in track.clips) {
-        if (!clip.enabled ||
-            !clip.isEffect ||
-            position < clip.startTime ||
-            position >= clip.endTime) {
-          continue;
-        }
-        items.add(
-          _EffectCanvasItem(
-            trackIndex: trackIndex,
-            trackId: track.id,
-            clip: clip,
-          ),
-        );
-      }
+    for (final lane in _cachedOverlayLanes) {
+      final clip = lane.activeAt(position);
+      if (clip == null || !clip.isEffect) continue;
+      items.add(
+        _EffectCanvasItem(
+          trackIndex: lane.trackIndex,
+          trackId: lane.track.id,
+          clip: clip,
+        ),
+      );
     }
     items.sort((a, b) {
       final trackCompare = b.trackIndex.compareTo(a.trackIndex);
@@ -1972,28 +2102,18 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     EditorTimeline timeline,
     Duration position,
   ) {
+    _ensurePreviewCaches(timeline);
     final items = <_TextCanvasItem>[];
-    for (
-      var trackIndex = 0;
-      trackIndex < timeline.tracks.length;
-      trackIndex++
-    ) {
-      final track = timeline.tracks[trackIndex];
-      if (track.type != TimelineTrackType.text || track.isHidden) continue;
-      for (final clip in track.clips) {
-        if (!clip.enabled ||
-            position < clip.startTime ||
-            position >= clip.endTime) {
-          continue;
-        }
-        items.add(
-          _TextCanvasItem(
-            trackIndex: trackIndex,
-            trackId: track.id,
-            clip: clip,
-          ),
-        );
-      }
+    for (final lane in _cachedTextLanes) {
+      final clip = lane.activeAt(position);
+      if (clip == null) continue;
+      items.add(
+        _TextCanvasItem(
+          trackIndex: lane.trackIndex,
+          trackId: lane.track.id,
+          clip: clip,
+        ),
+      );
     }
 
     items.sort((a, b) {
@@ -2009,43 +2129,53 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     Duration position,
     String? baseMonitoredClipId,
   ) {
+    _ensurePreviewCaches(timeline);
     final activeItems = <_AudioCanvasItem>[];
     final upcomingItems = <_AudioCanvasItem>[];
     final hasSoloMediaTrack = _hasSoloMediaTrack(timeline);
-    for (final track in timeline.tracks) {
-      if (track.section != TimelineTrackSection.audio) continue;
-      for (final clip in track.clips) {
-        if (!shouldCreateTimelineAudioPreviewForTesting(
-              track: track,
-              clip: clip,
-              hasSoloMediaTrack: hasSoloMediaTrack,
-              baseMonitoredClipId: baseMonitoredClipId,
-            ) ||
-            !shouldPreloadTimelineAudioPreviewForTesting(
-              clip: clip,
-              position: position,
-            )) {
-          continue;
-        }
-        final asset = _cachedAssetForClip(timeline, clip);
-        final sourcePath = asset?.sourcePath;
-        if (asset == null ||
-            sourcePath == null ||
-            !_cachedFileExists(sourcePath)) {
-          continue;
-        }
-        final isActive = position >= clip.startTime && position < clip.endTime;
-        final item = _AudioCanvasItem(
-          track: track,
-          clip: clip,
-          asset: asset,
-          isActive: isActive,
-        );
-        if (isActive) {
-          activeItems.add(item);
-        } else {
-          upcomingItems.add(item);
-        }
+    void collectClip(_PreviewTrackLane lane, TimelineClip clip) {
+      if (!shouldCreateTimelineAudioPreviewForTesting(
+            track: lane.track,
+            clip: clip,
+            hasSoloMediaTrack: hasSoloMediaTrack,
+            baseMonitoredClipId: baseMonitoredClipId,
+          ) ||
+          !shouldPreloadTimelineAudioPreviewForTesting(
+            clip: clip,
+            position: position,
+          )) {
+        return;
+      }
+      final asset = _cachedAssetForClip(timeline, clip);
+      final sourcePath = asset?.sourcePath;
+      if (asset == null ||
+          sourcePath == null ||
+          !_cachedFileExists(sourcePath)) {
+        return;
+      }
+      final isActive = position >= clip.startTime && position < clip.endTime;
+      final item = _AudioCanvasItem(
+        track: lane.track,
+        clip: clip,
+        asset: asset,
+        isActive: isActive,
+      );
+      if (isActive) {
+        activeItems.add(item);
+      } else {
+        upcomingItems.add(item);
+      }
+    }
+
+    final maximumStart = position + _audioPreviewPreloadWindow;
+    for (final lane in _cachedAudioLanes) {
+      final activeClip = lane.activeAt(position);
+      if (activeClip != null) collectClip(lane, activeClip);
+      final first = lane.firstStartingAfter(position);
+      for (var index = first; index < lane.clips.length; index++) {
+        final clip = lane.clips[index];
+        if (clip.startTime > maximumStart) break;
+        collectClip(lane, clip);
       }
     }
     upcomingItems.sort((a, b) => a.clip.startTime.compareTo(b.clip.startTime));
@@ -2073,6 +2203,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       timeline: timeline,
       entries: entries,
     );
+    _effectiveCaptionIndex = _PreviewCaptionIndex(_effectiveCaptionCache);
     return _effectiveCaptionCache;
   }
 
@@ -2337,6 +2468,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                   playbackPosition: playbackState.position,
                   isPlaying: playbackState.isPlaying,
                   playbackSpeed: _playbackSpeed,
+                  diagnostics: _performanceMonitor,
                   duckingGain: _previewDuckingGain(
                     item.clip,
                     playbackState.position,
@@ -3387,13 +3519,11 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       playbackState.position,
       baseAudioMonitor?.clip.id,
     );
-    final effectiveCaptions = _effectiveCaptions(
-      editorState.timeline,
-      subtitleState.entries,
-    );
+    _effectiveCaptions(editorState.timeline, subtitleState.entries);
     final controller = _controller;
     final controllerPath = _controllerPath;
     final controllerTrack = _controllerTrack;
+    _updateOwnedDecoderDiagnostics(playbackState.position);
     final controllerReady =
         controller != null &&
         controller.value.isInitialized &&
@@ -3403,13 +3533,9 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         widget.targetAspectRatio ??
         (controllerReady ? controller.value.aspectRatio : 16 / 9);
 
-    final activeSubtitles = effectiveCaptions
-        .where(
-          (entry) =>
-              playbackState.position >= entry.startTime &&
-              playbackState.position < entry.endTime,
-        )
-        .toList(growable: false);
+    final activeSubtitles = _effectiveCaptionIndex.activeAt(
+      playbackState.position,
+    );
     final activeSubtitle =
         activeSubtitles
             .where((entry) => entry.id == subtitleState.selectedEntryId)
@@ -3501,6 +3627,18 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                               ),
                             ),
                           ),
+                          if (_showPerformanceDiagnostics)
+                            Positioned(
+                              left: 10,
+                              top: 10,
+                              child: _PreviewDiagnosticsOverlay(
+                                snapshot: _performanceMonitor.snapshot(),
+                                onReset: () {
+                                  _performanceMonitor.resetCounters();
+                                  setState(() {});
+                                },
+                              ),
+                            ),
                           if (_previewError != null)
                             _CanvasBoundLayer(
                               aspectRatio: previewAspectRatio,
@@ -4232,6 +4370,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                   playbackPosition: playbackState.position,
                                   isPlaying: playbackState.isPlaying,
                                   playbackSpeed: _playbackSpeed,
+                                  diagnostics: _performanceMonitor,
                                   duckingGain: _previewDuckingGain(
                                     item.clip,
                                     playbackState.position,
@@ -4254,6 +4393,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                 isPlaying:
                                     playbackState.isPlaying && item.isActive,
                                 playbackSpeed: _playbackSpeed,
+                                diagnostics: _performanceMonitor,
                                 duckingGain: _previewDuckingGain(
                                   item.clip,
                                   playbackState.position,
@@ -4286,6 +4426,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                 playbackPosition: playbackState.position,
                                 isPlaying: playbackState.isPlaying,
                                 playbackSpeed: _playbackSpeed,
+                                diagnostics: _performanceMonitor,
                                 duckingGain: _previewDuckingGain(
                                   activeBaseClip,
                                   playbackState.position,
@@ -4465,6 +4606,27 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                               );
                                         },
                                       ),
+                                      IconButton(
+                                        tooltip: _showPerformanceDiagnostics
+                                            ? 'Hide preview diagnostics'
+                                            : 'Show preview diagnostics',
+                                        icon: Icon(
+                                          Icons.monitor_heart_outlined,
+                                          color: _showPerformanceDiagnostics
+                                              ? kAccent
+                                              : kTextSecondary,
+                                          size: 20,
+                                        ),
+                                        onPressed: () {
+                                          final next =
+                                              !_showPerformanceDiagnostics;
+                                          _performanceMonitor.setEnabled(next);
+                                          setState(
+                                            () => _showPerformanceDiagnostics =
+                                                next,
+                                          );
+                                        },
+                                      ),
                                       if (widget.onFullscreenToggle != null)
                                         IconButton(
                                           tooltip: widget.isFullscreen
@@ -4589,6 +4751,115 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   }
 }
 
+class _PreviewDiagnosticsOverlay extends StatelessWidget {
+  final PreviewPerformanceSnapshot snapshot;
+  final VoidCallback onReset;
+
+  const _PreviewDiagnosticsOverlay({
+    required this.snapshot,
+    required this.onReset,
+  });
+
+  String _milliseconds(Duration value) {
+    return '${(value.inMicroseconds / 1000).toStringAsFixed(1)} ms';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    const labelStyle = TextStyle(
+      color: Colors.white70,
+      fontFamily: 'SpaceMono',
+      fontSize: 9,
+      height: 1.35,
+    );
+    const valueStyle = TextStyle(
+      color: Colors.white,
+      fontFamily: 'SpaceMono',
+      fontSize: 9,
+      height: 1.35,
+      fontWeight: FontWeight.w700,
+    );
+    Widget row(String label, String value) {
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text('$label  ', style: labelStyle),
+          Flexible(child: Text(value, style: valueStyle)),
+        ],
+      );
+    }
+
+    return Semantics(
+      label: 'Preview performance diagnostics',
+      child: Container(
+        width: 226,
+        padding: const EdgeInsets.fromLTRB(10, 8, 8, 8),
+        decoration: BoxDecoration(
+          color: const Color(0xE611151C),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: kAccent.withValues(alpha: 0.55)),
+          boxShadow: const [
+            BoxShadow(color: Color(0x66000000), blurRadius: 12),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'PREVIEW DIAGNOSTICS',
+                    style: TextStyle(
+                      color: kAccent,
+                      fontFamily: 'SpaceMono',
+                      fontSize: 9,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+                InkWell(
+                  borderRadius: BorderRadius.circular(5),
+                  onTap: onReset,
+                  child: const Padding(
+                    padding: EdgeInsets.all(3),
+                    child: Text('RESET', style: labelStyle),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            row(
+              'Decoders',
+              '${snapshot.decoderCount} total • '
+                  '${snapshot.videoDecoderCount}V/${snapshot.audioDecoderCount}A • '
+                  '${snapshot.warmDecoderCount} warm',
+            ),
+            row(
+              'Audio/buffer',
+              '${snapshot.audibleDecoderCount} audible • '
+                  '${snapshot.bufferingDecoderCount} buffering '
+                  '(${snapshot.bufferingEventCount} events)',
+            ),
+            row(
+              'Clock drift',
+              '${_milliseconds(snapshot.maximumAbsoluteDrift)} max • '
+                  '${snapshot.hardSeekCount} corrections',
+            ),
+            row(
+              'Ticker',
+              '${_milliseconds(snapshot.averageTickInterval)} avg • '
+                  '${_milliseconds(snapshot.peakTickInterval)} peak • '
+                  '${snapshot.missedTickEstimate} missed',
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _OverlayAnimationState {
   final double opacity;
   final double scale;
@@ -4601,6 +4872,86 @@ class _OverlayAnimationState {
     required this.rotation,
     required this.offset,
   });
+}
+
+class _PreviewTrackLane {
+  final int trackIndex;
+  final TimelineTrack track;
+  final List<TimelineClip> clips;
+
+  const _PreviewTrackLane({
+    required this.trackIndex,
+    required this.track,
+    required this.clips,
+  });
+
+  TimelineClip? activeAt(Duration position, {bool includeEnd = false}) {
+    return resolveIndexedPreviewClipForTesting(
+      sortedClips: clips,
+      position: position,
+      includeEnd: includeEnd,
+    );
+  }
+
+  int firstStartingAfter(Duration position) =>
+      previewClipStartUpperBoundForTesting(clips, position);
+}
+
+class _PreviewCaptionIndex {
+  final List<SubtitleEntry> entries;
+  late final List<int> _segmentMaximumEndUs;
+
+  _PreviewCaptionIndex(Iterable<SubtitleEntry> source)
+    : entries = source.toList(growable: false)
+        ..sort((a, b) => a.startTime.compareTo(b.startTime)) {
+    _segmentMaximumEndUs = entries.isEmpty
+        ? const []
+        : List<int>.filled(entries.length * 4, 0);
+    if (entries.isNotEmpty) _build(1, 0, entries.length - 1);
+  }
+
+  _PreviewCaptionIndex.empty() : entries = const [] {
+    _segmentMaximumEndUs = const [];
+  }
+
+  int _build(int node, int start, int end) {
+    if (start == end) {
+      return _segmentMaximumEndUs[node] = entries[start].endTime.inMicroseconds;
+    }
+    final middle = start + ((end - start) >> 1);
+    return _segmentMaximumEndUs[node] = math.max(
+      _build(node * 2, start, middle),
+      _build(node * 2 + 1, middle + 1, end),
+    );
+  }
+
+  List<SubtitleEntry> activeAt(Duration position) {
+    if (entries.isEmpty) return const [];
+    final positionUs = position.inMicroseconds;
+    final active = <SubtitleEntry>[];
+    void collect(int node, int start, int end) {
+      if (_segmentMaximumEndUs[node] <= positionUs ||
+          entries[start].startTime > position) {
+        return;
+      }
+      if (start == end) {
+        final entry = entries[start];
+        if (entry.startTime <= position && position < entry.endTime) {
+          active.add(entry);
+        }
+        return;
+      }
+      final middle = start + ((end - start) >> 1);
+      collect(node * 2, start, middle);
+      if (middle + 1 < entries.length &&
+          entries[middle + 1].startTime <= position) {
+        collect(node * 2 + 1, middle + 1, end);
+      }
+    }
+
+    collect(1, 0, entries.length - 1);
+    return active;
+  }
 }
 
 class _OverlayCanvasItem {
@@ -5036,6 +5387,7 @@ class _OverlayVideoPreview extends StatefulWidget {
   final Duration playbackPosition;
   final bool isPlaying;
   final double playbackSpeed;
+  final PreviewPerformanceMonitor diagnostics;
   final double duckingGain;
   final bool isTrackAudible;
   final double width;
@@ -5051,6 +5403,7 @@ class _OverlayVideoPreview extends StatefulWidget {
     required this.playbackPosition,
     required this.isPlaying,
     required this.playbackSpeed,
+    required this.diagnostics,
     required this.duckingGain,
     required this.isTrackAudible,
     required this.width,
@@ -5076,6 +5429,39 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
   DateTime? _lastSyncStartedAt;
   DateTime? _lastDriftCorrectionAt;
 
+  String get _diagnosticId => 'overlay:${widget.clip.id}';
+
+  void _reportDiagnostics(
+    VideoPlayerController controller,
+    Duration target,
+    double volume,
+  ) {
+    widget.diagnostics.updateDecoder(
+      id: _diagnosticId,
+      label: widget.clip.label,
+      kind: PreviewDecoderKind.overlayVideo,
+      initialized: controller.value.isInitialized,
+      buffering: controller.value.isBuffering,
+      audible: volume > 0.001,
+      playing: controller.value.isPlaying,
+      warm: false,
+      drift: target - controller.value.position,
+    );
+  }
+
+  void _onControllerDiagnosticUpdate() {
+    if (!widget.diagnostics.isEnabled) return;
+    final controller = _controller;
+    if (!_ready || controller == null || !controller.value.isInitialized) {
+      return;
+    }
+    _reportDiagnostics(
+      controller,
+      _previewSourcePosition(widget.clip, widget.playbackPosition),
+      _lastVolume ?? 0,
+    );
+  }
+
   @override
   void initState() {
     super.initState();
@@ -5085,6 +5471,9 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
   @override
   void didUpdateWidget(covariant _OverlayVideoPreview oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.clip.id != widget.clip.id) {
+      oldWidget.diagnostics.removeDecoder('overlay:${oldWidget.clip.id}');
+    }
     if (oldWidget.videoPath != widget.videoPath) {
       unawaited(_loadController(widget.videoPath));
       return;
@@ -5106,6 +5495,7 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
   }
 
   Future<void> _loadController(String videoPath) async {
+    widget.diagnostics.removeDecoder(_diagnosticId);
     final generation = ++_controllerGeneration;
     final previous = _controller;
     _controller = null;
@@ -5117,6 +5507,7 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
     if (mounted) setState(() {});
     if (previous != null) {
       try {
+        previous.removeListener(_onControllerDiagnosticUpdate);
         await previous.dispose();
       } catch (_) {
         // Ownership was cleared synchronously; disposal remains best-effort.
@@ -5142,7 +5533,13 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
         _controller = controller;
         _ready = true;
       });
+      controller.addListener(_onControllerDiagnosticUpdate);
       _lastVolume = 0;
+      _reportDiagnostics(
+        controller,
+        _previewSourcePosition(widget.clip, widget.playbackPosition),
+        0,
+      );
       _schedulePlaybackSync(forceSeek: true);
     } catch (_) {
       final controller = createdController;
@@ -5234,6 +5631,7 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
           : now.difference(lastCorrection),
     );
     if (decision == PreviewMediaSyncDecision.seek) {
+      if (!forceSeek) widget.diagnostics.recordHardSeek();
       await controller.seekTo(target);
       if (!stillOwnsController()) return;
       _lastDriftCorrectionAt = now;
@@ -5268,6 +5666,9 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
         await controller.pause();
       }
     }
+    if (stillOwnsController()) {
+      _reportDiagnostics(controller, target, volume);
+    }
   }
 
   Future<void> _disposeController() async {
@@ -5280,12 +5681,14 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
     _lastSyncStartedAt = null;
     _lastDriftCorrectionAt = null;
     if (controller != null) {
+      controller.removeListener(_onControllerDiagnosticUpdate);
       await controller.dispose();
     }
   }
 
   @override
   void dispose() {
+    widget.diagnostics.removeDecoder(_diagnosticId);
     unawaited(_disposeController());
     super.dispose();
   }
@@ -5345,6 +5748,7 @@ class _TimelineAudioPreview extends StatefulWidget {
   final Duration playbackPosition;
   final bool isPlaying;
   final double playbackSpeed;
+  final PreviewPerformanceMonitor diagnostics;
   final double duckingGain;
   final bool isTrackAudible;
   final bool continueFreezeFrameAudio;
@@ -5357,6 +5761,7 @@ class _TimelineAudioPreview extends StatefulWidget {
     required this.playbackPosition,
     required this.isPlaying,
     required this.playbackSpeed,
+    required this.diagnostics,
     required this.duckingGain,
     required this.isTrackAudible,
     this.continueFreezeFrameAudio = false,
@@ -5379,6 +5784,39 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
   DateTime? _lastSyncStartedAt;
   DateTime? _lastDriftCorrectionAt;
 
+  String get _diagnosticId => 'audio:${widget.clip.id}';
+
+  void _reportDiagnostics(
+    VideoPlayerController controller,
+    Duration target,
+    double volume,
+  ) {
+    widget.diagnostics.updateDecoder(
+      id: _diagnosticId,
+      label: widget.clip.label,
+      kind: PreviewDecoderKind.timelineAudio,
+      initialized: controller.value.isInitialized,
+      buffering: controller.value.isBuffering,
+      audible: volume > 0.001,
+      playing: controller.value.isPlaying,
+      warm: widget.preloadOnly,
+      drift: target - controller.value.position,
+    );
+  }
+
+  void _onControllerDiagnosticUpdate() {
+    if (!widget.diagnostics.isEnabled) return;
+    final controller = _controller;
+    if (!_ready || controller == null || !controller.value.isInitialized) {
+      return;
+    }
+    _reportDiagnostics(
+      controller,
+      _previewSourcePosition(widget.clip, widget.playbackPosition),
+      _lastVolume ?? 0,
+    );
+  }
+
   @override
   void initState() {
     super.initState();
@@ -5388,12 +5826,16 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
   @override
   void didUpdateWidget(covariant _TimelineAudioPreview oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.clip.id != widget.clip.id) {
+      oldWidget.diagnostics.removeDecoder('audio:${oldWidget.clip.id}');
+    }
     if (oldWidget.audioPath != widget.audioPath) {
       unawaited(_loadController(widget.audioPath));
     } else {
       if (widget.preloadOnly &&
           oldWidget.preloadOnly &&
           identical(oldWidget.clip, widget.clip)) {
+        _onControllerDiagnosticUpdate();
         return;
       }
       final positionDelta =
@@ -5420,6 +5862,7 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
   }
 
   Future<void> _loadController(String audioPath) async {
+    widget.diagnostics.removeDecoder(_diagnosticId);
     final generation = ++_controllerGeneration;
     final previous = _controller;
     _controller = null;
@@ -5430,6 +5873,7 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
     _lastDriftCorrectionAt = null;
     if (previous != null) {
       try {
+        previous.removeListener(_onControllerDiagnosticUpdate);
         await previous.dispose();
       } catch (_) {
         // Ownership was cleared synchronously; disposal remains best-effort.
@@ -5452,6 +5896,12 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
       }
       _controller = controller;
       _ready = true;
+      controller.addListener(_onControllerDiagnosticUpdate);
+      _reportDiagnostics(
+        controller,
+        _previewSourcePosition(widget.clip, widget.playbackPosition),
+        0,
+      );
       _schedulePlaybackSync(forceSeek: true);
     } catch (_) {
       final controller = createdController;
@@ -5546,6 +5996,7 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
           : now.difference(lastCorrection),
     );
     if (decision == PreviewMediaSyncDecision.seek) {
+      if (!forceSeek) widget.diagnostics.recordHardSeek();
       await controller.seekTo(target);
       if (!stillOwnsController()) return;
       _lastDriftCorrectionAt = now;
@@ -5579,14 +6030,21 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
     } else if (!widget.isPlaying && controller.value.isPlaying) {
       await controller.pause();
     }
+    if (stillOwnsController()) {
+      _reportDiagnostics(controller, target, safeVolume);
+    }
   }
 
   @override
   void dispose() {
+    widget.diagnostics.removeDecoder(_diagnosticId);
     _controllerGeneration++;
     final controller = _controller;
     _controller = null;
-    if (controller != null) unawaited(controller.dispose());
+    if (controller != null) {
+      controller.removeListener(_onControllerDiagnosticUpdate);
+      unawaited(controller.dispose());
+    }
     super.dispose();
   }
 

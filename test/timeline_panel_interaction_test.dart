@@ -22,6 +22,168 @@ void main() {
     expect(zoomedOut.inSeconds * 12, greaterThanOrEqualTo(64));
   });
 
+  test('timeline viewport selects only visible clips plus pinned gestures', () {
+    final clips = List<TimelineClip>.generate(10000, (index) {
+      final start = Duration(milliseconds: index * 100);
+      return TimelineClip(
+        id: 'clip_$index',
+        trackId: 'video',
+        type: TimelineTrackType.video,
+        label: 'Clip $index',
+        startTime: start,
+        endTime: start + const Duration(milliseconds: 100),
+      );
+    }, growable: false);
+
+    final visible = timelineVisibleClipsForTesting(
+      sortedClips: clips,
+      viewportStart: const Duration(milliseconds: 777750),
+      viewportEnd: const Duration(milliseconds: 778050),
+      pinnedClips: [clips[5]],
+    );
+
+    expect(visible.map((clip) => clip.id), [
+      'clip_5',
+      'clip_7777',
+      'clip_7778',
+      'clip_7779',
+      'clip_7780',
+    ]);
+  });
+
+  testWidgets('timeline mounts only the horizontal clip window', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(390, 320));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final clips = List<TimelineClip>.generate(1000, (index) {
+      final start = Duration(milliseconds: index * 200);
+      return TimelineClip(
+        id: 'virtual_clip_$index',
+        trackId: 'base',
+        type: TimelineTrackType.video,
+        label: 'Clip $index',
+        startTime: start,
+        endTime: start + const Duration(milliseconds: 200),
+        sourceDuration: const Duration(milliseconds: 200),
+      );
+    }, growable: false);
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    container
+        .read(editorProvider.notifier)
+        .loadProject(
+          videoPath: 'missing.mp4',
+          projectId: 'horizontal-virtualization',
+          projectName: 'Horizontal virtualization',
+          timeline: EditorTimeline(
+            tracks: [
+              TimelineTrack(
+                id: 'base',
+                name: 'Base',
+                type: TimelineTrackType.video,
+                section: TimelineTrackSection.baseVideo,
+                clips: clips,
+              ),
+            ],
+          ),
+        );
+
+    await tester.pumpWidget(_timelineHarness(container));
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('timeline_clip_virtual_clip_0')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('timeline_clip_virtual_clip_999')),
+      findsNothing,
+    );
+
+    final horizontal = tester
+        .widgetList<SingleChildScrollView>(find.byType(SingleChildScrollView))
+        .singleWhere(
+          (view) =>
+              view.scrollDirection == Axis.horizontal &&
+              view.controller != null,
+        )
+        .controller!;
+    horizontal.jumpTo(horizontal.position.maxScrollExtent);
+    await tester.pump();
+    await tester.pump();
+    expect(
+      find.byKey(const ValueKey('timeline_clip_virtual_clip_999')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('timeline_clip_virtual_clip_0')),
+      findsNothing,
+    );
+  });
+
+  testWidgets('timeline mounts only vertically visible track lanes', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(390, 320));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final tracks = <TimelineTrack>[
+      TimelineTrack(
+        id: 'base',
+        name: 'Base',
+        type: TimelineTrackType.video,
+        section: TimelineTrackSection.baseVideo,
+        clips: [
+          TimelineClip(
+            id: 'base_clip',
+            trackId: 'base',
+            type: TimelineTrackType.video,
+            label: 'Base',
+            startTime: Duration.zero,
+            endTime: const Duration(seconds: 2),
+            sourceDuration: const Duration(seconds: 2),
+          ),
+        ],
+      ),
+      for (var index = 0; index < 100; index++)
+        TimelineTrack(
+          id: 'audio_virtual_$index',
+          name: 'Audio $index',
+          type: TimelineTrackType.audio,
+          section: TimelineTrackSection.audio,
+        ),
+    ];
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    container
+        .read(editorProvider.notifier)
+        .loadProject(
+          videoPath: 'missing.mp4',
+          projectId: 'vertical-virtualization',
+          projectName: 'Vertical virtualization',
+          timeline: EditorTimeline(tracks: tracks),
+        );
+
+    await tester.pumpWidget(_timelineHarness(container));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('timeline_lane_base')), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('timeline_lane_audio_virtual_99')),
+      findsNothing,
+    );
+
+    final vertical = tester.widget<SingleChildScrollView>(
+      find.byKey(const ValueKey('timeline_vertical_scroll')),
+    );
+    vertical.controller!.jumpTo(vertical.controller!.position.maxScrollExtent);
+    await tester.pump();
+    await tester.pump();
+    expect(
+      find.byKey(const ValueKey('timeline_lane_audio_virtual_99')),
+      findsOneWidget,
+    );
+    expect(find.byKey(const ValueKey('timeline_lane_base')), findsNothing);
+  });
+
   testWidgets('clip bodies and both trim handles let quick swipes scroll', (
     tester,
   ) async {

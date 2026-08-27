@@ -53,6 +53,46 @@ Duration timelineRulerLabelIntervalForTesting({
   return const Duration(hours: 1);
 }
 
+/// Selects only clips intersecting a horizontally visible timeline window.
+/// [sortedClips] must be ordered by start time and non-overlapping, which is
+/// guaranteed by the editor's normalized lane model.
+@visibleForTesting
+List<TimelineClip> timelineVisibleClipsForTesting({
+  required List<TimelineClip> sortedClips,
+  required Duration viewportStart,
+  required Duration viewportEnd,
+  Iterable<TimelineClip> pinnedClips = const [],
+}) {
+  if (sortedClips.isEmpty) return pinnedClips.toList(growable: false);
+  final start = viewportStart <= viewportEnd ? viewportStart : viewportEnd;
+  final end = viewportStart <= viewportEnd ? viewportEnd : viewportStart;
+  var lower = 0;
+  var upper = sortedClips.length;
+  while (lower < upper) {
+    final middle = lower + ((upper - lower) >> 1);
+    if (sortedClips[middle].startTime <= start) {
+      lower = middle + 1;
+    } else {
+      upper = middle;
+    }
+  }
+
+  final visible = <TimelineClip>[];
+  final includedIds = <String>{};
+  var index = math.max(0, lower - 1);
+  while (index < sortedClips.length) {
+    final clip = sortedClips[index];
+    if (clip.startTime > end) break;
+    if (clip.endTime >= start && includedIds.add(clip.id)) visible.add(clip);
+    index++;
+  }
+  for (final clip in pinnedClips) {
+    if (includedIds.add(clip.id)) visible.add(clip);
+  }
+  visible.sort((a, b) => a.startTime.compareTo(b.startTime));
+  return visible;
+}
+
 class TimelinePanel extends ConsumerStatefulWidget {
   final ValueChanged<SubtitleEntry>? onEditRequested;
   final ValueChanged<TimelineClip>? onTextClipEditRequested;
@@ -97,10 +137,19 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
   final Map<String, GlobalKey> _clipStateKeys = <String, GlobalKey>{};
   Timer? _edgeScrollTimer;
   Offset? _latestTimelineGesturePointer;
+  bool _viewportRebuildScheduled = false;
+  EditorTimeline? _cachedRenderIndexTimeline;
+  Duration _cachedRenderDuration = Duration.zero;
+  Map<String, List<TimelineClip>> _cachedSortedClipsByTrackId = const {};
+  Map<String, (TimelineTrack, TimelineClip)> _cachedClipSelectionById =
+      const {};
+  List<TimelineMarker> _cachedSortedMarkers = const [];
 
   @override
   void initState() {
     super.initState();
+    _horizontalScrollController.addListener(_scheduleViewportRebuild);
+    _verticalScrollController.addListener(_scheduleViewportRebuild);
     ref.listenManual<Duration>(
       playbackProvider.select((state) => state.position),
       (_, next) {
@@ -124,9 +173,66 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
   @override
   void dispose() {
     _edgeScrollTimer?.cancel();
+    _horizontalScrollController.removeListener(_scheduleViewportRebuild);
+    _verticalScrollController.removeListener(_scheduleViewportRebuild);
     _horizontalScrollController.dispose();
     _verticalScrollController.dispose();
     super.dispose();
+  }
+
+  void _scheduleViewportRebuild() {
+    if (_viewportRebuildScheduled || !mounted) return;
+    _viewportRebuildScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _viewportRebuildScheduled = false;
+      if (mounted) setState(() {});
+    });
+  }
+
+  void _ensureRenderIndex(EditorTimeline timeline) {
+    if (identical(_cachedRenderIndexTimeline, timeline)) return;
+    _cachedRenderIndexTimeline = timeline;
+    final sortedByTrack = <String, List<TimelineClip>>{};
+    final selections = <String, (TimelineTrack, TimelineClip)>{};
+    final liveClipIds = <String>{};
+    var duration = Duration.zero;
+    for (final track in timeline.tracks) {
+      final clips = [...track.clips]
+        ..sort((a, b) => a.startTime.compareTo(b.startTime));
+      sortedByTrack[track.id] = clips;
+      for (final clip in clips) {
+        selections[clip.id] = (track, clip);
+        liveClipIds.add(clip.id);
+        if (clip.endTime > duration) duration = clip.endTime;
+      }
+    }
+    _cachedSortedClipsByTrackId = sortedByTrack;
+    _cachedClipSelectionById = selections;
+    _cachedRenderDuration = duration;
+    _cachedSortedMarkers = [...timeline.markers]
+      ..sort((a, b) => a.position.compareTo(b.position));
+    _clipStateKeys.removeWhere((clipId, _) => !liveClipIds.contains(clipId));
+  }
+
+  List<TimelineMarker> _markersInWindow(Duration start, Duration end) {
+    if (_cachedSortedMarkers.isEmpty) return const [];
+    var lower = 0;
+    var upper = _cachedSortedMarkers.length;
+    while (lower < upper) {
+      final middle = lower + ((upper - lower) >> 1);
+      if (_cachedSortedMarkers[middle].position < start) {
+        lower = middle + 1;
+      } else {
+        upper = middle;
+      }
+    }
+    final visible = <TimelineMarker>[];
+    for (var index = lower; index < _cachedSortedMarkers.length; index++) {
+      final marker = _cachedSortedMarkers[index];
+      if (marker.position > end) break;
+      visible.add(marker);
+    }
+    return visible;
   }
 
   void _addTrack(TimelineTrackType type) {
@@ -2697,20 +2803,15 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       subtitleState.entries,
       subtitleState.globalStyle,
     );
+    _ensureRenderIndex(timeline);
     final workspace = timeline.workspaceSettings;
-    final fallbackDuration = timeline.tracks
-        .expand((track) => track.clips)
-        .fold<Duration>(
-          Duration.zero,
-          (current, clip) => clip.endTime > current ? clip.endTime : current,
-        );
+    final fallbackDuration = _cachedRenderDuration;
     final totalDuration = playbackDuration > fallbackDuration
         ? playbackDuration
         : fallbackDuration;
-    final selectedSelection = _selectedClipSelection(
-      timeline,
-      editorState.selectedClipId,
-    );
+    final selectedSelection = editorState.selectedClipId == null
+        ? null
+        : _cachedClipSelectionById[editorState.selectedClipId!];
     final selectedTrack = selectedSelection?.$1;
     final selectedClip = selectedSelection?.$2;
     final rawSelectedSubtitle = subtitleState.selectedEntry;
@@ -2722,7 +2823,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         : null;
     final selectedSubtitleTrack = selectedSubtitle == null
         ? null
-        : _selectedClipSelection(timeline, selectedSubtitle.id)?.$1;
+        : _cachedClipSelectionById[selectedSubtitle.id]?.$1;
     final canMutateSelectedSubtitle =
         selectedSubtitle != null &&
         selectedSubtitleTrack != null &&
@@ -3066,6 +3167,75 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                   contentHeight,
                   constraints.maxHeight,
                 );
+                final horizontalViewportWidth =
+                    _horizontalScrollController.hasClients
+                    ? _horizontalScrollController.position.viewportDimension
+                    : math.max(1.0, constraints.maxWidth - _labelColumnWidth);
+                final horizontalOffset = _horizontalScrollController.hasClients
+                    ? _horizontalScrollController.offset
+                    : 0.0;
+                final overscanPixels = math.max(
+                  180.0,
+                  horizontalViewportWidth * 0.35,
+                );
+                final viewportStart = Duration(
+                  milliseconds:
+                      ((horizontalOffset - overscanPixels) /
+                              _pixelsPerSecond *
+                              1000)
+                          .floor()
+                          .clamp(0, totalDuration.inMilliseconds)
+                          .toInt(),
+                );
+                final viewportEnd = Duration(
+                  milliseconds:
+                      ((horizontalOffset +
+                                  horizontalViewportWidth +
+                                  overscanPixels) /
+                              _pixelsPerSecond *
+                              1000)
+                          .ceil()
+                          .clamp(0, totalDuration.inMilliseconds)
+                          .toInt(),
+                );
+                final pinnedClipsByTrack = <String, List<TimelineClip>>{};
+                void pinClip(String? clipId) {
+                  if (clipId == null) return;
+                  final selection = _cachedClipSelectionById[clipId];
+                  if (selection == null) return;
+                  pinnedClipsByTrack
+                      .putIfAbsent(selection.$1.id, () => <TimelineClip>[])
+                      .add(selection.$2);
+                }
+
+                pinClip(editorState.selectedClipId);
+                pinClip(subtitleState.selectedEntryId);
+                pinClip(_clipMoveSession?.clip.id);
+                pinClip(_clipTrimSession?.clip.id);
+                final visibleMarkers = _markersInWindow(
+                  viewportStart,
+                  viewportEnd,
+                );
+                final verticalViewportHeight =
+                    _verticalScrollController.hasClients
+                    ? _verticalScrollController.position.viewportDimension
+                    : constraints.maxHeight;
+                final verticalOffset = _verticalScrollController.hasClients
+                    ? _verticalScrollController.offset
+                    : 0.0;
+                final verticalStart = math.max(0.0, verticalOffset - 100);
+                final verticalEnd =
+                    verticalOffset + verticalViewportHeight + 100;
+                final pinnedTrackIds = pinnedClipsByTrack.keys.toSet();
+                final visibleRowLayouts = rowLayouts
+                    .where(
+                      (row) =>
+                          (row.bottom >= verticalStart &&
+                              row.top <= verticalEnd) ||
+                          (row.track != null &&
+                              pinnedTrackIds.contains(row.track!.id)),
+                    )
+                    .toList(growable: false);
                 return Scrollbar(
                   controller: _verticalScrollController,
                   thumbVisibility: true,
@@ -3086,7 +3256,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                             width: _labelColumnWidth,
                             height: resolvedContentHeight,
                             child: _TimelineLabels(
-                              rowLayouts: rowLayouts,
+                              rowLayouts: visibleRowLayouts,
                               rulerHeight: _rulerHeight,
                               onAddTrack: _showAddTrackChooser,
                               onTrackTap: (track) {
@@ -3216,7 +3386,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                                             ),
                                           ),
                                         ),
-                                      for (final row in rowLayouts) ...[
+                                      for (final row in visibleRowLayouts) ...[
                                         if (row.sectionTitle != null)
                                           Positioned(
                                             top: row.top,
@@ -3246,6 +3416,18 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                                             height: row.laneHeight,
                                             child: _TimelineLane(
                                               track: row.track!,
+                                              sortedClips:
+                                                  _cachedSortedClipsByTrackId[row
+                                                      .track!
+                                                      .id] ??
+                                                  const [],
+                                              viewportStart: viewportStart,
+                                              viewportEnd: viewportEnd,
+                                              pinnedClips:
+                                                  pinnedClipsByTrack[row
+                                                      .track!
+                                                      .id] ??
+                                                  const [],
                                               pixelsPerSecond: _pixelsPerSecond,
                                               selectedClipId:
                                                   editorState.selectedClipId,
@@ -3345,7 +3527,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                                             ),
                                           ),
                                       ],
-                                      for (final marker in timeline.markers)
+                                      for (final marker in visibleMarkers)
                                         Positioned(
                                           left:
                                               marker.position.inMilliseconds /
@@ -3997,6 +4179,10 @@ class _DoubleTapTrackSurfaceState extends State<_DoubleTapTrackSurface> {
 
 class _TimelineLane extends StatelessWidget {
   final TimelineTrack track;
+  final List<TimelineClip> sortedClips;
+  final Duration viewportStart;
+  final Duration viewportEnd;
+  final List<TimelineClip> pinnedClips;
   final double pixelsPerSecond;
   final String? selectedClipId;
   final Set<String> selectedClipIds;
@@ -4021,6 +4207,10 @@ class _TimelineLane extends StatelessWidget {
 
   const _TimelineLane({
     required this.track,
+    required this.sortedClips,
+    required this.viewportStart,
+    required this.viewportEnd,
+    required this.pinnedClips,
     required this.pixelsPerSecond,
     required this.selectedClipId,
     required this.selectedClipIds,
@@ -4045,16 +4235,21 @@ class _TimelineLane extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final sortedClips = [...track.clips]
-      ..sort((a, b) => a.startTime.compareTo(b.startTime));
+    final visibleClips = timelineVisibleClipsForTesting(
+      sortedClips: sortedClips,
+      viewportStart: viewportStart,
+      viewportEnd: viewportEnd,
+      pinnedClips: pinnedClips,
+    );
     bool selectedForPaint(TimelineClip clip) =>
         selectedClipId == clip.id ||
         selectedSubtitleId == clip.id ||
         selectedClipIds.contains(clip.id);
     final paintOrderedClips = [
-      ...sortedClips.where((clip) => !selectedForPaint(clip)),
-      ...sortedClips.where(selectedForPaint),
+      ...visibleClips.where((clip) => !selectedForPaint(clip)),
+      ...visibleClips.where(selectedForPaint),
     ];
+    final transitionSources = _visibleTransitionSources();
 
     return _DoubleTapTrackSurface(
       onTap: onTrackTap,
@@ -4094,18 +4289,16 @@ class _TimelineLane extends StatelessWidget {
               // above neighboring clips at cuts and short overlaps.
               for (final clip in paintOrderedClips) _buildPositionedClip(clip),
               if (track.section == TimelineTrackSection.baseVideo)
-                for (var index = 0; index < sortedClips.length - 1; index++)
+                for (final clip in transitionSources)
                   Positioned(
                     left:
-                        sortedClips[index].endTime.inMilliseconds /
-                            1000 *
-                            pixelsPerSecond -
+                        clip.endTime.inMilliseconds / 1000 * pixelsPerSecond -
                         10,
                     top: 0,
                     bottom: 0,
                     child: Center(
                       child: GestureDetector(
-                        onTap: () => onTransitionTap(sortedClips[index]),
+                        onTap: () => onTransitionTap(clip),
                         child: Container(
                           width: 20,
                           height: 20,
@@ -4178,6 +4371,27 @@ class _TimelineLane extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  List<TimelineClip> _visibleTransitionSources() {
+    if (sortedClips.length < 2) return const [];
+    var lower = 0;
+    var upper = sortedClips.length - 1;
+    while (lower < upper) {
+      final middle = lower + ((upper - lower) >> 1);
+      if (sortedClips[middle].endTime < viewportStart) {
+        lower = middle + 1;
+      } else {
+        upper = middle;
+      }
+    }
+    final visible = <TimelineClip>[];
+    for (var index = lower; index < sortedClips.length - 1; index++) {
+      final clip = sortedClips[index];
+      if (clip.endTime > viewportEnd) break;
+      visible.add(clip);
+    }
+    return visible;
   }
 
   Widget _buildPositionedClip(TimelineClip clip) {

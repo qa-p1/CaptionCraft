@@ -24,11 +24,14 @@ on those foundations rather than adding isolated controls.
 
 ## Milestone 2 — heavy-project timeline interaction
 
-15. [ ] Virtualize off-screen clips, thumbnails, waveforms, and keyframe lanes.
+15. [x] Complete heavy-project timeline indexing and virtualization.
+    - [x] Resolve active preview clips and overlapping captions with interval indexes and bounded warm-window queries.
+    - [x] Horizontally virtualize off-screen clips, thumbnails, waveforms, keyframe lanes, transitions, and markers.
+    - [x] Virtualize vertically off-screen track lanes and labels while pinning active gestures.
 16. [ ] Separate live gesture state from committed render state to avoid full preview rebuilds.
 17. [ ] Add proxy media generation, relinking, and preview-quality controls.
 18. [ ] Cache waveforms by source fingerprint and source window.
-19. [ ] Add dropped-frame, buffering, decoder-count, and clock-drift diagnostics.
+19. [x] Add missed-tick, buffering, decoder-count, clock-drift, and correction diagnostics.
 20. [ ] Add zoom-to-playhead, zoom-to-selection, and exact frame navigation.
 21. [ ] Add configurable snapping for frames, clip edges, markers, beats, and keyframes.
 22. [ ] Implement ripple, roll, slip, and slide trim tools.
