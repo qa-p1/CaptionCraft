@@ -75,7 +75,7 @@ void main() {
 
     expect(generations, 1);
     expect(results.toSet(), hasLength(1));
-    expect(await File(results.single).readAsBytes(), [1, 2, 3, 4]);
+    expect(await File(results.first).readAsBytes(), [1, 2, 3, 4]);
 
     final cached = await cache.waveformFor(
       sourcePath: '/fixtures/audio.m4a',
@@ -83,7 +83,7 @@ void main() {
       sourceDuration: const Duration(seconds: 2),
       width: 800,
     );
-    expect(cached, results.single);
+    expect(cached, results.first);
     expect(generations, 1);
   });
 

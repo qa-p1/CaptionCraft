@@ -52,9 +52,9 @@ final class TimelineSnapIndex {
       markersUs: _sorted(markers),
       beatsUs: _sorted(beats),
       keyframesUs: _sorted(keyframes),
-      keyframesByClipId: Map.unmodifiable({
+      keyframesByClipId: Map<String, List<int>>.unmodifiable({
         for (final entry in keyframesByClipId.entries)
-          entry.key: List.unmodifiable(entry.value..sort()),
+          entry.key: List<int>.unmodifiable(entry.value..sort()),
       }),
     );
   }
@@ -81,7 +81,35 @@ final class TimelineSnapEngine {
     Duration? workAreaStart,
     Duration? workAreaEnd,
   }) {
-    if (!settings.enabled) return proposed;
+    return _snapPointResult(
+      proposed: proposed,
+      settings: settings,
+      index: index,
+      frameRate: frameRate,
+      threshold: threshold,
+      playhead: playhead,
+      selectionBoundaries: selectionBoundaries,
+      excludedClipBoundaries: excludedClipBoundaries,
+      excludedClipId: excludedClipId,
+      workAreaStart: workAreaStart,
+      workAreaEnd: workAreaEnd,
+    ).position;
+  }
+
+  static ({Duration position, bool matched}) _snapPointResult({
+    required Duration proposed,
+    required TimelineSnapSettings settings,
+    required TimelineSnapIndex index,
+    required int frameRate,
+    required Duration threshold,
+    Duration? playhead,
+    Iterable<Duration> selectionBoundaries = const [],
+    Iterable<Duration> excludedClipBoundaries = const [],
+    String? excludedClipId,
+    Duration? workAreaStart,
+    Duration? workAreaEnd,
+  }) {
+    if (!settings.enabled) return (position: proposed, matched: false);
     final proposedUs = proposed.inMicroseconds;
     final thresholdUs = math.max(0, threshold.inMicroseconds);
     var bestUs = proposedUs;
@@ -154,9 +182,11 @@ final class TimelineSnapEngine {
       if (workAreaStart != null) consider(workAreaStart.inMicroseconds);
       if (workAreaEnd != null) consider(workAreaEnd.inMicroseconds);
     }
-    return bestDistance <= thresholdUs
-        ? Duration(microseconds: bestUs)
-        : proposed;
+    final matched = bestDistance <= thresholdUs;
+    return (
+      position: matched ? Duration(microseconds: bestUs) : proposed,
+      matched: matched,
+    );
   }
 
   /// Snaps either edge of a moving range and returns the adjusted start.
@@ -174,7 +204,7 @@ final class TimelineSnapEngine {
     Duration? workAreaStart,
     Duration? workAreaEnd,
   }) {
-    final snappedStart = snapPoint(
+    final startResult = _snapPointResult(
       proposed: proposedStart,
       settings: settings,
       index: index,
@@ -188,7 +218,7 @@ final class TimelineSnapEngine {
       workAreaEnd: workAreaEnd,
     );
     final proposedEnd = proposedStart + duration;
-    final snappedEnd = snapPoint(
+    final endResult = _snapPointResult(
       proposed: proposedEnd,
       settings: settings,
       index: index,
@@ -201,10 +231,14 @@ final class TimelineSnapEngine {
       workAreaStart: workAreaStart,
       workAreaEnd: workAreaEnd,
     );
-    final startDistance = (snappedStart - proposedStart).abs();
-    final endDistance = (snappedEnd - proposedEnd).abs();
-    if (endDistance < startDistance) return snappedEnd - duration;
-    return snappedStart;
+    final startDistance = startResult.matched
+        ? (startResult.position - proposedStart).abs()
+        : threshold + const Duration(microseconds: 1);
+    final endDistance = endResult.matched
+        ? (endResult.position - proposedEnd).abs()
+        : threshold + const Duration(microseconds: 1);
+    if (endDistance < startDistance) return endResult.position - duration;
+    return startResult.position;
   }
 
   /// Returns the exact rational frame boundary nearest [positionUs].

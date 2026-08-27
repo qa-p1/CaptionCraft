@@ -89,7 +89,7 @@ void main() {
     expect(curvedMiddle.interpolation, TimelineKeyframeInterpolation.easeInOut);
 
     await tester.tap(find.byKey(const ValueKey('keyframe_graph_canvas')));
-    await tester.pump();
+    await tester.pumpAndSettle();
     expect(requestedSeek, isNotNull);
   });
 
@@ -169,7 +169,7 @@ void main() {
       await tester.pumpAndSettle();
       await tester.enterText(
         find.byKey(const ValueKey('keyframe_numeric_time')),
-        '250',
+        '300',
       );
       await tester.enterText(
         find.byKey(const ValueKey('keyframe_numeric_value')),
@@ -180,7 +180,7 @@ void main() {
       expect(
         clip.keyframes.any(
           (frame) =>
-              frame.time == const Duration(milliseconds: 250) &&
+              frame.time == const Duration(milliseconds: 300) &&
               (frame.value - 0.25).abs() < 0.0001,
         ),
         isTrue,

@@ -699,90 +699,40 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
   Future<void> _editSelectedNumeric() async {
     final selected = _selectedFrame;
     if (selected == null || _channelLocked) return;
-    final timeController = TextEditingController(
-      text: (selected.time.inMicroseconds / 1000).toStringAsFixed(3),
-    );
-    final valueController = TextEditingController(
-      text: selected.value.toStringAsFixed(4),
-    );
-    String? error;
     final replacement = await showDialog<TimelineKeyframe>(
       context: context,
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: const Text('Edit keyframe numerically'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                key: const ValueKey('keyframe_numeric_time'),
-                controller: timeController,
-                keyboardType: const TextInputType.numberWithOptions(
-                  decimal: true,
-                ),
-                decoration: const InputDecoration(
-                  labelText: 'Clip-relative time (ms)',
-                ),
-              ),
-              const SizedBox(height: 10),
-              TextField(
-                key: const ValueKey('keyframe_numeric_value'),
-                controller: valueController,
-                keyboardType: const TextInputType.numberWithOptions(
-                  decimal: true,
-                  signed: true,
-                ),
-                decoration: InputDecoration(
-                  labelText: '${_propertyLabel(_property)} value',
-                  errorText: error,
-                ),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('Cancel'),
+      builder: (dialogContext) => _NumericKeyframeDialog(
+        initialTimeMs: (selected.time.inMicroseconds / 1000).toStringAsFixed(3),
+        initialValue: selected.value.toStringAsFixed(4),
+        valueLabel: '${_propertyLabel(_property)} value',
+        resolve: (timeText, valueText) {
+          final timeMs = double.tryParse(timeText.trim());
+          final value = double.tryParse(valueText.trim());
+          if (timeMs == null || value == null || !value.isFinite) {
+            return (frame: null, error: 'Enter valid numbers.');
+          }
+          final time = _snapTime(
+            Duration(microseconds: (timeMs * 1000).round()),
+          );
+          final collision = _propertyFrames.any(
+            (frame) => frame.id != selected.id && frame.time == time,
+          );
+          if (collision) {
+            return (
+              frame: null,
+              error: 'Another keyframe already uses this frame.',
+            );
+          }
+          return (
+            frame: selected.copyWith(
+              time: time,
+              value: value.clamp(_range.minimum, _range.maximum).toDouble(),
             ),
-            FilledButton(
-              key: const ValueKey('keyframe_numeric_apply'),
-              onPressed: () {
-                final timeMs = double.tryParse(timeController.text.trim());
-                final value = double.tryParse(valueController.text.trim());
-                if (timeMs == null || value == null || !value.isFinite) {
-                  setDialogState(() => error = 'Enter valid numbers.');
-                  return;
-                }
-                final time = _snapTime(
-                  Duration(microseconds: (timeMs * 1000).round()),
-                );
-                final collision = _propertyFrames.any(
-                  (frame) => frame.id != selected.id && frame.time == time,
-                );
-                if (collision) {
-                  setDialogState(
-                    () => error = 'Another keyframe already uses this frame.',
-                  );
-                  return;
-                }
-                Navigator.pop(
-                  dialogContext,
-                  selected.copyWith(
-                    time: time,
-                    value: value
-                        .clamp(_range.minimum, _range.maximum)
-                        .toDouble(),
-                  ),
-                );
-              },
-              child: const Text('Apply'),
-            ),
-          ],
-        ),
+            error: null,
+          );
+        },
       ),
     );
-    timeController.dispose();
-    valueController.dispose();
     if (replacement == null || !mounted) return;
     _replaceFrame(replacement, recordHistory: true);
     widget.onSeek(widget.clip.startTime + replacement.time);
@@ -1132,6 +1082,108 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
             style: TextStyle(color: kTextSecondary, fontSize: 11),
           ),
         ],
+      ],
+    );
+  }
+}
+
+typedef _NumericKeyframeResolver =
+    ({TimelineKeyframe? frame, String? error}) Function(
+      String timeText,
+      String valueText,
+    );
+
+class _NumericKeyframeDialog extends StatefulWidget {
+  final String initialTimeMs;
+  final String initialValue;
+  final String valueLabel;
+  final _NumericKeyframeResolver resolve;
+
+  const _NumericKeyframeDialog({
+    required this.initialTimeMs,
+    required this.initialValue,
+    required this.valueLabel,
+    required this.resolve,
+  });
+
+  @override
+  State<_NumericKeyframeDialog> createState() => _NumericKeyframeDialogState();
+}
+
+class _NumericKeyframeDialogState extends State<_NumericKeyframeDialog> {
+  late final TextEditingController _timeController;
+  late final TextEditingController _valueController;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _timeController = TextEditingController(text: widget.initialTimeMs);
+    _valueController = TextEditingController(text: widget.initialValue);
+  }
+
+  @override
+  void dispose() {
+    _timeController.dispose();
+    _valueController.dispose();
+    super.dispose();
+  }
+
+  void _apply() {
+    final result = widget.resolve(_timeController.text, _valueController.text);
+    final frame = result.frame;
+    if (frame == null) {
+      setState(() => _error = result.error ?? 'Enter valid numbers.');
+      return;
+    }
+    Navigator.pop(context, frame);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Edit keyframe numerically'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              key: const ValueKey('keyframe_numeric_time'),
+              controller: _timeController,
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
+              ),
+              decoration: const InputDecoration(
+                labelText: 'Clip-relative time (ms)',
+              ),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              key: const ValueKey('keyframe_numeric_value'),
+              controller: _valueController,
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
+                signed: true,
+              ),
+              decoration: InputDecoration(
+                labelText: widget.valueLabel,
+                errorText: _error,
+              ),
+              onSubmitted: (_) => _apply(),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          key: const ValueKey('keyframe_numeric_apply'),
+          onPressed: _apply,
+          child: const Text('Apply'),
+        ),
       ],
     );
   }
