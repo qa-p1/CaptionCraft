@@ -1915,6 +1915,8 @@ class TimelineExportService {
     required ExportCanvasSize canvasSize,
   }) async {
     final entries = <SubtitleEntry>[];
+    final cueRotationRadians = <String, double>{};
+    final cueOpacities = <String, double>{};
     if (settings.burnSubtitles) {
       entries.addAll(
         SubtitleExportService.effectiveTimelineCaptions(
@@ -1949,6 +1951,8 @@ class TimelineExportService {
             styleOverride: style,
           ),
         );
+        cueRotationRadians[clip.id] = clip.transform.rotation;
+        cueOpacities[clip.id] = clip.transform.opacity;
       }
     }
 
@@ -1959,6 +1963,8 @@ class TimelineExportService {
       fileName: 'timeline_${DateTime.now().microsecondsSinceEpoch}.ass',
       playResX: canvasSize.width,
       playResY: canvasSize.height,
+      cueRotationRadians: cueRotationRadians,
+      cueOpacities: cueOpacities,
     );
   }
 

@@ -12,6 +12,7 @@ import 'package:path_provider/path_provider.dart';
 import '../../features/editor/models/timeline_models.dart';
 import 'ffmpeg_service.dart';
 import 'timeline_export_service.dart';
+import 'timeline_media_cache_pruner.dart';
 
 class PreviewAudioMixPlan {
   final String fingerprint;
@@ -51,6 +52,9 @@ class PreviewAudioMixResult {
 /// and seek storms when many videos overlap.
 class TimelinePreviewAudioService {
   TimelinePreviewAudioService._();
+
+  static const _maximumCacheEntries = 8;
+  static const _maximumCacheBytes = 512 * 1024 * 1024;
 
   static Future<void> _renderTail = Future<void>.value();
   static final Map<String, bool> _probedAudioCapabilities = {};
@@ -200,7 +204,6 @@ class TimelinePreviewAudioService {
             'sourceDurationUs': input.clip.sourceDuration.inMicroseconds,
             'playbackRate': input.clip.playbackRate,
             'reversed': input.clip.isReversed,
-            'freezeFrame': input.clip.freezeFrame,
             'audioMix': input.clip.audioMix.toJson(),
             'autoDuck': input.clip.autoDuck,
             'duckAmount': input.clip.duckAmount,
@@ -260,6 +263,10 @@ class TimelinePreviewAudioService {
     );
     final output = File(outputPath);
     if (await output.exists() && await output.length() > 0) {
+      try {
+        await output.setLastModified(DateTime.now());
+      } catch (_) {}
+      await _pruneCache(temporaryDirectory, preservingPath: outputPath);
       return PreviewAudioMixResult(
         fingerprint: plan.fingerprint,
         outputPath: outputPath,
@@ -300,6 +307,7 @@ class TimelinePreviewAudioService {
       }
       if (await output.exists()) await output.delete();
       await partial.rename(outputPath);
+      await _pruneCache(temporaryDirectory, preservingPath: outputPath);
       return PreviewAudioMixResult(
         fingerprint: plan.fingerprint,
         outputPath: outputPath,
@@ -315,6 +323,21 @@ class TimelinePreviewAudioService {
         }
       }
     }
+  }
+
+  static Future<void> _pruneCache(
+    Directory directory, {
+    required String preservingPath,
+  }) {
+    return pruneTimelineMediaCache(
+      directory: directory,
+      includes: (file) => RegExp(
+        r'^caption_craft_preview_audio_[0-9a-f]{64}\.m4a$',
+      ).hasMatch(p.basename(file.path)),
+      preservingPath: preservingPath,
+      maximumEntries: _maximumCacheEntries,
+      maximumBytes: _maximumCacheBytes,
+    );
   }
 
   static Future<List<TimelineRenderInput>> _verifiedAudioInputs(

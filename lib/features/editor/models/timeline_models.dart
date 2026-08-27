@@ -544,7 +544,7 @@ class TimelineWorkspaceSettings {
 
   factory TimelineWorkspaceSettings.fromJson(Map<String, dynamic> json) {
     return TimelineWorkspaceSettings(
-      frameRate: (json['frameRate'] as num?)?.toInt() ?? 30,
+      frameRate: _timelineInt(json['frameRate'], fallback: 30).clamp(1, 120),
       loopPlayback: json['loopPlayback'] as bool? ?? false,
       showWaveforms: json['showWaveforms'] as bool? ?? true,
       showThumbnails: json['showThumbnails'] as bool? ?? true,
@@ -608,6 +608,8 @@ extension TimelineTrackTypeCapabilities on TimelineTrackType {
         this == TimelineTrackType.text ||
         this == TimelineTrackType.effect;
   }
+
+  bool get supportsTransformKeyframes => isVisualMedia;
 
   /// Generic clip transitions are rendered by the visual-media pipeline.
   /// Text uses its dedicated subtitle/text animation presets instead.
@@ -1623,6 +1625,7 @@ extension TimelineClipCapabilities on TimelineClip {
           type == TimelineTrackType.gif ||
           type == TimelineTrackType.sticker);
   bool get supportsTransform => type.supportsTransform;
+  bool get supportsTransformKeyframes => type.supportsTransformKeyframes;
   bool get supportsClipAnimation => type.supportsClipAnimation;
   bool get supportsSourceTiming => type.supportsSourceTiming;
   bool get supportsReversePlayback => type.supportsReversePlayback;
@@ -1630,10 +1633,12 @@ extension TimelineClipCapabilities on TimelineClip {
 
   bool get hasKeyframes => keyframes.isNotEmpty;
 
-  bool get hasTransformKeyframes => keyframes.any(
-    (keyframe) =>
-        kTimelineTransformKeyframeProperties.contains(keyframe.property),
-  );
+  bool get hasTransformKeyframes =>
+      supportsTransformKeyframes &&
+      keyframes.any(
+        (keyframe) =>
+            kTimelineTransformKeyframeProperties.contains(keyframe.property),
+      );
 
   bool get hasVolumeKeyframes => keyframes.any(
     (keyframe) => keyframe.property == TimelineKeyframeProperty.volume,

@@ -1100,7 +1100,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       SnackBarHelper.showInfo(context, 'Enable blur on this clip first.');
       return;
     }
-    if (!isVolume && !isBlur && !clip.supportsVisualEffects) {
+    if (!isVolume && !isBlur && !clip.supportsTransformKeyframes) {
       SnackBarHelper.showInfo(
         context,
         'Transform keyframes require visual media.',
@@ -1248,7 +1248,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
 
   bool _clipCanUseStateKeyframes(EditorTimeline timeline, TimelineClip? clip) {
     if (clip == null) return false;
-    return clip.supportsTransform ||
+    return clip.supportsTransformKeyframes ||
         clip.blur.isEnabled ||
         timeline.clipHasAudio(clip);
   }
@@ -1496,7 +1496,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     TimelineClip clip,
   ) {
     final properties = <TimelineKeyframeProperty>[
-      if (clip.supportsVisualEffects) ...const [
+      if (clip.supportsTransformKeyframes) ...const [
         TimelineKeyframeProperty.opacity,
         TimelineKeyframeProperty.scale,
         TimelineKeyframeProperty.rotation,
@@ -1507,7 +1507,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       if (timeline.clipHasAudio(clip)) TimelineKeyframeProperty.volume,
     ];
     for (final keyframe in clip.keyframes) {
-      if (!properties.contains(keyframe.property)) {
+      final supported = switch (keyframe.property) {
+        TimelineKeyframeProperty.volume => timeline.clipHasAudio(clip),
+        TimelineKeyframeProperty.blurStrength => clip.blur.isEnabled,
+        _ => clip.supportsTransformKeyframes,
+      };
+      if (supported && !properties.contains(keyframe.property)) {
         properties.add(keyframe.property);
       }
     }
@@ -1744,8 +1749,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               (source.type == TimelineTrackType.video || sourceHasAudio) &&
               (clip.type == TimelineTrackType.video || targetHasAudio);
 
+          final copyTransformKeyframes =
+              source.supportsTransformKeyframes &&
+              clip.supportsTransformKeyframes;
           final copiedKeyframeProperties = <TimelineKeyframeProperty>{
-            if (copyFullTransform) ...[
+            if (copyTransformKeyframes) ...[
               TimelineKeyframeProperty.opacity,
               TimelineKeyframeProperty.scale,
               TimelineKeyframeProperty.rotation,
@@ -2171,7 +2179,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       context,
       'Building ${candidates.length} editing ${candidates.length == 1 ? 'proxy' : 'proxies'}…',
     );
-    final metadataByAssetId = <String, Map<String, dynamic>>{};
+    final resultByAssetId = <String, TimelineProxyMediaResult>{};
     var completed = 0;
     for (final asset in candidates) {
       final result = await TimelineProxyMediaService.instance.ensureProxy(
@@ -2179,39 +2187,51 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       );
       if (!mounted) return;
       if (result != null) {
-        metadataByAssetId[asset.id] = {
-          ...asset.metadata,
-          'proxyMedia': result.toMetadata(),
-        };
+        resultByAssetId[asset.id] = result;
         completed++;
       }
     }
-    if (metadataByAssetId.isNotEmpty) {
+    var applied = 0;
+    if (resultByAssetId.isNotEmpty) {
       final current = ref.read(editorProvider).timeline;
-      ref
-          .read(editorProvider.notifier)
-          .setTimeline(
-            current.copyWith(
-              assets: current.assets
-                  .map(
-                    (asset) => metadataByAssetId.containsKey(asset.id)
-                        ? asset.copyWith(metadata: metadataByAssetId[asset.id])
-                        : asset,
-                  )
-                  .toList(),
-              workspaceSettings: current.workspaceSettings.copyWith(
-                previewMediaQuality: PreviewMediaQuality.auto,
+      final startingQuality =
+          startingTimeline.workspaceSettings.previewMediaQuality;
+      final currentSettings = current.workspaceSettings;
+      final nextAssets = current.assets.map((asset) {
+        final result = resultByAssetId[asset.id];
+        if (result == null ||
+            !TimelineProxyMediaService.resultMatchesAsset(result, asset)) {
+          return asset;
+        }
+        applied++;
+        return asset.copyWith(
+          metadata: {...asset.metadata, 'proxyMedia': result.toMetadata()},
+        );
+      }).toList();
+      if (applied > 0) {
+        ref
+            .read(editorProvider.notifier)
+            .setTimeline(
+              current.copyWith(
+                assets: nextAssets,
+                workspaceSettings:
+                    currentSettings.previewMediaQuality == startingQuality
+                    ? currentSettings.copyWith(
+                        previewMediaQuality: PreviewMediaQuality.auto,
+                      )
+                    : currentSettings,
               ),
-            ),
-          );
+            );
+      }
     }
     if (!mounted) return;
-    if (completed == candidates.length) {
-      SnackBarHelper.showSuccess(context, '$completed editing proxies ready');
+    if (applied == candidates.length) {
+      SnackBarHelper.showSuccess(context, '$applied editing proxies ready');
     } else {
       SnackBarHelper.showInfo(
         context,
-        '$completed of ${candidates.length} editing proxies ready',
+        '$applied of ${candidates.length} editing proxies ready'
+        '${completed > applied ? ' (${completed - applied} source changes skipped)' : ''}',
       );
     }
   }
@@ -5421,7 +5441,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         type: assetType,
         label: file.name,
         sourcePath: sourcePath,
-        metadata: {...?oldAsset?.metadata, ...mediaInfo},
+        metadata: TimelineProxyMediaService.metadataAfterSourceRelink(
+          previousMetadata: oldAsset?.metadata ?? const {},
+          mediaInfo: mediaInfo,
+        ),
       );
       final probedDurationMs = (mediaInfo['durationMs'] as num?)?.toInt();
       final replacementSourceDuration =
@@ -6995,12 +7018,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       return track.copyWith(clips: [...track.clips, clip]);
     }).toList();
 
-    ref
-        .read(editorProvider.notifier)
-        .setTimeline(timeline.copyWith(tracks: nextTracks));
-    ref.read(editorProvider.notifier).selectTrack(targetTrack.id);
-    ref.read(editorProvider.notifier).selectClip(clip.id);
-    await _openTextClipEditor(clip, isNew: true);
+    await _openTextClipEditor(
+      clip,
+      isNew: true,
+      insertionTimeline: timeline.copyWith(tracks: nextTracks),
+    );
   }
 
   Future<void> _editTextClip(TimelineClip clip) async {
@@ -7021,6 +7043,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   Future<void> _openTextClipEditor(
     TimelineClip originalClip, {
     bool isNew = false,
+    EditorTimeline? insertionTimeline,
   }) async {
     final scaffold = _scaffoldKey.currentState;
     if (scaffold == null) return;
@@ -7029,6 +7052,16 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       previousSheet.close();
       await previousSheet.closed;
       if (!mounted) return;
+    }
+
+    final editorNotifier = ref.read(editorProvider.notifier);
+    var gestureOpen = false;
+    if (isNew && insertionTimeline != null) {
+      editorNotifier.beginTimelineGestureEdit();
+      gestureOpen = true;
+      editorNotifier.setTimeline(insertionTimeline, recordHistory: false);
+      editorNotifier.selectTrack(originalClip.trackId);
+      editorNotifier.selectClip(originalClip.id);
     }
 
     final controller = TextEditingController(
@@ -7049,10 +7082,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           maxWidthFactor: 0.75,
         );
     var keepChanges = true;
-    var gestureOpen = true;
     var isClosing = false;
-    final editorNotifier = ref.read(editorProvider.notifier);
-    editorNotifier.beginTimelineGestureEdit();
+    if (!gestureOpen) {
+      editorNotifier.beginTimelineGestureEdit();
+      gestureOpen = true;
+    }
 
     void updateClip({String? text, SubtitleStyleModel? style}) {
       final liveClip = _clipById(originalClip.id, ref.read(editorProvider));
@@ -7106,23 +7140,14 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       _textEditorSheetController = null;
     }
 
-    if (!keepChanges || controller.text.trim().isEmpty) {
-      final liveClip = _clipById(originalClip.id, ref.read(editorProvider));
-      if (liveClip != null) {
-        if (isNew) {
-          _deleteClip(liveClip);
-        } else {
-          _updateTimelineClip(
-            liveClip,
-            (_) => originalClip,
-            recordHistory: false,
-          );
-        }
-      }
-    }
+    final shouldKeepChanges = keepChanges && controller.text.trim().isNotEmpty;
     if (gestureOpen) {
       gestureOpen = false;
-      editorNotifier.endTimelineGestureEdit();
+      if (shouldKeepChanges) {
+        editorNotifier.endTimelineGestureEdit();
+      } else {
+        editorNotifier.cancelTimelineGestureEdit();
+      }
     }
     // `PersistentBottomSheetController.closed` can complete during the same
     // frame in which the route removes its TextField. Dispose input objects on
@@ -7132,7 +7157,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       focusNode.dispose();
       controller.dispose();
     });
-    if (mounted && keepChanges && !isNew) {
+    if (mounted && shouldKeepChanges && !isNew) {
       SnackBarHelper.showSuccess(context, 'Text updated');
     }
   }
@@ -7972,6 +7997,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         ) ??
         false;
     final hasAudio = clip != null && timeline.clipHasAudio(clip);
+    final canTransformKeyframes =
+        capabilities.canEdit && clip?.supportsTransformKeyframes == true;
     final graphProperties = clip == null
         ? const <TimelineKeyframeProperty>[]
         : _graphPropertiesForClip(timeline, clip);
@@ -8047,7 +8074,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         label: 'Opacity',
         tooltip: 'Edit only the opacity channel at the playhead',
         icon: Icons.opacity_rounded,
-        onTap: capabilities.canVisualEffects
+        onTap: canTransformKeyframes
             ? () => _addSelectedKeyframe(
                 TimelineKeyframeProperty.opacity,
                 targetClip: clip,
@@ -8059,7 +8086,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         label: 'Scale',
         tooltip: 'Edit only the scale channel at the playhead',
         icon: Icons.zoom_in_rounded,
-        onTap: capabilities.canVisualEffects
+        onTap: canTransformKeyframes
             ? () => _addSelectedKeyframe(
                 TimelineKeyframeProperty.scale,
                 targetClip: clip,
@@ -8071,7 +8098,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         label: 'Position X',
         tooltip: 'Edit only horizontal position at the playhead',
         icon: Icons.swap_horiz_rounded,
-        onTap: capabilities.canVisualEffects
+        onTap: canTransformKeyframes
             ? () => _addSelectedKeyframe(
                 TimelineKeyframeProperty.positionX,
                 targetClip: clip,
@@ -8083,7 +8110,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         label: 'Position Y',
         tooltip: 'Edit only vertical position at the playhead',
         icon: Icons.swap_vert_rounded,
-        onTap: capabilities.canVisualEffects
+        onTap: canTransformKeyframes
             ? () => _addSelectedKeyframe(
                 TimelineKeyframeProperty.positionY,
                 targetClip: clip,
@@ -8095,7 +8122,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         label: 'Rotation',
         tooltip: 'Edit only rotation at the playhead',
         icon: Icons.rotate_right_rounded,
-        onTap: capabilities.canVisualEffects
+        onTap: canTransformKeyframes
             ? () => _addSelectedKeyframe(
                 TimelineKeyframeProperty.rotation,
                 targetClip: clip,

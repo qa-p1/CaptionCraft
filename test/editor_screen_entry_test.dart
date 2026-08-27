@@ -3,6 +3,7 @@ import 'package:caption_craft/features/auth/providers/auth_provider.dart';
 import 'package:caption_craft/features/editor/models/subtitle_entry.dart';
 import 'package:caption_craft/features/editor/models/subtitle_style_model.dart';
 import 'package:caption_craft/features/editor/models/timeline_models.dart';
+import 'package:caption_craft/features/editor/providers/editor_provider.dart';
 import 'package:caption_craft/features/editor/providers/subtitle_provider.dart';
 import 'package:caption_craft/features/editor/screens/editor_screen.dart';
 import 'package:caption_craft/features/editor/widgets/subtitle_edit_modal.dart';
@@ -258,8 +259,19 @@ void main() {
     tester,
   ) async {
     _setTestView(tester, const Size(390, 844));
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
+    addTearDown(container.dispose);
     await tester.pumpWidget(
-      _testApp(home: EditorScreen(project: _layeredProject())),
+      UncontrolledProviderScope(
+        container: container,
+        child: MaterialApp(
+          debugShowCheckedModeBanner: false,
+          theme: AppTheme.darkTheme,
+          home: EditorScreen(project: _layeredProject()),
+        ),
+      ),
     );
     await tester.pump(const Duration(milliseconds: 700));
 
@@ -319,6 +331,30 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const ValueKey('text_editor_done')));
     await tester.pumpAndSettle();
+
+    final editorNotifier = container.read(editorProvider.notifier);
+    expect(
+      container
+          .read(editorProvider)
+          .timeline
+          .tracks
+          .where((track) => track.type == TimelineTrackType.text)
+          .expand((track) => track.clips)
+          .single
+          .text,
+      'Direct canvas title',
+    );
+    editorNotifier.undo();
+    expect(
+      container
+          .read(editorProvider)
+          .timeline
+          .tracks
+          .where((track) => track.type == TimelineTrackType.text)
+          .expand((track) => track.clips),
+      isEmpty,
+    );
+    editorNotifier.redo();
 
     await tester.tap(
       find.byKey(const ValueKey('timeline_track_add_source-audio')),

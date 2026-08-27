@@ -8,6 +8,8 @@ import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import 'timeline_media_cache_pruner.dart';
+
 typedef WaveformFingerprintResolver = Future<String> Function(String path);
 typedef WaveformGenerator =
     Future<bool> Function({
@@ -61,6 +63,7 @@ class TimelineWaveformCache {
     final safeWidth = width.clamp(64, 4096).toInt();
     final safeHeight = height.clamp(24, 256).toInt();
     final sourceFingerprint = await _fingerprintResolver(normalizedPath);
+    if (sourceFingerprint == 'missing') return '';
     final identity = cacheIdentity(
       sourcePath: normalizedPath,
       sourceFingerprint: sourceFingerprint,
@@ -118,6 +121,7 @@ class TimelineWaveformCache {
         } catch (_) {
           // Cache recency is an optimization only.
         }
+        await _prune(directory, preservingPath: output.path);
         return output.path;
       }
       final partial = File(
@@ -165,34 +169,14 @@ class TimelineWaveformCache {
     Directory directory, {
     required String preservingPath,
   }) async {
-    final entries = <({File file, FileStat stat})>[];
-    await for (final entity in directory.list(followLinks: false)) {
-      if (entity is! File || !entity.path.endsWith('.png')) continue;
-      try {
-        entries.add((file: entity, stat: await entity.stat()));
-      } catch (_) {
-        // A concurrent cleanup may have removed the file.
-      }
-    }
-    entries.sort((a, b) => b.stat.modified.compareTo(a.stat.modified));
-    var retainedBytes = 0;
-    var retainedEntries = 0;
-    for (final entry in entries) {
-      final preserve = entry.file.path == preservingPath;
-      final fits =
-          retainedEntries < maximumEntries &&
-          retainedBytes + entry.stat.size <= maximumBytes;
-      if (preserve || fits) {
-        retainedEntries++;
-        retainedBytes += entry.stat.size;
-        continue;
-      }
-      try {
-        await entry.file.delete();
-      } catch (_) {
-        // Cache cleanup is best effort.
-      }
-    }
+    await pruneTimelineMediaCache(
+      directory: directory,
+      includes: (file) =>
+          RegExp(r'^[0-9a-f]{64}\.png$').hasMatch(p.basename(file.path)),
+      preservingPath: preservingPath,
+      maximumEntries: maximumEntries,
+      maximumBytes: maximumBytes,
+    );
   }
 
   static String cacheIdentity({

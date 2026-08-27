@@ -39,9 +39,10 @@ diagnostics and release stale controllers and native work.
 
 Continuous canvas, graph, and timeline gestures publish live model values for
 visual feedback. The provider's gesture session keeps `editRevision` stable so
-expensive preview-audio/composite invalidation remains pinned until the gesture
-commits. Ending the session advances that revision and leaves one history
-transaction.
+native preview-audio/composite rendering remains deferred until the gesture
+commits. A rendered bus or composite is detached as soon as its live model is
+stale, allowing the bounded fallback to remain correct during manipulation.
+Ending the session advances that revision and leaves one history transaction.
 
 This separation covers native media work and undo coalescing. Some broad
 provider/widget rebuilds still occur during live inspector and transform
@@ -63,11 +64,12 @@ absolute frame number, avoiding accumulated rounded-millisecond drift.
 
 ## Animation and curve-preserving edits
 
-State keyframes capture position X/Y, scale, rotation, opacity, volume, and
-blur together. Once animation is armed, later gestures and inspector changes
-update the complete state at the frame-snapped playhead. The graph editor uses
-the same `TimelineKeyframe` values and interpolation evaluator as preview and
-export.
+State keyframes capture position X/Y, scale, rotation, and opacity for visual
+media, plus volume and blur where those channels are renderable. Text and
+effect-region transforms remain static because the shared export path cannot
+encode their transform animation; accepting those keyframes would make preview
+disagree with delivery. The graph editor uses the same `TimelineKeyframe`
+values and interpolation evaluator as preview and export.
 
 Split and inward trim operations preserve the visible segment of an animation.
 For a cut through a cubic Bézier segment, De Casteljau subdivision produces two
@@ -83,16 +85,18 @@ persistent; multi-channel display configuration is not yet persistent.
 ## Proxies, waveforms, and cache boundaries
 
 Source proxies are distinct from dense composite/render caches. Their identity
-includes the source fingerprint and encoding profile. Preview can select Auto,
-Proxy, or Original quality, and a persisted valid proxy can keep an offline
-source previewable. Relinking changes the source fingerprint and invalidates a
-stale proxy. Final export always resolves the original asset.
+includes the source path, source fingerprint, and encoding profile. Preview can
+select Auto, Proxy, or Original quality, and a persisted valid proxy can keep an
+offline source previewable. Relinking clears stale proxy metadata, and an
+asynchronous proxy result is attached only if the asset still references the
+same source version. Final export always resolves the original asset.
 
 Waveform identity includes the source fingerprint, source window, audio stream,
 and requested density. Identical in-flight requests share one job. Proxy and
 waveform generation are serialized, write through temporary files, discard
-cancelled output, and enforce entry/byte limits. Generated media belongs only
-in app cache directories and must never be committed.
+cancelled output, and enforce entry/byte limits. Preview-audio and dense visual
+composite outputs use the same deterministic bounded-pruning policy. Generated
+media belongs only in app cache directories and must never be committed.
 
 ## Audio semantics
 
@@ -124,6 +128,9 @@ state are intentionally not serialized.
 
 One gesture produces one undo transaction for direct manipulation, clip moves
 and trims, graph/keyframe drags, state changes, split, duplicate, and delete.
+Cancellation restores the complete baseline without consuming redo history;
+new text insertion and editing are one atomic transaction. Active timeline,
+canvas, and graph sessions also close safely if their widgets are disposed.
 The existing architecture should be extended—not duplicated—for the remaining
 roll, slip, slide, group, track-target, sync-lock, meter, and threshold-ducking
 work. Those capabilities remain explicitly partial in the roadmap.
@@ -138,7 +145,7 @@ flutter analyze
 flutter test
 ```
 
-The latest implementation audit has a clean analyzer and passing editor-core
-tests. The full suite currently reports 399 passed, 22 skipped, and three
-unrelated Linux visual-golden mismatches. Physical iOS long-GOP 4K/60 stress
-validation has not been performed and must remain an explicit release gate.
+The latest local implementation audit has a clean analyzer and 433 passing
+tests on Windows with Flutter 3.41.2. Historical Linux visual-golden baseline
+differences still require CI verification. Physical iOS long-GOP 4K/60 stress
+validation has not been performed and remains an explicit release gate.

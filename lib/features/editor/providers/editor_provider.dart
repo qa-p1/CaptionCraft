@@ -120,6 +120,23 @@ class _EditorHistorySnapshot {
     required this.sequence,
     required this.branch,
   });
+
+  _EditorHistorySnapshot withHistory({
+    required int sequence,
+    required int branch,
+  }) {
+    return _EditorHistorySnapshot(
+      timeline: timeline,
+      subtitleEntries: subtitleEntries,
+      subtitleStyle: subtitleStyle,
+      selectedTrackId: selectedTrackId,
+      selectedClipId: selectedClipId,
+      selectedClipIds: selectedClipIds,
+      selectedSubtitleId: selectedSubtitleId,
+      sequence: sequence,
+      branch: branch,
+    );
+  }
 }
 
 class EditorNotifier extends StateNotifier<EditorState> {
@@ -128,6 +145,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
   final List<_EditorHistorySnapshot> _redoStack = [];
   bool _isTimelineGestureEditing = false;
   bool _timelineChangedDuringGesture = false;
+  _EditorHistorySnapshot? _timelineGestureBaseline;
   bool _isRestoringEditorSubtitleState = false;
   late final EditorHistoryClock _historyClock = _ref.read(
     editorHistoryClockProvider,
@@ -135,9 +153,11 @@ class EditorNotifier extends StateNotifier<EditorState> {
 
   static const int _maxHistoryDepth = 100;
 
-  bool get canUndo => _undoStack.isNotEmpty;
+  bool get canUndo => !_isTimelineGestureEditing && _undoStack.isNotEmpty;
   bool get canRedo =>
-      _redoStack.isNotEmpty && _redoStack.last.branch == _historyClock.branch;
+      !_isTimelineGestureEditing &&
+      _redoStack.isNotEmpty &&
+      _redoStack.last.branch == _historyClock.branch;
   int? get latestUndoSequence => canUndo ? _undoStack.last.sequence : null;
   int? get latestRedoSequence => canRedo ? _redoStack.last.sequence : null;
 
@@ -157,6 +177,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
     _redoStack.clear();
     _isTimelineGestureEditing = false;
     _timelineChangedDuringGesture = false;
+    _timelineGestureBaseline = null;
     final currentSubtitles = _ref.read(subtitleProvider);
     final normalizedTimeline =
         (currentSubtitles.entries.isEmpty
@@ -202,10 +223,10 @@ class EditorNotifier extends StateNotifier<EditorState> {
     final normalizedTimeline = timeline.withoutTrackOverlaps();
     if (identical(state.timeline, normalizedTimeline)) return;
     if (_isTimelineGestureEditing) {
-      // Gesture callers pass recordHistory:false for their live intermediate
-      // values. The first actual change still needs one baseline snapshot so
-      // the completed slider/drag remains a single undoable action.
-      if (!_timelineChangedDuringGesture) _pushUndoSnapshot();
+      _timelineGestureBaseline ??= _captureSnapshot(
+        sequence: 0,
+        branch: _historyClock.branch,
+      );
       _timelineChangedDuringGesture = true;
     } else if (recordHistory) {
       _pushUndoSnapshot();
@@ -213,8 +234,8 @@ class EditorNotifier extends StateNotifier<EditorState> {
     state = state.copyWith(
       timeline: normalizedTimeline,
       isSnappingEnabled: normalizedTimeline.workspaceSettings.snapping.enabled,
-      canUndo: canUndo,
-      canRedo: canRedo,
+      canUndo: _isTimelineGestureEditing ? false : canUndo,
+      canRedo: _isTimelineGestureEditing ? false : canRedo,
       // Preview widgets still rebuild from the live timeline during a gesture,
       // but expensive media re-seeks are deferred until the edit is committed.
       editRevision: _isTimelineGestureEditing
@@ -289,15 +310,35 @@ class EditorNotifier extends StateNotifier<EditorState> {
 
   void beginTimelineGestureEdit() {
     if (_isTimelineGestureEditing) return;
+    final baseline = _captureSnapshot(
+      sequence: 0,
+      branch: _historyClock.branch,
+    );
     _isTimelineGestureEditing = true;
     _timelineChangedDuringGesture = false;
-    state = state.copyWith(isTimelineGestureEditing: true);
+    _timelineGestureBaseline = baseline;
+    state = state.copyWith(
+      canUndo: false,
+      canRedo: false,
+      isTimelineGestureEditing: true,
+    );
   }
 
   void endTimelineGestureEdit() {
+    if (!_isTimelineGestureEditing) return;
     final shouldNotifyPreview = _timelineChangedDuringGesture;
+    final baseline = _timelineGestureBaseline;
     _isTimelineGestureEditing = false;
     _timelineChangedDuringGesture = false;
+    _timelineGestureBaseline = null;
+    if (shouldNotifyPreview && baseline != null) {
+      final sequence = _historyClock.recordAction();
+      _undoStack.add(
+        baseline.withHistory(sequence: sequence, branch: _historyClock.branch),
+      );
+      if (_undoStack.length > _maxHistoryDepth) _undoStack.removeAt(0);
+      _redoStack.clear();
+    }
     state = state.copyWith(
       canUndo: canUndo,
       canRedo: canRedo,
@@ -308,8 +349,26 @@ class EditorNotifier extends StateNotifier<EditorState> {
     );
   }
 
+  void cancelTimelineGestureEdit() {
+    if (!_isTimelineGestureEditing) return;
+    final baseline = _timelineGestureBaseline;
+    final changed = _timelineChangedDuringGesture;
+    _isTimelineGestureEditing = false;
+    _timelineChangedDuringGesture = false;
+    _timelineGestureBaseline = null;
+    if (changed && baseline != null) {
+      _restoreSnapshot(baseline);
+      return;
+    }
+    state = state.copyWith(
+      canUndo: canUndo,
+      canRedo: canRedo,
+      isTimelineGestureEditing: false,
+    );
+  }
+
   void undo() {
-    if (!canUndo) return;
+    if (_isTimelineGestureEditing || !canUndo) return;
     final previous = _undoStack.removeLast();
     final current = _captureSnapshot(
       sequence: _historyClock.recordTraversal(),
@@ -320,7 +379,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
   }
 
   void redo() {
-    if (!canRedo) return;
+    if (_isTimelineGestureEditing || !canRedo) return;
     final next = _redoStack.removeLast();
     final current = _captureSnapshot(
       sequence: _historyClock.recordTraversal(),
@@ -335,6 +394,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
     _redoStack.clear();
     _isTimelineGestureEditing = false;
     _timelineChangedDuringGesture = false;
+    _timelineGestureBaseline = null;
     _refreshHistoryFlags();
   }
 
@@ -616,17 +676,27 @@ class EditorNotifier extends StateNotifier<EditorState> {
     TimelineKeyframeInterpolation? interpolation,
     TimelineBezierCurve? curve,
   }) {
+    final targetClip = state.timeline.tracks
+        .expand((track) => track.clips)
+        .where((clip) => clip.id == clipId)
+        .firstOrNull;
     final hasAudio = state.timeline.tracks.any(
       (track) => track.clips.any(
         (clip) => clip.id == clipId && state.timeline.clipHasAudio(clip),
       ),
     );
+    if (targetClip == null ||
+        (!targetClip.supportsTransformKeyframes &&
+            !hasAudio &&
+            !targetClip.blur.isEnabled)) {
+      return false;
+    }
     return updateClip(clipId, (clip) {
       final time = _snappedKeyframeTime(clip, absolutePosition);
       final resolvedPosition = clip.startTime + time;
       final transform = clip.transformAt(resolvedPosition);
       final values = <TimelineKeyframeProperty, double>{
-        if (clip.supportsTransform) ...{
+        if (clip.supportsTransformKeyframes) ...{
           TimelineKeyframeProperty.opacity: transform.opacity,
           TimelineKeyframeProperty.scale: transform.scale,
           TimelineKeyframeProperty.rotation: transform.rotation,
@@ -665,9 +735,11 @@ class EditorNotifier extends StateNotifier<EditorState> {
       ),
     );
     return updateClip(clipId, (clip) {
-      final current = clip.transformAt(absolutePosition);
+      final current = clip.supportsTransformKeyframes
+          ? clip.transformAt(absolutePosition)
+          : clip.transform;
       final updated = mapper(current);
-      if (!clip.hasTransformKeyframes) {
+      if (!clip.supportsTransformKeyframes || !clip.hasTransformKeyframes) {
         return clip.copyWith(transform: updated);
       }
       final time = _snappedKeyframeTime(clip, absolutePosition);
@@ -920,6 +992,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
     _redoStack.clear();
     _isTimelineGestureEditing = false;
     _timelineChangedDuringGesture = false;
+    _timelineGestureBaseline = null;
     state = const EditorState();
   }
 
@@ -955,6 +1028,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
   void _restoreSnapshot(_EditorHistorySnapshot snapshot) {
     _isTimelineGestureEditing = false;
     _timelineChangedDuringGesture = false;
+    _timelineGestureBaseline = null;
     _restoreEditorSubtitleState(
       entries: snapshot.subtitleEntries,
       globalStyle: snapshot.subtitleStyle,

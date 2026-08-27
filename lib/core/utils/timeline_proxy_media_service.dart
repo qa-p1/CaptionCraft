@@ -9,6 +9,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import '../../features/editor/models/timeline_models.dart';
+import 'timeline_media_cache_pruner.dart';
 
 typedef ProxyMediaGenerator =
     Future<bool> Function({
@@ -20,6 +21,7 @@ typedef ProxyMediaGenerator =
 
 class TimelineProxyMediaResult {
   final String path;
+  final String sourcePath;
   final String identity;
   final String sourceFingerprint;
   final int maximumDimension;
@@ -27,6 +29,7 @@ class TimelineProxyMediaResult {
 
   const TimelineProxyMediaResult({
     required this.path,
+    required this.sourcePath,
     required this.identity,
     required this.sourceFingerprint,
     required this.maximumDimension,
@@ -34,8 +37,9 @@ class TimelineProxyMediaResult {
   });
 
   Map<String, dynamic> toMetadata() => {
-    'version': 1,
+    'version': 2,
     'path': path,
+    'sourcePath': sourcePath,
     'identity': identity,
     'sourceFingerprint': sourceFingerprint,
     'maximumDimension': maximumDimension,
@@ -126,8 +130,10 @@ class TimelineProxyMediaService {
         try {
           await output.setLastModified(DateTime.now());
         } catch (_) {}
+        await _prune(directory, preservingPath: output.path);
         return TimelineProxyMediaResult(
           path: output.path,
+          sourcePath: sourcePath,
           identity: identity,
           sourceFingerprint: sourceFingerprint,
           maximumDimension: maximumDimension,
@@ -159,6 +165,7 @@ class TimelineProxyMediaService {
         await _prune(directory, preservingPath: output.path);
         return TimelineProxyMediaResult(
           path: output.path,
+          sourcePath: sourcePath,
           identity: identity,
           sourceFingerprint: sourceFingerprint,
           maximumDimension: maximumDimension,
@@ -180,30 +187,14 @@ class TimelineProxyMediaService {
     Directory directory, {
     required String preservingPath,
   }) async {
-    final entries = <({File file, FileStat stat})>[];
-    await for (final entity in directory.list(followLinks: false)) {
-      if (entity is! File || !entity.path.endsWith('.mp4')) continue;
-      try {
-        entries.add((file: entity, stat: await entity.stat()));
-      } catch (_) {}
-    }
-    entries.sort((a, b) => b.stat.modified.compareTo(a.stat.modified));
-    var retainedBytes = 0;
-    var retainedEntries = 0;
-    for (final entry in entries) {
-      final preserve = entry.file.path == preservingPath;
-      final fits =
-          retainedEntries < maximumEntries &&
-          retainedBytes + entry.stat.size <= maximumBytes;
-      if (preserve || fits) {
-        retainedEntries++;
-        retainedBytes += entry.stat.size;
-        continue;
-      }
-      try {
-        await entry.file.delete();
-      } catch (_) {}
-    }
+    await pruneTimelineMediaCache(
+      directory: directory,
+      includes: (file) =>
+          RegExp(r'^[0-9a-f]{64}\.mp4$').hasMatch(p.basename(file.path)),
+      preservingPath: preservingPath,
+      maximumEntries: maximumEntries,
+      maximumBytes: maximumBytes,
+    );
   }
 
   static String? validProxyPath(
@@ -217,6 +208,14 @@ class TimelineProxyMediaService {
     final storedFingerprint = proxy['sourceFingerprint'];
     if (path is! String || path.isEmpty || !fileExists(path)) return null;
     final sourcePath = asset.sourcePath?.trim();
+    final storedSourcePath = proxy['sourcePath'];
+    if (storedSourcePath is String &&
+        storedSourcePath.trim().isNotEmpty &&
+        (sourcePath == null ||
+            sourcePath.isEmpty ||
+            !_sameSourcePath(storedSourcePath, sourcePath))) {
+      return null;
+    }
     if (sourcePath == null || sourcePath.isEmpty || !fileExists(sourcePath)) {
       // A proxy keeps an offline project previewable, but export still resolves
       // the original and will report it missing.
@@ -227,6 +226,39 @@ class TimelineProxyMediaService {
       return null;
     }
     return path;
+  }
+
+  static bool resultMatchesAsset(
+    TimelineProxyMediaResult result,
+    EditorAssetReference asset, {
+    String Function(String path)? sourceFingerprintSync,
+  }) {
+    final sourcePath = asset.sourcePath?.trim();
+    if (sourcePath == null ||
+        sourcePath.isEmpty ||
+        !_sameSourcePath(result.sourcePath, sourcePath)) {
+      return false;
+    }
+    return result.sourceFingerprint ==
+        (sourceFingerprintSync ??
+            TimelineProxyMediaService.sourceFingerprintSync)(sourcePath);
+  }
+
+  static Map<String, dynamic> metadataAfterSourceRelink({
+    required Map<String, dynamic> previousMetadata,
+    required Map<String, dynamic> mediaInfo,
+  }) {
+    return <String, dynamic>{...previousMetadata, ...mediaInfo}
+      ..remove('proxyMedia');
+  }
+
+  static bool _sameSourcePath(String first, String second) {
+    String key(String value) {
+      final normalized = p.normalize(p.absolute(value.trim()));
+      return Platform.isWindows ? normalized.toLowerCase() : normalized;
+    }
+
+    return key(first) == key(second);
   }
 
   static String cacheIdentity({

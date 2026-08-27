@@ -258,6 +258,18 @@ void main() {
         ),
       ],
     );
+    final frozen = timeline.copyWith(
+      tracks: [
+        track.copyWith(
+          clips: [
+            clip.copyWith(
+              freezeFrame: true,
+              freezeFrameSourceTime: const Duration(seconds: 2),
+            ),
+          ],
+        ),
+      ],
+    );
     final quieter = timeline.copyWith(
       tracks: [
         track.copyWith(
@@ -270,6 +282,7 @@ void main() {
     );
 
     expect(buildPlan(transformed).fingerprint, buildPlan(timeline).fingerprint);
+    expect(buildPlan(frozen).fingerprint, buildPlan(timeline).fingerprint);
     expect(
       buildPlan(quieter).fingerprint,
       isNot(buildPlan(timeline).fingerprint),

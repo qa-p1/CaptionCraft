@@ -68,6 +68,7 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
   double _valueZoom = 1;
   double _timeOffsetUs = 0;
   double? _valueCenter;
+  bool _editGestureOpen = false;
 
   @override
   void initState() {
@@ -92,6 +93,24 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
         !_selectedKeyframeIds.contains(_selectedKeyframeId)) {
       _selectedKeyframeId = _selectedKeyframeIds.firstOrNull;
     }
+  }
+
+  void _beginEdit() {
+    if (_editGestureOpen) return;
+    _editGestureOpen = true;
+    widget.onEditStart();
+  }
+
+  void _endEdit() {
+    if (!_editGestureOpen) return;
+    _editGestureOpen = false;
+    widget.onEditEnd();
+  }
+
+  @override
+  void dispose() {
+    _endEdit();
+    super.dispose();
   }
 
   List<TimelineKeyframe> get _propertyFrames =>
@@ -444,7 +463,7 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
     if (_dragKind != _GraphDragKind.pan &&
         _dragKind != _GraphDragKind.boxSelect &&
         _dragKind != _GraphDragKind.none) {
-      widget.onEditStart();
+      _beginEdit();
     }
   }
 
@@ -608,7 +627,7 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
     if (_dragKind != _GraphDragKind.none &&
         _dragKind != _GraphDragKind.pan &&
         _dragKind != _GraphDragKind.boxSelect) {
-      widget.onEditEnd();
+      _endEdit();
     }
     setState(() {
       _dragKind = _GraphDragKind.none;
@@ -1033,11 +1052,11 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
             min: _range.minimum,
             max: _range.maximum,
             label: _range.format(selected.value),
-            onChangeStart: _channelLocked ? null : (_) => widget.onEditStart(),
+            onChangeStart: _channelLocked ? null : (_) => _beginEdit(),
             onChanged: _channelLocked
                 ? null
                 : (value) => _changeSelectedValue(value, recordHistory: false),
-            onChangeEnd: _channelLocked ? null : (_) => widget.onEditEnd(),
+            onChangeEnd: _channelLocked ? null : (_) => _endEdit(),
           ),
           SingleChildScrollView(
             scrollDirection: Axis.horizontal,

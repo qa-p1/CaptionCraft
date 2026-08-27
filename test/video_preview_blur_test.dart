@@ -1322,6 +1322,84 @@ void main() {
     );
   });
 
+  test('ducking fallback honors selected sidechains and envelope timing', () {
+    final ducked = TimelineClip(
+      id: 'music',
+      trackId: 'music-track',
+      type: TimelineTrackType.audio,
+      label: 'Music',
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 5),
+      autoDuck: true,
+      duckAmount: 0.5,
+      duckAttackMs: 400,
+      duckReleaseMs: 600,
+      duckSidechainTrackIds: const ['selected-speech'],
+    );
+    TimelineTrack speechTrack(String id, int startMs, int endMs) {
+      return TimelineTrack(
+        id: id,
+        name: id,
+        type: TimelineTrackType.text,
+        section: TimelineTrackSection.textSubtitle,
+        clips: [
+          TimelineClip(
+            id: '$id-clip',
+            trackId: id,
+            type: TimelineTrackType.text,
+            label: id,
+            startTime: Duration(milliseconds: startMs),
+            endTime: Duration(milliseconds: endMs),
+          ),
+        ],
+      );
+    }
+
+    final timeline = EditorTimeline(
+      tracks: [
+        TimelineTrack(
+          id: 'music-track',
+          name: 'Music',
+          type: TimelineTrackType.audio,
+          section: TimelineTrackSection.audio,
+          clips: [ducked],
+        ),
+        speechTrack('selected-speech', 1000, 2000),
+        speechTrack('ignored-speech', 3000, 4000),
+      ],
+    );
+
+    final intervals = buildPreviewDuckingIntervalsForTesting(
+      timeline: timeline,
+      clip: ducked,
+    );
+    expect(intervals, [(startMs: 1000, endMs: 2000)]);
+    expect(
+      previewDuckingGainForTesting(
+        clip: ducked,
+        position: const Duration(milliseconds: 800),
+        intervals: intervals,
+      ),
+      closeTo(0.75, 0.0001),
+    );
+    expect(
+      previewDuckingGainForTesting(
+        clip: ducked,
+        position: const Duration(milliseconds: 1500),
+        intervals: intervals,
+      ),
+      0.5,
+    );
+    expect(
+      previewDuckingGainForTesting(
+        clip: ducked,
+        position: const Duration(milliseconds: 2300),
+        intervals: intervals,
+      ),
+      closeTo(0.75, 0.0001),
+    );
+  });
+
   testWidgets('full blur filters the media widget itself', (tester) async {
     const mediaKey = ValueKey('full-blur-media');
 

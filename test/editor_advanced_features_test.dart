@@ -471,4 +471,89 @@ void main() {
       expect(live.keyframeStateTimes, [Duration.zero]);
     },
   );
+
+  test('non-renderable transform channels remain static', () {
+    final text = TimelineClip(
+      id: 'text',
+      trackId: 'text-track',
+      type: TimelineTrackType.text,
+      label: 'Text',
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 2),
+    );
+    final effect = TimelineClip.effect(
+      id: 'effect',
+      trackId: 'effect-track',
+      effectKind: TimelineEffectKind.blur,
+      label: 'Blur',
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 2),
+      blur: const ClipBlurSettings(mode: ClipBlurMode.region, strength: 8),
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    final notifier = container.read(editorProvider.notifier);
+    notifier.loadProject(
+      videoPath: 'source.mp4',
+      projectId: 'static-transform-project',
+      projectName: 'Static transforms',
+      timeline: EditorTimeline(
+        tracks: [
+          TimelineTrack(
+            id: 'text-track',
+            name: 'Text',
+            type: TimelineTrackType.text,
+            section: TimelineTrackSection.textSubtitle,
+            clips: [text],
+          ),
+          TimelineTrack(
+            id: 'effect-track',
+            name: 'Effects',
+            type: TimelineTrackType.effect,
+            section: TimelineTrackSection.overlay,
+            clips: [effect],
+          ),
+        ],
+      ),
+    );
+
+    expect(
+      notifier.upsertKeyframeState(
+        clipId: text.id,
+        absolutePosition: const Duration(seconds: 1),
+      ),
+      isFalse,
+    );
+    expect(
+      notifier.updateClipTransformAt(
+        clipId: text.id,
+        absolutePosition: const Duration(seconds: 1),
+        mapper: (transform) => transform.copyWith(rotation: 0.5),
+      ),
+      isTrue,
+    );
+    expect(
+      notifier.upsertKeyframeState(
+        clipId: effect.id,
+        absolutePosition: const Duration(seconds: 1),
+      ),
+      isTrue,
+    );
+
+    final clips = container
+        .read(editorProvider)
+        .timeline
+        .tracks
+        .expand((track) => track.clips)
+        .toList();
+    final liveText = clips.singleWhere((clip) => clip.id == text.id);
+    final liveEffect = clips.singleWhere((clip) => clip.id == effect.id);
+    expect(liveText.transform.rotation, 0.5);
+    expect(liveText.keyframes, isEmpty);
+    expect(liveEffect.keyframes, hasLength(1));
+    expect(
+      liveEffect.keyframes.single.property,
+      TimelineKeyframeProperty.blurStrength,
+    );
+  });
 }

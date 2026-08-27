@@ -408,6 +408,8 @@ List<PreviewDuckingInterval> buildPreviewDuckingIntervalsForTesting({
 
   for (final track in timeline.tracks) {
     if (track.isHidden ||
+        (clip.duckSidechainTrackIds.isNotEmpty &&
+            !clip.duckSidechainTrackIds.contains(track.id)) ||
         (track.type != TimelineTrackType.subtitle &&
             track.type != TimelineTrackType.text)) {
       continue;
@@ -425,6 +427,8 @@ List<PreviewDuckingInterval> buildPreviewDuckingIntervalsForTesting({
   final hasSoloTrack = previewHasSoloMediaTrackForTesting(timeline);
   for (final track in timeline.tracks) {
     if (track.isMuted ||
+        (clip.duckSidechainTrackIds.isNotEmpty &&
+            !clip.duckSidechainTrackIds.contains(track.id)) ||
         (hasSoloTrack && !track.isSolo) ||
         (track.isHidden && track.section != TimelineTrackSection.audio)) {
       continue;
@@ -444,8 +448,10 @@ List<PreviewDuckingInterval> buildPreviewDuckingIntervalsForTesting({
   if (intervals.isEmpty) return const [];
   intervals.sort((a, b) => a.startMs.compareTo(b.startMs));
   final merged = <PreviewDuckingInterval>[];
+  final mergeGapMs =
+      clip.duckAttackMs.clamp(0, 5000) + clip.duckReleaseMs.clamp(0, 10000);
   for (final interval in intervals) {
-    if (merged.isEmpty || interval.startMs > merged.last.endMs + 300) {
+    if (merged.isEmpty || interval.startMs > merged.last.endMs + mergeGapMs) {
       merged.add(interval);
     } else {
       final previous = merged.removeLast();
@@ -456,6 +462,46 @@ List<PreviewDuckingInterval> buildPreviewDuckingIntervalsForTesting({
     }
   }
   return List.unmodifiable(merged);
+}
+
+@visibleForTesting
+double previewDuckingGainForTesting({
+  required TimelineClip clip,
+  required Duration position,
+  required List<PreviewDuckingInterval> intervals,
+}) {
+  if (!clip.autoDuck || clip.duckAmount <= 0.001 || intervals.isEmpty) {
+    return 1;
+  }
+  final duckedGain = (1 - clip.duckAmount.clamp(0.0, 1.0)).toDouble();
+  final positionMs = position.inMilliseconds;
+  final clipStartMs = clip.startTime.inMilliseconds;
+  final clipEndMs = clip.endTime.inMilliseconds;
+  final attackMs = clip.duckAttackMs.clamp(0, 5000);
+  final releaseMs = clip.duckReleaseMs.clamp(0, 10000);
+  var gain = 1.0;
+  for (final interval in intervals) {
+    final startMs = interval.startMs;
+    final endMs = interval.endMs;
+    final attackStartMs = math.max(clipStartMs, startMs - attackMs);
+    final releaseEndMs = math.min(clipEndMs, endMs + releaseMs);
+    if (positionMs < attackStartMs || positionMs > releaseEndMs) continue;
+
+    double intervalGain;
+    if (positionMs < startMs && startMs > attackStartMs) {
+      final progress = (positionMs - attackStartMs) / (startMs - attackStartMs);
+      intervalGain = 1 - (1 - duckedGain) * progress.clamp(0.0, 1.0);
+    } else if (positionMs <= endMs) {
+      intervalGain = duckedGain;
+    } else if (releaseEndMs > endMs) {
+      final progress = (positionMs - endMs) / (releaseEndMs - endMs);
+      intervalGain = duckedGain + (1 - duckedGain) * progress.clamp(0.0, 1.0);
+    } else {
+      intervalGain = 1;
+    }
+    gain = math.min(gain, intervalGain);
+  }
+  return gain.clamp(0.0, 1.0).toDouble();
 }
 
 @visibleForTesting
@@ -791,6 +837,7 @@ class VideoPreviewPanel extends ConsumerStatefulWidget {
 
 class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     with WidgetsBindingObserver {
+  late final EditorNotifier _editorNotifier;
   VideoPlayerController? _controller;
   VideoPlayerController? _previewAudioMixController;
   TimelineClip? _controllerClip;
@@ -838,6 +885,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   String? _activePreviewAudioMixFingerprint;
   String? _previewAudioMixError;
   PreviewAudioMixResult? _previewAudioMixResult;
+  bool _previewAudioMixLiveEditPending = false;
   EditorTimeline? _previewAudioPlanTimeline;
   int? _previewAudioPlanEditRevision;
   String? _previewAudioPlanProjectId;
@@ -964,6 +1012,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         _previewAudioMixResult != null &&
         _activePreviewAudioMixFingerprint ==
             _previewAudioMixResult!.fingerprint &&
+        !_previewAudioMixLiveEditPending &&
         _activePreviewAudioMixFingerprint == _plannedPreviewAudioMixFingerprint;
   }
 
@@ -971,12 +1020,31 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     EditorTimeline timeline,
     int editRevision,
     String? projectId,
+    bool isTimelineGestureEditing,
   ) {
-    if (_previewAudioPlanTimeline != null &&
+    final samePlanRevision =
+        _previewAudioPlanTimeline != null &&
         _previewAudioPlanEditRevision == editRevision &&
-        _previewAudioPlanProjectId == projectId) {
+        _previewAudioPlanProjectId == projectId;
+    if (samePlanRevision &&
+        isTimelineGestureEditing &&
+        !identical(_previewAudioPlanTimeline, timeline)) {
+      if (!_previewAudioMixLiveEditPending) {
+        _previewAudioMixLiveEditPending = true;
+        _previewAudioMixDebounce?.cancel();
+        final generation = ++_previewAudioMixGeneration;
+        if (_previewAudioMixController != null || _previewAudioMixBuilding) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) unawaited(_clearPreviewAudioMix(generation));
+          });
+        }
+      }
       return;
     }
+    if (samePlanRevision && identical(_previewAudioPlanTimeline, timeline)) {
+      return;
+    }
+    _previewAudioMixLiveEditPending = false;
     _previewAudioPlanTimeline = timeline;
     _previewAudioPlanEditRevision = editRevision;
     _previewAudioPlanProjectId = projectId;
@@ -1635,6 +1703,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   @override
   void initState() {
     super.initState();
+    _editorNotifier = ref.read(editorProvider.notifier);
     _timelineClock.start();
     WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1850,6 +1919,9 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    if (_freeTransformTimelinePosition != null) {
+      _editorNotifier.endTimelineGestureEdit();
+    }
     _stopPlaybackTicker();
     _timelineClock.stop();
     _controllerGeneration++;
@@ -3111,12 +3183,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   }
 
   double _previewDuckingGain(TimelineClip clip, Duration position) {
-    if (!clip.autoDuck || clip.duckAmount <= 0.001) return 1;
     final timeline = ref.read(editorProvider).timeline;
-    final duckedGain = (1 - clip.duckAmount.clamp(0.0, 1.0)).toDouble();
-    final positionMs = position.inMilliseconds;
-    final clipStartMs = clip.startTime.inMilliseconds;
-    final clipEndMs = clip.endTime.inMilliseconds;
     _ensurePreviewCaches(timeline);
     final intervals = _cachedDuckingIntervals.putIfAbsent(
       clip.id,
@@ -3125,32 +3192,11 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         clip: clip,
       ),
     );
-    if (intervals.isEmpty) return 1;
-
-    var gain = 1.0;
-    for (final interval in intervals) {
-      final startMs = interval.startMs;
-      final endMs = interval.endMs;
-      final attackStartMs = math.max(clipStartMs, startMs - 120);
-      final releaseEndMs = math.min(clipEndMs, endMs + 180);
-      if (positionMs < attackStartMs || positionMs > releaseEndMs) continue;
-
-      double intervalGain;
-      if (positionMs < startMs && startMs > attackStartMs) {
-        final progress =
-            (positionMs - attackStartMs) / (startMs - attackStartMs);
-        intervalGain = 1 - (1 - duckedGain) * progress.clamp(0.0, 1.0);
-      } else if (positionMs <= endMs) {
-        intervalGain = duckedGain;
-      } else if (releaseEndMs > endMs) {
-        final progress = (positionMs - endMs) / (releaseEndMs - endMs);
-        intervalGain = duckedGain + (1 - duckedGain) * progress.clamp(0.0, 1.0);
-      } else {
-        intervalGain = 1;
-      }
-      gain = math.min(gain, intervalGain);
-    }
-    return gain.clamp(0.0, 1.0).toDouble();
+    return previewDuckingGainForTesting(
+      clip: clip,
+      position: position,
+      intervals: intervals,
+    );
   }
 
   Widget _applyClipMediaEffects(
@@ -3756,7 +3802,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
           position: SubtitlePosition.center,
           fontSize: 32,
         );
-    final transform = item.clip.transformAt(playbackPosition);
+    final transform = item.clip.transform;
     final previewEntry = SubtitleEntry(
       id: item.clip.id,
       startTime: item.clip.startTime,
@@ -3990,7 +4036,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                   effected,
                   effect.clip,
                   resolvedBlur,
-                  playbackPosition,
                 )
               : _applyBlurPreview(effected, resolvedBlur);
           break;
@@ -4005,10 +4050,9 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     Widget child,
     TimelineClip clip,
     ClipBlurSettings blur,
-    Duration playbackPosition,
   ) {
     if (!blur.isEnabled) return child;
-    final transform = clip.transformAt(playbackPosition);
+    final transform = clip.transform;
     return LayoutBuilder(
       builder: (context, constraints) {
         if (!constraints.hasBoundedWidth ||
@@ -4352,6 +4396,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       editorState.timeline,
       editorState.editRevision,
       editorState.projectId,
+      editorState.isTimelineGestureEditing,
     );
     _ensurePreviewCompositePlan(
       timeline: editorState.timeline,

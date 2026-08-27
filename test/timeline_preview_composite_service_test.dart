@@ -3,6 +3,7 @@ import 'package:caption_craft/core/utils/timeline_preview_composite_service.dart
 import 'package:caption_craft/features/editor/models/export_settings.dart';
 import 'package:caption_craft/features/editor/models/subtitle_style_model.dart';
 import 'package:caption_craft/features/editor/models/timeline_models.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -175,6 +176,12 @@ void main() {
               audioMix: const AudioMixSettings(volume: 0.25),
               autoDuck: true,
               duckAmount: 0.1,
+              duckAttackMs: 450,
+              duckReleaseMs: 900,
+              duckSidechainTrackIds: const ['dialogue'],
+              linkedClipId: 'audio-owner',
+              notes: 'Mix note',
+              timelineColor: const Color(0xFF123456),
             ),
           ],
         ),

@@ -100,7 +100,7 @@ preview/export semantics, caching, and known limitations.
 - [x] Size overlay gesture bounds from visible fitted/cropped media instead of a fixed layout slot.
 - [x] Apply the selection outline after fit, scale, rotation, and transition transforms.
 - [x] Pause and pin the playhead when a direct-manipulation gesture starts.
-- [x] Capture position, scale, rotation, opacity, volume, and blur as one state keyframe.
+- [x] Capture renderable media transforms, volume, and blur as one state keyframe without exposing text/effect transform animation that export cannot reproduce.
 - [x] Automatically create/update a complete state when a keyed clip changes later in time.
 - [x] Keep unkeyed clips editing their base values until animation is intentionally armed.
 - [x] Add dedicated Add/Update, Delete, Previous, and Next state controls.
@@ -113,9 +113,8 @@ preview/export semantics, caching, and known limitations.
 - [x] `flutter pub get --enforce-lockfile` succeeds on GitHub Actions with Flutter 3.41.2.
 - [x] `flutter analyze` is clean on Flutter 3.41.2.
 - [x] All editor, timeline, preview, proxy, waveform, audio, animation, persistence, and undo tests pass.
-- [ ] The complete `flutter test` invocation is green.
-    - [x] 399 tests pass and 22 platform/integration fixtures skip as designed.
-    - [ ] Three unrelated Linux visual-golden comparisons differ from their checked-in PNG baselines; no editor task file or golden was changed to mask them.
+- [x] The complete local `flutter test` invocation is green with 433 passing tests on Windows.
+- [ ] Reverify the three historical Linux visual-golden baseline differences in CI; no golden was changed to mask them.
 - [x] Preview/export parity tests cover every interpolation mode and the shared audio filter graph.
 - [ ] Stress playback is verified on a real iOS device.
 - [x] Work remains isolated to `editor-heavy-project-foundation`; it is not merged into the default branch.

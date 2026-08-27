@@ -137,6 +137,7 @@ class TimelinePanel extends ConsumerStatefulWidget {
 }
 
 class _TimelinePanelState extends ConsumerState<TimelinePanel> {
+  late final EditorNotifier _editorNotifier;
   final ScrollController _horizontalScrollController = ScrollController();
   final ScrollController _verticalScrollController = ScrollController();
   final GlobalKey _horizontalViewportKey = GlobalKey();
@@ -167,6 +168,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
   @override
   void initState() {
     super.initState();
+    _editorNotifier = ref.read(editorProvider.notifier);
     _horizontalScrollController.addListener(_scheduleViewportRebuild);
     _verticalScrollController.addListener(_scheduleViewportRebuild);
     ref.listenManual<Duration>(
@@ -192,6 +194,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
   @override
   void dispose() {
     _edgeScrollTimer?.cancel();
+    if (_clipMoveSession != null || _clipTrimSession != null) {
+      _editorNotifier.endTimelineGestureEdit();
+    }
     _horizontalScrollController.removeListener(_scheduleViewportRebuild);
     _verticalScrollController.removeListener(_scheduleViewportRebuild);
     _horizontalScrollController.dispose();

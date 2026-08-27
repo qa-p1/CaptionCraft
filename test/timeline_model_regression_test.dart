@@ -5,6 +5,21 @@ import 'package:caption_craft/features/editor/models/word_timing.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('workspace persistence clamps malformed frame rates', () {
+    expect(
+      TimelineWorkspaceSettings.fromJson(const {'frameRate': 0}).frameRate,
+      1,
+    );
+    expect(
+      TimelineWorkspaceSettings.fromJson(const {'frameRate': 240}).frameRate,
+      120,
+    );
+    expect(
+      TimelineWorkspaceSettings.fromJson(const {'frameRate': '24'}).frameRate,
+      24,
+    );
+  });
+
   group('typed track compatibility', () {
     final visualTrack = TimelineTrack(
       id: 'visual',
@@ -135,12 +150,15 @@ void main() {
       expect(TimelineTrackType.video.supportsVisualEffects, isTrue);
       expect(TimelineTrackType.image.supportsClipAnimation, isTrue);
       expect(TimelineTrackType.text.supportsTransform, isTrue);
+      expect(TimelineTrackType.text.supportsTransformKeyframes, isFalse);
       expect(TimelineTrackType.text.supportsClipAnimation, isFalse);
       expect(TimelineTrackType.audio.supportsVisualEffects, isFalse);
       expect(TimelineTrackType.audio.supportsSourceTiming, isTrue);
       expect(TimelineTrackType.audio.supportsReversePlayback, isFalse);
       expect(TimelineTrackType.video.supportsReversePlayback, isTrue);
       expect(TimelineTrackType.effect.supportsTransform, isTrue);
+      expect(TimelineTrackType.effect.supportsTransformKeyframes, isFalse);
+      expect(TimelineTrackType.video.supportsTransformKeyframes, isTrue);
       expect(const TimelineTransform().isIdentity, isTrue);
       expect(const TimelineTransform(scale: 1.2).isIdentity, isFalse);
       expect(const AudioMixSettings().hasMixAdjustment, isFalse);

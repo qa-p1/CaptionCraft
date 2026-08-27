@@ -183,4 +183,34 @@ void main() {
       expect(directory.listSync().whereType<File>(), isEmpty);
     },
   );
+
+  test('missing sources do not enqueue native waveform work', () async {
+    var generations = 0;
+    final cache = TimelineWaveformCache(
+      fingerprintResolver: (_) async => 'missing',
+      generator:
+          ({
+            required sourcePath,
+            required outputPath,
+            required sourceStart,
+            required sourceDuration,
+            required audioStreamIndex,
+            required width,
+            required height,
+          }) async {
+            generations++;
+            return true;
+          },
+    );
+
+    expect(
+      await cache.waveformFor(
+        sourcePath: '/missing/audio.m4a',
+        sourceStart: Duration.zero,
+        sourceDuration: const Duration(seconds: 1),
+      ),
+      isEmpty,
+    );
+    expect(generations, 0);
+  });
 }

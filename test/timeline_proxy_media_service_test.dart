@@ -67,6 +67,7 @@ void main() {
     expect(cached?.path, results.first?.path);
     expect(generations, 1);
     expect(cached?.toMetadata()['sourceFingerprint'], 'fixture-v1');
+    expect(cached?.toMetadata()['sourcePath'], '/fixtures/source.mp4');
   });
 
   test('source changes invalidate proxies and cache remains bounded', () async {
@@ -162,6 +163,62 @@ void main() {
         sourceFingerprintSync: (_) => 'fixture-v2',
       ),
       isNull,
+    );
+
+    final sourceBoundProxy = proxied.copyWith(
+      sourcePath: '/media/relinked.mp4',
+      metadata: const {
+        'proxyMedia': {
+          'path': '/cache/proxy.mp4',
+          'sourcePath': '/media/source.mp4',
+          'sourceFingerprint': 'fixture-v1',
+        },
+      },
+    );
+    expect(
+      TimelineProxyMediaService.validProxyPath(
+        sourceBoundProxy,
+        fileExists: (path) => path == '/cache/proxy.mp4',
+        sourceFingerprintSync: (_) => 'missing',
+      ),
+      isNull,
+    );
+  });
+
+  test('stale proxy results and relink metadata are rejected', () {
+    const result = TimelineProxyMediaResult(
+      path: '/cache/proxy.mp4',
+      sourcePath: '/media/source.mp4',
+      identity: 'proxy-id',
+      sourceFingerprint: 'fixture-v1',
+      maximumDimension: 960,
+      maximumFrameRate: 30,
+    );
+    expect(
+      TimelineProxyMediaService.resultMatchesAsset(
+        result,
+        asset('/media/source.mp4'),
+        sourceFingerprintSync: (_) => 'fixture-v1',
+      ),
+      isTrue,
+    );
+    expect(
+      TimelineProxyMediaService.resultMatchesAsset(
+        result,
+        asset('/media/relinked.mp4'),
+        sourceFingerprintSync: (_) => 'fixture-v1',
+      ),
+      isFalse,
+    );
+    expect(
+      TimelineProxyMediaService.metadataAfterSourceRelink(
+        previousMetadata: const {
+          'width': 1920,
+          'proxyMedia': {'path': '/cache/proxy.mp4'},
+        },
+        mediaInfo: const {'width': 1280, 'height': 720},
+      ),
+      {'width': 1280, 'height': 720},
     );
   });
 }

@@ -16,6 +16,7 @@ import '../../features/editor/models/timeline_models.dart';
 import 'caption_font_service.dart';
 import 'subtitle_export_service.dart';
 import 'timeline_export_service.dart';
+import 'timeline_media_cache_pruner.dart';
 
 /// A conservative ceiling that remains reliable on mobile hardware decoders.
 /// Denser projects are rendered to one low-resolution composite stream.
@@ -73,6 +74,9 @@ class PreviewCompositeRenderCancelled implements Exception {
 /// one H.264 stream after the overlap exceeds the safe live decoder budget.
 class TimelinePreviewCompositeService {
   TimelinePreviewCompositeService._();
+
+  static const _maximumCacheEntries = 4;
+  static const _maximumCacheBytes = 1024 * 1024 * 1024;
 
   static const _previewSettings = ExportSettings(
     resolution: ExportResolution.p480,
@@ -310,6 +314,10 @@ class TimelinePreviewCompositeService {
     );
     final output = File(outputPath);
     if (await output.exists() && await output.length() > 0) {
+      try {
+        await output.setLastModified(DateTime.now());
+      } catch (_) {}
+      await _pruneCache(temporaryDirectory, preservingPath: outputPath);
       _cancelledFingerprints.remove(plan.fingerprint);
       return _result(plan, outputPath);
     }
@@ -392,6 +400,7 @@ class TimelinePreviewCompositeService {
       }
       if (await output.exists()) await output.delete();
       await partial.rename(outputPath);
+      await _pruneCache(temporaryDirectory, preservingPath: outputPath);
       return _result(plan, outputPath);
     } finally {
       _activeSessionIds.remove(plan.fingerprint);
@@ -412,6 +421,21 @@ class TimelinePreviewCompositeService {
         }
       }
     }
+  }
+
+  static Future<void> _pruneCache(
+    Directory directory, {
+    required String preservingPath,
+  }) {
+    return pruneTimelineMediaCache(
+      directory: directory,
+      includes: (file) => RegExp(
+        r'^caption_craft_preview_composite_[0-9a-f]{64}\.mp4$',
+      ).hasMatch(p.basename(file.path)),
+      preservingPath: preservingPath,
+      maximumEntries: _maximumCacheEntries,
+      maximumBytes: _maximumCacheBytes,
+    );
   }
 
   static PreviewCompositeResult _result(
@@ -472,7 +496,15 @@ class TimelinePreviewCompositeService {
     final payload = Map<String, dynamic>.from(clip.toJson())
       ..remove('audioMix')
       ..remove('autoDuck')
-      ..remove('duckAmount');
+      ..remove('duckAmount')
+      ..remove('duckAttackMs')
+      ..remove('duckReleaseMs')
+      ..remove('duckSidechainTrackIds')
+      ..remove('notes')
+      ..remove('timelineColor');
+    if (clip.type.isVisualMedia || clip.type == TimelineTrackType.effect) {
+      payload.remove('linkedClipId');
+    }
     payload['keyframes'] = [
       for (final keyframe in clip.keyframes)
         if (keyframe.property != TimelineKeyframeProperty.volume)
