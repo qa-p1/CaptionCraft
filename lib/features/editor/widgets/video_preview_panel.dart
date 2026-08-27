@@ -8,6 +8,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:video_player/video_player.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/utils/subtitle_export_service.dart';
+import '../../../core/utils/timeline_preview_audio_service.dart';
 import '../models/subtitle_entry.dart';
 import '../models/subtitle_style_model.dart';
 import '../models/timeline_models.dart';
@@ -23,6 +24,7 @@ double _previewAudioVolume({
   required Duration position,
   required bool isTrackAudible,
   double duckingGain = 1,
+  double busGain = 1,
 }) {
   final mix = clip.audioMix;
   if (!isTrackAudible || mix.muted) return 0;
@@ -49,7 +51,16 @@ double _previewAudioVolume({
   if (fadeOutMs > 0) {
     volume *= (remainingMs / fadeOutMs).clamp(0.0, 1.0);
   }
-  return volume.clamp(0.0, 1.0).toDouble();
+  return (volume * busGain.clamp(0.0, 1.0)).clamp(0.0, 1.0).toDouble();
+}
+
+/// Conservative fallback gain while the rendered mix bus is not ready.
+/// Dividing by the number of simultaneously audible voices guarantees that
+/// even fully correlated full-scale sources cannot digitally overdrive the
+/// platform mixer. The rendered bus replaces this with a peak limiter.
+@visibleForTesting
+double previewFallbackMixBusGainForTesting(int audibleVoiceCount) {
+  return 1 / math.max(1, audibleVoiceCount);
 }
 
 Widget _cropSourcePreview({
@@ -719,6 +730,7 @@ class VideoPreviewPanel extends ConsumerStatefulWidget {
 class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     with WidgetsBindingObserver {
   VideoPlayerController? _controller;
+  VideoPlayerController? _previewAudioMixController;
   TimelineClip? _controllerClip;
   TimelineTrack? _controllerTrack;
   String? _controllerPath;
@@ -741,6 +753,8 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   bool _baseFollowerSyncInFlight = false;
   DateTime? _lastBaseFollowerSyncAt;
   DateTime? _lastBaseDriftCorrectionAt;
+  DateTime? _lastPreviewAudioMixSyncAt;
+  DateTime? _lastPreviewAudioMixDriftCorrectionAt;
   VideoPlayerController? _preparedBaseController;
   String? _preparedBaseClipId;
   String? _preparedBasePath;
@@ -750,6 +764,24 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   double _playbackSpeed = 1.0;
   double? _lastBaseVolume;
   double? _lastBasePlaybackSpeed;
+  double? _lastPreviewAudioMixPlaybackSpeed;
+  Timer? _previewAudioMixDebounce;
+  int _previewAudioMixGeneration = 0;
+  bool _previewAudioMixBuilding = false;
+  bool _previewAudioMixSyncInFlight = false;
+  bool _previewAudioMixSyncQueued = false;
+  bool _previewAudioMixForceSeekQueued = false;
+  Duration? _previewAudioMixRequestedTarget;
+  String? _plannedPreviewAudioMixFingerprint;
+  String? _activePreviewAudioMixFingerprint;
+  String? _previewAudioMixError;
+  PreviewAudioMixResult? _previewAudioMixResult;
+  EditorTimeline? _previewAudioPlanTimeline;
+  int? _previewAudioPlanEditRevision;
+  String? _previewAudioPlanProjectId;
+  String? _previewAudioMixFailureFingerprint;
+  int _previewAudioMixFailureCount = 0;
+  double _fallbackAudioBusGain = 1;
   bool _isSeekingReverseFrame = false;
   final PreviewPerformanceMonitor _performanceMonitor =
       PreviewPerformanceMonitor(enabled: false);
@@ -846,6 +878,350 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     );
   }
 
+  bool get _hasRenderedPreviewAudioMix {
+    final controller = _previewAudioMixController;
+    return controller != null &&
+        controller.value.isInitialized &&
+        _activePreviewAudioMixFingerprint != null;
+  }
+
+  void _ensurePreviewAudioMixPlan(
+    EditorTimeline timeline,
+    int editRevision,
+    String? projectId,
+  ) {
+    if (_previewAudioPlanTimeline != null &&
+        _previewAudioPlanEditRevision == editRevision &&
+        _previewAudioPlanProjectId == projectId) {
+      return;
+    }
+    _previewAudioPlanTimeline = timeline;
+    _previewAudioPlanEditRevision = editRevision;
+    _previewAudioPlanProjectId = projectId;
+    final plan = TimelinePreviewAudioService.buildPlan(
+      timeline: timeline,
+      legacyVideoPath: widget.videoPath,
+      fileExists: _cachedFileExists,
+    );
+    if (plan == null) {
+      _plannedPreviewAudioMixFingerprint = null;
+      _previewAudioMixFailureFingerprint = null;
+      _previewAudioMixFailureCount = 0;
+      _previewAudioMixDebounce?.cancel();
+      final generation = ++_previewAudioMixGeneration;
+      if (_previewAudioMixController != null || _previewAudioMixBuilding) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) unawaited(_clearPreviewAudioMix(generation));
+        });
+      }
+      return;
+    }
+    if (plan.fingerprint == _plannedPreviewAudioMixFingerprint ||
+        plan.fingerprint == _activePreviewAudioMixFingerprint) {
+      _plannedPreviewAudioMixFingerprint = plan.fingerprint;
+      return;
+    }
+    if (_previewAudioMixFailureFingerprint != plan.fingerprint) {
+      _previewAudioMixFailureFingerprint = null;
+      _previewAudioMixFailureCount = 0;
+    }
+
+    _plannedPreviewAudioMixFingerprint = plan.fingerprint;
+    _previewAudioMixDebounce?.cancel();
+    final generation = ++_previewAudioMixGeneration;
+    // Never keep an out-of-date rendered bus audible while an audio edit is
+    // being rebuilt. The per-clip fallback resumes for this short window.
+    if (_previewAudioMixController != null || _previewAudioMixBuilding) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_clearPreviewAudioMix(generation));
+      });
+    }
+    _previewAudioMixDebounce = Timer(const Duration(milliseconds: 650), () {
+      if (mounted) unawaited(_renderPreviewAudioMix(plan, generation));
+    });
+  }
+
+  Future<void> _clearPreviewAudioMix(int generation) async {
+    if (!mounted || generation != _previewAudioMixGeneration) return;
+    final previous = _previewAudioMixController;
+    if (previous != null) {
+      previous.removeListener(_onPreviewAudioMixControllerUpdate);
+    }
+    _previewAudioMixController = null;
+    _activePreviewAudioMixFingerprint = null;
+    _previewAudioMixResult = null;
+    _previewAudioMixBuilding = false;
+    _previewAudioMixSyncInFlight = false;
+    _previewAudioMixSyncQueued = false;
+    _previewAudioMixForceSeekQueued = false;
+    _previewAudioMixRequestedTarget = null;
+    _lastPreviewAudioMixSyncAt = null;
+    _lastPreviewAudioMixDriftCorrectionAt = null;
+    _lastPreviewAudioMixPlaybackSpeed = null;
+    _previewAudioMixError = null;
+    _performanceMonitor.removeDecoder('preview-audio-bus');
+    setState(() {});
+    if (previous != null) {
+      await _disposeDetachedController(previous);
+    }
+  }
+
+  Future<void> _renderPreviewAudioMix(
+    PreviewAudioMixPlan plan,
+    int generation,
+  ) async {
+    if (!mounted || generation != _previewAudioMixGeneration) return;
+    setState(() {
+      _previewAudioMixBuilding = true;
+      _previewAudioMixError = null;
+    });
+    VideoPlayerController? created;
+    try {
+      final result = await TimelinePreviewAudioService.ensureRendered(plan);
+      if (!mounted || generation != _previewAudioMixGeneration) return;
+      created = VideoPlayerController.file(
+        File(result.outputPath),
+        videoPlayerOptions: buildPreviewVideoPlayerOptions(),
+      );
+      await created.initialize();
+      await created.setLooping(false);
+      await created.setVolume(0);
+      final playback = ref.read(playbackProvider);
+      final requestedTarget = _previewAudioMixRequestedTarget;
+      final targetMs = (requestedTarget ?? playback.position).inMilliseconds
+          .clamp(0, created.value.duration.inMilliseconds)
+          .toInt();
+      await created.seekTo(Duration(milliseconds: targetMs));
+      await created.setPlaybackSpeed(_playbackSpeed);
+      if (_playRequested && !_playbackSuspendedByLifecycle) {
+        await created.play();
+      }
+      if (!mounted || generation != _previewAudioMixGeneration) {
+        await created.dispose();
+        return;
+      }
+
+      final previous = _previewAudioMixController;
+      previous?.removeListener(_onPreviewAudioMixControllerUpdate);
+      _previewAudioMixController = created;
+      _activePreviewAudioMixFingerprint = result.fingerprint;
+      _previewAudioMixResult = result;
+      _previewAudioMixBuilding = false;
+      _previewAudioMixError = null;
+      _previewAudioMixFailureFingerprint = null;
+      _previewAudioMixFailureCount = 0;
+      _lastPreviewAudioMixSyncAt = null;
+      _lastPreviewAudioMixDriftCorrectionAt = null;
+      _lastPreviewAudioMixPlaybackSpeed = _playbackSpeed;
+      _previewAudioMixSyncInFlight = true;
+      _previewAudioMixSyncQueued = false;
+      _previewAudioMixForceSeekQueued = false;
+      created.addListener(_onPreviewAudioMixControllerUpdate);
+      setState(() {});
+
+      // The rebuild above removes hidden per-clip audio players and tells every
+      // visual controller to become silent. Complete that handoff before the
+      // single mix bus becomes audible so there is never a doubled sample.
+      if (previous != null) await previous.setVolume(0);
+      await WidgetsBinding.instance.endOfFrame;
+      final baseController = _controller;
+      if (baseController != null && baseController.value.isInitialized) {
+        await baseController.setVolume(0);
+        if (identical(baseController, _controller)) _lastBaseVolume = 0;
+      }
+      try {
+        var shouldForceSeek = true;
+        do {
+          _previewAudioMixSyncQueued = false;
+          shouldForceSeek = shouldForceSeek || _previewAudioMixForceSeekQueued;
+          _previewAudioMixForceSeekQueued = false;
+          await _syncPreviewAudioMixOnce(forceSeek: shouldForceSeek);
+          shouldForceSeek = false;
+        } while (mounted && _previewAudioMixSyncQueued);
+      } catch (_) {
+        // A transport update can race the muted handoff; the regular follower
+        // will reconcile it after activation.
+      } finally {
+        _previewAudioMixSyncInFlight = false;
+      }
+      if (mounted &&
+          generation == _previewAudioMixGeneration &&
+          identical(created, _previewAudioMixController)) {
+        await created.setVolume(1);
+        if (_previewAudioMixSyncQueued ||
+            _previewAudioMixRequestedTarget != null) {
+          final followUpForceSeek = _previewAudioMixForceSeekQueued;
+          _previewAudioMixSyncQueued = false;
+          _previewAudioMixForceSeekQueued = false;
+          _schedulePreviewAudioMixSync(
+            forceSeek: followUpForceSeek,
+            urgent: true,
+          );
+        }
+      }
+      if (previous != null) await _disposeDetachedController(previous);
+    } catch (error) {
+      if (created != null && !identical(created, _previewAudioMixController)) {
+        try {
+          await created.dispose();
+        } catch (_) {
+          // Failed audio-bus initialization may already release its handle.
+        }
+      }
+      if (!mounted || generation != _previewAudioMixGeneration) return;
+      final previous = _previewAudioMixController;
+      previous?.removeListener(_onPreviewAudioMixControllerUpdate);
+      _previewAudioMixController = null;
+      _activePreviewAudioMixFingerprint = null;
+      _previewAudioMixResult = null;
+      _previewAudioMixBuilding = false;
+      _previewAudioMixSyncInFlight = false;
+      _previewAudioMixSyncQueued = false;
+      _previewAudioMixForceSeekQueued = false;
+      _previewAudioMixRequestedTarget = null;
+      _previewAudioMixError = error.toString();
+      if (_previewAudioMixFailureFingerprint == plan.fingerprint) {
+        _previewAudioMixFailureCount++;
+      } else {
+        _previewAudioMixFailureFingerprint = plan.fingerprint;
+        _previewAudioMixFailureCount = 1;
+      }
+      if (_previewAudioMixFailureCount == 1) {
+        // One automatic retry handles a transient FFmpeg/AVPlayer startup
+        // failure without creating an unbounded render loop for bad media.
+        _plannedPreviewAudioMixFingerprint = null;
+        _previewAudioPlanTimeline = null;
+        _previewAudioPlanEditRevision = null;
+      }
+      _performanceMonitor.removeDecoder('preview-audio-bus');
+      setState(() {});
+      if (previous != null) await _disposeDetachedController(previous);
+      unawaited(_applyBaseAudioVolume(ref.read(playbackProvider).position));
+    }
+  }
+
+  void _schedulePreviewAudioMixSync({
+    Duration? target,
+    bool forceSeek = false,
+    bool urgent = false,
+  }) {
+    if (target != null) _previewAudioMixRequestedTarget = target;
+    if (!_hasRenderedPreviewAudioMix) return;
+    final now = DateTime.now();
+    if (!forceSeek && !urgent) {
+      final previous = _lastPreviewAudioMixSyncAt;
+      if (previous != null &&
+          now.difference(previous) < const Duration(milliseconds: 240)) {
+        return;
+      }
+    }
+    if (_previewAudioMixSyncInFlight) {
+      _previewAudioMixSyncQueued = true;
+      _previewAudioMixForceSeekQueued =
+          _previewAudioMixForceSeekQueued || forceSeek;
+      return;
+    }
+    _lastPreviewAudioMixSyncAt = now;
+    unawaited(_runPreviewAudioMixSync(forceSeek: forceSeek));
+  }
+
+  Future<void> _runPreviewAudioMixSync({required bool forceSeek}) async {
+    _previewAudioMixSyncInFlight = true;
+    try {
+      var shouldForceSeek = forceSeek;
+      do {
+        _previewAudioMixSyncQueued = false;
+        shouldForceSeek = shouldForceSeek || _previewAudioMixForceSeekQueued;
+        _previewAudioMixForceSeekQueued = false;
+        await _syncPreviewAudioMixOnce(forceSeek: shouldForceSeek);
+        shouldForceSeek = false;
+      } while (mounted && _previewAudioMixSyncQueued);
+    } catch (_) {
+      // The cached bus can be replaced while an asynchronous seek is pending.
+    } finally {
+      _previewAudioMixSyncInFlight = false;
+    }
+  }
+
+  Future<void> _syncPreviewAudioMixOnce({bool forceSeek = false}) async {
+    final controller = _previewAudioMixController;
+    final generation = _previewAudioMixGeneration;
+    if (controller == null || !controller.value.isInitialized) return;
+    bool stillOwnsController() =>
+        mounted &&
+        generation == _previewAudioMixGeneration &&
+        identical(controller, _previewAudioMixController);
+
+    final playback = ref.read(playbackProvider);
+    final requestedTarget = _previewAudioMixRequestedTarget;
+    _previewAudioMixRequestedTarget = null;
+    final target = Duration(
+      milliseconds: (requestedTarget ?? playback.position).inMilliseconds
+          .clamp(0, controller.value.duration.inMilliseconds)
+          .toInt(),
+    );
+    final shouldPlay = _playRequested && !_playbackSuspendedByLifecycle;
+    final now = DateTime.now();
+    final lastCorrection = _lastPreviewAudioMixDriftCorrectionAt;
+    final decision = decidePreviewMediaSync(
+      timelineTarget: target,
+      decoderPosition: controller.value.position,
+      isPlaying: shouldPlay,
+      isAudible: true,
+      isBuffering: controller.value.isBuffering,
+      forceSeek: forceSeek,
+      timeSinceLastCorrection: lastCorrection == null
+          ? null
+          : now.difference(lastCorrection),
+      // The continuous bus is the protected audio clock. During normal play it
+      // is allowed to run without disruptive correction unless drift is truly
+      // unrecoverable; paused/user seeks remain exact through [forceSeek].
+      audiblePlaybackTolerance: const Duration(milliseconds: 1500),
+      audibleCorrectionCooldown: const Duration(seconds: 5),
+      emergencyDrift: const Duration(seconds: 5),
+    );
+    if (decision == PreviewMediaSyncDecision.seek) {
+      if (!forceSeek) _performanceMonitor.recordHardSeek();
+      await controller.seekTo(target);
+      if (!stillOwnsController()) return;
+      _lastPreviewAudioMixDriftCorrectionAt = now;
+    }
+    if (_lastPreviewAudioMixPlaybackSpeed == null ||
+        (_lastPreviewAudioMixPlaybackSpeed! - _playbackSpeed).abs() > 0.001) {
+      await controller.setPlaybackSpeed(_playbackSpeed);
+      if (!stillOwnsController()) return;
+      _lastPreviewAudioMixPlaybackSpeed = _playbackSpeed;
+    }
+    if (shouldPlay && !controller.value.isPlaying) {
+      await controller.play();
+    } else if (!shouldPlay && controller.value.isPlaying) {
+      await controller.pause();
+    }
+    if (stillOwnsController()) _reportPreviewAudioMixDiagnostics(controller);
+  }
+
+  void _onPreviewAudioMixControllerUpdate() {
+    final controller = _previewAudioMixController;
+    if (controller == null || !controller.value.isInitialized) return;
+    _reportPreviewAudioMixDiagnostics(controller);
+  }
+
+  void _reportPreviewAudioMixDiagnostics(VideoPlayerController controller) {
+    if (!_performanceMonitor.isEnabled) return;
+    final playbackPosition = ref.read(playbackProvider).position;
+    _performanceMonitor.updateDecoder(
+      id: 'preview-audio-bus',
+      label: 'Rendered preview mix',
+      kind: PreviewDecoderKind.previewAudioMix,
+      initialized: controller.value.isInitialized,
+      buffering: controller.value.isBuffering,
+      audible: true,
+      playing: controller.value.isPlaying,
+      warm: false,
+      drift: playbackPosition - controller.value.position,
+    );
+  }
+
   EditorAssetReference? _cachedAssetForClip(
     EditorTimeline timeline,
     TimelineClip clip,
@@ -935,6 +1311,12 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         // counted when playback resumes.
         _stopPlaybackTicker();
         unawaited(_controller?.pause());
+        unawaited(_previewAudioMixController?.pause());
+        _schedulePreviewAudioMixSync(
+          target: position,
+          forceSeek: true,
+          urgent: true,
+        );
         ref.read(playbackProvider.notifier).setPlaying(false);
         break;
     }
@@ -958,6 +1340,11 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       return;
     }
     _syncPlaybackState();
+    _schedulePreviewAudioMixSync(
+      target: ref.read(playbackProvider).position,
+      forceSeek: !_playRequested,
+      urgent: !_playRequested,
+    );
     if (_playRequested) {
       _startPlaybackTicker();
     } else {
@@ -1014,6 +1401,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       ref.read(playbackProvider.notifier)
         ..updatePosition(target)
         ..setPlaying(true);
+      _schedulePreviewAudioMixSync(target: target);
       final selection = _baseSelectionAt(timeline, target);
       final selectedClip = selection?.$2;
       if (!_isSwitchingClip && selectedClip?.id != _controllerClip?.id) {
@@ -1107,10 +1495,14 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     _timelineClock.stop();
     _controllerGeneration++;
     _preparedBaseGeneration++;
+    _previewAudioMixGeneration++;
+    _previewAudioMixDebounce?.cancel();
     final controller = _controller;
     final preparedController = _preparedBaseController;
+    final previewAudioMixController = _previewAudioMixController;
     _controller = null;
     _preparedBaseController = null;
+    _previewAudioMixController = null;
     _preparedBaseClipId = null;
     _preparedBasePath = null;
     _controllerClip = null;
@@ -1123,6 +1515,12 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     if (preparedController != null) {
       unawaited(preparedController.dispose());
     }
+    if (previewAudioMixController != null) {
+      previewAudioMixController.removeListener(
+        _onPreviewAudioMixControllerUpdate,
+      );
+      unawaited(previewAudioMixController.dispose());
+    }
     _performanceMonitor.clear();
     super.dispose();
   }
@@ -1134,10 +1532,16 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       _playRequested = false;
       _anchorTimelineClock(current);
       unawaited(_controller?.pause());
+      unawaited(_previewAudioMixController?.pause());
       _stopPlaybackTicker();
       ref.read(playbackProvider.notifier)
         ..updatePosition(current)
         ..setPlaying(false);
+      _schedulePreviewAudioMixSync(
+        target: current,
+        forceSeek: true,
+        urgent: true,
+      );
     } else {
       final startPosition = playback.position >= playback.duration
           ? Duration.zero
@@ -1168,6 +1572,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         : ref.read(playbackProvider).position;
     if (mounted) setState(() => _playbackSpeed = speed);
     _anchorTimelineClock(current);
+    _schedulePreviewAudioMixSync(target: current, urgent: true);
     final controller = _controller;
     final clip = _controllerClip;
     if (controller != null && clip != null) {
@@ -1385,6 +1790,11 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         ? playbackRange.start
         : requestedTarget;
     _playRequested = shouldPlay;
+    _schedulePreviewAudioMixSync(
+      target: target,
+      forceSeek: forceSeek || !shouldPlay,
+      urgent: forceSeek || !shouldPlay,
+    );
     if (!preserveTimelineClock || !_timelineClockAnchored) {
       _anchorTimelineClock(target);
     }
@@ -1812,6 +2222,13 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         drift: Duration.zero,
       );
     }
+
+    final previewAudioMix = _previewAudioMixController;
+    if (previewAudioMix == null || !previewAudioMix.value.isInitialized) {
+      _performanceMonitor.removeDecoder('preview-audio-bus');
+    } else {
+      _reportPreviewAudioMixDiagnostics(previewAudioMix);
+    }
   }
 
   Future<void> _applyBaseAudioVolume(Duration position) async {
@@ -1837,20 +2254,31 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     );
     final monitoredClip = linkedAudio?.clip ?? clip;
     final monitoredTrack = linkedAudio?.track ?? track;
-    final volume = _previewAudioVolume(
-      clip: monitoredClip,
-      position: position,
-      isTrackAudible:
-          (!hasExplicitLinkedAudio || linkedAudio != null) &&
-          !monitoredTrack.isMuted &&
-          (!hasSolo || monitoredTrack.isSolo),
-      duckingGain: _previewDuckingGain(monitoredClip, position),
-    );
+    final volume = _hasRenderedPreviewAudioMix
+        ? 0.0
+        : _previewAudioVolume(
+            clip: monitoredClip,
+            position: position,
+            isTrackAudible:
+                (!hasExplicitLinkedAudio || linkedAudio != null) &&
+                !monitoredTrack.isMuted &&
+                (!hasSolo || monitoredTrack.isSolo),
+            duckingGain: _previewDuckingGain(monitoredClip, position),
+            busGain: _fallbackAudioBusGain,
+          );
     if (_lastBaseVolume != null && (_lastBaseVolume! - volume).abs() <= 0.01) {
       return;
     }
     await controller.setVolume(volume);
-    if (identical(controller, _controller)) _lastBaseVolume = volume;
+    if (identical(controller, _controller)) {
+      // A rendered bus may have become active while the platform call yielded.
+      if (_hasRenderedPreviewAudioMix && volume > 0) {
+        await controller.setVolume(0);
+        _lastBaseVolume = 0;
+      } else {
+        _lastBaseVolume = volume;
+      }
+    }
   }
 
   Duration _sourceTargetForClip(TimelineClip clip, Duration timelinePosition) {
@@ -2185,10 +2613,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     ];
   }
 
-  TimelineClip? _activeBaseClip(EditorTimeline timeline, Duration position) {
-    return _baseSelectionAt(timeline, position)?.$2;
-  }
-
   List<SubtitleEntry> _effectiveCaptions(
     EditorTimeline timeline,
     List<SubtitleEntry> entries,
@@ -2473,12 +2897,14 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                     item.clip,
                     playbackState.position,
                   ),
+                  busGain: _fallbackAudioBusGain,
                   // The visual controller already owns one platform decoder
                   // and audio output. Reusing it for normal overlays avoids a
                   // second hidden decoder per active video. Freeze frames keep
                   // a separate audio-only controller so their audio can carry
                   // on while the visual frame is held.
                   isTrackAudible:
+                      !_hasRenderedPreviewAudioMix &&
                       !item.clip.freezeFrame &&
                       previewVisualUsesEmbeddedAudioForTesting(
                         timeline: timeline,
@@ -3490,6 +3916,11 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       editorState.timeline,
       editRevision: editorState.editRevision,
     );
+    _ensurePreviewAudioMixPlan(
+      editorState.timeline,
+      editorState.editRevision,
+      editorState.projectId,
+    );
     final workspaceLoop = editorState.timeline.workspaceSettings.loopPlayback;
     final activeOverlayItems = _activeOverlayItems(
       editorState.timeline,
@@ -3503,10 +3934,12 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       editorState.timeline,
       playbackState.position,
     );
-    final activeBaseClip = _activeBaseClip(
+    final activeBaseSelection = _baseSelectionAt(
       editorState.timeline,
       playbackState.position,
     );
+    final activeBaseTrack = activeBaseSelection?.$1;
+    final activeBaseClip = activeBaseSelection?.$2;
     final baseAudioMonitor = activeBaseClip == null
         ? null
         : resolvePreviewBaseAudioMonitorForTesting(
@@ -3518,6 +3951,39 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       editorState.timeline,
       playbackState.position,
       baseAudioMonitor?.clip.id,
+    );
+    var fallbackAudioVoiceCount = activeAudioItems
+        .where((item) => item.isActive)
+        .length;
+    if (activeBaseClip != null && activeBaseTrack != null) {
+      final explicitLinkedAudio = previewHasExplicitLinkedAudioForTesting(
+        timeline: editorState.timeline,
+        visualClip: activeBaseClip,
+      );
+      final monitoredClip = baseAudioMonitor?.clip ?? activeBaseClip;
+      final monitoredTrack = baseAudioMonitor?.track ?? activeBaseTrack;
+      if (editorState.timeline.clipHasAudio(activeBaseClip) &&
+          !monitoredClip.audioMix.muted &&
+          (!explicitLinkedAudio || baseAudioMonitor != null) &&
+          !monitoredTrack.isMuted &&
+          (!_hasSoloMediaTrack(editorState.timeline) ||
+              monitoredTrack.isSolo)) {
+        fallbackAudioVoiceCount++;
+      }
+    }
+    for (final item in activeOverlayItems) {
+      if (previewVisualUsesEmbeddedAudioForTesting(
+        timeline: editorState.timeline,
+        visualTrack: item.track,
+        visualClip: item.clip,
+        position: playbackState.position,
+        hasSoloMediaTrack: _hasSoloMediaTrack(editorState.timeline),
+      )) {
+        fallbackAudioVoiceCount++;
+      }
+    }
+    _fallbackAudioBusGain = previewFallbackMixBusGainForTesting(
+      fallbackAudioVoiceCount,
     );
     _effectiveCaptions(editorState.timeline, subtitleState.entries);
     final controller = _controller;
@@ -3633,6 +4099,14 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                               top: 10,
                               child: _PreviewDiagnosticsOverlay(
                                 snapshot: _performanceMonitor.snapshot(),
+                                audioMixStatus: _previewAudioMixBuilding
+                                    ? 'building • $fallbackAudioVoiceCount fallback'
+                                    : _previewAudioMixResult != null
+                                    ? '1 bus • ${_previewAudioMixResult!.inputCount} sources • '
+                                          '${_previewAudioMixResult!.maximumConcurrentVoices} peak'
+                                    : _previewAudioMixError != null
+                                    ? 'fallback • mix render unavailable'
+                                    : 'fallback • $fallbackAudioVoiceCount active',
                                 onReset: () {
                                   _performanceMonitor.resetCounters();
                                   setState(() {});
@@ -4340,69 +4814,74 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                 ),
                               ),
                             ),
-                          for (final item in activeOverlayItems)
-                            if (item.asset.type == EditorAssetType.video &&
-                                item.clip.freezeFrame &&
-                                !item.clip.isReversed &&
-                                previewVisualUsesEmbeddedAudioForTesting(
-                                  timeline: editorState.timeline,
-                                  visualTrack: item.track,
-                                  visualClip: item.clip,
-                                  position: playbackState.position,
-                                  hasSoloMediaTrack: _hasSoloMediaTrack(
-                                    editorState.timeline,
+                          if (!_hasRenderedPreviewAudioMix)
+                            for (final item in activeOverlayItems)
+                              if (item.asset.type == EditorAssetType.video &&
+                                  item.clip.freezeFrame &&
+                                  !item.clip.isReversed &&
+                                  previewVisualUsesEmbeddedAudioForTesting(
+                                    timeline: editorState.timeline,
+                                    visualTrack: item.track,
+                                    visualClip: item.clip,
+                                    position: playbackState.position,
+                                    hasSoloMediaTrack: _hasSoloMediaTrack(
+                                      editorState.timeline,
+                                    ),
+                                  ) &&
+                                  item.asset.sourcePath != null &&
+                                  _cachedFileExists(item.asset.sourcePath!) &&
+                                  editorState.timeline.clipHasAudio(item.clip))
+                                Positioned(
+                                  left: 0,
+                                  top: 0,
+                                  width: 1,
+                                  height: 1,
+                                  child: _TimelineAudioPreview(
+                                    key: ValueKey(
+                                      'overlay_audio_${item.clip.id}',
+                                    ),
+                                    audioPath: item.asset.sourcePath!,
+                                    clip: item.clip,
+                                    playbackPosition: playbackState.position,
+                                    isPlaying: playbackState.isPlaying,
+                                    playbackSpeed: _playbackSpeed,
+                                    diagnostics: _performanceMonitor,
+                                    duckingGain: _previewDuckingGain(
+                                      item.clip,
+                                      playbackState.position,
+                                    ),
+                                    busGain: _fallbackAudioBusGain,
+                                    isTrackAudible: true,
+                                    continueFreezeFrameAudio: true,
                                   ),
-                                ) &&
-                                item.asset.sourcePath != null &&
-                                _cachedFileExists(item.asset.sourcePath!) &&
-                                editorState.timeline.clipHasAudio(item.clip))
+                                ),
+                          if (!_hasRenderedPreviewAudioMix)
+                            for (final item in activeAudioItems)
                               Positioned(
                                 left: 0,
                                 top: 0,
                                 width: 1,
                                 height: 1,
                                 child: _TimelineAudioPreview(
-                                  key: ValueKey(
-                                    'overlay_audio_${item.clip.id}',
-                                  ),
+                                  key: ValueKey('audio_${item.clip.id}'),
                                   audioPath: item.asset.sourcePath!,
                                   clip: item.clip,
                                   playbackPosition: playbackState.position,
-                                  isPlaying: playbackState.isPlaying,
+                                  isPlaying:
+                                      playbackState.isPlaying && item.isActive,
                                   playbackSpeed: _playbackSpeed,
                                   diagnostics: _performanceMonitor,
                                   duckingGain: _previewDuckingGain(
                                     item.clip,
                                     playbackState.position,
                                   ),
-                                  isTrackAudible: true,
-                                  continueFreezeFrameAudio: true,
+                                  busGain: _fallbackAudioBusGain,
+                                  isTrackAudible: item.isActive,
+                                  preloadOnly: !item.isActive,
                                 ),
                               ),
-                          for (final item in activeAudioItems)
-                            Positioned(
-                              left: 0,
-                              top: 0,
-                              width: 1,
-                              height: 1,
-                              child: _TimelineAudioPreview(
-                                key: ValueKey('audio_${item.clip.id}'),
-                                audioPath: item.asset.sourcePath!,
-                                clip: item.clip,
-                                playbackPosition: playbackState.position,
-                                isPlaying:
-                                    playbackState.isPlaying && item.isActive,
-                                playbackSpeed: _playbackSpeed,
-                                diagnostics: _performanceMonitor,
-                                duckingGain: _previewDuckingGain(
-                                  item.clip,
-                                  playbackState.position,
-                                ),
-                                isTrackAudible: item.isActive,
-                                preloadOnly: !item.isActive,
-                              ),
-                            ),
-                          if (controllerReady &&
+                          if (!_hasRenderedPreviewAudioMix &&
+                              controllerReady &&
                               activeBaseClip.freezeFrame &&
                               !activeBaseClip.isReversed &&
                               !activeBaseClip.audioMix.muted &&
@@ -4431,6 +4910,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                   activeBaseClip,
                                   playbackState.position,
                                 ),
+                                busGain: _fallbackAudioBusGain,
                                 isTrackAudible: true,
                                 continueFreezeFrameAudio: true,
                               ),
@@ -4753,10 +5233,12 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
 
 class _PreviewDiagnosticsOverlay extends StatelessWidget {
   final PreviewPerformanceSnapshot snapshot;
+  final String audioMixStatus;
   final VoidCallback onReset;
 
   const _PreviewDiagnosticsOverlay({
     required this.snapshot,
+    required this.audioMixStatus,
     required this.onReset,
   });
 
@@ -4842,6 +5324,7 @@ class _PreviewDiagnosticsOverlay extends StatelessWidget {
                   '${snapshot.bufferingDecoderCount} buffering '
                   '(${snapshot.bufferingEventCount} events)',
             ),
+            row('Mix bus', audioMixStatus),
             row(
               'Clock drift',
               '${_milliseconds(snapshot.maximumAbsoluteDrift)} max • '
@@ -5389,6 +5872,7 @@ class _OverlayVideoPreview extends StatefulWidget {
   final double playbackSpeed;
   final PreviewPerformanceMonitor diagnostics;
   final double duckingGain;
+  final double busGain;
   final bool isTrackAudible;
   final double width;
   final double height;
@@ -5405,6 +5889,7 @@ class _OverlayVideoPreview extends StatefulWidget {
     required this.playbackSpeed,
     required this.diagnostics,
     required this.duckingGain,
+    required this.busGain,
     required this.isTrackAudible,
     required this.width,
     required this.height,
@@ -5487,6 +5972,8 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
     final controlsChanged =
         oldWidget.isPlaying != widget.isPlaying ||
         oldWidget.playbackSpeed != widget.playbackSpeed ||
+        oldWidget.busGain != widget.busGain ||
+        oldWidget.isTrackAudible != widget.isTrackAudible ||
         !identical(oldWidget.clip, widget.clip);
     _schedulePlaybackSync(
       forceSeek: positionJump,
@@ -5616,7 +6103,16 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
       position: widget.playbackPosition,
       isTrackAudible: widget.isTrackAudible,
       duckingGain: widget.duckingGain,
+      busGain: widget.busGain,
     );
+    // Muting for a rendered-bus handoff must not wait behind a potentially
+    // slow decoder seek. That ordering can otherwise double the clip and bus
+    // audio for the duration of the platform seek.
+    if (volume <= 0.001 && (_lastVolume ?? 0) > 0.001) {
+      await controller.setVolume(0);
+      if (!stillOwnsController()) return;
+      _lastVolume = 0;
+    }
     final now = DateTime.now();
     final lastCorrection = _lastDriftCorrectionAt;
     final decision = decidePreviewMediaSync(
@@ -5750,6 +6246,7 @@ class _TimelineAudioPreview extends StatefulWidget {
   final double playbackSpeed;
   final PreviewPerformanceMonitor diagnostics;
   final double duckingGain;
+  final double busGain;
   final bool isTrackAudible;
   final bool continueFreezeFrameAudio;
   final bool preloadOnly;
@@ -5763,6 +6260,7 @@ class _TimelineAudioPreview extends StatefulWidget {
     required this.playbackSpeed,
     required this.diagnostics,
     required this.duckingGain,
+    required this.busGain,
     required this.isTrackAudible,
     this.continueFreezeFrameAudio = false,
     this.preloadOnly = false,
@@ -5853,6 +6351,8 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
           oldWidget.isPlaying != widget.isPlaying ||
           oldWidget.preloadOnly != widget.preloadOnly ||
           oldWidget.playbackSpeed != widget.playbackSpeed ||
+          oldWidget.busGain != widget.busGain ||
+          oldWidget.isTrackAudible != widget.isTrackAudible ||
           !identical(oldWidget.clip, widget.clip);
       _schedulePlaybackSync(
         forceSeek: positionJump,
@@ -5981,6 +6481,7 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
       position: widget.playbackPosition,
       isTrackAudible: widget.isTrackAudible,
       duckingGain: widget.duckingGain,
+      busGain: widget.busGain,
     );
     final now = DateTime.now();
     final lastCorrection = _lastDriftCorrectionAt;

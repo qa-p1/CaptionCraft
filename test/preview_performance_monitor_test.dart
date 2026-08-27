@@ -80,4 +80,25 @@ void main() {
       expect(monitor.snapshot().averageTickInterval, Duration.zero);
     },
   );
+
+  test('rendered mix bus counts as audio without inflating video pressure', () {
+    final monitor = PreviewPerformanceMonitor();
+    monitor.updateDecoder(
+      id: 'preview-audio-bus',
+      label: 'Rendered preview mix',
+      kind: PreviewDecoderKind.previewAudioMix,
+      initialized: true,
+      buffering: false,
+      audible: true,
+      playing: true,
+      warm: false,
+      drift: Duration.zero,
+    );
+
+    final snapshot = monitor.snapshot();
+    expect(snapshot.decoderCount, 1);
+    expect(snapshot.audioDecoderCount, 1);
+    expect(snapshot.videoDecoderCount, 0);
+    expect(snapshot.audibleDecoderCount, 1);
+  });
 }

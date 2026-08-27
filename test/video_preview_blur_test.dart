@@ -39,6 +39,12 @@ void main() {
     expect(buildPreviewVideoPlayerOptions().mixWithOthers, isTrue);
   });
 
+  test('fallback mixer protects a thirty-voice overlap from clipping', () {
+    expect(previewFallbackMixBusGainForTesting(0), 1);
+    expect(previewFallbackMixBusGainForTesting(2), 0.5);
+    expect(previewFallbackMixBusGainForTesting(30), closeTo(1 / 30, 0.000001));
+  });
+
   test('audio warm window includes only current and near-future clips', () {
     final clip = TimelineClip(
       trackId: 'audio',

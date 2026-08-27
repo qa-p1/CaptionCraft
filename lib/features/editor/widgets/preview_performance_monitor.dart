@@ -6,6 +6,7 @@ enum PreviewDecoderKind {
   preparedVideo,
   overlayVideo,
   timelineAudio,
+  previewAudioMix,
 }
 
 class PreviewDecoderTelemetry {
@@ -178,10 +179,18 @@ class PreviewPerformanceMonitor {
     return PreviewPerformanceSnapshot(
       decoderCount: initialized.length,
       videoDecoderCount: initialized
-          .where((decoder) => decoder.kind != PreviewDecoderKind.timelineAudio)
+          .where(
+            (decoder) =>
+                decoder.kind != PreviewDecoderKind.timelineAudio &&
+                decoder.kind != PreviewDecoderKind.previewAudioMix,
+          )
           .length,
       audioDecoderCount: initialized
-          .where((decoder) => decoder.kind == PreviewDecoderKind.timelineAudio)
+          .where(
+            (decoder) =>
+                decoder.kind == PreviewDecoderKind.timelineAudio ||
+                decoder.kind == PreviewDecoderKind.previewAudioMix,
+          )
           .length,
       warmDecoderCount: initialized.where((decoder) => decoder.warm).length,
       audibleDecoderCount: initialized

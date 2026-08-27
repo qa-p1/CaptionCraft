@@ -370,6 +370,66 @@ class TimelineExportService {
     return args;
   }
 
+  /// Builds an audio-only render that uses the exact same clip timing, volume
+  /// automation, fades, pan, ducking, and peak limiter as final export.
+  ///
+  /// The editor uses this for its preview mix bus. Rendering overlapping media
+  /// into one continuous audio stream prevents a large collection of platform
+  /// video players from independently owning the device audio clock.
+  static List<String> buildPreviewAudioMixArguments({
+    required EditorTimeline timeline,
+    required List<TimelineRenderInput> inputs,
+    required Duration timelineDuration,
+    required String outputPath,
+  }) {
+    if (inputs.isEmpty) {
+      throw ArgumentError.value(inputs, 'inputs', 'Must contain audio inputs.');
+    }
+    final safeDuration = timelineDuration <= Duration.zero
+        ? const Duration(milliseconds: 1)
+        : timelineDuration;
+    final args = <String>['-hide_banner', '-y'];
+    for (final input in inputs) {
+      args.addAll(_inputArguments(input));
+    }
+    final filters = <String>[];
+    final hasAudio = _appendAudioMixFilters(
+      filters: filters,
+      timeline: timeline,
+      inputs: inputs,
+      timelineDuration: safeDuration,
+      includeAudio: true,
+    );
+    if (!hasAudio) {
+      throw ArgumentError.value(
+        inputs,
+        'inputs',
+        'Must contain at least one audible input.',
+      );
+    }
+    args.addAll([
+      '-filter_complex',
+      filters.join(';'),
+      '-map',
+      '[aout]',
+      '-vn',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '192k',
+      '-ar',
+      '48000',
+      '-ac',
+      '2',
+      '-t',
+      _seconds(safeDuration),
+      '-movflags',
+      '+faststart',
+      outputPath,
+    ]);
+    return args;
+  }
+
   static ExportCanvasSize resolveCanvasSize(
     CanvasSettings canvasSettings,
     ExportSettings exportSettings, {
@@ -928,8 +988,27 @@ class TimelineExportService {
       'trim=duration=$durationSeconds[vout]',
     );
 
+    _appendAudioMixFilters(
+      filters: filters,
+      timeline: timeline,
+      inputs: inputs,
+      timelineDuration: timelineDuration,
+      includeAudio: settings.includeAudio,
+    );
+
+    return filters.join(';');
+  }
+
+  static bool _appendAudioMixFilters({
+    required List<String> filters,
+    required EditorTimeline timeline,
+    required List<TimelineRenderInput> inputs,
+    required Duration timelineDuration,
+    required bool includeAudio,
+  }) {
+    final durationSeconds = _seconds(timelineDuration);
     final audioLabels = <String>[];
-    if (settings.includeAudio) {
+    if (includeAudio) {
       final soloTrackIds = inputs
           .where((input) => input.track.isSolo)
           .map((input) => input.track.id)
@@ -990,11 +1069,13 @@ class TimelineExportService {
         '$inputsExpression'
         'amix=inputs=${audioLabels.length}:duration=longest:'
         'dropout_transition=0:normalize=0,'
-        'alimiter=limit=0.95,atrim=duration=$durationSeconds[aout]',
+        // Compensating limiter latency keeps the rendered preview bus aligned
+        // to the visual timeline while protecting dense mixes from clipping.
+        'alimiter=limit=0.95:attack=5:release=50:latency=1,'
+        'atrim=duration=$durationSeconds[aout]',
       );
     }
-
-    return filters.join(';');
+    return audioLabels.isNotEmpty;
   }
 
   static ({String sourceLabel, int nextEffectIndex}) _appendTimelineEffects({
