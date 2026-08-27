@@ -151,6 +151,111 @@ enum TimelineKeyframeProperty {
   blurStrength,
 }
 
+/// Interpolation applied by a keyframe to the segment that follows it.
+enum TimelineKeyframeInterpolation {
+  hold,
+  linear,
+  easeIn,
+  easeOut,
+  easeInOut,
+  cubicBezier,
+}
+
+/// Serializable cubic-bezier timing handles for a keyframe segment.
+///
+/// X coordinates are constrained to [0, 1] so time always moves forward. Y
+/// coordinates deliberately allow overshoot, matching professional graph
+/// editors where a value can pass its destination before settling.
+@immutable
+class TimelineBezierCurve {
+  final double x1;
+  final double y1;
+  final double x2;
+  final double y2;
+
+  const TimelineBezierCurve({
+    required this.x1,
+    required this.y1,
+    required this.x2,
+    required this.y2,
+  });
+
+  static const linear = TimelineBezierCurve(x1: 0, y1: 0, x2: 1, y2: 1);
+  static const easeIn = TimelineBezierCurve(x1: 0.42, y1: 0, x2: 1, y2: 1);
+  static const easeOut = TimelineBezierCurve(x1: 0, y1: 0, x2: 0.58, y2: 1);
+  static const easeInOut = TimelineBezierCurve(
+    x1: 0.42,
+    y1: 0,
+    x2: 0.58,
+    y2: 1,
+  );
+
+  TimelineBezierCurve normalized() {
+    return TimelineBezierCurve(
+      x1: x1.isFinite ? x1.clamp(0.0, 1.0).toDouble() : 0,
+      y1: y1.isFinite ? y1.clamp(-4.0, 5.0).toDouble() : 0,
+      x2: x2.isFinite ? x2.clamp(0.0, 1.0).toDouble() : 1,
+      y2: y2.isFinite ? y2.clamp(-4.0, 5.0).toDouble() : 1,
+    );
+  }
+
+  double transform(double progress) {
+    final x = progress.clamp(0.0, 1.0).toDouble();
+    if (x <= 0 || x >= 1) return x;
+    final curve = normalized();
+
+    double sample(double first, double second, double t) {
+      final inverse = 1 - t;
+      return 3 * inverse * inverse * t * first +
+          3 * inverse * t * t * second +
+          t * t * t;
+    }
+
+    double derivative(double first, double second, double t) {
+      final inverse = 1 - t;
+      return 3 * inverse * inverse * first +
+          6 * inverse * t * (second - first) +
+          3 * t * t * (1 - second);
+    }
+
+    var parameter = x;
+    for (var iteration = 0; iteration < 8; iteration++) {
+      final error = sample(curve.x1, curve.x2, parameter) - x;
+      if (error.abs() < 0.000001) break;
+      final slope = derivative(curve.x1, curve.x2, parameter);
+      if (slope.abs() < 0.000001) break;
+      parameter = (parameter - error / slope).clamp(0.0, 1.0).toDouble();
+    }
+
+    // Newton iteration can become unstable for nearly-flat handles. A short
+    // bisection pass makes the evaluator deterministic for every valid curve.
+    var lower = 0.0;
+    var upper = 1.0;
+    for (var iteration = 0; iteration < 12; iteration++) {
+      final sampledX = sample(curve.x1, curve.x2, parameter);
+      if ((sampledX - x).abs() < 0.000001) break;
+      if (sampledX < x) {
+        lower = parameter;
+      } else {
+        upper = parameter;
+      }
+      parameter = (lower + upper) / 2;
+    }
+    return sample(curve.y1, curve.y2, parameter);
+  }
+
+  Map<String, dynamic> toJson() => {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2};
+
+  factory TimelineBezierCurve.fromJson(Map<String, dynamic> json) {
+    return TimelineBezierCurve(
+      x1: (json['x1'] as num?)?.toDouble() ?? 0,
+      y1: (json['y1'] as num?)?.toDouble() ?? 0,
+      x2: (json['x2'] as num?)?.toDouble() ?? 1,
+      y2: (json['y2'] as num?)?.toDouble() ?? 1,
+    ).normalized();
+  }
+}
+
 /// A non-destructive value change stored relative to the start of a clip.
 /// Keyframes are deliberately small and serializable so they remain safe for
 /// older projects and can be interpolated by both preview and export paths.
@@ -159,25 +264,50 @@ class TimelineKeyframe {
   final Duration time;
   final TimelineKeyframeProperty property;
   final double value;
+  final TimelineKeyframeInterpolation interpolation;
+  final TimelineBezierCurve curve;
 
   TimelineKeyframe({
     String? id,
     required this.time,
     required this.property,
     required this.value,
+    this.interpolation = TimelineKeyframeInterpolation.linear,
+    this.curve = TimelineBezierCurve.linear,
   }) : id = id ?? const Uuid().v4();
 
   TimelineKeyframe copyWith({
     Duration? time,
     TimelineKeyframeProperty? property,
     double? value,
+    TimelineKeyframeInterpolation? interpolation,
+    TimelineBezierCurve? curve,
   }) {
     return TimelineKeyframe(
       id: id,
       time: time ?? this.time,
       property: property ?? this.property,
       value: value ?? this.value,
+      interpolation: interpolation ?? this.interpolation,
+      curve: curve ?? this.curve,
     );
+  }
+
+  TimelineBezierCurve get effectiveCurve => switch (interpolation) {
+    TimelineKeyframeInterpolation.easeIn => TimelineBezierCurve.easeIn,
+    TimelineKeyframeInterpolation.easeOut => TimelineBezierCurve.easeOut,
+    TimelineKeyframeInterpolation.easeInOut => TimelineBezierCurve.easeInOut,
+    TimelineKeyframeInterpolation.cubicBezier => curve,
+    _ => TimelineBezierCurve.linear,
+  };
+
+  double transformProgress(double progress) {
+    final normalized = progress.clamp(0.0, 1.0).toDouble();
+    return switch (interpolation) {
+      TimelineKeyframeInterpolation.hold => normalized >= 1 ? 1 : 0,
+      TimelineKeyframeInterpolation.linear => normalized,
+      _ => effectiveCurve.transform(normalized),
+    };
   }
 
   Map<String, dynamic> toJson() {
@@ -186,6 +316,8 @@ class TimelineKeyframe {
       'timeMs': time.inMilliseconds,
       'property': property.name,
       'value': value,
+      'interpolation': interpolation.name,
+      'curve': curve.toJson(),
     };
   }
 
@@ -198,6 +330,15 @@ class TimelineKeyframe {
         orElse: () => TimelineKeyframeProperty.opacity,
       ),
       value: (json['value'] as num?)?.toDouble() ?? 0,
+      interpolation: TimelineKeyframeInterpolation.values.firstWhere(
+        (candidate) => candidate.name == json['interpolation'],
+        orElse: () => TimelineKeyframeInterpolation.linear,
+      ),
+      curve: _timelineModelFromJson(
+        json['curve'],
+        TimelineBezierCurve.fromJson,
+        TimelineBezierCurve.linear,
+      ),
     );
   }
 }
@@ -1345,8 +1486,11 @@ extension TimelineClipCapabilities on TimelineClip {
           next.time.inMilliseconds - previous.time.inMilliseconds,
         );
         final progress = ((relative - previous.time.inMilliseconds) / span)
-            .clamp(0.0, 1.0);
-        return previous.value + (next.value - previous.value) * progress;
+            .clamp(0.0, 1.0)
+            .toDouble();
+        final interpolatedProgress = previous.transformProgress(progress);
+        return previous.value +
+            (next.value - previous.value) * interpolatedProgress;
       }
     }
     return frames.last.value;

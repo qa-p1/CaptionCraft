@@ -1129,17 +1129,20 @@ class TimelineExportService {
     return frames.any((frame) => frame.value.clamp(0, 30) > 0.01);
   }
 
-  /// Produces a Gaussian blur whose sigma follows the editor's linear
-  /// keyframe interpolation. `gblur` accepts runtime commands but not a sigma
-  /// expression, so `sendcmd` evaluates the interpolation once per frame and
-  /// updates the named filter instance.
+  /// Produces a Gaussian blur whose sigma follows the editor's keyframe
+  /// evaluator. `gblur` accepts runtime commands but not a sigma expression,
+  /// so curved segments are deterministically sampled into short linear
+  /// commands that use the same model values as preview.
   static List<String> _blurFilterChain(
     TimelineClip clip, {
     required String target,
     Duration timelineOffset = Duration.zero,
     String? enableExpression,
   }) {
-    final frames = _keyframesFor(clip, TimelineKeyframeProperty.blurStrength);
+    final frames = _renderKeyframesFor(
+      clip,
+      TimelineKeyframeProperty.blurStrength,
+    );
     final initialStrength = frames.isEmpty
         ? clip.blur.safeStrength
         : frames.first.value.clamp(0, 30).toDouble();
@@ -1200,8 +1203,74 @@ class TimelineExportService {
     return frames;
   }
 
-  /// Builds a piecewise-linear FFmpeg expression with the same endpoint
-  /// behavior as [TimelineClip.keyframedValue].
+  /// Expands non-linear timing into bounded linear samples for FFmpeg filters.
+  /// Hold segments receive a point one microsecond before their destination,
+  /// preserving the step without requiring filter-specific expression logic.
+  static List<TimelineKeyframe> _renderKeyframesFor(
+    TimelineClip clip,
+    TimelineKeyframeProperty property,
+  ) {
+    final frames = _keyframesFor(clip, property);
+    if (frames.length < 2) return frames;
+    final rendered = <TimelineKeyframe>[];
+    void addLinear(Duration time, double value) {
+      if (rendered.isNotEmpty && rendered.last.time == time) {
+        rendered[rendered.length - 1] = TimelineKeyframe(
+          id: rendered.last.id,
+          time: time,
+          property: property,
+          value: value,
+        );
+        return;
+      }
+      rendered.add(
+        TimelineKeyframe(
+          id: 'render_${property.name}_${time.inMicroseconds}',
+          time: time,
+          property: property,
+          value: value,
+        ),
+      );
+    }
+
+    addLinear(frames.first.time, frames.first.value);
+    for (var index = 0; index + 1 < frames.length; index++) {
+      final previous = frames[index];
+      final next = frames[index + 1];
+      final startUs = previous.time.inMicroseconds;
+      final endUs = next.time.inMicroseconds;
+      final spanUs = endUs - startUs;
+      if (spanUs <= 0) {
+        addLinear(next.time, next.value);
+        continue;
+      }
+      if (previous.interpolation == TimelineKeyframeInterpolation.hold) {
+        if (spanUs > 1) {
+          addLinear(Duration(microseconds: endUs - 1), previous.value);
+        }
+      } else if (previous.interpolation !=
+          TimelineKeyframeInterpolation.linear) {
+        final spanSeconds = spanUs / Duration.microsecondsPerSecond;
+        final sampleCount = (spanSeconds * 12).ceil().clamp(4, 48);
+        for (var sample = 1; sample < sampleCount; sample++) {
+          final progress = sample / sampleCount;
+          final value =
+              previous.value +
+              (next.value - previous.value) *
+                  previous.transformProgress(progress);
+          addLinear(
+            Duration(microseconds: startUs + (spanUs * progress).round()),
+            value,
+          );
+        }
+      }
+      addLinear(next.time, next.value);
+    }
+    return rendered;
+  }
+
+  /// Builds a piecewise-linear FFmpeg expression from values sampled through
+  /// [TimelineKeyframe.transformProgress].
   static String _keyframedValueExpression(
     TimelineClip clip,
     TimelineKeyframeProperty property, {
@@ -1210,7 +1279,7 @@ class TimelineExportService {
     double? minimum,
     double? maximum,
   }) {
-    final frames = _keyframesFor(clip, property);
+    final frames = _renderKeyframesFor(clip, property);
     if (frames.isEmpty) {
       final value = minimum == null || maximum == null
           ? fallback

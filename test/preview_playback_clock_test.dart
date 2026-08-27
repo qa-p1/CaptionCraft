@@ -86,4 +86,75 @@ void main() {
       );
     });
   });
+
+  group('preview decoder sync policy', () {
+    test('protects audible playback from small drift and seek storms', () {
+      expect(
+        decidePreviewMediaSync(
+          timelineTarget: const Duration(seconds: 5),
+          decoderPosition: const Duration(milliseconds: 4300),
+          isPlaying: true,
+          isAudible: true,
+        ),
+        PreviewMediaSyncDecision.none,
+      );
+      expect(
+        decidePreviewMediaSync(
+          timelineTarget: const Duration(seconds: 5),
+          decoderPosition: const Duration(seconds: 4),
+          isPlaying: true,
+          isAudible: true,
+          timeSinceLastCorrection: const Duration(milliseconds: 300),
+        ),
+        PreviewMediaSyncDecision.none,
+      );
+      expect(
+        decidePreviewMediaSync(
+          timelineTarget: const Duration(seconds: 5),
+          decoderPosition: const Duration(seconds: 4),
+          isPlaying: true,
+          isAudible: true,
+          timeSinceLastCorrection: const Duration(seconds: 2),
+        ),
+        PreviewMediaSyncDecision.seek,
+      );
+    });
+
+    test('paused scrubbing stays frame-accurate', () {
+      expect(
+        decidePreviewMediaSync(
+          timelineTarget: const Duration(milliseconds: 500),
+          decoderPosition: const Duration(milliseconds: 420),
+          isPlaying: false,
+          isAudible: true,
+          timeSinceLastCorrection: Duration.zero,
+        ),
+        PreviewMediaSyncDecision.seek,
+      );
+    });
+
+    test('buffering followers wait unless an explicit seek is requested', () {
+      expect(
+        decidePreviewMediaSync(
+          timelineTarget: const Duration(seconds: 5),
+          decoderPosition: Duration.zero,
+          isPlaying: true,
+          isAudible: true,
+          isBuffering: true,
+        ),
+        PreviewMediaSyncDecision.none,
+      );
+      expect(
+        decidePreviewMediaSync(
+          timelineTarget: const Duration(seconds: 5),
+          decoderPosition: Duration.zero,
+          isPlaying: true,
+          isAudible: true,
+          isBuffering: true,
+          forceSeek: true,
+        ),
+        PreviewMediaSyncDecision.seek,
+      );
+    });
+  });
 }

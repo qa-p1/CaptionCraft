@@ -471,11 +471,21 @@ class EditorNotifier extends StateNotifier<EditorState> {
     required TimelineKeyframeProperty property,
     required Duration time,
     required double value,
+    TimelineKeyframeInterpolation? interpolation,
+    TimelineBezierCurve? curve,
   }) {
     return updateClip(clipId, (clip) {
       final relativeMs = time.inMilliseconds
           .clamp(0, math.max(0, clip.duration.inMilliseconds))
           .toInt();
+      TimelineKeyframe? existing;
+      for (final keyframe in clip.keyframes) {
+        if (keyframe.property == property &&
+            keyframe.time.inMilliseconds == relativeMs) {
+          existing = keyframe;
+          break;
+        }
+      }
       final next = [...clip.keyframes]
         ..removeWhere(
           (keyframe) =>
@@ -483,11 +493,20 @@ class EditorNotifier extends StateNotifier<EditorState> {
               keyframe.time.inMilliseconds == relativeMs,
         )
         ..add(
-          TimelineKeyframe(
-            time: Duration(milliseconds: relativeMs),
-            property: property,
-            value: value,
-          ),
+          existing?.copyWith(
+                time: Duration(milliseconds: relativeMs),
+                value: value,
+                interpolation: interpolation,
+                curve: curve,
+              ) ??
+              TimelineKeyframe(
+                time: Duration(milliseconds: relativeMs),
+                property: property,
+                value: value,
+                interpolation:
+                    interpolation ?? TimelineKeyframeInterpolation.linear,
+                curve: curve ?? TimelineBezierCurve.linear,
+              ),
         )
         ..sort((a, b) => a.time.compareTo(b.time));
       return clip.copyWith(keyframes: next);

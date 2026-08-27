@@ -53,6 +53,7 @@ import '../widgets/text_clip_editor_sheet.dart';
 import '../widgets/video_preview_panel.dart';
 import '../widgets/resizable_editor_sheet.dart';
 import '../widgets/sfx_library_sheet.dart';
+import '../widgets/keyframe_graph_editor.dart';
 
 /// Resolves the default mix for media inserted into a visual timeline lane.
 ///
@@ -173,6 +174,10 @@ TimelineClip restoreAttachedAudioForDuplicate({
       splitAt,
       fallback: propertyFrames.first.value,
     );
+    final boundarySource = propertyFrames.lastWhere(
+      (frame) => frame.time <= splitOffset,
+      orElse: () => propertyFrames.first,
+    );
     leftKeyframes.addAll(
       propertyFrames.where((frame) => frame.time <= splitOffset),
     );
@@ -184,6 +189,8 @@ TimelineClip restoreAttachedAudioForDuplicate({
           time: splitOffset,
           property: property,
           value: boundaryValue,
+          interpolation: boundarySource.interpolation,
+          curve: boundarySource.curve,
         ),
       );
     }
@@ -192,6 +199,8 @@ TimelineClip restoreAttachedAudioForDuplicate({
         time: Duration.zero,
         property: property,
         value: boundaryValue,
+        interpolation: boundarySource.interpolation,
+        curve: boundarySource.curve,
       ),
     );
     rightKeyframes.addAll(
@@ -202,6 +211,8 @@ TimelineClip restoreAttachedAudioForDuplicate({
               time: frame.time - splitOffset,
               property: property,
               value: frame.value,
+              interpolation: frame.interpolation,
+              curve: frame.curve,
             ),
           ),
     );
@@ -1267,6 +1278,134 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         );
   }
 
+  List<TimelineKeyframeProperty> _graphPropertiesForClip(
+    EditorTimeline timeline,
+    TimelineClip clip,
+  ) {
+    final properties = <TimelineKeyframeProperty>[
+      if (clip.supportsVisualEffects) ...const [
+        TimelineKeyframeProperty.opacity,
+        TimelineKeyframeProperty.scale,
+        TimelineKeyframeProperty.rotation,
+        TimelineKeyframeProperty.positionX,
+        TimelineKeyframeProperty.positionY,
+      ],
+      if (clip.blur.isEnabled) TimelineKeyframeProperty.blurStrength,
+      if (timeline.clipHasAudio(clip)) TimelineKeyframeProperty.volume,
+    ];
+    for (final keyframe in clip.keyframes) {
+      if (!properties.contains(keyframe.property)) {
+        properties.add(keyframe.property);
+      }
+    }
+    return properties;
+  }
+
+  Future<void> _openKeyframeGraphEditor(
+    TimelineClip clip, {
+    required TimelineKeyframeProperty initialProperty,
+  }) async {
+    final editorState = ref.read(editorProvider);
+    final liveClip = _clipById(clip.id, editorState);
+    final track = _trackForClip(liveClip, editorState);
+    if (liveClip == null || track == null) return;
+    if (track.isLocked) {
+      SnackBarHelper.showInfo(context, 'Unlock the selected track first.');
+      return;
+    }
+    final properties = _graphPropertiesForClip(editorState.timeline, liveClip);
+    if (properties.isEmpty) {
+      SnackBarHelper.showInfo(
+        context,
+        'This clip has no properties that can be animated.',
+      );
+      return;
+    }
+    final resolvedInitial = properties.contains(initialProperty)
+        ? initialProperty
+        : properties.first;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: false,
+      backgroundColor: Colors.transparent,
+      builder: (sheetContext) => Consumer(
+        builder: (context, sheetRef, _) {
+          final state = sheetRef.watch(editorProvider);
+          TimelineClip? currentClip;
+          for (final candidateTrack in state.timeline.tracks) {
+            for (final candidate in candidateTrack.clips) {
+              if (candidate.id == liveClip.id) {
+                currentClip = candidate;
+                break;
+              }
+            }
+            if (currentClip != null) break;
+          }
+          if (currentClip == null) {
+            return ResizableEditorSheet(
+              title: 'Keyframe graph',
+              subtitle: 'The clip was removed from the timeline.',
+              initialHeightFactor: 0.78,
+              minHeightFactor: 0.52,
+              maxHeightFactor: 0.94,
+              scrollable: false,
+              onClose: () => Navigator.pop(sheetContext),
+              child: const Center(
+                child: Text(
+                  'Select another clip to continue.',
+                  style: TextStyle(color: kTextSecondary),
+                ),
+              ),
+            );
+          }
+          final currentProperties = _graphPropertiesForClip(
+            state.timeline,
+            currentClip,
+          );
+          final playback = sheetRef.watch(playbackProvider);
+          return ResizableEditorSheet(
+            title: 'Keyframe graph',
+            subtitle:
+                '${currentClip.label} • Curves are shared by preview and export',
+            initialHeightFactor: 0.78,
+            minHeightFactor: 0.52,
+            maxHeightFactor: 0.94,
+            scrollable: false,
+            contentPadding: const EdgeInsets.fromLTRB(14, 12, 14, 20),
+            onClose: () => Navigator.pop(sheetContext),
+            child: KeyframeGraphEditor(
+              clip: currentClip,
+              properties: currentProperties,
+              initialProperty: resolvedInitial,
+              playhead: playback.position,
+              frameRate: state.timeline.workspaceSettings.frameRate,
+              onChanged: (keyframes, recordHistory) {
+                sheetRef
+                    .read(editorProvider.notifier)
+                    .updateClip(
+                      currentClip!.id,
+                      (candidate) => candidate.copyWith(keyframes: keyframes),
+                      recordHistory: recordHistory,
+                    );
+              },
+              onSeek: (position) => sheetRef
+                  .read(playbackProvider.notifier)
+                  .requestSeek(position),
+              onEditStart: () => sheetRef
+                  .read(editorProvider.notifier)
+                  .beginTimelineGestureEdit(),
+              onEditEnd: () => sheetRef
+                  .read(editorProvider.notifier)
+                  .endTimelineGestureEdit(),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
   Future<void> _setSelectedClipNote() async {
     final clip = _toolSelectedClip();
     if (clip == null) return;
@@ -1422,6 +1561,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   time: Duration(milliseconds: timeMs),
                   property: keyframe.property,
                   value: keyframe.value,
+                  interpolation: keyframe.interpolation,
+                  curve: keyframe.curve,
                 );
           }
           nextKeyframes.addAll(copiedFramesByPropertyAndTime.values);
@@ -3434,6 +3575,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         splitPoint,
         fallback: propertyFrames.first.value,
       );
+      final splitOffset = Duration(milliseconds: timelineOffsetMs);
+      final boundarySource = propertyFrames.lastWhere(
+        (keyframe) => keyframe.time <= splitOffset,
+        orElse: () => propertyFrames.first,
+      );
       leftKeyframes.addAll(
         propertyFrames.where(
           (keyframe) => keyframe.time.inMilliseconds <= timelineOffsetMs,
@@ -3449,6 +3595,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             time: Duration(milliseconds: timelineOffsetMs),
             property: property,
             value: boundaryValue,
+            interpolation: boundarySource.interpolation,
+            curve: boundarySource.curve,
           ),
         );
       }
@@ -3457,6 +3605,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           time: Duration.zero,
           property: property,
           value: boundaryValue,
+          interpolation: boundarySource.interpolation,
+          curve: boundarySource.curve,
         ),
       );
       rightKeyframes.addAll(
@@ -3469,6 +3619,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 time: keyframe.time - Duration(milliseconds: timelineOffsetMs),
                 property: property,
                 value: keyframe.value,
+                interpolation: keyframe.interpolation,
+                curve: keyframe.curve,
               ),
             ),
       );
@@ -7678,6 +7830,21 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       ),
       _ActionSpec(
         group: 'Keyframes',
+        label: 'Graph',
+        tooltip: 'Edit animation curves, timing, and Bézier handles',
+        icon: Icons.show_chart_rounded,
+        active: clip?.hasKeyframes == true,
+        onTap: visual || blur
+            ? () => _openKeyframeGraphEditor(
+                clip,
+                initialProperty: blur
+                    ? TimelineKeyframeProperty.blurStrength
+                    : TimelineKeyframeProperty.opacity,
+              )
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Keyframes',
         label: 'Opacity',
         tooltip: 'Add an opacity keyframe at the playhead',
         icon: Icons.opacity_rounded,
@@ -7903,6 +8070,23 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 fadeOutMs: 0,
                 pan: 0,
                 normalize: false,
+              )
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Automation',
+        label: 'Graph',
+        tooltip: 'Edit volume automation curves and timing',
+        icon: Icons.multiline_chart_rounded,
+        active:
+            audioClip?.keyframes.any(
+              (frame) => frame.property == TimelineKeyframeProperty.volume,
+            ) ==
+            true,
+        onTap: audio
+            ? () => _openKeyframeGraphEditor(
+                audioClip,
+                initialProperty: TimelineKeyframeProperty.volume,
               )
             : null,
       ),

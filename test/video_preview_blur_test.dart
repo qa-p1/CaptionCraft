@@ -39,6 +39,70 @@ void main() {
     expect(buildPreviewVideoPlayerOptions().mixWithOthers, isTrue);
   });
 
+  test('audio warm window includes only current and near-future clips', () {
+    final clip = TimelineClip(
+      trackId: 'audio',
+      type: TimelineTrackType.audio,
+      label: 'Music',
+      startTime: const Duration(seconds: 5),
+      endTime: const Duration(seconds: 8),
+    );
+
+    expect(
+      shouldPreloadTimelineAudioPreviewForTesting(
+        clip: clip,
+        position: const Duration(milliseconds: 3100),
+      ),
+      isTrue,
+    );
+    expect(
+      shouldPreloadTimelineAudioPreviewForTesting(
+        clip: clip,
+        position: const Duration(seconds: 2),
+      ),
+      isFalse,
+    );
+    expect(
+      shouldPreloadTimelineAudioPreviewForTesting(
+        clip: clip,
+        position: const Duration(seconds: 8),
+      ),
+      isFalse,
+    );
+  });
+
+  test('base video warm window is bounded and ignores active clips', () {
+    final clip = TimelineClip(
+      trackId: 'video',
+      type: TimelineTrackType.video,
+      label: 'Next shot',
+      startTime: const Duration(seconds: 10),
+      endTime: const Duration(seconds: 14),
+    );
+
+    expect(
+      shouldPreloadBaseVideoForTesting(
+        clip: clip,
+        position: const Duration(milliseconds: 6600),
+      ),
+      isTrue,
+    );
+    expect(
+      shouldPreloadBaseVideoForTesting(
+        clip: clip,
+        position: const Duration(seconds: 6),
+      ),
+      isFalse,
+    );
+    expect(
+      shouldPreloadBaseVideoForTesting(
+        clip: clip,
+        position: const Duration(seconds: 10),
+      ),
+      isFalse,
+    );
+  });
+
   test(
     'referenced missing media never falls back to the first project video',
     () {

@@ -75,6 +75,80 @@ void main() {
     expect(restored.autoDuck, isTrue);
   });
 
+  test('keyframe interpolation supports holds, easing, and custom curves', () {
+    TimelineClip animated(TimelineKeyframeInterpolation interpolation) {
+      return TimelineClip(
+        trackId: 'video',
+        type: TimelineTrackType.video,
+        label: 'Animated',
+        startTime: Duration.zero,
+        endTime: const Duration(seconds: 1),
+        keyframes: [
+          TimelineKeyframe(
+            time: Duration.zero,
+            property: TimelineKeyframeProperty.opacity,
+            value: 0,
+            interpolation: interpolation,
+            curve: const TimelineBezierCurve(
+              x1: 0.2,
+              y1: 0.8,
+              x2: 0.4,
+              y2: 1.2,
+            ),
+          ),
+          TimelineKeyframe(
+            time: const Duration(seconds: 1),
+            property: TimelineKeyframeProperty.opacity,
+            value: 1,
+          ),
+        ],
+      );
+    }
+
+    expect(
+      animated(TimelineKeyframeInterpolation.hold).keyframedValue(
+        TimelineKeyframeProperty.opacity,
+        const Duration(milliseconds: 999),
+      ),
+      0,
+    );
+    expect(
+      animated(TimelineKeyframeInterpolation.hold).keyframedValue(
+        TimelineKeyframeProperty.opacity,
+        const Duration(seconds: 1),
+      ),
+      1,
+    );
+    expect(
+      animated(TimelineKeyframeInterpolation.easeIn).keyframedValue(
+        TimelineKeyframeProperty.opacity,
+        const Duration(milliseconds: 500),
+      ),
+      lessThan(0.5),
+    );
+
+    final restored = TimelineClip.fromJson(
+      animated(TimelineKeyframeInterpolation.cubicBezier).toJson(),
+    );
+    final first = restored.keyframes.first;
+    expect(first.interpolation, TimelineKeyframeInterpolation.cubicBezier);
+    expect(first.curve.x1, closeTo(0.2, 0.0001));
+    expect(first.curve.y2, closeTo(1.2, 0.0001));
+  });
+
+  test('legacy keyframes default to linear interpolation', () {
+    final restored = TimelineKeyframe.fromJson({
+      'id': 'legacy',
+      'timeMs': 250,
+      'property': 'scale',
+      'value': 1.5,
+    });
+
+    expect(restored.interpolation, TimelineKeyframeInterpolation.linear);
+    expect(restored.curve.x1, 0);
+    expect(restored.curve.x2, 1);
+  });
+
   test('freeze selection and blur-strength keyframes survive persistence', () {
     final clip = TimelineClip(
       id: 'freeze_blur',
@@ -177,6 +251,36 @@ void main() {
       expect(
         container.read(editorProvider).timeline.videoClips.single.keyframes,
         hasLength(1),
+      );
+      final originalFrame = container
+          .read(editorProvider)
+          .timeline
+          .videoClips
+          .single
+          .keyframes
+          .single;
+      expect(
+        notifier.upsertKeyframe(
+          clipId: 'first',
+          property: TimelineKeyframeProperty.opacity,
+          time: const Duration(seconds: 1),
+          value: 0.7,
+          interpolation: TimelineKeyframeInterpolation.easeInOut,
+        ),
+        isTrue,
+      );
+      final updatedFrame = container
+          .read(editorProvider)
+          .timeline
+          .videoClips
+          .single
+          .keyframes
+          .single;
+      expect(updatedFrame.id, originalFrame.id);
+      expect(updatedFrame.value, 0.7);
+      expect(
+        updatedFrame.interpolation,
+        TimelineKeyframeInterpolation.easeInOut,
       );
 
       expect(notifier.renameTrack('audio', 'Music'), isTrue);
