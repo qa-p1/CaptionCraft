@@ -4674,7 +4674,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                         0,
                                   );
                                   final controllerSource = controllerReady
-                                      ? controller?.value.size
+                                      ? controller.value.size
                                       : null;
                                   final sourceSize =
                                       controllerSource != null &&
