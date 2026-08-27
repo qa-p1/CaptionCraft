@@ -18,7 +18,7 @@ on those foundations rather than adding isolated controls.
 9. [x] Persist hold, linear, ease-in, ease-out, ease-in-out, and cubic Bézier interpolation.
 10. [x] Preserve legacy projects by defaulting old keyframes to linear.
 11. [x] Use the model curve evaluator in preview and sampled FFmpeg export expressions.
-12. [x] Add a graph editor with draggable keys, tangent handles, presets, panning, and zoom.
+12. [x] Add a graph editor with draggable keys, tangent handles, 15 timing presets, custom Bézier curves, panning, and zoom.
 13. [x] Make graph drags a single undo transaction instead of one undo step per pointer update.
 14. [ ] Add device-level playback stress fixtures for long-GOP 4K/60 media and overlapping audio.
 
@@ -46,6 +46,23 @@ on those foundations rather than adding isolated controls.
 28. [ ] Add graph box selection, multi-key dragging, copy/paste, and numeric time/value entry.
 29. [ ] Preserve cubic curve shape exactly when splitting or trimming through an animated segment.
 30. [ ] Add animation-channel visibility, solo, locking, and reusable curve presets.
+    - [x] Ship reusable Hold, Linear, Ease, Sine, Quad, Cubic, and Back timing presets.
+    - [ ] Add channel visibility, solo, and locking.
+
+## Current feature branch — state animation and canvas manipulation
+
+- [x] Treat base video, image, and GIF clips as normal transformable canvas layers.
+- [x] Give base media the same drag, pinch-scale, and two-finger rotation gestures as overlays.
+- [x] Size overlay gesture bounds from visible fitted/cropped media instead of a fixed layout slot.
+- [x] Apply the selection outline after fit, scale, rotation, and transition transforms.
+- [x] Pause and pin the playhead when a direct-manipulation gesture starts.
+- [x] Capture position, scale, rotation, opacity, volume, and blur as one state keyframe.
+- [x] Automatically create/update a complete state when a keyed clip changes later in time.
+- [x] Keep unkeyed clips editing their base values until animation is intentionally armed.
+- [x] Add dedicated Add/Update, Delete, Previous, and Next state controls.
+- [x] Give keyframes a first-class bottom-dock category instead of nesting them under Effects.
+- [x] Apply an outgoing preset to every channel in the current state in one operation.
+- [x] Preserve individual-channel editing as an advanced workflow in the graph editor.
 
 ## Release gates
 

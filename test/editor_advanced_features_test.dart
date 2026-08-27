@@ -1,4 +1,5 @@
 import 'package:caption_craft/features/editor/models/timeline_models.dart';
+import 'package:caption_craft/features/editor/models/keyframe_curve_presets.dart';
 import 'package:caption_craft/features/editor/providers/editor_provider.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -149,6 +150,15 @@ void main() {
     expect(restored.curve.x2, 1);
   });
 
+  test('graph exposes fifteen standard curves plus custom Bézier editing', () {
+    expect(timelineCurvePresets, hasLength(15));
+    expect(
+      timelineCurvePresets.map((preset) => preset.id).toSet(),
+      hasLength(15),
+    );
+    expect(timelineCurvePresets.any((preset) => preset.curve.y2 > 1), isTrue);
+  });
+
   test('freeze selection and blur-strength keyframes survive persistence', () {
     final clip = TimelineClip(
       id: 'freeze_blur',
@@ -296,6 +306,112 @@ void main() {
             .every((track) => track.isCollapsed),
         isTrue,
       );
+    },
+  );
+
+  test(
+    'state keyframes capture all channels and direct manipulation auto-keys',
+    () {
+      final clip = TimelineClip(
+        id: 'stateful',
+        trackId: 'video',
+        type: TimelineTrackType.video,
+        label: 'Stateful',
+        startTime: Duration.zero,
+        endTime: const Duration(seconds: 4),
+        blur: const ClipBlurSettings(mode: ClipBlurMode.full, strength: 6),
+      );
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      final notifier = container.read(editorProvider.notifier);
+      notifier.loadProject(
+        videoPath: 'source.mp4',
+        projectId: 'state-project',
+        projectName: 'State project',
+        timeline: EditorTimeline(
+          workspaceSettings: const TimelineWorkspaceSettings(frameRate: 30),
+          tracks: [
+            TimelineTrack(
+              id: 'video',
+              name: 'Base layer',
+              type: TimelineTrackType.video,
+              section: TimelineTrackSection.baseVideo,
+              clips: [clip],
+            ),
+          ],
+        ),
+      );
+
+      expect(
+        notifier.upsertKeyframeState(
+          clipId: clip.id,
+          absolutePosition: Duration.zero,
+        ),
+        isTrue,
+      );
+      var live = container.read(editorProvider).timeline.videoClips.single;
+      expect(live.keyframes, hasLength(7));
+      expect(live.keyframeStateTimes, [Duration.zero]);
+      expect(live.transformAt(const Duration(seconds: 1)).scale, 1);
+
+      expect(
+        notifier.updateClipTransformAt(
+          clipId: clip.id,
+          absolutePosition: const Duration(seconds: 2),
+          mapper: (current) => current.copyWith(
+            offsetX: 100,
+            scale: 2,
+            rotation: 1,
+            opacity: 0.5,
+          ),
+        ),
+        isTrue,
+      );
+      live = container.read(editorProvider).timeline.videoClips.single;
+      expect(live.keyframes, hasLength(14));
+      expect(live.keyframeStateTimes, [
+        Duration.zero,
+        const Duration(seconds: 2),
+      ]);
+      expect(live.transform.scale, 1, reason: 'base state remains untouched');
+      final middle = live.transformAt(const Duration(seconds: 1));
+      expect(middle.scale, closeTo(1.5, 0.0001));
+      expect(middle.offsetX, closeTo(50, 0.0001));
+      expect(middle.rotation, closeTo(0.5, 0.0001));
+      expect(middle.opacity, closeTo(0.75, 0.0001));
+      expect(live.transformAt(const Duration(seconds: 3)).scale, 2);
+
+      expect(
+        notifier.setKeyframeStateCurve(
+          clipId: clip.id,
+          absolutePosition: Duration.zero,
+          interpolation: TimelineKeyframeInterpolation.easeIn,
+          curve: TimelineBezierCurve.easeIn,
+        ),
+        isTrue,
+      );
+      live = container.read(editorProvider).timeline.videoClips.single;
+      expect(live.transformAt(const Duration(seconds: 1)).scale, lessThan(1.5));
+      expect(
+        live.keyframes
+            .where((frame) => frame.time == Duration.zero)
+            .every(
+              (frame) =>
+                  frame.interpolation == TimelineKeyframeInterpolation.easeIn,
+            ),
+        isTrue,
+      );
+
+      expect(
+        notifier.removeKeyframeState(
+          clipId: clip.id,
+          absolutePosition: const Duration(seconds: 2),
+        ),
+        isTrue,
+      );
+      live = container.read(editorProvider).timeline.videoClips.single;
+      expect(live.keyframes, hasLength(7));
+      expect(live.keyframeStateTimes, [Duration.zero]);
     },
   );
 }

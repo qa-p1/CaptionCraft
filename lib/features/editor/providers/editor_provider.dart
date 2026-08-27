@@ -522,6 +522,258 @@ class EditorNotifier extends StateNotifier<EditorState> {
     });
   }
 
+  Duration _snappedKeyframeTime(TimelineClip clip, Duration absolutePosition) {
+    final frameRate = state.timeline.workspaceSettings.frameRate.clamp(1, 120);
+    final frameUs = Duration.microsecondsPerSecond / frameRate;
+    final relativeUs = (absolutePosition - clip.startTime).inMicroseconds.clamp(
+      0,
+      math.max(0, clip.duration.inMicroseconds),
+    );
+    final snappedUs = (relativeUs / frameUs).round() * frameUs;
+    return Duration(
+      microseconds: snappedUs
+          .round()
+          .clamp(0, math.max(0, clip.duration.inMicroseconds))
+          .toInt(),
+    );
+  }
+
+  TimelineClip _upsertKeyframeValues(
+    TimelineClip clip, {
+    required Duration time,
+    required Map<TimelineKeyframeProperty, double> values,
+    TimelineKeyframeInterpolation? interpolation,
+    TimelineBezierCurve? curve,
+  }) {
+    final next = [...clip.keyframes];
+    for (final entry in values.entries) {
+      TimelineKeyframe? existing;
+      for (final keyframe in next) {
+        if (keyframe.property == entry.key &&
+            keyframe.time.inMilliseconds == time.inMilliseconds) {
+          existing = keyframe;
+          break;
+        }
+      }
+      next.removeWhere(
+        (keyframe) =>
+            keyframe.property == entry.key &&
+            keyframe.time.inMilliseconds == time.inMilliseconds,
+      );
+      next.add(
+        existing?.copyWith(
+              value: entry.value,
+              interpolation: interpolation,
+              curve: curve,
+            ) ??
+            TimelineKeyframe(
+              time: time,
+              property: entry.key,
+              value: entry.value,
+              interpolation:
+                  interpolation ?? TimelineKeyframeInterpolation.linear,
+              curve: curve ?? TimelineBezierCurve.linear,
+            ),
+      );
+    }
+    next.sort((a, b) {
+      final timeOrder = a.time.compareTo(b.time);
+      return timeOrder != 0
+          ? timeOrder
+          : a.property.index.compareTo(b.property.index);
+    });
+    return clip.copyWith(keyframes: next);
+  }
+
+  /// Captures every animatable value supported by the clip in one undoable
+  /// state. A later state automatically interpolates from this snapshot.
+  bool upsertKeyframeState({
+    required String clipId,
+    required Duration absolutePosition,
+    TimelineKeyframeInterpolation? interpolation,
+    TimelineBezierCurve? curve,
+  }) {
+    final hasAudio = state.timeline.tracks.any(
+      (track) => track.clips.any(
+        (clip) => clip.id == clipId && state.timeline.clipHasAudio(clip),
+      ),
+    );
+    return updateClip(clipId, (clip) {
+      final time = _snappedKeyframeTime(clip, absolutePosition);
+      final resolvedPosition = clip.startTime + time;
+      final transform = clip.transformAt(resolvedPosition);
+      final values = <TimelineKeyframeProperty, double>{
+        if (clip.supportsTransform) ...{
+          TimelineKeyframeProperty.opacity: transform.opacity,
+          TimelineKeyframeProperty.scale: transform.scale,
+          TimelineKeyframeProperty.rotation: transform.rotation,
+          TimelineKeyframeProperty.positionX: transform.offsetX,
+          TimelineKeyframeProperty.positionY: transform.offsetY,
+        },
+        if (hasAudio)
+          TimelineKeyframeProperty.volume: clip.volumeAt(resolvedPosition),
+        if (clip.blur.isEnabled)
+          TimelineKeyframeProperty.blurStrength: clip
+              .blurAt(resolvedPosition)
+              .safeStrength,
+      };
+      return _upsertKeyframeValues(
+        clip,
+        time: time,
+        values: values,
+        interpolation: interpolation,
+        curve: curve,
+      );
+    });
+  }
+
+  /// Direct manipulation edits the base transform until the first transform
+  /// state exists. Once armed, every later gesture writes a complete state at
+  /// the playhead so position, scale, rotation and opacity stay synchronized.
+  bool updateClipTransformAt({
+    required String clipId,
+    required Duration absolutePosition,
+    required TimelineTransform Function(TimelineTransform current) mapper,
+    bool recordHistory = true,
+  }) {
+    final hasAudio = state.timeline.tracks.any(
+      (track) => track.clips.any(
+        (clip) => clip.id == clipId && state.timeline.clipHasAudio(clip),
+      ),
+    );
+    return updateClip(clipId, (clip) {
+      final current = clip.transformAt(absolutePosition);
+      final updated = mapper(current);
+      if (!clip.hasTransformKeyframes) {
+        return clip.copyWith(transform: updated);
+      }
+      final time = _snappedKeyframeTime(clip, absolutePosition);
+      return _upsertKeyframeValues(
+        clip,
+        time: time,
+        values: {
+          TimelineKeyframeProperty.opacity: updated.opacity,
+          TimelineKeyframeProperty.scale: updated.scale,
+          TimelineKeyframeProperty.rotation: updated.rotation,
+          TimelineKeyframeProperty.positionX: updated.offsetX,
+          TimelineKeyframeProperty.positionY: updated.offsetY,
+          if (hasAudio)
+            TimelineKeyframeProperty.volume: clip.volumeAt(absolutePosition),
+          if (clip.blur.isEnabled)
+            TimelineKeyframeProperty.blurStrength: clip
+                .blurAt(absolutePosition)
+                .safeStrength,
+        },
+      );
+    }, recordHistory: recordHistory);
+  }
+
+  bool updateClipVolumeAt({
+    required String clipId,
+    required Duration absolutePosition,
+    required double volume,
+    bool recordHistory = true,
+  }) {
+    return updateClip(clipId, (clip) {
+      final safeVolume = volume.clamp(0.0, 2.0).toDouble();
+      if (!clip.hasVolumeKeyframes) {
+        return clip.copyWith(
+          audioMix: clip.audioMix.copyWith(volume: safeVolume),
+        );
+      }
+      final time = _snappedKeyframeTime(clip, absolutePosition);
+      final transform = clip.transformAt(absolutePosition);
+      return _upsertKeyframeValues(
+        clip,
+        time: time,
+        values: {
+          if (clip.hasTransformKeyframes) ...{
+            TimelineKeyframeProperty.opacity: transform.opacity,
+            TimelineKeyframeProperty.scale: transform.scale,
+            TimelineKeyframeProperty.rotation: transform.rotation,
+            TimelineKeyframeProperty.positionX: transform.offsetX,
+            TimelineKeyframeProperty.positionY: transform.offsetY,
+          },
+          TimelineKeyframeProperty.volume: safeVolume,
+          if (clip.blur.isEnabled)
+            TimelineKeyframeProperty.blurStrength: clip
+                .blurAt(absolutePosition)
+                .safeStrength,
+        },
+      );
+    }, recordHistory: recordHistory);
+  }
+
+  bool updateClipBlurStrengthAt({
+    required String clipId,
+    required Duration absolutePosition,
+    required double strength,
+    bool recordHistory = true,
+  }) {
+    return updateClip(clipId, (clip) {
+      final safeStrength = strength.clamp(0.0, 30.0).toDouble();
+      final hasBlurKeyframes = clip.keyframes.any(
+        (keyframe) =>
+            keyframe.property == TimelineKeyframeProperty.blurStrength,
+      );
+      if (!hasBlurKeyframes) {
+        return clip.copyWith(blur: clip.blur.copyWith(strength: safeStrength));
+      }
+      final time = _snappedKeyframeTime(clip, absolutePosition);
+      final transform = clip.transformAt(absolutePosition);
+      return _upsertKeyframeValues(
+        clip,
+        time: time,
+        values: {
+          if (clip.hasTransformKeyframes) ...{
+            TimelineKeyframeProperty.opacity: transform.opacity,
+            TimelineKeyframeProperty.scale: transform.scale,
+            TimelineKeyframeProperty.rotation: transform.rotation,
+            TimelineKeyframeProperty.positionX: transform.offsetX,
+            TimelineKeyframeProperty.positionY: transform.offsetY,
+          },
+          if (clip.hasVolumeKeyframes)
+            TimelineKeyframeProperty.volume: clip.volumeAt(absolutePosition),
+          TimelineKeyframeProperty.blurStrength: safeStrength,
+        },
+      );
+    }, recordHistory: recordHistory);
+  }
+
+  bool removeKeyframeState({
+    required String clipId,
+    required Duration absolutePosition,
+  }) {
+    return updateClip(clipId, (clip) {
+      final time = _snappedKeyframeTime(clip, absolutePosition);
+      final next = clip.keyframes
+          .where(
+            (keyframe) => keyframe.time.inMilliseconds != time.inMilliseconds,
+          )
+          .toList();
+      return clip.copyWith(keyframes: next);
+    });
+  }
+
+  bool setKeyframeStateCurve({
+    required String clipId,
+    required Duration absolutePosition,
+    required TimelineKeyframeInterpolation interpolation,
+    required TimelineBezierCurve curve,
+  }) {
+    return updateClip(clipId, (clip) {
+      final time = _snappedKeyframeTime(clip, absolutePosition);
+      final next = clip.keyframes
+          .map(
+            (keyframe) => keyframe.time.inMilliseconds == time.inMilliseconds
+                ? keyframe.copyWith(interpolation: interpolation, curve: curve)
+                : keyframe,
+          )
+          .toList();
+      return clip.copyWith(keyframes: next);
+    });
+  }
+
   bool removeKeyframes(String clipId, {TimelineKeyframeProperty? property}) {
     return updateClip(clipId, (clip) {
       final next = property == null

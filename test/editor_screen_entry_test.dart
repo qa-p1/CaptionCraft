@@ -98,6 +98,7 @@ void main() {
     for (final category in const {
       'edit': 'Edit',
       'effects': 'Effects',
+      'keyframes': 'Keyframes',
       'audio': 'Audio',
       'text': 'Text',
       'timeline': 'Timeline',
@@ -175,7 +176,6 @@ void main() {
       'effectsColor',
       'effectsBlur',
       'effectsMotion',
-      'effectsKeyframes',
       'effectsEnhance',
     ]) {
       expect(find.byKey(ValueKey('dock_subgroup_$subgroup')), findsOneWidget);
@@ -184,6 +184,32 @@ void main() {
     for (final tool in const ['chroma_key', 'filters', 'adjust']) {
       expect(
         find.byKey(ValueKey('dock_tool_effects_effectsColor_$tool')),
+        findsOneWidget,
+      );
+    }
+    await tapDock('dock_back_button');
+    await tapDock('dock_back_button');
+
+    await tapDock('dock_category_keyframes');
+    for (final subgroup in const [
+      'keyframeControls',
+      'keyframeCurves',
+      'keyframeProperties',
+    ]) {
+      expect(find.byKey(ValueKey('dock_subgroup_$subgroup')), findsOneWidget);
+    }
+    await tapDock('dock_subgroup_keyframeControls');
+    for (final tool in const ['add_state', 'delete', 'previous', 'next']) {
+      expect(
+        find.byKey(ValueKey('dock_tool_keyframes_keyframeControls_$tool')),
+        findsOneWidget,
+      );
+    }
+    await tapDock('dock_back_button');
+    await tapDock('dock_subgroup_keyframeCurves');
+    for (final tool in const ['graph', 'presets', 'clear_all']) {
+      expect(
+        find.byKey(ValueKey('dock_tool_keyframes_keyframeCurves_$tool')),
         findsOneWidget,
       );
     }

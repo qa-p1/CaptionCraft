@@ -45,6 +45,35 @@ void main() {
     expect(previewFallbackMixBusGainForTesting(30), closeTo(1 / 30, 0.000001));
   });
 
+  test(
+    'preview hit bounds follow visible media instead of the layout slot',
+    () {
+      final contained = previewVisibleMediaSizeForTesting(
+        sourceSize: const Size(400, 100),
+        targetSize: const Size(200, 200),
+        fitMode: ClipFitMode.contain,
+      );
+      expect(contained, const Size(200, 50));
+
+      final cropped = previewVisibleMediaSizeForTesting(
+        sourceSize: const Size(400, 200),
+        targetSize: const Size(200, 200),
+        fitMode: ClipFitMode.contain,
+        crop: const ClipCropSettings(left: 0.25, right: 0.25),
+      );
+      expect(cropped, const Size(200, 200));
+
+      expect(
+        previewVisibleMediaSizeForTesting(
+          sourceSize: const Size(400, 100),
+          targetSize: const Size(200, 200),
+          fitMode: ClipFitMode.cover,
+        ),
+        const Size(200, 200),
+      );
+    },
+  );
+
   test('audio warm window includes only current and near-future clips', () {
     final clip = TimelineClip(
       trackId: 'audio',
@@ -434,6 +463,10 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 50));
     expect(find.byType(Image), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('preview-source-interaction-base-image')),
+      findsOneWidget,
+    );
 
     await tester.tap(find.byTooltip('Play'));
     await tester.pump(const Duration(milliseconds: 220));

@@ -64,6 +64,35 @@ double previewFallbackMixBusGainForTesting(int audibleVoiceCount) {
   return 1 / math.max(1, audibleVoiceCount);
 }
 
+/// Returns the on-canvas bounds of the pixels a user can actually see.
+///
+/// Contained media often occupies only part of its layout slot; using the slot
+/// as a gesture target produces the detached fixed-box behavior common in
+/// basic editors. Cover and stretch intentionally use the complete target.
+@visibleForTesting
+Size previewVisibleMediaSizeForTesting({
+  required Size sourceSize,
+  required Size targetSize,
+  required ClipFitMode fitMode,
+  ClipCropSettings crop = const ClipCropSettings(),
+}) {
+  if (targetSize.width <= 0 || targetSize.height <= 0) return Size.zero;
+  final safeSource = sourceSize.width > 0 && sourceSize.height > 0
+      ? Size(
+          sourceSize.width * crop.visibleWidth,
+          sourceSize.height * crop.visibleHeight,
+        )
+      : targetSize;
+  return switch (fitMode) {
+    ClipFitMode.contain => applyBoxFit(
+      BoxFit.contain,
+      safeSource,
+      targetSize,
+    ).destination,
+    ClipFitMode.cover || ClipFitMode.stretch => targetSize,
+  };
+}
+
 Widget _cropSourcePreview({
   required Widget child,
   required double sourceWidth,
@@ -823,6 +852,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   double? _freeTransformStartScale;
   double? _freeTransformStartRotation;
   double? _freeTransformStartFontSize;
+  Duration? _freeTransformTimelinePosition;
 
   void _ensurePreviewCaches(EditorTimeline timeline, {int? editRevision}) {
     if (identical(_cachedPreviewTimeline, timeline) &&
@@ -2964,18 +2994,15 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     String clipId,
     TimelineTransform Function(TimelineTransform current) mapper,
   ) {
-    final editorState = ref.read(editorProvider);
-    final nextTracks = editorState.timeline.tracks.map((track) {
-      final updatedClips = track.clips.map((clip) {
-        if (clip.id != clipId) return clip;
-        return clip.copyWith(transform: mapper(clip.transform));
-      }).toList();
-      return track.copyWith(clips: updatedClips);
-    }).toList();
-
     ref
         .read(editorProvider.notifier)
-        .setTimeline(editorState.timeline.copyWith(tracks: nextTracks));
+        .updateClipTransformAt(
+          clipId: clipId,
+          absolutePosition:
+              _freeTransformTimelinePosition ??
+              ref.read(playbackProvider).position,
+          mapper: mapper,
+        );
   }
 
   double _snapDesignCoordinate({
@@ -3024,10 +3051,15 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   }
 
   void _beginSnappedDrag(TimelineTransform transform) {
+    final playback = ref.read(playbackProvider);
     _dragSourceOffsetX = transform.offsetX;
     _dragSourceOffsetY = transform.offsetY;
     _freeTransformStartScale = transform.scale;
     _freeTransformStartRotation = transform.rotation;
+    _freeTransformTimelinePosition = playback.position;
+    if (playback.isPlaying) {
+      ref.read(playbackProvider.notifier).setPlaying(false);
+    }
   }
 
   void _endSnappedDrag() {
@@ -3036,6 +3068,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     _freeTransformStartScale = null;
     _freeTransformStartRotation = null;
     _freeTransformStartFontSize = null;
+    _freeTransformTimelinePosition = null;
     ref.read(editorProvider.notifier).endTimelineGestureEdit();
   }
 
@@ -4587,34 +4620,45 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                               child: const SizedBox.expand(),
                             ),
                           ),
-                          if (controllerReady &&
-                              (activeBaseClip.fitMode == ClipFitMode.contain ||
-                                  activeBaseClip.transform.scale < 0.999 ||
-                                  activeBaseClip.transform.rotation.abs() >
-                                      0.0001 ||
-                                  activeBaseClip.transform.offsetX.abs() >
-                                      0.0001 ||
-                                  activeBaseClip.transform.offsetY.abs() >
-                                      0.0001))
+                          if (activeBaseClip != null &&
+                              activeBaseTrack != null &&
+                              activeBaseClip.supportsTransform)
                             _CanvasBoundLayer(
                               aspectRatio: previewAspectRatio,
                               child: LayoutBuilder(
                                 builder: (context, constraints) {
-                                  final sourceSize = controller.value.size;
-                                  final safeSourceSize = Size(
-                                    sourceSize.width <= 0
-                                        ? constraints.maxWidth
-                                        : sourceSize.width,
-                                    sourceSize.height <= 0
-                                        ? constraints.maxHeight
-                                        : sourceSize.height,
+                                  final asset = editorState.timeline
+                                      .assetForClip(activeBaseClip);
+                                  final metadataSource = Size(
+                                    (asset?.metadata['width'] as num?)
+                                            ?.toDouble() ??
+                                        0,
+                                    (asset?.metadata['height'] as num?)
+                                            ?.toDouble() ??
+                                        0,
                                   );
-                                  final destination = applyBoxFit(
-                                    BoxFit.contain,
-                                    safeSourceSize,
-                                    constraints.biggest,
-                                  ).destination;
+                                  final controllerSource = controllerReady
+                                      ? controller?.value.size
+                                      : null;
+                                  final sourceSize =
+                                      controllerSource != null &&
+                                          controllerSource.width > 0 &&
+                                          controllerSource.height > 0
+                                      ? controllerSource
+                                      : metadataSource;
+                                  final destination =
+                                      previewVisibleMediaSizeForTesting(
+                                        sourceSize: sourceSize,
+                                        targetSize: constraints.biggest,
+                                        fitMode: activeBaseClip.fitMode,
+                                        crop: activeBaseClip.crop,
+                                      );
                                   final transform = activeBaseClip.transformAt(
+                                    playbackState.position,
+                                  );
+                                  final animation = _resolveOverlayAnimation(
+                                    activeBaseClip,
+                                    constraints,
                                     playbackState.position,
                                   );
                                   final isSelected =
@@ -4622,29 +4666,33 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                       activeBaseClip.id;
                                   return Align(
                                     child: Transform.translate(
-                                      offset: Offset(
-                                        transform.offsetX *
-                                            constraints.maxWidth /
-                                            kTimelineDesignWidth,
-                                        transform.offsetY *
-                                            constraints.maxHeight /
-                                            kTimelineDesignHeight,
-                                      ),
-                                      child: Transform.rotate(
-                                        angle: transform.rotation,
-                                        child: Transform.scale(
-                                          scale: transform.scale.clamp(
-                                            0.2,
-                                            4.0,
+                                      offset:
+                                          animation.offset +
+                                          Offset(
+                                            transform.offsetX *
+                                                constraints.maxWidth /
+                                                kTimelineDesignWidth,
+                                            transform.offsetY *
+                                                constraints.maxHeight /
+                                                kTimelineDesignHeight,
                                           ),
+                                      child: Transform.rotate(
+                                        angle:
+                                            transform.rotation +
+                                            animation.rotation,
+                                        child: Transform.scale(
+                                          scale:
+                                              (transform.scale *
+                                                      animation.scale)
+                                                  .clamp(0.2, 4.0),
                                           child: _OverlayTransformBox(
                                             isSelected: isSelected,
                                             onTap: () {
-                                              final track = controllerTrack;
-                                              if (track == null) return;
                                               ref
                                                   .read(editorProvider.notifier)
-                                                  .selectTrack(track.id);
+                                                  .selectTrack(
+                                                    activeBaseTrack.id,
+                                                  );
                                               ref
                                                   .read(editorProvider.notifier)
                                                   .selectClip(
@@ -4652,14 +4700,14 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                                   );
                                             },
                                             onMoveStart: () {
-                                              final track = controllerTrack;
-                                              if (track == null ||
-                                                  track.isLocked) {
+                                              if (activeBaseTrack.isLocked) {
                                                 return;
                                               }
                                               ref
                                                   .read(editorProvider.notifier)
-                                                  .selectTrack(track.id);
+                                                  .selectTrack(
+                                                    activeBaseTrack.id,
+                                                  );
                                               ref
                                                   .read(editorProvider.notifier)
                                                   .selectClip(
@@ -4671,8 +4719,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                                   .beginTimelineGestureEdit();
                                             },
                                             onMoveUpdate: (delta) {
-                                              if (controllerTrack?.isLocked ==
-                                                  true) {
+                                              if (activeBaseTrack.isLocked) {
                                                 return;
                                               }
                                               _updateOverlayTransform(
@@ -4708,8 +4755,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                               }
                                             },
                                             onScaleFactorUpdate: (factor) {
-                                              if (controllerTrack?.isLocked ==
-                                                  true) {
+                                              if (activeBaseTrack.isLocked) {
                                                 return;
                                               }
                                               _updateOverlayTransform(
@@ -4726,8 +4772,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                               );
                                             },
                                             onRotationUpdate: (rotation) {
-                                              if (controllerTrack?.isLocked ==
-                                                  true) {
+                                              if (activeBaseTrack.isLocked) {
                                                 return;
                                               }
                                               _updateOverlayTransform(
@@ -4771,121 +4816,186 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                       final transform = item.clip.transformAt(
                                         playbackState.position,
                                       );
+                                      final animation =
+                                          _resolveOverlayAnimation(
+                                            item.clip,
+                                            constraints,
+                                            playbackState.position,
+                                          );
+                                      final sourceSize = Size(
+                                        (item.asset.metadata['width'] as num?)
+                                                ?.toDouble() ??
+                                            0,
+                                        (item.asset.metadata['height'] as num?)
+                                                ?.toDouble() ??
+                                            0,
+                                      );
+                                      final targetSize = Size(
+                                        constraints.maxWidth * 0.36,
+                                        constraints.maxHeight * 0.5,
+                                      );
+                                      final interactionSize =
+                                          previewVisibleMediaSizeForTesting(
+                                            sourceSize: sourceSize,
+                                            targetSize: targetSize,
+                                            fitMode: item.clip.fitMode,
+                                            crop: item.clip.crop,
+                                          );
                                       return Align(
                                         child: Transform.translate(
-                                          offset: Offset(
-                                            transform.offsetX.clamp(
-                                                  -maxX,
-                                                  maxX,
-                                                ) *
-                                                constraints.maxWidth /
-                                                kTimelineDesignWidth,
-                                            transform.offsetY.clamp(
-                                                  -maxY,
-                                                  maxY,
-                                                ) *
-                                                constraints.maxHeight /
-                                                kTimelineDesignHeight,
-                                          ),
-                                          child: _OverlayTransformBox(
-                                            isSelected: isSelected,
-                                            onTap: () =>
-                                                _selectOverlayClip(item),
-                                            onMoveStart: () {
-                                              _selectOverlayClip(item);
-                                              _beginSnappedDrag(transform);
-                                              ref
-                                                  .read(editorProvider.notifier)
-                                                  .beginTimelineGestureEdit();
-                                            },
-                                            onMoveUpdate: (delta) {
-                                              _updateOverlayTransform(item.clip.id, (
-                                                current,
-                                              ) {
-                                                final proposedX =
-                                                    (_dragSourceOffsetX ??
-                                                        current.offsetX) +
-                                                    delta.dx *
-                                                        kTimelineDesignWidth /
-                                                        constraints.maxWidth;
-                                                final proposedY =
-                                                    (_dragSourceOffsetY ??
-                                                        current.offsetY) +
-                                                    delta.dy *
-                                                        kTimelineDesignHeight /
-                                                        constraints.maxHeight;
-                                                _dragSourceOffsetX = proposedX;
-                                                _dragSourceOffsetY = proposedY;
-                                                final halfWidth =
-                                                    kTimelineDesignWidth *
-                                                    0.18 *
-                                                    current.scale;
-                                                final halfHeight =
-                                                    kTimelineDesignHeight *
-                                                    0.25 *
-                                                    current.scale;
-                                                return current.copyWith(
-                                                  offsetX: _snapDesignCoordinate(
-                                                    proposed: proposedX,
-                                                    designExtent:
-                                                        kTimelineDesignWidth,
-                                                    viewportExtent:
-                                                        constraints.maxWidth,
-                                                    objectHalfExtent: halfWidth,
-                                                  ).clamp(-maxX, maxX).toDouble(),
-                                                  offsetY: _snapDesignCoordinate(
-                                                    proposed: proposedY,
-                                                    designExtent:
-                                                        kTimelineDesignHeight,
-                                                    viewportExtent:
-                                                        constraints.maxHeight,
-                                                    objectHalfExtent:
-                                                        halfHeight,
-                                                  ).clamp(-maxY, maxY).toDouble(),
-                                                );
-                                              });
-                                            },
-                                            onMoveEnd: _endSnappedDrag,
-                                            onScaleFactorUpdate: (factor) {
-                                              _updateOverlayTransform(
-                                                item.clip.id,
-                                                (current) => current.copyWith(
-                                                  scale:
-                                                      ((_freeTransformStartScale ??
-                                                                  current
-                                                                      .scale) *
-                                                              factor)
-                                                          .clamp(0.2, 4.0)
-                                                          .toDouble(),
-                                                ),
-                                              );
-                                            },
-                                            onRotationUpdate: (rotation) {
-                                              _updateOverlayTransform(
-                                                item.clip.id,
-                                                (current) => current.copyWith(
-                                                  rotation:
-                                                      (_freeTransformStartRotation ??
-                                                          current.rotation) +
-                                                      rotation,
-                                                ),
-                                              );
-                                            },
-                                            // Media is painted once in the
-                                            // composed canvas below timeline
-                                            // effects. Keep only this clear
-                                            // edit target above the effects so
-                                            // selection chrome stays crisp and
-                                            // video controllers are not
-                                            // duplicated.
-                                            child: SizedBox(
-                                              key: ValueKey(
-                                                'preview-overlay-interaction-${item.clip.id}',
+                                          offset:
+                                              animation.offset +
+                                              Offset(
+                                                transform.offsetX *
+                                                    constraints.maxWidth /
+                                                    kTimelineDesignWidth,
+                                                transform.offsetY *
+                                                    constraints.maxHeight /
+                                                    kTimelineDesignHeight,
                                               ),
-                                              width:
-                                                  constraints.maxWidth * 0.36,
-                                              height:
-                                                  constraints.maxHeight * 0.5,
+                                          child: Transform.rotate(
+                                            angle:
+                                                transform.rotation +
+                                                animation.rotation,
+                                            child: Transform.scale(
+                                              scale:
+                                                  (transform.scale *
+                                                          animation.scale)
+                                                      .clamp(0.2, 4.0),
+                                              child: _OverlayTransformBox(
+                                                isSelected: isSelected,
+                                                onTap: () =>
+                                                    _selectOverlayClip(item),
+                                                onMoveStart: () {
+                                                  if (item.track.isLocked) {
+                                                    return;
+                                                  }
+                                                  _selectOverlayClip(item);
+                                                  _beginSnappedDrag(transform);
+                                                  ref
+                                                      .read(
+                                                        editorProvider.notifier,
+                                                      )
+                                                      .beginTimelineGestureEdit();
+                                                },
+                                                onMoveUpdate: (delta) {
+                                                  if (item.track.isLocked) {
+                                                    return;
+                                                  }
+                                                  _updateOverlayTransform(item.clip.id, (
+                                                    current,
+                                                  ) {
+                                                    final proposedX =
+                                                        (_dragSourceOffsetX ??
+                                                            current.offsetX) +
+                                                        delta.dx *
+                                                            kTimelineDesignWidth /
+                                                            constraints
+                                                                .maxWidth;
+                                                    final proposedY =
+                                                        (_dragSourceOffsetY ??
+                                                            current.offsetY) +
+                                                        delta.dy *
+                                                            kTimelineDesignHeight /
+                                                            constraints
+                                                                .maxHeight;
+                                                    _dragSourceOffsetX =
+                                                        proposedX;
+                                                    _dragSourceOffsetY =
+                                                        proposedY;
+                                                    final halfWidth =
+                                                        interactionSize.width /
+                                                        constraints.maxWidth *
+                                                        kTimelineDesignWidth /
+                                                        2 *
+                                                        current.scale;
+                                                    final halfHeight =
+                                                        interactionSize.height /
+                                                        constraints.maxHeight *
+                                                        kTimelineDesignHeight /
+                                                        2 *
+                                                        current.scale;
+                                                    return current.copyWith(
+                                                      offsetX: _snapDesignCoordinate(
+                                                        proposed: proposedX,
+                                                        designExtent:
+                                                            kTimelineDesignWidth,
+                                                        viewportExtent:
+                                                            constraints
+                                                                .maxWidth,
+                                                        objectHalfExtent:
+                                                            halfWidth,
+                                                      ).clamp(-maxX, maxX).toDouble(),
+                                                      offsetY: _snapDesignCoordinate(
+                                                        proposed: proposedY,
+                                                        designExtent:
+                                                            kTimelineDesignHeight,
+                                                        viewportExtent:
+                                                            constraints
+                                                                .maxHeight,
+                                                        objectHalfExtent:
+                                                            halfHeight,
+                                                      ).clamp(-maxY, maxY).toDouble(),
+                                                    );
+                                                  });
+                                                },
+                                                onMoveEnd: () {
+                                                  if (_freeTransformStartScale !=
+                                                      null) {
+                                                    _endSnappedDrag();
+                                                  }
+                                                },
+                                                onScaleFactorUpdate: (factor) {
+                                                  if (item.track.isLocked) {
+                                                    return;
+                                                  }
+                                                  _updateOverlayTransform(
+                                                    item.clip.id,
+                                                    (
+                                                      current,
+                                                    ) => current.copyWith(
+                                                      scale:
+                                                          ((_freeTransformStartScale ??
+                                                                      current
+                                                                          .scale) *
+                                                                  factor)
+                                                              .clamp(0.2, 4.0)
+                                                              .toDouble(),
+                                                    ),
+                                                  );
+                                                },
+                                                onRotationUpdate: (rotation) {
+                                                  if (item.track.isLocked) {
+                                                    return;
+                                                  }
+                                                  _updateOverlayTransform(
+                                                    item.clip.id,
+                                                    (
+                                                      current,
+                                                    ) => current.copyWith(
+                                                      rotation:
+                                                          (_freeTransformStartRotation ??
+                                                              current
+                                                                  .rotation) +
+                                                          rotation,
+                                                    ),
+                                                  );
+                                                },
+                                                // Media is painted once in the
+                                                // composition. This matching
+                                                // target follows its real
+                                                // fitted, scaled and rotated
+                                                // pixels without another media
+                                                // decoder.
+                                                child: SizedBox(
+                                                  key: ValueKey(
+                                                    'preview-overlay-interaction-${item.clip.id}',
+                                                  ),
+                                                  width: interactionSize.width,
+                                                  height:
+                                                      interactionSize.height,
+                                                ),
+                                              ),
                                             ),
                                           ),
                                         ),
@@ -7404,7 +7514,7 @@ class _OverlayTransformBoxState extends State<_OverlayTransformBox> {
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
-      behavior: HitTestBehavior.translucent,
+      behavior: HitTestBehavior.opaque,
       onTap: widget.onTap,
       onScaleStart: (_) {
         widget.onMoveStart();
@@ -7418,18 +7528,22 @@ class _OverlayTransformBoxState extends State<_OverlayTransformBox> {
       child: Stack(
         clipBehavior: Clip.none,
         children: [
-          AnimatedContainer(
-            duration: const Duration(milliseconds: 100),
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-            decoration: BoxDecoration(
-              border: Border.all(
-                color: widget.isSelected
-                    ? kAccent.withValues(alpha: 0.8)
-                    : Colors.transparent,
+          widget.child,
+          Positioned.fill(
+            child: IgnorePointer(
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 100),
+                decoration: BoxDecoration(
+                  border: Border.all(
+                    color: widget.isSelected
+                        ? kAccent.withValues(alpha: 0.9)
+                        : Colors.transparent,
+                    width: widget.isSelected ? 1.5 : 0,
+                  ),
+                  borderRadius: BorderRadius.circular(8),
+                ),
               ),
-              borderRadius: BorderRadius.circular(8),
             ),
-            child: widget.child,
           ),
         ],
       ),

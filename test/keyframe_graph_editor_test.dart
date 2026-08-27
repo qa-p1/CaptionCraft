@@ -59,6 +59,18 @@ void main() {
     );
 
     expect(find.byKey(const ValueKey('keyframe_graph_canvas')), findsOneWidget);
+    for (final key in const [
+      'keyframe_curve_hold',
+      'keyframe_curve_linear',
+      'keyframe_curve_easeInOut',
+      'keyframe_curve_sineOut',
+      'keyframe_curve_quadInOut',
+      'keyframe_curve_cubicOut',
+      'keyframe_curve_backOut',
+      'keyframe_curve_custom',
+    ]) {
+      expect(find.byKey(ValueKey(key)), findsOneWidget);
+    }
     await tester.tap(find.text('Add'));
     await tester.pump();
 

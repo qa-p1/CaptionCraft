@@ -151,6 +151,17 @@ enum TimelineKeyframeProperty {
   blurStrength,
 }
 
+/// Transform channels captured together by the editor's state-keyframe flow.
+/// Keeping this list canonical prevents preview gestures, the dock and export
+/// from disagreeing about what constitutes a visual state.
+const Set<TimelineKeyframeProperty> kTimelineTransformKeyframeProperties = {
+  TimelineKeyframeProperty.opacity,
+  TimelineKeyframeProperty.scale,
+  TimelineKeyframeProperty.rotation,
+  TimelineKeyframeProperty.positionX,
+  TimelineKeyframeProperty.positionY,
+};
+
 /// Interpolation applied by a keyframe to the segment that follows it.
 enum TimelineKeyframeInterpolation {
   hold,
@@ -1453,6 +1464,26 @@ extension TimelineClipCapabilities on TimelineClip {
   bool get canCarryAudio => type.canCarryAudio;
 
   bool get hasKeyframes => keyframes.isNotEmpty;
+
+  bool get hasTransformKeyframes => keyframes.any(
+    (keyframe) =>
+        kTimelineTransformKeyframeProperties.contains(keyframe.property),
+  );
+
+  bool get hasVolumeKeyframes => keyframes.any(
+    (keyframe) => keyframe.property == TimelineKeyframeProperty.volume,
+  );
+
+  /// Unique clip-relative state times used by previous/next navigation.
+  List<Duration> get keyframeStateTimes {
+    final times = keyframes.map((keyframe) => keyframe.time).toSet().toList()
+      ..sort();
+    return times;
+  }
+
+  bool hasKeyframeStateAt(Duration relativeTime) => keyframes.any(
+    (keyframe) => keyframe.time.inMilliseconds == relativeTime.inMilliseconds,
+  );
 
   bool get hasAdvancedProcessing =>
       freezeFrame ||

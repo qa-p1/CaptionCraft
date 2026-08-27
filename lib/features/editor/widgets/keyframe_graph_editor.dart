@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import '../../../core/theme/app_theme.dart';
+import '../models/keyframe_curve_presets.dart';
 import '../models/timeline_models.dart';
 
 typedef KeyframeGraphChanged =
@@ -227,6 +228,18 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
     };
     _replaceFrame(
       selected.copyWith(interpolation: interpolation, curve: curve),
+      recordHistory: true,
+    );
+  }
+
+  void _setCurvePreset(TimelineCurvePreset preset) {
+    final selected = _selectedFrame;
+    if (selected == null) return;
+    _replaceFrame(
+      selected.copyWith(
+        interpolation: preset.interpolation,
+        curve: preset.curve,
+      ),
       recordHistory: true,
     );
   }
@@ -630,16 +643,32 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
             scrollDirection: Axis.horizontal,
             child: Row(
               children: [
-                for (final interpolation
-                    in TimelineKeyframeInterpolation.values)
+                for (final preset in timelineCurvePresets)
                   Padding(
                     padding: const EdgeInsets.only(right: 7),
                     child: ChoiceChip(
-                      label: Text(_interpolationLabel(interpolation)),
-                      selected: selected.interpolation == interpolation,
-                      onSelected: (_) => _setInterpolation(interpolation),
+                      key: ValueKey('keyframe_curve_${preset.id}'),
+                      label: Text(preset.label),
+                      selected: preset.matches(selected),
+                      onSelected: (_) => _setCurvePreset(preset),
                     ),
                   ),
+                Padding(
+                  padding: const EdgeInsets.only(right: 7),
+                  child: ChoiceChip(
+                    key: const ValueKey('keyframe_curve_custom'),
+                    label: const Text('Custom'),
+                    selected:
+                        selected.interpolation ==
+                            TimelineKeyframeInterpolation.cubicBezier &&
+                        !timelineCurvePresets.any(
+                          (preset) => preset.matches(selected),
+                        ),
+                    onSelected: (_) => _setInterpolation(
+                      TimelineKeyframeInterpolation.cubicBezier,
+                    ),
+                  ),
+                ),
               ],
             ),
           ),
@@ -1026,17 +1055,6 @@ String _propertyLabel(TimelineKeyframeProperty property) {
     TimelineKeyframeProperty.positionY => 'Position Y',
     TimelineKeyframeProperty.volume => 'Volume',
     TimelineKeyframeProperty.blurStrength => 'Blur strength',
-  };
-}
-
-String _interpolationLabel(TimelineKeyframeInterpolation interpolation) {
-  return switch (interpolation) {
-    TimelineKeyframeInterpolation.hold => 'Hold',
-    TimelineKeyframeInterpolation.linear => 'Linear',
-    TimelineKeyframeInterpolation.easeIn => 'Ease in',
-    TimelineKeyframeInterpolation.easeOut => 'Ease out',
-    TimelineKeyframeInterpolation.easeInOut => 'Ease in/out',
-    TimelineKeyframeInterpolation.cubicBezier => 'Custom',
   };
 }
 
