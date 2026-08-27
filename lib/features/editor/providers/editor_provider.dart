@@ -23,6 +23,7 @@ class EditorState {
   final bool canUndo;
   final bool canRedo;
   final int editRevision;
+  final bool isTimelineGestureEditing;
   final Set<String> selectedClipIds;
 
   const EditorState({
@@ -39,6 +40,7 @@ class EditorState {
     this.canUndo = false,
     this.canRedo = false,
     this.editRevision = 0,
+    this.isTimelineGestureEditing = false,
     this.selectedClipIds = const <String>{},
   });
 
@@ -56,6 +58,7 @@ class EditorState {
     bool? canUndo,
     bool? canRedo,
     int? editRevision,
+    bool? isTimelineGestureEditing,
     Set<String>? selectedClipIds,
     bool clearTrackSelection = false,
     bool clearClipSelection = false,
@@ -78,6 +81,8 @@ class EditorState {
       canUndo: canUndo ?? this.canUndo,
       canRedo: canRedo ?? this.canRedo,
       editRevision: editRevision ?? this.editRevision,
+      isTimelineGestureEditing:
+          isTimelineGestureEditing ?? this.isTimelineGestureEditing,
       selectedClipIds: selectedClipIds ?? this.selectedClipIds,
     );
   }
@@ -115,6 +120,23 @@ class _EditorHistorySnapshot {
     required this.sequence,
     required this.branch,
   });
+
+  _EditorHistorySnapshot withHistory({
+    required int sequence,
+    required int branch,
+  }) {
+    return _EditorHistorySnapshot(
+      timeline: timeline,
+      subtitleEntries: subtitleEntries,
+      subtitleStyle: subtitleStyle,
+      selectedTrackId: selectedTrackId,
+      selectedClipId: selectedClipId,
+      selectedClipIds: selectedClipIds,
+      selectedSubtitleId: selectedSubtitleId,
+      sequence: sequence,
+      branch: branch,
+    );
+  }
 }
 
 class EditorNotifier extends StateNotifier<EditorState> {
@@ -123,6 +145,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
   final List<_EditorHistorySnapshot> _redoStack = [];
   bool _isTimelineGestureEditing = false;
   bool _timelineChangedDuringGesture = false;
+  _EditorHistorySnapshot? _timelineGestureBaseline;
   bool _isRestoringEditorSubtitleState = false;
   late final EditorHistoryClock _historyClock = _ref.read(
     editorHistoryClockProvider,
@@ -130,9 +153,11 @@ class EditorNotifier extends StateNotifier<EditorState> {
 
   static const int _maxHistoryDepth = 100;
 
-  bool get canUndo => _undoStack.isNotEmpty;
+  bool get canUndo => !_isTimelineGestureEditing && _undoStack.isNotEmpty;
   bool get canRedo =>
-      _redoStack.isNotEmpty && _redoStack.last.branch == _historyClock.branch;
+      !_isTimelineGestureEditing &&
+      _redoStack.isNotEmpty &&
+      _redoStack.last.branch == _historyClock.branch;
   int? get latestUndoSequence => canUndo ? _undoStack.last.sequence : null;
   int? get latestRedoSequence => canRedo ? _redoStack.last.sequence : null;
 
@@ -152,6 +177,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
     _redoStack.clear();
     _isTimelineGestureEditing = false;
     _timelineChangedDuringGesture = false;
+    _timelineGestureBaseline = null;
     final currentSubtitles = _ref.read(subtitleProvider);
     final normalizedTimeline =
         (currentSubtitles.entries.isEmpty
@@ -166,9 +192,11 @@ class EditorNotifier extends StateNotifier<EditorState> {
       projectId: projectId,
       projectName: projectName,
       timeline: normalizedTimeline,
+      isSnappingEnabled: normalizedTimeline.workspaceSettings.snapping.enabled,
       canUndo: false,
       canRedo: false,
       editRevision: 0,
+      isTimelineGestureEditing: false,
       clearTrackSelection: true,
       clearClipSelection: true,
       selectedClipIds: const <String>{},
@@ -195,18 +223,19 @@ class EditorNotifier extends StateNotifier<EditorState> {
     final normalizedTimeline = timeline.withoutTrackOverlaps();
     if (identical(state.timeline, normalizedTimeline)) return;
     if (_isTimelineGestureEditing) {
-      // Gesture callers pass recordHistory:false for their live intermediate
-      // values. The first actual change still needs one baseline snapshot so
-      // the completed slider/drag remains a single undoable action.
-      if (!_timelineChangedDuringGesture) _pushUndoSnapshot();
+      _timelineGestureBaseline ??= _captureSnapshot(
+        sequence: 0,
+        branch: _historyClock.branch,
+      );
       _timelineChangedDuringGesture = true;
     } else if (recordHistory) {
       _pushUndoSnapshot();
     }
     state = state.copyWith(
       timeline: normalizedTimeline,
-      canUndo: canUndo,
-      canRedo: canRedo,
+      isSnappingEnabled: normalizedTimeline.workspaceSettings.snapping.enabled,
+      canUndo: _isTimelineGestureEditing ? false : canUndo,
+      canRedo: _isTimelineGestureEditing ? false : canRedo,
       // Preview widgets still rebuild from the live timeline during a gesture,
       // but expensive media re-seeks are deferred until the edit is committed.
       editRevision: _isTimelineGestureEditing
@@ -274,31 +303,72 @@ class EditorNotifier extends StateNotifier<EditorState> {
       timeline: normalizedTimeline,
       canUndo: canUndo,
       canRedo: canRedo,
+      isTimelineGestureEditing: false,
       editRevision: state.editRevision + 1,
     );
   }
 
   void beginTimelineGestureEdit() {
     if (_isTimelineGestureEditing) return;
+    final baseline = _captureSnapshot(
+      sequence: 0,
+      branch: _historyClock.branch,
+    );
     _isTimelineGestureEditing = true;
     _timelineChangedDuringGesture = false;
+    _timelineGestureBaseline = baseline;
+    state = state.copyWith(
+      canUndo: false,
+      canRedo: false,
+      isTimelineGestureEditing: true,
+    );
   }
 
   void endTimelineGestureEdit() {
+    if (!_isTimelineGestureEditing) return;
     final shouldNotifyPreview = _timelineChangedDuringGesture;
+    final baseline = _timelineGestureBaseline;
     _isTimelineGestureEditing = false;
     _timelineChangedDuringGesture = false;
+    _timelineGestureBaseline = null;
+    if (shouldNotifyPreview && baseline != null) {
+      final sequence = _historyClock.recordAction();
+      _undoStack.add(
+        baseline.withHistory(sequence: sequence, branch: _historyClock.branch),
+      );
+      if (_undoStack.length > _maxHistoryDepth) _undoStack.removeAt(0);
+      _redoStack.clear();
+    }
     state = state.copyWith(
       canUndo: canUndo,
       canRedo: canRedo,
+      isTimelineGestureEditing: false,
       editRevision: shouldNotifyPreview
           ? state.editRevision + 1
           : state.editRevision,
     );
   }
 
+  void cancelTimelineGestureEdit() {
+    if (!_isTimelineGestureEditing) return;
+    final baseline = _timelineGestureBaseline;
+    final changed = _timelineChangedDuringGesture;
+    _isTimelineGestureEditing = false;
+    _timelineChangedDuringGesture = false;
+    _timelineGestureBaseline = null;
+    if (changed && baseline != null) {
+      _restoreSnapshot(baseline);
+      return;
+    }
+    state = state.copyWith(
+      canUndo: canUndo,
+      canRedo: canRedo,
+      isTimelineGestureEditing: false,
+    );
+  }
+
   void undo() {
-    if (!canUndo) return;
+    if (_isTimelineGestureEditing || !canUndo) return;
     final previous = _undoStack.removeLast();
     final current = _captureSnapshot(
       sequence: _historyClock.recordTraversal(),
@@ -309,7 +379,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
   }
 
   void redo() {
-    if (!canRedo) return;
+    if (_isTimelineGestureEditing || !canRedo) return;
     final next = _redoStack.removeLast();
     final current = _captureSnapshot(
       sequence: _historyClock.recordTraversal(),
@@ -324,6 +394,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
     _redoStack.clear();
     _isTimelineGestureEditing = false;
     _timelineChangedDuringGesture = false;
+    _timelineGestureBaseline = null;
     _refreshHistoryFlags();
   }
 
@@ -466,16 +537,47 @@ class EditorNotifier extends StateNotifier<EditorState> {
     return true;
   }
 
+  bool updateTrack(
+    String trackId,
+    TimelineTrack Function(TimelineTrack track) mapper, {
+    bool recordHistory = true,
+  }) {
+    final current = state.timeline.tracks
+        .where((track) => track.id == trackId)
+        .firstOrNull;
+    if (current == null || current.isLocked) return false;
+    final updated = mapper(current);
+    setTimeline(
+      state.timeline.copyWith(
+        tracks: state.timeline.tracks
+            .map((track) => track.id == trackId ? updated : track)
+            .toList(),
+      ),
+      recordHistory: recordHistory,
+    );
+    return true;
+  }
+
   bool upsertKeyframe({
     required String clipId,
     required TimelineKeyframeProperty property,
     required Duration time,
     required double value,
+    TimelineKeyframeInterpolation? interpolation,
+    TimelineBezierCurve? curve,
   }) {
     return updateClip(clipId, (clip) {
       final relativeMs = time.inMilliseconds
           .clamp(0, math.max(0, clip.duration.inMilliseconds))
           .toInt();
+      TimelineKeyframe? existing;
+      for (final keyframe in clip.keyframes) {
+        if (keyframe.property == property &&
+            keyframe.time.inMilliseconds == relativeMs) {
+          existing = keyframe;
+          break;
+        }
+      }
       final next = [...clip.keyframes]
         ..removeWhere(
           (keyframe) =>
@@ -483,13 +585,286 @@ class EditorNotifier extends StateNotifier<EditorState> {
               keyframe.time.inMilliseconds == relativeMs,
         )
         ..add(
-          TimelineKeyframe(
-            time: Duration(milliseconds: relativeMs),
-            property: property,
-            value: value,
-          ),
+          existing?.copyWith(
+                time: Duration(milliseconds: relativeMs),
+                value: value,
+                interpolation: interpolation,
+                curve: curve,
+              ) ??
+              TimelineKeyframe(
+                time: Duration(milliseconds: relativeMs),
+                property: property,
+                value: value,
+                interpolation:
+                    interpolation ?? TimelineKeyframeInterpolation.linear,
+                curve: curve ?? TimelineBezierCurve.linear,
+              ),
         )
         ..sort((a, b) => a.time.compareTo(b.time));
+      return clip.copyWith(keyframes: next);
+    });
+  }
+
+  Duration _snappedKeyframeTime(TimelineClip clip, Duration absolutePosition) {
+    final frameRate = state.timeline.workspaceSettings.frameRate.clamp(1, 120);
+    final frameUs = Duration.microsecondsPerSecond / frameRate;
+    final relativeUs = (absolutePosition - clip.startTime).inMicroseconds.clamp(
+      0,
+      math.max(0, clip.duration.inMicroseconds),
+    );
+    final snappedUs = (relativeUs / frameUs).round() * frameUs;
+    return Duration(
+      microseconds: snappedUs
+          .round()
+          .clamp(0, math.max(0, clip.duration.inMicroseconds))
+          .toInt(),
+    );
+  }
+
+  TimelineClip _upsertKeyframeValues(
+    TimelineClip clip, {
+    required Duration time,
+    required Map<TimelineKeyframeProperty, double> values,
+    TimelineKeyframeInterpolation? interpolation,
+    TimelineBezierCurve? curve,
+  }) {
+    final next = [...clip.keyframes];
+    for (final entry in values.entries) {
+      TimelineKeyframe? existing;
+      for (final keyframe in next) {
+        if (keyframe.property == entry.key &&
+            keyframe.time.inMilliseconds == time.inMilliseconds) {
+          existing = keyframe;
+          break;
+        }
+      }
+      next.removeWhere(
+        (keyframe) =>
+            keyframe.property == entry.key &&
+            keyframe.time.inMilliseconds == time.inMilliseconds,
+      );
+      next.add(
+        existing?.copyWith(
+              value: entry.value,
+              interpolation: interpolation,
+              curve: curve,
+            ) ??
+            TimelineKeyframe(
+              time: time,
+              property: entry.key,
+              value: entry.value,
+              interpolation:
+                  interpolation ?? TimelineKeyframeInterpolation.linear,
+              curve: curve ?? TimelineBezierCurve.linear,
+            ),
+      );
+    }
+    next.sort((a, b) {
+      final timeOrder = a.time.compareTo(b.time);
+      return timeOrder != 0
+          ? timeOrder
+          : a.property.index.compareTo(b.property.index);
+    });
+    return clip.copyWith(keyframes: next);
+  }
+
+  /// Captures every animatable value supported by the clip in one undoable
+  /// state. A later state automatically interpolates from this snapshot.
+  bool upsertKeyframeState({
+    required String clipId,
+    required Duration absolutePosition,
+    TimelineKeyframeInterpolation? interpolation,
+    TimelineBezierCurve? curve,
+  }) {
+    final targetClip = state.timeline.tracks
+        .expand((track) => track.clips)
+        .where((clip) => clip.id == clipId)
+        .firstOrNull;
+    final hasAudio = state.timeline.tracks.any(
+      (track) => track.clips.any(
+        (clip) => clip.id == clipId && state.timeline.clipHasAudio(clip),
+      ),
+    );
+    if (targetClip == null ||
+        (!targetClip.supportsTransformKeyframes &&
+            !hasAudio &&
+            !targetClip.blur.isEnabled)) {
+      return false;
+    }
+    return updateClip(clipId, (clip) {
+      final time = _snappedKeyframeTime(clip, absolutePosition);
+      final resolvedPosition = clip.startTime + time;
+      final transform = clip.transformAt(resolvedPosition);
+      final values = <TimelineKeyframeProperty, double>{
+        if (clip.supportsTransformKeyframes) ...{
+          TimelineKeyframeProperty.opacity: transform.opacity,
+          TimelineKeyframeProperty.scale: transform.scale,
+          TimelineKeyframeProperty.rotation: transform.rotation,
+          TimelineKeyframeProperty.positionX: transform.offsetX,
+          TimelineKeyframeProperty.positionY: transform.offsetY,
+        },
+        if (hasAudio)
+          TimelineKeyframeProperty.volume: clip.volumeAt(resolvedPosition),
+        if (clip.blur.isEnabled)
+          TimelineKeyframeProperty.blurStrength: clip
+              .blurAt(resolvedPosition)
+              .safeStrength,
+      };
+      return _upsertKeyframeValues(
+        clip,
+        time: time,
+        values: values,
+        interpolation: interpolation,
+        curve: curve,
+      );
+    });
+  }
+
+  /// Direct manipulation edits the base transform until the first transform
+  /// state exists. Once armed, every later gesture writes a complete state at
+  /// the playhead so position, scale, rotation and opacity stay synchronized.
+  bool updateClipTransformAt({
+    required String clipId,
+    required Duration absolutePosition,
+    required TimelineTransform Function(TimelineTransform current) mapper,
+    bool recordHistory = true,
+  }) {
+    final hasAudio = state.timeline.tracks.any(
+      (track) => track.clips.any(
+        (clip) => clip.id == clipId && state.timeline.clipHasAudio(clip),
+      ),
+    );
+    return updateClip(clipId, (clip) {
+      final current = clip.supportsTransformKeyframes
+          ? clip.transformAt(absolutePosition)
+          : clip.transform;
+      final updated = mapper(current);
+      if (!clip.supportsTransformKeyframes || !clip.hasTransformKeyframes) {
+        return clip.copyWith(transform: updated);
+      }
+      final time = _snappedKeyframeTime(clip, absolutePosition);
+      return _upsertKeyframeValues(
+        clip,
+        time: time,
+        values: {
+          TimelineKeyframeProperty.opacity: updated.opacity,
+          TimelineKeyframeProperty.scale: updated.scale,
+          TimelineKeyframeProperty.rotation: updated.rotation,
+          TimelineKeyframeProperty.positionX: updated.offsetX,
+          TimelineKeyframeProperty.positionY: updated.offsetY,
+          if (hasAudio)
+            TimelineKeyframeProperty.volume: clip.volumeAt(absolutePosition),
+          if (clip.blur.isEnabled)
+            TimelineKeyframeProperty.blurStrength: clip
+                .blurAt(absolutePosition)
+                .safeStrength,
+        },
+      );
+    }, recordHistory: recordHistory);
+  }
+
+  bool updateClipVolumeAt({
+    required String clipId,
+    required Duration absolutePosition,
+    required double volume,
+    bool recordHistory = true,
+  }) {
+    return updateClip(clipId, (clip) {
+      final safeVolume = volume.clamp(0.0, 2.0).toDouble();
+      if (!clip.hasVolumeKeyframes) {
+        return clip.copyWith(
+          audioMix: clip.audioMix.copyWith(volume: safeVolume),
+        );
+      }
+      final time = _snappedKeyframeTime(clip, absolutePosition);
+      final transform = clip.transformAt(absolutePosition);
+      return _upsertKeyframeValues(
+        clip,
+        time: time,
+        values: {
+          if (clip.hasTransformKeyframes) ...{
+            TimelineKeyframeProperty.opacity: transform.opacity,
+            TimelineKeyframeProperty.scale: transform.scale,
+            TimelineKeyframeProperty.rotation: transform.rotation,
+            TimelineKeyframeProperty.positionX: transform.offsetX,
+            TimelineKeyframeProperty.positionY: transform.offsetY,
+          },
+          TimelineKeyframeProperty.volume: safeVolume,
+          if (clip.blur.isEnabled)
+            TimelineKeyframeProperty.blurStrength: clip
+                .blurAt(absolutePosition)
+                .safeStrength,
+        },
+      );
+    }, recordHistory: recordHistory);
+  }
+
+  bool updateClipBlurStrengthAt({
+    required String clipId,
+    required Duration absolutePosition,
+    required double strength,
+    bool recordHistory = true,
+  }) {
+    return updateClip(clipId, (clip) {
+      final safeStrength = strength.clamp(0.0, 30.0).toDouble();
+      final hasBlurKeyframes = clip.keyframes.any(
+        (keyframe) =>
+            keyframe.property == TimelineKeyframeProperty.blurStrength,
+      );
+      if (!hasBlurKeyframes) {
+        return clip.copyWith(blur: clip.blur.copyWith(strength: safeStrength));
+      }
+      final time = _snappedKeyframeTime(clip, absolutePosition);
+      final transform = clip.transformAt(absolutePosition);
+      return _upsertKeyframeValues(
+        clip,
+        time: time,
+        values: {
+          if (clip.hasTransformKeyframes) ...{
+            TimelineKeyframeProperty.opacity: transform.opacity,
+            TimelineKeyframeProperty.scale: transform.scale,
+            TimelineKeyframeProperty.rotation: transform.rotation,
+            TimelineKeyframeProperty.positionX: transform.offsetX,
+            TimelineKeyframeProperty.positionY: transform.offsetY,
+          },
+          if (clip.hasVolumeKeyframes)
+            TimelineKeyframeProperty.volume: clip.volumeAt(absolutePosition),
+          TimelineKeyframeProperty.blurStrength: safeStrength,
+        },
+      );
+    }, recordHistory: recordHistory);
+  }
+
+  bool removeKeyframeState({
+    required String clipId,
+    required Duration absolutePosition,
+  }) {
+    return updateClip(clipId, (clip) {
+      final time = _snappedKeyframeTime(clip, absolutePosition);
+      final next = clip.keyframes
+          .where(
+            (keyframe) => keyframe.time.inMilliseconds != time.inMilliseconds,
+          )
+          .toList();
+      return clip.copyWith(keyframes: next);
+    });
+  }
+
+  bool setKeyframeStateCurve({
+    required String clipId,
+    required Duration absolutePosition,
+    required TimelineKeyframeInterpolation interpolation,
+    required TimelineBezierCurve curve,
+  }) {
+    return updateClip(clipId, (clip) {
+      final time = _snappedKeyframeTime(clip, absolutePosition);
+      final next = clip.keyframes
+          .map(
+            (keyframe) => keyframe.time.inMilliseconds == time.inMilliseconds
+                ? keyframe.copyWith(interpolation: interpolation, curve: curve)
+                : keyframe,
+          )
+          .toList();
       return clip.copyWith(keyframes: next);
     });
   }
@@ -537,6 +912,8 @@ class EditorNotifier extends StateNotifier<EditorState> {
       name: '${source.name} copy',
       type: source.type,
       section: source.section,
+      audioGain: source.audioGain,
+      audioPan: source.audioPan,
       clips: source.clips
           .map(
             (clip) => clip.copyWith(
@@ -603,7 +980,11 @@ class EditorNotifier extends StateNotifier<EditorState> {
   }
 
   void setSnappingEnabled(bool enabled) {
-    state = state.copyWith(isSnappingEnabled: enabled);
+    setWorkspaceSettings(
+      (settings) => settings.copyWith(
+        snapping: settings.snapping.copyWith(enabled: enabled),
+      ),
+    );
   }
 
   void reset() {
@@ -611,6 +992,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
     _redoStack.clear();
     _isTimelineGestureEditing = false;
     _timelineChangedDuringGesture = false;
+    _timelineGestureBaseline = null;
     state = const EditorState();
   }
 
@@ -646,6 +1028,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
   void _restoreSnapshot(_EditorHistorySnapshot snapshot) {
     _isTimelineGestureEditing = false;
     _timelineChangedDuringGesture = false;
+    _timelineGestureBaseline = null;
     _restoreEditorSubtitleState(
       entries: snapshot.subtitleEntries,
       globalStyle: snapshot.subtitleStyle,
@@ -653,6 +1036,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
     );
     state = state.copyWith(
       timeline: snapshot.timeline,
+      isSnappingEnabled: snapshot.timeline.workspaceSettings.snapping.enabled,
       selectedTrackId: snapshot.selectedTrackId,
       selectedClipId: snapshot.selectedClipId,
       selectedClipIds: snapshot.selectedClipIds,
@@ -660,12 +1044,17 @@ class EditorNotifier extends StateNotifier<EditorState> {
       clearClipSelection: snapshot.selectedClipId == null,
       canUndo: canUndo,
       canRedo: canRedo,
+      isTimelineGestureEditing: false,
       editRevision: state.editRevision + 1,
     );
   }
 
   void _refreshHistoryFlags() {
-    state = state.copyWith(canUndo: canUndo, canRedo: canRedo);
+    state = state.copyWith(
+      canUndo: canUndo,
+      canRedo: canRedo,
+      isTimelineGestureEditing: _isTimelineGestureEditing,
+    );
   }
 
   void _restoreEditorSubtitleState({

@@ -8,9 +8,12 @@ import 'package:caption_craft/features/editor/models/subtitle_entry.dart';
 import 'package:caption_craft/features/editor/models/subtitle_style_model.dart';
 import 'package:caption_craft/features/editor/models/timeline_models.dart';
 import 'package:caption_craft/features/editor/models/word_timing.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   group('caption export safeguards', () {
     test('bounds imported cues to the playable composition', () {
       final inside = SubtitleEntry(
@@ -186,6 +189,76 @@ void main() {
         ),
       ], const SubtitleStyleModel(fontFamily: 'Arial'));
       expect(document, contains('Style: Default,Roboto,'));
+    });
+
+    test('timeline text rotation and opacity survive ASS export', () async {
+      const pathProviderChannel = MethodChannel(
+        'plugins.flutter.io/path_provider',
+      );
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            pathProviderChannel,
+            (_) async => Directory.systemTemp.path,
+          );
+      addTearDown(() {
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(pathProviderChannel, null);
+      });
+      final clip = TimelineClip(
+        id: 'title',
+        trackId: 'text-track',
+        type: TimelineTrackType.text,
+        label: 'Title',
+        text: 'Title',
+        startTime: Duration.zero,
+        endTime: const Duration(seconds: 2),
+        transform: const TimelineTransform(
+          rotation: 0.7853981633974483,
+          opacity: 0.5,
+          scale: 1.25,
+          offsetX: 40,
+          offsetY: -20,
+        ),
+        subtitleStyle: const SubtitleStyleModel(
+          position: SubtitlePosition.center,
+          fontSize: 32,
+        ),
+      );
+      final path = await TimelineExportService.buildAssTrack(
+        timeline: EditorTimeline(
+          tracks: [
+            TimelineTrack(
+              id: 'text-track',
+              name: 'Text',
+              type: TimelineTrackType.text,
+              section: TimelineTrackSection.textSubtitle,
+              clips: [clip],
+            ),
+          ],
+        ),
+        subtitleEntries: const [],
+        globalSubtitleStyle: const SubtitleStyleModel(),
+        settings: const ExportSettings(),
+        canvasSize: const ExportCanvasSize(
+          width: 1920,
+          height: 1080,
+          framesPerSecond: 30,
+        ),
+      );
+      addTearDown(() async {
+        if (path != null && await File(path).exists()) {
+          await File(path).delete();
+        }
+      });
+
+      final document = await File(path!).readAsString();
+      final style = document
+          .split(RegExp(r'\r?\n'))
+          .singleWhere((line) => line.startsWith('Style: Cue0,'))
+          .split(',');
+      expect(style[3], '&H7FFFFFFF');
+      expect(style[5], '&H7F000000');
+      expect(style[14], '45');
     });
   });
 

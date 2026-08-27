@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/gestures.dart';
@@ -7,6 +8,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../../core/theme/app_theme.dart';
+import '../../../core/utils/timeline_waveform_cache.dart';
 import '../../../shared/widgets/snack_bar_helper.dart';
 import '../models/subtitle_entry.dart';
 import '../models/subtitle_style_model.dart';
@@ -14,6 +16,8 @@ import '../models/timeline_models.dart';
 import '../providers/editor_provider.dart';
 import '../providers/playback_provider.dart';
 import '../providers/subtitle_provider.dart';
+import '../services/timeline_keyframe_editing.dart';
+import '../services/timeline_snapping.dart';
 import 'resizable_editor_sheet.dart';
 
 @visibleForTesting
@@ -53,6 +57,59 @@ Duration timelineRulerLabelIntervalForTesting({
   return const Duration(hours: 1);
 }
 
+String _snapTargetLabel(TimelineSnapTarget target) {
+  return switch (target) {
+    TimelineSnapTarget.frames => 'Frame boundaries',
+    TimelineSnapTarget.playhead => 'Playhead',
+    TimelineSnapTarget.clipEdges => 'Clip starts and ends',
+    TimelineSnapTarget.markers => 'Markers and chapters',
+    TimelineSnapTarget.beats => 'Beat markers',
+    TimelineSnapTarget.keyframes => 'Keyframes',
+    TimelineSnapTarget.selectionBoundaries => 'Selection boundaries',
+    TimelineSnapTarget.workAreaBoundaries => 'Work-area boundaries',
+  };
+}
+
+/// Selects only clips intersecting a horizontally visible timeline window.
+/// [sortedClips] must be ordered by start time and non-overlapping, which is
+/// guaranteed by the editor's normalized lane model.
+@visibleForTesting
+List<TimelineClip> timelineVisibleClipsForTesting({
+  required List<TimelineClip> sortedClips,
+  required Duration viewportStart,
+  required Duration viewportEnd,
+  Iterable<TimelineClip> pinnedClips = const [],
+}) {
+  if (sortedClips.isEmpty) return pinnedClips.toList(growable: false);
+  final start = viewportStart <= viewportEnd ? viewportStart : viewportEnd;
+  final end = viewportStart <= viewportEnd ? viewportEnd : viewportStart;
+  var lower = 0;
+  var upper = sortedClips.length;
+  while (lower < upper) {
+    final middle = lower + ((upper - lower) >> 1);
+    if (sortedClips[middle].startTime <= start) {
+      lower = middle + 1;
+    } else {
+      upper = middle;
+    }
+  }
+
+  final visible = <TimelineClip>[];
+  final includedIds = <String>{};
+  var index = math.max(0, lower - 1);
+  while (index < sortedClips.length) {
+    final clip = sortedClips[index];
+    if (clip.startTime > end) break;
+    if (clip.endTime >= start && includedIds.add(clip.id)) visible.add(clip);
+    index++;
+  }
+  for (final clip in pinnedClips) {
+    if (includedIds.add(clip.id)) visible.add(clip);
+  }
+  visible.sort((a, b) => a.startTime.compareTo(b.startTime));
+  return visible;
+}
+
 class TimelinePanel extends ConsumerStatefulWidget {
   final ValueChanged<SubtitleEntry>? onEditRequested;
   final ValueChanged<TimelineClip>? onTextClipEditRequested;
@@ -80,6 +137,7 @@ class TimelinePanel extends ConsumerStatefulWidget {
 }
 
 class _TimelinePanelState extends ConsumerState<TimelinePanel> {
+  late final EditorNotifier _editorNotifier;
   final ScrollController _horizontalScrollController = ScrollController();
   final ScrollController _verticalScrollController = ScrollController();
   final GlobalKey _horizontalViewportKey = GlobalKey();
@@ -97,10 +155,22 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
   final Map<String, GlobalKey> _clipStateKeys = <String, GlobalKey>{};
   Timer? _edgeScrollTimer;
   Offset? _latestTimelineGesturePointer;
+  bool _viewportRebuildScheduled = false;
+  EditorTimeline? _cachedRenderIndexTimeline;
+  Duration _cachedRenderDuration = Duration.zero;
+  Map<String, List<TimelineClip>> _cachedSortedClipsByTrackId = const {};
+  Map<String, (TimelineTrack, TimelineClip)> _cachedClipSelectionById =
+      const {};
+  List<TimelineMarker> _cachedSortedMarkers = const [];
+  TimelineSnapIndex _cachedSnapIndex = const TimelineSnapIndex();
+  Map<String, String> _cachedWaveformSourceByAssetId = const {};
 
   @override
   void initState() {
     super.initState();
+    _editorNotifier = ref.read(editorProvider.notifier);
+    _horizontalScrollController.addListener(_scheduleViewportRebuild);
+    _verticalScrollController.addListener(_scheduleViewportRebuild);
     ref.listenManual<Duration>(
       playbackProvider.select((state) => state.position),
       (_, next) {
@@ -124,9 +194,75 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
   @override
   void dispose() {
     _edgeScrollTimer?.cancel();
+    if (_clipMoveSession != null || _clipTrimSession != null) {
+      _editorNotifier.endTimelineGestureEdit();
+    }
+    _horizontalScrollController.removeListener(_scheduleViewportRebuild);
+    _verticalScrollController.removeListener(_scheduleViewportRebuild);
     _horizontalScrollController.dispose();
     _verticalScrollController.dispose();
     super.dispose();
+  }
+
+  void _scheduleViewportRebuild() {
+    if (_viewportRebuildScheduled || !mounted) return;
+    _viewportRebuildScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _viewportRebuildScheduled = false;
+      if (mounted) setState(() {});
+    });
+  }
+
+  void _ensureRenderIndex(EditorTimeline timeline) {
+    if (identical(_cachedRenderIndexTimeline, timeline)) return;
+    _cachedRenderIndexTimeline = timeline;
+    final sortedByTrack = <String, List<TimelineClip>>{};
+    final selections = <String, (TimelineTrack, TimelineClip)>{};
+    final liveClipIds = <String>{};
+    var duration = Duration.zero;
+    for (final track in timeline.tracks) {
+      final clips = [...track.clips]
+        ..sort((a, b) => a.startTime.compareTo(b.startTime));
+      sortedByTrack[track.id] = clips;
+      for (final clip in clips) {
+        selections[clip.id] = (track, clip);
+        liveClipIds.add(clip.id);
+        if (clip.endTime > duration) duration = clip.endTime;
+      }
+    }
+    _cachedSortedClipsByTrackId = sortedByTrack;
+    _cachedClipSelectionById = selections;
+    _cachedRenderDuration = duration;
+    _cachedSortedMarkers = [...timeline.markers]
+      ..sort((a, b) => a.position.compareTo(b.position));
+    _cachedSnapIndex = TimelineSnapIndex.fromTimeline(timeline);
+    _cachedWaveformSourceByAssetId = Map.unmodifiable({
+      for (final asset in timeline.assets)
+        if (asset.sourcePath?.trim().isNotEmpty == true)
+          asset.id: asset.sourcePath!.trim(),
+    });
+    _clipStateKeys.removeWhere((clipId, _) => !liveClipIds.contains(clipId));
+  }
+
+  List<TimelineMarker> _markersInWindow(Duration start, Duration end) {
+    if (_cachedSortedMarkers.isEmpty) return const [];
+    var lower = 0;
+    var upper = _cachedSortedMarkers.length;
+    while (lower < upper) {
+      final middle = lower + ((upper - lower) >> 1);
+      if (_cachedSortedMarkers[middle].position < start) {
+        lower = middle + 1;
+      } else {
+        upper = middle;
+      }
+    }
+    final visible = <TimelineMarker>[];
+    for (var index = lower; index < _cachedSortedMarkers.length; index++) {
+      final marker = _cachedSortedMarkers[index];
+      if (marker.position > end) break;
+      visible.add(marker);
+    }
+    return visible;
   }
 
   void _addTrack(TimelineTrackType type) {
@@ -375,12 +511,129 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
     ref.read(playbackProvider.notifier).requestSeek(target.position);
   }
 
-  void _zoomBy(double factor) {
+  void _zoomBy(double factor, {Duration? anchor, bool centerAnchor = false}) {
+    final oldPixelsPerSecond = _pixelsPerSecond;
+    final anchorPosition = anchor ?? ref.read(playbackProvider).position;
+    final oldScroll = _horizontalScrollController.hasClients
+        ? _horizontalScrollController.offset
+        : 0.0;
+    final oldAnchorX =
+        anchorPosition.inMicroseconds /
+        Duration.microsecondsPerSecond *
+        oldPixelsPerSecond;
+    final viewportAnchorX =
+        centerAnchor && _horizontalScrollController.hasClients
+        ? _horizontalScrollController.position.viewportDimension / 2
+        : oldAnchorX - oldScroll;
     setState(() {
       _pixelsPerSecond = (_pixelsPerSecond * factor)
           .clamp(_minPixelsPerSecond, _maxPixelsPerSecond)
           .toDouble();
     });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_horizontalScrollController.hasClients) return;
+      final newAnchorX =
+          anchorPosition.inMicroseconds /
+          Duration.microsecondsPerSecond *
+          _pixelsPerSecond;
+      final target = (newAnchorX - viewportAnchorX).clamp(
+        _horizontalScrollController.position.minScrollExtent,
+        _horizontalScrollController.position.maxScrollExtent,
+      );
+      _horizontalScrollController.jumpTo(target.toDouble());
+    });
+  }
+
+  void _zoomToSelection() {
+    final editorState = ref.read(editorProvider);
+    final selectedIds = editorState.selectedClipIds.isNotEmpty
+        ? editorState.selectedClipIds
+        : {if (editorState.selectedClipId != null) editorState.selectedClipId!};
+    final clips = selectedIds
+        .map((id) => _cachedClipSelectionById[id]?.$2)
+        .whereType<TimelineClip>()
+        .toList();
+    if (clips.isEmpty) {
+      SnackBarHelper.showInfo(context, 'Select one or more clips to zoom.');
+      return;
+    }
+    final startUs = clips
+        .map((clip) => clip.startTime.inMicroseconds)
+        .reduce((first, second) => first < second ? first : second);
+    final endUs = clips
+        .map((clip) => clip.endTime.inMicroseconds)
+        .reduce((first, second) => first > second ? first : second);
+    final spanSeconds = math.max(
+      0.001,
+      (endUs - startUs) / Duration.microsecondsPerSecond,
+    );
+    final viewportWidth = _horizontalScrollController.hasClients
+        ? _horizontalScrollController.position.viewportDimension
+        : math.max(0.0, MediaQuery.sizeOf(context).width - _labelColumnWidth);
+    final usableWidth = math.max(80.0, viewportWidth - 32);
+    setState(() {
+      _pixelsPerSecond = (usableWidth / spanSeconds)
+          .clamp(_minPixelsPerSecond, _maxPixelsPerSecond)
+          .toDouble();
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_horizontalScrollController.hasClients) return;
+      final target =
+          startUs / Duration.microsecondsPerSecond * _pixelsPerSecond - 16;
+      _horizontalScrollController.jumpTo(
+        target
+            .clamp(
+              _horizontalScrollController.position.minScrollExtent,
+              _horizontalScrollController.position.maxScrollExtent,
+            )
+            .toDouble(),
+      );
+    });
+  }
+
+  Future<void> _showSnappingSettings() async {
+    var settings = ref.read(editorProvider).timeline.workspaceSettings.snapping;
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (context, setSheetState) => SafeArea(
+          child: ListView(
+            shrinkWrap: true,
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
+            children: [
+              const Text(
+                'Snapping targets',
+                style: TextStyle(
+                  color: kTextPrimary,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                'Choose which timeline relationships become magnetic while moving or trimming clips.',
+                style: TextStyle(color: kTextSecondary, fontSize: 12),
+              ),
+              const SizedBox(height: 8),
+              for (final target in TimelineSnapTarget.values)
+                SwitchListTile.adaptive(
+                  key: ValueKey('timeline_snap_target_${target.name}'),
+                  value: settings.targets.contains(target),
+                  title: Text(_snapTargetLabel(target)),
+                  onChanged: (enabled) {
+                    final next = settings.withTarget(target, enabled: enabled);
+                    setSheetState(() => settings = next);
+                    _updateWorkspace(
+                      (workspace) => workspace.copyWith(snapping: next),
+                    );
+                  },
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   void _fitTimeline(Duration duration) {
@@ -647,66 +900,57 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
     int proposedStartMs,
     int durationMs,
   ) {
-    if (!ref.read(editorProvider).isSnappingEnabled) return proposedStartMs;
-    final thresholdMs = (10 / _pixelsPerSecond * 1000).round().clamp(40, 700);
-    final candidates = <int>{
-      0,
-      ref.read(playbackProvider).position.inMilliseconds,
-      ...timeline.markers.map((marker) => marker.position.inMilliseconds),
-      ...timeline.tracks
-          .expand((track) => track.clips)
-          .where((candidate) => candidate.id != clip.id)
-          .expand(
-            (candidate) => [
-              candidate.startTime.inMilliseconds,
-              candidate.endTime.inMilliseconds,
-            ],
-          ),
-    };
-    var bestStart = proposedStartMs;
-    var bestDistance = thresholdMs + 1;
-    for (final candidate in candidates) {
-      final startDistance = (candidate - proposedStartMs).abs();
-      if (startDistance < bestDistance) {
-        bestDistance = startDistance;
-        bestStart = candidate;
-      }
-      final endDistance = (candidate - (proposedStartMs + durationMs)).abs();
-      if (endDistance < bestDistance) {
-        bestDistance = endDistance;
-        bestStart = candidate - durationMs;
-      }
-    }
-    return bestDistance <= thresholdMs ? bestStart : proposedStartMs;
+    final workspace = timeline.workspaceSettings;
+    final snapped = TimelineSnapEngine.snapRangeStart(
+      proposedStart: Duration(milliseconds: proposedStartMs),
+      duration: Duration(milliseconds: durationMs),
+      settings: workspace.snapping,
+      index: _cachedSnapIndex,
+      frameRate: workspace.frameRate,
+      threshold: _timelineSnapThreshold,
+      playhead: ref.read(playbackProvider).position,
+      selectionBoundaries: _selectedSnapBoundaries(clip.id),
+      excludedClipBoundaries: [clip.startTime, clip.endTime],
+      excludedClipId: clip.id,
+      workAreaStart: workspace.normalizedWorkAreaStart,
+      workAreaEnd: workspace.normalizedWorkAreaEnd,
+    );
+    return (snapped.inMicroseconds / 1000).round();
   }
 
   int _snapEdgeMs(EditorTimeline timeline, TimelineClip clip, int proposedMs) {
-    if (!ref.read(editorProvider).isSnappingEnabled) return proposedMs;
-    final thresholdMs = (10 / _pixelsPerSecond * 1000).round().clamp(40, 700);
-    final candidates = <int>{
-      0,
-      ref.read(playbackProvider).position.inMilliseconds,
-      ...timeline.markers.map((marker) => marker.position.inMilliseconds),
-      ...timeline.tracks
-          .expand((track) => track.clips)
-          .where((candidate) => candidate.id != clip.id)
-          .expand(
-            (candidate) => [
-              candidate.startTime.inMilliseconds,
-              candidate.endTime.inMilliseconds,
-            ],
-          ),
-    };
-    var best = proposedMs;
-    var bestDistance = thresholdMs + 1;
-    for (final candidate in candidates) {
-      final distance = (candidate - proposedMs).abs();
-      if (distance < bestDistance) {
-        best = candidate;
-        bestDistance = distance;
-      }
+    final workspace = timeline.workspaceSettings;
+    final snapped = TimelineSnapEngine.snapPoint(
+      proposed: Duration(milliseconds: proposedMs),
+      settings: workspace.snapping,
+      index: _cachedSnapIndex,
+      frameRate: workspace.frameRate,
+      threshold: _timelineSnapThreshold,
+      playhead: ref.read(playbackProvider).position,
+      selectionBoundaries: _selectedSnapBoundaries(clip.id),
+      excludedClipBoundaries: [clip.startTime, clip.endTime],
+      excludedClipId: clip.id,
+      workAreaStart: workspace.normalizedWorkAreaStart,
+      workAreaEnd: workspace.normalizedWorkAreaEnd,
+    );
+    return (snapped.inMicroseconds / 1000).round();
+  }
+
+  Duration get _timelineSnapThreshold => Duration(
+    microseconds: (10 / _pixelsPerSecond * Duration.microsecondsPerSecond)
+        .round()
+        .clamp(40000, 700000),
+  );
+
+  Iterable<Duration> _selectedSnapBoundaries(String movingClipId) sync* {
+    final selectedIds = ref.read(editorProvider).selectedClipIds;
+    for (final selectedId in selectedIds) {
+      if (selectedId == movingClipId) continue;
+      final selection = _cachedClipSelectionById[selectedId];
+      if (selection == null) continue;
+      yield selection.$2.startTime;
+      yield selection.$2.endTime;
     }
-    return bestDistance <= thresholdMs ? best : proposedMs;
   }
 
   void _copySelection(
@@ -1445,6 +1689,10 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       startTime: Duration(milliseconds: newStartMs),
       sourceStartTime: Duration(milliseconds: newSourceStartMs),
       sourceDuration: Duration(milliseconds: newSourceDurationMs),
+      keyframes: TimelineKeyframeEditing.forNewStart(
+        clip,
+        Duration(milliseconds: newStartMs),
+      ),
     );
     if (!track.canPlaceClip(updatedClip, ignoringClipId: clip.id)) return;
 
@@ -1474,6 +1722,10 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
             endTime: updatedClip.endTime,
             sourceStartTime: updatedClip.sourceStartTime,
             sourceDuration: updatedClip.sourceDuration,
+            keyframes: TimelineKeyframeEditing.forNewStart(
+              candidate,
+              updatedClip.startTime,
+            ),
           );
         }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
         return candidateTrack.copyWith(clips: nextClips);
@@ -1568,6 +1820,10 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       endTime: Duration(milliseconds: newEndMs),
       sourceStartTime: Duration(milliseconds: newSourceStartMs),
       sourceDuration: Duration(milliseconds: newSourceDurationMs),
+      keyframes: TimelineKeyframeEditing.forNewEnd(
+        clip,
+        Duration(milliseconds: newEndMs),
+      ),
     );
     if (!track.canPlaceClip(updatedClip, ignoringClipId: clip.id)) return;
 
@@ -1597,6 +1853,10 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
             endTime: updatedClip.endTime,
             sourceStartTime: updatedClip.sourceStartTime,
             sourceDuration: updatedClip.sourceDuration,
+            keyframes: TimelineKeyframeEditing.forNewEnd(
+              candidate,
+              updatedClip.endTime,
+            ),
           );
         }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
         return candidateTrack.copyWith(clips: nextClips);
@@ -1703,6 +1963,10 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       sourceDuration: sourceBounded
           ? clip.sourceDuration - Duration(milliseconds: sourceDeltaMs)
           : newDuration,
+      keyframes: TimelineKeyframeEditing.forNewStart(
+        clip,
+        Duration(milliseconds: newStartMs),
+      ),
     );
     if (!track.canPlaceClip(updatedClip, ignoringClipId: clip.id)) return;
     final nextStart = Duration(milliseconds: newStartMs);
@@ -1731,6 +1995,10 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
             endTime: updatedClip.endTime,
             sourceStartTime: updatedClip.sourceStartTime,
             sourceDuration: updatedClip.sourceDuration,
+            keyframes: TimelineKeyframeEditing.forNewStart(
+              candidate,
+              updatedClip.startTime,
+            ),
           );
         }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
         return candidateTrack.copyWith(clips: nextClips);
@@ -1816,6 +2084,10 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       sourceDuration: sourceBounded
           ? clip.sourceDuration + Duration(milliseconds: sourceDeltaMs)
           : newDuration,
+      keyframes: TimelineKeyframeEditing.forNewEnd(
+        clip,
+        Duration(milliseconds: newEndMs),
+      ),
     );
     if (!track.canPlaceClip(updatedClip, ignoringClipId: clip.id)) return;
     final nextEnd = Duration(milliseconds: newEndMs);
@@ -1844,6 +2116,10 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
             endTime: updatedClip.endTime,
             sourceStartTime: updatedClip.sourceStartTime,
             sourceDuration: updatedClip.sourceDuration,
+            keyframes: TimelineKeyframeEditing.forNewEnd(
+              candidate,
+              updatedClip.endTime,
+            ),
           );
         }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
         return candidateTrack.copyWith(clips: nextClips);
@@ -2016,11 +2292,16 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
     final secondSourceStart = clip.isReversed
         ? clip.sourceStartTime
         : clip.sourceStartTime + Duration(milliseconds: leftSourceDurationMs);
+    final keyframeSplit = TimelineKeyframeEditing.split(
+      clip,
+      Duration(milliseconds: leftTimelineDurationMs),
+    );
     final firstClip = clip.copyWith(
       endTime: splitPoint,
       sourceStartTime: firstSourceStart,
       sourceDuration: Duration(milliseconds: leftSourceDurationMs),
       outroTransition: const ClipTransition(),
+      keyframes: keyframeSplit.leading,
     );
     final secondClip = TimelineClip(
       trackId: clip.trackId,
@@ -2028,6 +2309,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       effectKind: clip.effectKind,
       label: clip.label,
       assetId: clip.assetId,
+      linkedClipId: clip.linkedClipId,
       startTime: splitPoint,
       endTime: clip.endTime,
       sourceStartTime: secondSourceStart,
@@ -2046,8 +2328,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       subtitleStyle: clip.subtitleStyle,
       introTransition: const ClipTransition(),
       outroTransition: clip.outroTransition,
-      keyframes: clip.keyframes,
+      keyframes: keyframeSplit.trailing,
       freezeFrame: clip.freezeFrame,
+      freezeFrameSourceTime: clip.freezeFrameSourceTime,
       stabilize: clip.stabilize,
       denoise: clip.denoise,
       chromaKeyEnabled: clip.chromaKeyEnabled,
@@ -2057,6 +2340,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       notes: clip.notes,
       autoDuck: clip.autoDuck,
       duckAmount: clip.duckAmount,
+      duckAttackMs: clip.duckAttackMs,
+      duckReleaseMs: clip.duckReleaseMs,
+      duckSidechainTrackIds: clip.duckSidechainTrackIds,
     );
 
     final nextTracks = timeline.tracks.map((track) {
@@ -2146,6 +2432,10 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
     required TimelineClip firstSource,
     required TimelineClip secondSource,
   }) {
+    final keyframeSplit = TimelineKeyframeEditing.split(
+      audio,
+      firstSource.duration,
+    );
     final first = audio.copyWith(
       linkedClipId: firstSource.id,
       endTime: firstSource.endTime,
@@ -2153,6 +2443,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       sourceDuration: firstSource.sourceDuration,
       audioMix: audio.audioMix.copyWith(fadeOutMs: 0),
       outroTransition: const ClipTransition(),
+      keyframes: keyframeSplit.leading,
     );
     final second = TimelineClip(
       trackId: audio.trackId,
@@ -2176,7 +2467,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       colorAdjustments: audio.colorAdjustments,
       introTransition: const ClipTransition(),
       outroTransition: audio.outroTransition,
-      keyframes: audio.keyframes,
+      keyframes: keyframeSplit.trailing,
       freezeFrame: audio.freezeFrame,
       freezeFrameSourceTime: audio.freezeFrameSourceTime,
       stabilize: audio.stabilize,
@@ -2188,6 +2479,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       notes: audio.notes,
       autoDuck: audio.autoDuck,
       duckAmount: audio.duckAmount,
+      duckAttackMs: audio.duckAttackMs,
+      duckReleaseMs: audio.duckReleaseMs,
+      duckSidechainTrackIds: audio.duckSidechainTrackIds,
     );
     return (first: first, second: second);
   }
@@ -2456,6 +2750,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       notes: clip.notes,
       autoDuck: clip.autoDuck,
       duckAmount: clip.duckAmount,
+      duckAttackMs: clip.duckAttackMs,
+      duckReleaseMs: clip.duckReleaseMs,
+      duckSidechainTrackIds: clip.duckSidechainTrackIds,
     );
     if (!track.canPlaceClip(duplicate)) {
       SnackBarHelper.showInfo(
@@ -2510,11 +2807,16 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
     final secondSourceStart = clip.isReversed
         ? clip.sourceStartTime
         : clip.sourceStartTime + Duration(milliseconds: leftSourceDurationMs);
+    final keyframeSplit = TimelineKeyframeEditing.split(
+      clip,
+      Duration(milliseconds: leftTimelineDurationMs),
+    );
     final firstClip = clip.copyWith(
       endTime: splitPoint,
       sourceStartTime: firstSourceStart,
       sourceDuration: Duration(milliseconds: leftSourceDurationMs),
       outroTransition: const ClipTransition(),
+      keyframes: keyframeSplit.leading,
     );
     final secondClip = TimelineClip(
       trackId: track.id,
@@ -2541,8 +2843,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       subtitleStyle: clip.subtitleStyle,
       introTransition: const ClipTransition(),
       outroTransition: clip.outroTransition,
-      keyframes: clip.keyframes,
+      keyframes: keyframeSplit.trailing,
       freezeFrame: clip.freezeFrame,
+      freezeFrameSourceTime: clip.freezeFrameSourceTime,
       stabilize: clip.stabilize,
       denoise: clip.denoise,
       chromaKeyEnabled: clip.chromaKeyEnabled,
@@ -2552,6 +2855,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       notes: clip.notes,
       autoDuck: clip.autoDuck,
       duckAmount: clip.duckAmount,
+      duckAttackMs: clip.duckAttackMs,
+      duckReleaseMs: clip.duckReleaseMs,
+      duckSidechainTrackIds: clip.duckSidechainTrackIds,
     );
 
     final nextTracks = timeline.tracks.map((candidateTrack) {
@@ -2674,12 +2980,15 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
 
   void _nudgePlayhead(int direction) {
     final workspace = ref.read(editorProvider).timeline.workspaceSettings;
-    final frameMs = math.max(1, (1000 / workspace.frameRate).round());
     final playback = ref.read(playbackProvider);
     ref
         .read(playbackProvider.notifier)
         .requestSeek(
-          playback.position + Duration(milliseconds: direction * frameMs),
+          TimelineSnapEngine.adjacentFrame(
+            playback.position,
+            frameRate: workspace.frameRate,
+            direction: direction,
+          ),
         );
   }
 
@@ -2697,20 +3006,15 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       subtitleState.entries,
       subtitleState.globalStyle,
     );
+    _ensureRenderIndex(timeline);
     final workspace = timeline.workspaceSettings;
-    final fallbackDuration = timeline.tracks
-        .expand((track) => track.clips)
-        .fold<Duration>(
-          Duration.zero,
-          (current, clip) => clip.endTime > current ? clip.endTime : current,
-        );
+    final fallbackDuration = _cachedRenderDuration;
     final totalDuration = playbackDuration > fallbackDuration
         ? playbackDuration
         : fallbackDuration;
-    final selectedSelection = _selectedClipSelection(
-      timeline,
-      editorState.selectedClipId,
-    );
+    final selectedSelection = editorState.selectedClipId == null
+        ? null
+        : _cachedClipSelectionById[editorState.selectedClipId!];
     final selectedTrack = selectedSelection?.$1;
     final selectedClip = selectedSelection?.$2;
     final rawSelectedSubtitle = subtitleState.selectedEntry;
@@ -2722,7 +3026,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         : null;
     final selectedSubtitleTrack = selectedSubtitle == null
         ? null
-        : _selectedClipSelection(timeline, selectedSubtitle.id)?.$1;
+        : _cachedClipSelectionById[selectedSubtitle.id]?.$1;
     final canMutateSelectedSubtitle =
         selectedSubtitle != null &&
         selectedSubtitleTrack != null &&
@@ -2897,13 +3201,18 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                   ),
                   _buildToolbarButton(
                     icon: Icons.grid_on_rounded,
-                    tooltip: editorState.isSnappingEnabled
+                    tooltip: workspace.snapping.enabled
                         ? 'Turn snapping off'
                         : 'Turn snapping on',
                     onPressed: () => editorNotifier.setSnappingEnabled(
-                      !editorState.isSnappingEnabled,
+                      !workspace.snapping.enabled,
                     ),
-                    isActive: editorState.isSnappingEnabled,
+                    isActive: workspace.snapping.enabled,
+                  ),
+                  _buildToolbarButton(
+                    icon: Icons.tune_rounded,
+                    tooltip: 'Configure snapping targets',
+                    onPressed: _showSnappingSettings,
                   ),
                   _buildToolbarButton(
                     icon: Icons.keyboard_arrow_left_rounded,
@@ -3041,7 +3350,28 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                     tooltip: 'Zoom out',
                     onPressed: _pixelsPerSecond <= _minPixelsPerSecond
                         ? null
-                        : () => _zoomBy(0.8),
+                        : () => _zoomBy(
+                            0.8,
+                            anchor: ref.read(playbackProvider).position,
+                          ),
+                  ),
+                  _buildToolbarButton(
+                    icon: Icons.center_focus_strong_rounded,
+                    tooltip: 'Zoom to playhead',
+                    onPressed: _pixelsPerSecond >= _maxPixelsPerSecond
+                        ? () => _scrollToPlayhead(
+                            ref.read(playbackProvider).position,
+                          )
+                        : () => _zoomBy(
+                            2,
+                            anchor: ref.read(playbackProvider).position,
+                            centerAnchor: true,
+                          ),
+                  ),
+                  _buildToolbarButton(
+                    icon: Icons.select_all_rounded,
+                    tooltip: 'Zoom to selection',
+                    onPressed: _zoomToSelection,
                   ),
                   _buildToolbarButton(
                     icon: Icons.fit_screen_rounded,
@@ -3053,7 +3383,10 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                     tooltip: 'Zoom in',
                     onPressed: _pixelsPerSecond >= _maxPixelsPerSecond
                         ? null
-                        : () => _zoomBy(1.25),
+                        : () => _zoomBy(
+                            1.25,
+                            anchor: ref.read(playbackProvider).position,
+                          ),
                   ),
                 ],
               ),
@@ -3066,6 +3399,75 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                   contentHeight,
                   constraints.maxHeight,
                 );
+                final horizontalViewportWidth =
+                    _horizontalScrollController.hasClients
+                    ? _horizontalScrollController.position.viewportDimension
+                    : math.max(1.0, constraints.maxWidth - _labelColumnWidth);
+                final horizontalOffset = _horizontalScrollController.hasClients
+                    ? _horizontalScrollController.offset
+                    : 0.0;
+                final overscanPixels = math.max(
+                  180.0,
+                  horizontalViewportWidth * 0.35,
+                );
+                final viewportStart = Duration(
+                  milliseconds:
+                      ((horizontalOffset - overscanPixels) /
+                              _pixelsPerSecond *
+                              1000)
+                          .floor()
+                          .clamp(0, totalDuration.inMilliseconds)
+                          .toInt(),
+                );
+                final viewportEnd = Duration(
+                  milliseconds:
+                      ((horizontalOffset +
+                                  horizontalViewportWidth +
+                                  overscanPixels) /
+                              _pixelsPerSecond *
+                              1000)
+                          .ceil()
+                          .clamp(0, totalDuration.inMilliseconds)
+                          .toInt(),
+                );
+                final pinnedClipsByTrack = <String, List<TimelineClip>>{};
+                void pinClip(String? clipId) {
+                  if (clipId == null) return;
+                  final selection = _cachedClipSelectionById[clipId];
+                  if (selection == null) return;
+                  pinnedClipsByTrack
+                      .putIfAbsent(selection.$1.id, () => <TimelineClip>[])
+                      .add(selection.$2);
+                }
+
+                pinClip(editorState.selectedClipId);
+                pinClip(subtitleState.selectedEntryId);
+                pinClip(_clipMoveSession?.clip.id);
+                pinClip(_clipTrimSession?.clip.id);
+                final visibleMarkers = _markersInWindow(
+                  viewportStart,
+                  viewportEnd,
+                );
+                final verticalViewportHeight =
+                    _verticalScrollController.hasClients
+                    ? _verticalScrollController.position.viewportDimension
+                    : constraints.maxHeight;
+                final verticalOffset = _verticalScrollController.hasClients
+                    ? _verticalScrollController.offset
+                    : 0.0;
+                final verticalStart = math.max(0.0, verticalOffset - 100);
+                final verticalEnd =
+                    verticalOffset + verticalViewportHeight + 100;
+                final pinnedTrackIds = pinnedClipsByTrack.keys.toSet();
+                final visibleRowLayouts = rowLayouts
+                    .where(
+                      (row) =>
+                          (row.bottom >= verticalStart &&
+                              row.top <= verticalEnd) ||
+                          (row.track != null &&
+                              pinnedTrackIds.contains(row.track!.id)),
+                    )
+                    .toList(growable: false);
                 return Scrollbar(
                   controller: _verticalScrollController,
                   thumbVisibility: true,
@@ -3086,7 +3488,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                             width: _labelColumnWidth,
                             height: resolvedContentHeight,
                             child: _TimelineLabels(
-                              rowLayouts: rowLayouts,
+                              rowLayouts: visibleRowLayouts,
                               rulerHeight: _rulerHeight,
                               onAddTrack: _showAddTrackChooser,
                               onTrackTap: (track) {
@@ -3216,7 +3618,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                                             ),
                                           ),
                                         ),
-                                      for (final row in rowLayouts) ...[
+                                      for (final row in visibleRowLayouts) ...[
                                         if (row.sectionTitle != null)
                                           Positioned(
                                             top: row.top,
@@ -3246,6 +3648,18 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                                             height: row.laneHeight,
                                             child: _TimelineLane(
                                               track: row.track!,
+                                              sortedClips:
+                                                  _cachedSortedClipsByTrackId[row
+                                                      .track!
+                                                      .id] ??
+                                                  const [],
+                                              viewportStart: viewportStart,
+                                              viewportEnd: viewportEnd,
+                                              pinnedClips:
+                                                  pinnedClipsByTrack[row
+                                                      .track!
+                                                      .id] ??
+                                                  const [],
                                               pixelsPerSecond: _pixelsPerSecond,
                                               selectedClipId:
                                                   editorState.selectedClipId,
@@ -3255,6 +3669,8 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                                                   subtitleState.selectedEntryId,
                                               workspaceSettings:
                                                   timeline.workspaceSettings,
+                                              waveformSourceByAssetId:
+                                                  _cachedWaveformSourceByAssetId,
                                               onTrackTap: () {
                                                 editorNotifier.selectTrack(
                                                   row.track!.id,
@@ -3345,7 +3761,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                                             ),
                                           ),
                                       ],
-                                      for (final marker in timeline.markers)
+                                      for (final marker in visibleMarkers)
                                         Positioned(
                                           left:
                                               marker.position.inMilliseconds /
@@ -3997,11 +4413,16 @@ class _DoubleTapTrackSurfaceState extends State<_DoubleTapTrackSurface> {
 
 class _TimelineLane extends StatelessWidget {
   final TimelineTrack track;
+  final List<TimelineClip> sortedClips;
+  final Duration viewportStart;
+  final Duration viewportEnd;
+  final List<TimelineClip> pinnedClips;
   final double pixelsPerSecond;
   final String? selectedClipId;
   final Set<String> selectedClipIds;
   final String? selectedSubtitleId;
   final TimelineWorkspaceSettings workspaceSettings;
+  final Map<String, String> waveformSourceByAssetId;
   final VoidCallback onTrackTap;
   final ValueChanged<Offset> onShowTrackActions;
   final ValueChanged<TimelineClip> onClipTap;
@@ -4021,11 +4442,16 @@ class _TimelineLane extends StatelessWidget {
 
   const _TimelineLane({
     required this.track,
+    required this.sortedClips,
+    required this.viewportStart,
+    required this.viewportEnd,
+    required this.pinnedClips,
     required this.pixelsPerSecond,
     required this.selectedClipId,
     required this.selectedClipIds,
     required this.selectedSubtitleId,
     required this.workspaceSettings,
+    required this.waveformSourceByAssetId,
     required this.onTrackTap,
     required this.onShowTrackActions,
     required this.onClipTap,
@@ -4045,16 +4471,21 @@ class _TimelineLane extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final sortedClips = [...track.clips]
-      ..sort((a, b) => a.startTime.compareTo(b.startTime));
+    final visibleClips = timelineVisibleClipsForTesting(
+      sortedClips: sortedClips,
+      viewportStart: viewportStart,
+      viewportEnd: viewportEnd,
+      pinnedClips: pinnedClips,
+    );
     bool selectedForPaint(TimelineClip clip) =>
         selectedClipId == clip.id ||
         selectedSubtitleId == clip.id ||
         selectedClipIds.contains(clip.id);
     final paintOrderedClips = [
-      ...sortedClips.where((clip) => !selectedForPaint(clip)),
-      ...sortedClips.where(selectedForPaint),
+      ...visibleClips.where((clip) => !selectedForPaint(clip)),
+      ...visibleClips.where(selectedForPaint),
     ];
+    final transitionSources = _visibleTransitionSources();
 
     return _DoubleTapTrackSurface(
       onTap: onTrackTap,
@@ -4094,18 +4525,16 @@ class _TimelineLane extends StatelessWidget {
               // above neighboring clips at cuts and short overlaps.
               for (final clip in paintOrderedClips) _buildPositionedClip(clip),
               if (track.section == TimelineTrackSection.baseVideo)
-                for (var index = 0; index < sortedClips.length - 1; index++)
+                for (final clip in transitionSources)
                   Positioned(
                     left:
-                        sortedClips[index].endTime.inMilliseconds /
-                            1000 *
-                            pixelsPerSecond -
+                        clip.endTime.inMilliseconds / 1000 * pixelsPerSecond -
                         10,
                     top: 0,
                     bottom: 0,
                     child: Center(
                       child: GestureDetector(
-                        onTap: () => onTransitionTap(sortedClips[index]),
+                        onTap: () => onTransitionTap(clip),
                         child: Container(
                           width: 20,
                           height: 20,
@@ -4180,6 +4609,27 @@ class _TimelineLane extends StatelessWidget {
     );
   }
 
+  List<TimelineClip> _visibleTransitionSources() {
+    if (sortedClips.length < 2) return const [];
+    var lower = 0;
+    var upper = sortedClips.length - 1;
+    while (lower < upper) {
+      final middle = lower + ((upper - lower) >> 1);
+      if (sortedClips[middle].endTime < viewportStart) {
+        lower = middle + 1;
+      } else {
+        upper = middle;
+      }
+    }
+    final visible = <TimelineClip>[];
+    for (var index = lower; index < sortedClips.length - 1; index++) {
+      final clip = sortedClips[index];
+      if (clip.endTime > viewportEnd) break;
+      visible.add(clip);
+    }
+    return visible;
+  }
+
   Widget _buildPositionedClip(TimelineClip clip) {
     final visualWidth = math.max(
       1.0,
@@ -4215,6 +4665,7 @@ class _TimelineLane extends StatelessWidget {
           showTimecode: workspaceSettings.showTimecode,
           showKeyframes: workspaceSettings.showKeyframes,
           showClipLabel: workspaceSettings.showClipLabels,
+          waveformSourcePath: waveformSourceByAssetId[clip.assetId],
           showTrimHandles: isSelected && !track.isCollapsed,
           isLocked: track.isLocked,
           canMove: !track.isLocked,
@@ -4376,6 +4827,7 @@ class _TimelineClipBlock extends StatelessWidget {
   final bool showTimecode;
   final bool showKeyframes;
   final bool showClipLabel;
+  final String? waveformSourcePath;
   final bool showTrimHandles;
   final bool isLocked;
   final bool canMove;
@@ -4400,6 +4852,7 @@ class _TimelineClipBlock extends StatelessWidget {
     required this.showTimecode,
     required this.showKeyframes,
     required this.showClipLabel,
+    required this.waveformSourcePath,
     required this.showTrimHandles,
     required this.isLocked,
     required this.canMove,
@@ -4489,11 +4942,11 @@ class _TimelineClipBlock extends StatelessWidget {
                             (clip.type == TimelineTrackType.audio ||
                                 clip.canCarryAudio))
                           IgnorePointer(
-                            child: CustomPaint(
-                              painter: _WaveformPainter(
-                                seed: clip.id.hashCode,
-                                color: colors.$2.withValues(alpha: 0.35),
-                              ),
+                            child: _CachedTimelineWaveform(
+                              clip: clip,
+                              sourcePath: waveformSourcePath,
+                              targetWidth: resolvedVisualWidth,
+                              color: colors.$2.withValues(alpha: 0.35),
                             ),
                           ),
                         IgnorePointer(
@@ -4893,6 +5346,106 @@ class _ClipEnvelopePainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _ClipEnvelopePainter oldDelegate) {
     return oldDelegate.clip != clip || oldDelegate.accentColor != accentColor;
+  }
+}
+
+class _CachedTimelineWaveform extends StatefulWidget {
+  final TimelineClip clip;
+  final String? sourcePath;
+  final double targetWidth;
+  final Color color;
+
+  const _CachedTimelineWaveform({
+    required this.clip,
+    required this.sourcePath,
+    required this.targetWidth,
+    required this.color,
+  });
+
+  @override
+  State<_CachedTimelineWaveform> createState() =>
+      _CachedTimelineWaveformState();
+}
+
+class _CachedTimelineWaveformState extends State<_CachedTimelineWaveform> {
+  Future<String>? _waveform;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void didUpdateWidget(covariant _CachedTimelineWaveform oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final resolutionChanged =
+        (_resolutionFor(oldWidget.targetWidth) -
+                _resolutionFor(widget.targetWidth))
+            .abs() >=
+        128;
+    if (oldWidget.sourcePath != widget.sourcePath ||
+        oldWidget.clip.sourceStartTime != widget.clip.sourceStartTime ||
+        oldWidget.clip.sourceDuration != widget.clip.sourceDuration ||
+        resolutionChanged) {
+      _load();
+    }
+  }
+
+  void _load() {
+    final sourcePath = widget.sourcePath;
+    if (sourcePath == null ||
+        sourcePath.trim().isEmpty ||
+        !File(sourcePath).existsSync()) {
+      _waveform = null;
+      return;
+    }
+    final sourceDuration = widget.clip.sourceDuration > Duration.zero
+        ? widget.clip.sourceDuration
+        : Duration(
+            microseconds:
+                (widget.clip.duration.inMicroseconds * widget.clip.playbackRate)
+                    .round(),
+          );
+    _waveform = TimelineWaveformCache.instance.waveformFor(
+      sourcePath: sourcePath,
+      sourceStart: widget.clip.sourceStartTime,
+      sourceDuration: sourceDuration,
+      width: _resolutionFor(widget.targetWidth),
+      height: 72,
+    );
+  }
+
+  int _resolutionFor(double logicalWidth) {
+    return (logicalWidth * 2).round().clamp(128, 2048).toInt();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final fallback = CustomPaint(
+      painter: _WaveformPainter(
+        seed: widget.clip.id.hashCode,
+        color: widget.color,
+      ),
+      child: const SizedBox.expand(),
+    );
+    final waveform = _waveform;
+    if (waveform == null) return fallback;
+    return FutureBuilder<String>(
+      future: waveform,
+      builder: (context, snapshot) {
+        final path = snapshot.data;
+        if (path == null || path.isEmpty) return fallback;
+        return Image.file(
+          File(path),
+          fit: BoxFit.fill,
+          color: widget.color,
+          colorBlendMode: BlendMode.srcIn,
+          filterQuality: FilterQuality.low,
+          errorBuilder: (_, _, _) => fallback,
+        );
+      },
+    );
   }
 }
 

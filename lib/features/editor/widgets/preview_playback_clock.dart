@@ -48,6 +48,58 @@ bool shouldCorrectPreviewMediaDrift({
   return (timelineTarget - decoderPosition).abs() > safeTolerance;
 }
 
+/// The result of comparing a platform decoder with the editor's monotonic
+/// composition clock.
+enum PreviewMediaSyncDecision { none, seek }
+
+/// Decides whether a preview decoder should be hard-seeked back to the shared
+/// composition clock.
+///
+/// A hard seek is intentionally rare while playing, especially for audible
+/// media. Platform seeks flush decoder/audio buffers; issuing one every time a
+/// busy decoder reports a late position produces the stutter and pitch-like
+/// artifacts users hear in complex projects. Paused scrubbing remains precise,
+/// while playing media gets a wider tolerance and a correction cooldown.
+PreviewMediaSyncDecision decidePreviewMediaSync({
+  required Duration timelineTarget,
+  required Duration decoderPosition,
+  required bool isPlaying,
+  required bool isAudible,
+  Duration? timeSinceLastCorrection,
+  bool forceSeek = false,
+  bool isBuffering = false,
+  Duration pausedTolerance = const Duration(milliseconds: 12),
+  Duration silentPlaybackTolerance = const Duration(milliseconds: 320),
+  Duration audiblePlaybackTolerance = const Duration(milliseconds: 850),
+  Duration silentCorrectionCooldown = const Duration(milliseconds: 550),
+  Duration audibleCorrectionCooldown = const Duration(milliseconds: 1200),
+  Duration emergencyDrift = const Duration(milliseconds: 2400),
+}) {
+  if (forceSeek) return PreviewMediaSyncDecision.seek;
+  if (isPlaying && isBuffering) return PreviewMediaSyncDecision.none;
+
+  final drift = (timelineTarget - decoderPosition).abs();
+  final tolerance = !isPlaying
+      ? pausedTolerance
+      : isAudible
+      ? audiblePlaybackTolerance
+      : silentPlaybackTolerance;
+  if (drift <= tolerance) return PreviewMediaSyncDecision.none;
+
+  // Very large drift is allowed to recover immediately. This also ensures a
+  // controller that has stopped advancing can never remain stale forever.
+  if (drift >= emergencyDrift) return PreviewMediaSyncDecision.seek;
+  if (!isPlaying) return PreviewMediaSyncDecision.seek;
+
+  final cooldown = isAudible
+      ? audibleCorrectionCooldown
+      : silentCorrectionCooldown;
+  if (timeSinceLastCorrection != null && timeSinceLastCorrection < cooldown) {
+    return PreviewMediaSyncDecision.none;
+  }
+  return PreviewMediaSyncDecision.seek;
+}
+
 /// Rebuilds only its preview subtree at vsync while time-driven visuals are
 /// visible. Static footage bypasses the ticker completely.
 class PreviewPlaybackClock extends StatefulWidget {

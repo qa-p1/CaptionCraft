@@ -39,6 +39,203 @@ void main() {
     expect(buildPreviewVideoPlayerOptions().mixWithOthers, isTrue);
   });
 
+  test('fallback mixer protects a thirty-voice overlap from clipping', () {
+    expect(previewFallbackMixBusGainForTesting(0), 1);
+    expect(previewFallbackMixBusGainForTesting(2), 0.5);
+    expect(previewFallbackMixBusGainForTesting(30), closeTo(1 / 30, 0.000001));
+  });
+
+  test(
+    'preview hit bounds follow visible media instead of the layout slot',
+    () {
+      final contained = previewVisibleMediaSizeForTesting(
+        sourceSize: const Size(400, 100),
+        targetSize: const Size(200, 200),
+        fitMode: ClipFitMode.contain,
+      );
+      expect(contained, const Size(200, 50));
+
+      final cropped = previewVisibleMediaSizeForTesting(
+        sourceSize: const Size(400, 200),
+        targetSize: const Size(200, 200),
+        fitMode: ClipFitMode.contain,
+        crop: const ClipCropSettings(left: 0.25, right: 0.25),
+      );
+      expect(cropped, const Size(200, 200));
+
+      expect(
+        previewVisibleMediaSizeForTesting(
+          sourceSize: const Size(400, 100),
+          targetSize: const Size(200, 200),
+          fitMode: ClipFitMode.cover,
+        ),
+        const Size(200, 200),
+      );
+    },
+  );
+
+  test('audio warm window includes only current and near-future clips', () {
+    final clip = TimelineClip(
+      trackId: 'audio',
+      type: TimelineTrackType.audio,
+      label: 'Music',
+      startTime: const Duration(seconds: 5),
+      endTime: const Duration(seconds: 8),
+    );
+
+    expect(
+      shouldPreloadTimelineAudioPreviewForTesting(
+        clip: clip,
+        position: const Duration(milliseconds: 3100),
+      ),
+      isTrue,
+    );
+    expect(
+      shouldPreloadTimelineAudioPreviewForTesting(
+        clip: clip,
+        position: const Duration(seconds: 2),
+      ),
+      isFalse,
+    );
+    expect(
+      shouldPreloadTimelineAudioPreviewForTesting(
+        clip: clip,
+        position: const Duration(seconds: 8),
+      ),
+      isFalse,
+    );
+  });
+
+  test('base video warm window is bounded and ignores active clips', () {
+    final clip = TimelineClip(
+      trackId: 'video',
+      type: TimelineTrackType.video,
+      label: 'Next shot',
+      startTime: const Duration(seconds: 10),
+      endTime: const Duration(seconds: 14),
+    );
+
+    expect(
+      shouldPreloadBaseVideoForTesting(
+        clip: clip,
+        position: const Duration(milliseconds: 6600),
+      ),
+      isTrue,
+    );
+    expect(
+      shouldPreloadBaseVideoForTesting(
+        clip: clip,
+        position: const Duration(seconds: 6),
+      ),
+      isFalse,
+    );
+    expect(
+      shouldPreloadBaseVideoForTesting(
+        clip: clip,
+        position: const Duration(seconds: 10),
+      ),
+      isFalse,
+    );
+  });
+
+  test('indexed preview lookup stays correct on a long timeline lane', () {
+    final clips = List<TimelineClip>.generate(10000, (index) {
+      final start = Duration(milliseconds: index * 100);
+      return TimelineClip(
+        id: 'clip_$index',
+        trackId: 'long-track',
+        type: TimelineTrackType.video,
+        label: 'Clip $index',
+        startTime: start,
+        endTime: start + const Duration(milliseconds: 100),
+      );
+    }, growable: false);
+    const position = Duration(milliseconds: 777750);
+
+    expect(previewClipStartUpperBoundForTesting(clips, position), 7778);
+    expect(
+      resolveIndexedPreviewClipForTesting(
+        sortedClips: clips,
+        position: position,
+      )?.id,
+      'clip_7777',
+    );
+    expect(
+      indexedPreviewClipsStartingInWindowForTesting(
+        sortedClips: clips,
+        position: position,
+        window: const Duration(milliseconds: 250),
+      ).map((clip) => clip.id),
+      ['clip_7778', 'clip_7779', 'clip_7780'],
+    );
+  });
+
+  test(
+    'indexed lookup handles gaps and an explicitly included final frame',
+    () {
+      final clips = [
+        TimelineClip(
+          id: 'first',
+          trackId: 'video',
+          type: TimelineTrackType.video,
+          label: 'First',
+          startTime: Duration.zero,
+          endTime: const Duration(seconds: 1),
+        ),
+        TimelineClip(
+          id: 'second',
+          trackId: 'video',
+          type: TimelineTrackType.video,
+          label: 'Second',
+          startTime: const Duration(seconds: 2),
+          endTime: const Duration(seconds: 3),
+        ),
+      ];
+
+      expect(
+        resolveIndexedPreviewClipForTesting(
+          sortedClips: clips,
+          position: const Duration(milliseconds: 1500),
+        ),
+        isNull,
+      );
+      expect(
+        resolveIndexedPreviewClipForTesting(
+          sortedClips: clips,
+          position: const Duration(seconds: 3),
+          includeEnd: true,
+        )?.id,
+        'second',
+      );
+    },
+  );
+
+  test('caption interval index finds overlaps deep in a large caption set', () {
+    final entries = <SubtitleEntry>[
+      SubtitleEntry(
+        id: 'long-caption',
+        startTime: Duration.zero,
+        endTime: const Duration(seconds: 1000),
+        text: 'Persistent title',
+      ),
+      ...List<SubtitleEntry>.generate(10000, (index) {
+        final start = Duration(milliseconds: index * 100);
+        return SubtitleEntry(
+          id: 'caption_$index',
+          startTime: start,
+          endTime: start + const Duration(milliseconds: 100),
+          text: 'Caption $index',
+        );
+      }, growable: false),
+    ];
+
+    final active = resolveIndexedPreviewSubtitlesForTesting(
+      entries: entries,
+      position: const Duration(milliseconds: 777750),
+    );
+    expect(active.map((entry) => entry.id), ['long-caption', 'caption_7777']);
+  });
+
   test(
     'referenced missing media never falls back to the first project video',
     () {
@@ -110,6 +307,127 @@ void main() {
     );
     expect(clamped.start, const Duration(seconds: 2));
     expect(clamped.end, const Duration(seconds: 5));
+  });
+
+  test(
+    'preview resolves validated proxies without affecting original mode',
+    () {
+      final asset = EditorAssetReference(
+        id: 'asset-video',
+        type: EditorAssetType.video,
+        label: 'Video',
+        sourcePath: '/media/original.mp4',
+        metadata: const {
+          'proxyMedia': {
+            'path': '/cache/proxy.mp4',
+            'sourceFingerprint': 'fixture-v1',
+          },
+        },
+      );
+      final clip = TimelineClip(
+        id: 'clip-video',
+        trackId: 'track-video',
+        type: TimelineTrackType.video,
+        label: 'Video',
+        assetId: asset.id,
+        startTime: Duration.zero,
+        endTime: const Duration(seconds: 2),
+      );
+      EditorTimeline timeline(PreviewMediaQuality quality) => EditorTimeline(
+        assets: [asset],
+        workspaceSettings: TimelineWorkspaceSettings(
+          previewMediaQuality: quality,
+        ),
+        tracks: [
+          TimelineTrack(
+            id: 'track-video',
+            name: 'Video',
+            type: TimelineTrackType.video,
+            section: TimelineTrackSection.baseVideo,
+            clips: [clip],
+          ),
+        ],
+      );
+      bool exists(String path) =>
+          path == '/media/original.mp4' || path == '/cache/proxy.mp4';
+
+      expect(
+        resolvePreviewSourcePathForTesting(
+          timeline: timeline(PreviewMediaQuality.auto),
+          clip: clip,
+          legacyVideoPath: '',
+          fileExists: exists,
+          sourceFingerprintSync: (_) => 'fixture-v1',
+        ),
+        '/cache/proxy.mp4',
+      );
+      expect(
+        resolvePreviewSourcePathForTesting(
+          timeline: timeline(PreviewMediaQuality.original),
+          clip: clip,
+          legacyVideoPath: '',
+          fileExists: exists,
+          sourceFingerprintSync: (_) => 'fixture-v1',
+        ),
+        '/media/original.mp4',
+      );
+      expect(
+        resolvePreviewSourcePathForTesting(
+          timeline: timeline(PreviewMediaQuality.proxy),
+          clip: clip,
+          legacyVideoPath: '',
+          fileExists: (path) => path == '/cache/proxy.mp4',
+          sourceFingerprintSync: (_) => 'missing',
+        ),
+        '/cache/proxy.mp4',
+        reason: 'an offline original remains previewable from its proxy',
+      );
+      expect(
+        resolvePreviewSourcePathForTesting(
+          timeline: timeline(PreviewMediaQuality.proxy),
+          clip: clip,
+          legacyVideoPath: '',
+          fileExists: exists,
+          sourceFingerprintSync: (_) => 'changed-source',
+        ),
+        '/media/original.mp4',
+        reason: 'relinked or modified sources invalidate stale proxies',
+      );
+    },
+  );
+
+  testWidgets('preview diagnostics can be shown, reset, and hidden', (
+    tester,
+  ) async {
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    container
+        .read(editorProvider.notifier)
+        .loadProject(
+          videoPath: '',
+          projectId: 'diagnostics-preview',
+          projectName: 'Diagnostics preview',
+        );
+
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(
+          home: Scaffold(body: VideoPreviewPanel(videoPath: '')),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    await tester.tap(find.byTooltip('Show preview diagnostics'));
+    await tester.pump();
+    expect(find.text('PREVIEW DIAGNOSTICS'), findsOneWidget);
+    await tester.tap(find.text('RESET'));
+    await tester.pump();
+
+    await tester.tap(find.byTooltip('Hide preview diagnostics'));
+    await tester.pump();
+    expect(find.text('PREVIEW DIAGNOSTICS'), findsNothing);
   });
 
   testWidgets('gap playback excludes time spent in the background', (
@@ -232,6 +550,10 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 50));
     expect(find.byType(Image), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('preview-source-interaction-base-image')),
+      findsOneWidget,
+    );
 
     await tester.tap(find.byTooltip('Play'));
     await tester.pump(const Duration(milliseconds: 220));
@@ -997,6 +1319,84 @@ void main() {
     expect(
       buildPreviewDuckingIntervalsForTesting(timeline: timeline, clip: ducked),
       [(startMs: 1000, endMs: 2100)],
+    );
+  });
+
+  test('ducking fallback honors selected sidechains and envelope timing', () {
+    final ducked = TimelineClip(
+      id: 'music',
+      trackId: 'music-track',
+      type: TimelineTrackType.audio,
+      label: 'Music',
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 5),
+      autoDuck: true,
+      duckAmount: 0.5,
+      duckAttackMs: 400,
+      duckReleaseMs: 600,
+      duckSidechainTrackIds: const ['selected-speech'],
+    );
+    TimelineTrack speechTrack(String id, int startMs, int endMs) {
+      return TimelineTrack(
+        id: id,
+        name: id,
+        type: TimelineTrackType.text,
+        section: TimelineTrackSection.textSubtitle,
+        clips: [
+          TimelineClip(
+            id: '$id-clip',
+            trackId: id,
+            type: TimelineTrackType.text,
+            label: id,
+            startTime: Duration(milliseconds: startMs),
+            endTime: Duration(milliseconds: endMs),
+          ),
+        ],
+      );
+    }
+
+    final timeline = EditorTimeline(
+      tracks: [
+        TimelineTrack(
+          id: 'music-track',
+          name: 'Music',
+          type: TimelineTrackType.audio,
+          section: TimelineTrackSection.audio,
+          clips: [ducked],
+        ),
+        speechTrack('selected-speech', 1000, 2000),
+        speechTrack('ignored-speech', 3000, 4000),
+      ],
+    );
+
+    final intervals = buildPreviewDuckingIntervalsForTesting(
+      timeline: timeline,
+      clip: ducked,
+    );
+    expect(intervals, [(startMs: 1000, endMs: 2000)]);
+    expect(
+      previewDuckingGainForTesting(
+        clip: ducked,
+        position: const Duration(milliseconds: 800),
+        intervals: intervals,
+      ),
+      closeTo(0.75, 0.0001),
+    );
+    expect(
+      previewDuckingGainForTesting(
+        clip: ducked,
+        position: const Duration(milliseconds: 1500),
+        intervals: intervals,
+      ),
+      0.5,
+    );
+    expect(
+      previewDuckingGainForTesting(
+        clip: ducked,
+        position: const Duration(milliseconds: 2300),
+        intervals: intervals,
+      ),
+      closeTo(0.75, 0.0001),
     );
   });
 

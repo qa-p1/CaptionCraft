@@ -114,6 +114,10 @@ enum ClipFilterPreset {
   vintage,
 }
 
+enum AudioFadeShape { linear, logarithmic, exponential, sCurve }
+
+enum PreviewMediaQuality { auto, proxy, original }
+
 enum CanvasAspectRatioPreset {
   original,
   ratio16x9,
@@ -141,6 +145,96 @@ enum TransitionType {
 
 enum TimelineMarkerType { marker, chapter, beat }
 
+/// Independent magnetic targets available to timeline move/trim operations.
+///
+/// This is persisted as a set so adding a new target does not require another
+/// top-level workspace boolean or a second snapping implementation in the UI.
+enum TimelineSnapTarget {
+  frames,
+  playhead,
+  clipEdges,
+  markers,
+  beats,
+  keyframes,
+  selectionBoundaries,
+  workAreaBoundaries,
+}
+
+const Set<TimelineSnapTarget> kDefaultTimelineSnapTargets = {
+  TimelineSnapTarget.frames,
+  TimelineSnapTarget.playhead,
+  TimelineSnapTarget.clipEdges,
+  TimelineSnapTarget.markers,
+  TimelineSnapTarget.beats,
+  TimelineSnapTarget.keyframes,
+  TimelineSnapTarget.selectionBoundaries,
+  TimelineSnapTarget.workAreaBoundaries,
+};
+
+class TimelineSnapSettings {
+  final bool enabled;
+  final Set<TimelineSnapTarget> targets;
+
+  const TimelineSnapSettings({
+    this.enabled = true,
+    this.targets = kDefaultTimelineSnapTargets,
+  });
+
+  bool includes(TimelineSnapTarget target) =>
+      enabled && targets.contains(target);
+
+  TimelineSnapSettings copyWith({
+    bool? enabled,
+    Set<TimelineSnapTarget>? targets,
+  }) {
+    return TimelineSnapSettings(
+      enabled: enabled ?? this.enabled,
+      targets: Set.unmodifiable(targets ?? this.targets),
+    );
+  }
+
+  TimelineSnapSettings withTarget(
+    TimelineSnapTarget target, {
+    required bool enabled,
+  }) {
+    final next = {...targets};
+    if (enabled) {
+      next.add(target);
+    } else {
+      next.remove(target);
+    }
+    return copyWith(targets: next);
+  }
+
+  Map<String, dynamic> toJson() {
+    final ordered = targets.toList()
+      ..sort((a, b) => a.index.compareTo(b.index));
+    return {
+      'enabled': enabled,
+      'targets': ordered.map((target) => target.name).toList(),
+    };
+  }
+
+  factory TimelineSnapSettings.fromJson(Map<String, dynamic> json) {
+    final rawTargets = json['targets'];
+    final parsedTargets = rawTargets is List
+        ? rawTargets
+              .whereType<String>()
+              .map(
+                (name) => TimelineSnapTarget.values
+                    .where((target) => target.name == name)
+                    .firstOrNull,
+              )
+              .whereType<TimelineSnapTarget>()
+              .toSet()
+        : kDefaultTimelineSnapTargets;
+    return TimelineSnapSettings(
+      enabled: json['enabled'] as bool? ?? true,
+      targets: Set.unmodifiable(parsedTargets),
+    );
+  }
+}
+
 enum TimelineKeyframeProperty {
   opacity,
   scale,
@@ -151,6 +245,122 @@ enum TimelineKeyframeProperty {
   blurStrength,
 }
 
+/// Transform channels captured together by the editor's state-keyframe flow.
+/// Keeping this list canonical prevents preview gestures, the dock and export
+/// from disagreeing about what constitutes a visual state.
+const Set<TimelineKeyframeProperty> kTimelineTransformKeyframeProperties = {
+  TimelineKeyframeProperty.opacity,
+  TimelineKeyframeProperty.scale,
+  TimelineKeyframeProperty.rotation,
+  TimelineKeyframeProperty.positionX,
+  TimelineKeyframeProperty.positionY,
+};
+
+/// Interpolation applied by a keyframe to the segment that follows it.
+enum TimelineKeyframeInterpolation {
+  hold,
+  linear,
+  easeIn,
+  easeOut,
+  easeInOut,
+  cubicBezier,
+}
+
+/// Serializable cubic-bezier timing handles for a keyframe segment.
+///
+/// X coordinates are constrained to [0, 1] so time always moves forward. Y
+/// coordinates deliberately allow overshoot, matching professional graph
+/// editors where a value can pass its destination before settling.
+@immutable
+class TimelineBezierCurve {
+  final double x1;
+  final double y1;
+  final double x2;
+  final double y2;
+
+  const TimelineBezierCurve({
+    required this.x1,
+    required this.y1,
+    required this.x2,
+    required this.y2,
+  });
+
+  static const linear = TimelineBezierCurve(x1: 0, y1: 0, x2: 1, y2: 1);
+  static const easeIn = TimelineBezierCurve(x1: 0.42, y1: 0, x2: 1, y2: 1);
+  static const easeOut = TimelineBezierCurve(x1: 0, y1: 0, x2: 0.58, y2: 1);
+  static const easeInOut = TimelineBezierCurve(
+    x1: 0.42,
+    y1: 0,
+    x2: 0.58,
+    y2: 1,
+  );
+
+  TimelineBezierCurve normalized() {
+    return TimelineBezierCurve(
+      x1: x1.isFinite ? x1.clamp(0.0, 1.0).toDouble() : 0,
+      y1: y1.isFinite ? y1.clamp(-4.0, 5.0).toDouble() : 0,
+      x2: x2.isFinite ? x2.clamp(0.0, 1.0).toDouble() : 1,
+      y2: y2.isFinite ? y2.clamp(-4.0, 5.0).toDouble() : 1,
+    );
+  }
+
+  double transform(double progress) {
+    final x = progress.clamp(0.0, 1.0).toDouble();
+    if (x <= 0 || x >= 1) return x;
+    final curve = normalized();
+
+    double sample(double first, double second, double t) {
+      final inverse = 1 - t;
+      return 3 * inverse * inverse * t * first +
+          3 * inverse * t * t * second +
+          t * t * t;
+    }
+
+    double derivative(double first, double second, double t) {
+      final inverse = 1 - t;
+      return 3 * inverse * inverse * first +
+          6 * inverse * t * (second - first) +
+          3 * t * t * (1 - second);
+    }
+
+    var parameter = x;
+    for (var iteration = 0; iteration < 8; iteration++) {
+      final error = sample(curve.x1, curve.x2, parameter) - x;
+      if (error.abs() < 0.000001) break;
+      final slope = derivative(curve.x1, curve.x2, parameter);
+      if (slope.abs() < 0.000001) break;
+      parameter = (parameter - error / slope).clamp(0.0, 1.0).toDouble();
+    }
+
+    // Newton iteration can become unstable for nearly-flat handles. A short
+    // bisection pass makes the evaluator deterministic for every valid curve.
+    var lower = 0.0;
+    var upper = 1.0;
+    for (var iteration = 0; iteration < 12; iteration++) {
+      final sampledX = sample(curve.x1, curve.x2, parameter);
+      if ((sampledX - x).abs() < 0.000001) break;
+      if (sampledX < x) {
+        lower = parameter;
+      } else {
+        upper = parameter;
+      }
+      parameter = (lower + upper) / 2;
+    }
+    return sample(curve.y1, curve.y2, parameter);
+  }
+
+  Map<String, dynamic> toJson() => {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2};
+
+  factory TimelineBezierCurve.fromJson(Map<String, dynamic> json) {
+    return TimelineBezierCurve(
+      x1: (json['x1'] as num?)?.toDouble() ?? 0,
+      y1: (json['y1'] as num?)?.toDouble() ?? 0,
+      x2: (json['x2'] as num?)?.toDouble() ?? 1,
+      y2: (json['y2'] as num?)?.toDouble() ?? 1,
+    ).normalized();
+  }
+}
+
 /// A non-destructive value change stored relative to the start of a clip.
 /// Keyframes are deliberately small and serializable so they remain safe for
 /// older projects and can be interpolated by both preview and export paths.
@@ -159,25 +369,50 @@ class TimelineKeyframe {
   final Duration time;
   final TimelineKeyframeProperty property;
   final double value;
+  final TimelineKeyframeInterpolation interpolation;
+  final TimelineBezierCurve curve;
 
   TimelineKeyframe({
     String? id,
     required this.time,
     required this.property,
     required this.value,
+    this.interpolation = TimelineKeyframeInterpolation.linear,
+    this.curve = TimelineBezierCurve.linear,
   }) : id = id ?? const Uuid().v4();
 
   TimelineKeyframe copyWith({
     Duration? time,
     TimelineKeyframeProperty? property,
     double? value,
+    TimelineKeyframeInterpolation? interpolation,
+    TimelineBezierCurve? curve,
   }) {
     return TimelineKeyframe(
       id: id,
       time: time ?? this.time,
       property: property ?? this.property,
       value: value ?? this.value,
+      interpolation: interpolation ?? this.interpolation,
+      curve: curve ?? this.curve,
     );
+  }
+
+  TimelineBezierCurve get effectiveCurve => switch (interpolation) {
+    TimelineKeyframeInterpolation.easeIn => TimelineBezierCurve.easeIn,
+    TimelineKeyframeInterpolation.easeOut => TimelineBezierCurve.easeOut,
+    TimelineKeyframeInterpolation.easeInOut => TimelineBezierCurve.easeInOut,
+    TimelineKeyframeInterpolation.cubicBezier => curve,
+    _ => TimelineBezierCurve.linear,
+  };
+
+  double transformProgress(double progress) {
+    final normalized = progress.clamp(0.0, 1.0).toDouble();
+    return switch (interpolation) {
+      TimelineKeyframeInterpolation.hold => normalized >= 1 ? 1 : 0,
+      TimelineKeyframeInterpolation.linear => normalized,
+      _ => effectiveCurve.transform(normalized),
+    };
   }
 
   Map<String, dynamic> toJson() {
@@ -186,6 +421,8 @@ class TimelineKeyframe {
       'timeMs': time.inMilliseconds,
       'property': property.name,
       'value': value,
+      'interpolation': interpolation.name,
+      'curve': curve.toJson(),
     };
   }
 
@@ -198,6 +435,15 @@ class TimelineKeyframe {
         orElse: () => TimelineKeyframeProperty.opacity,
       ),
       value: (json['value'] as num?)?.toDouble() ?? 0,
+      interpolation: TimelineKeyframeInterpolation.values.firstWhere(
+        (candidate) => candidate.name == json['interpolation'],
+        orElse: () => TimelineKeyframeInterpolation.linear,
+      ),
+      curve: _timelineModelFromJson(
+        json['curve'],
+        TimelineBezierCurve.fromJson,
+        TimelineBezierCurve.linear,
+      ),
     );
   }
 }
@@ -213,6 +459,8 @@ class TimelineWorkspaceSettings {
   final bool showClipLabels;
   final Duration? workAreaStart;
   final Duration? workAreaEnd;
+  final TimelineSnapSettings snapping;
+  final PreviewMediaQuality previewMediaQuality;
 
   const TimelineWorkspaceSettings({
     this.frameRate = 30,
@@ -225,6 +473,8 @@ class TimelineWorkspaceSettings {
     this.showClipLabels = true,
     this.workAreaStart,
     this.workAreaEnd,
+    this.snapping = const TimelineSnapSettings(),
+    this.previewMediaQuality = PreviewMediaQuality.auto,
   });
 
   TimelineWorkspaceSettings copyWith({
@@ -238,6 +488,8 @@ class TimelineWorkspaceSettings {
     bool? showClipLabels,
     Duration? workAreaStart,
     Duration? workAreaEnd,
+    TimelineSnapSettings? snapping,
+    PreviewMediaQuality? previewMediaQuality,
     bool clearWorkAreaStart = false,
     bool clearWorkAreaEnd = false,
   }) {
@@ -254,6 +506,8 @@ class TimelineWorkspaceSettings {
           ? null
           : (workAreaStart ?? this.workAreaStart),
       workAreaEnd: clearWorkAreaEnd ? null : (workAreaEnd ?? this.workAreaEnd),
+      snapping: snapping ?? this.snapping,
+      previewMediaQuality: previewMediaQuality ?? this.previewMediaQuality,
     );
   }
 
@@ -283,12 +537,14 @@ class TimelineWorkspaceSettings {
       'showClipLabels': showClipLabels,
       'workAreaStartMs': normalizedWorkAreaStart?.inMilliseconds,
       'workAreaEndMs': normalizedWorkAreaEnd?.inMilliseconds,
+      'snapping': snapping.toJson(),
+      'previewMediaQuality': previewMediaQuality.name,
     };
   }
 
   factory TimelineWorkspaceSettings.fromJson(Map<String, dynamic> json) {
     return TimelineWorkspaceSettings(
-      frameRate: (json['frameRate'] as num?)?.toInt() ?? 30,
+      frameRate: _timelineInt(json['frameRate'], fallback: 30).clamp(1, 120),
       loopPlayback: json['loopPlayback'] as bool? ?? false,
       showWaveforms: json['showWaveforms'] as bool? ?? true,
       showThumbnails: json['showThumbnails'] as bool? ?? true,
@@ -302,6 +558,15 @@ class TimelineWorkspaceSettings {
       workAreaEnd: (json['workAreaEndMs'] as num?) == null
           ? null
           : Duration(milliseconds: (json['workAreaEndMs'] as num).toInt()),
+      snapping: _timelineModelFromJson(
+        json['snapping'],
+        TimelineSnapSettings.fromJson,
+        const TimelineSnapSettings(),
+      ),
+      previewMediaQuality: PreviewMediaQuality.values.firstWhere(
+        (quality) => quality.name == json['previewMediaQuality'],
+        orElse: () => PreviewMediaQuality.auto,
+      ),
     );
   }
 }
@@ -343,6 +608,8 @@ extension TimelineTrackTypeCapabilities on TimelineTrackType {
         this == TimelineTrackType.text ||
         this == TimelineTrackType.effect;
   }
+
+  bool get supportsTransformKeyframes => isVisualMedia;
 
   /// Generic clip transitions are rendered by the visual-media pipeline.
   /// Text uses its dedicated subtitle/text animation presets instead.
@@ -696,6 +963,8 @@ class AudioMixSettings {
   final int fadeOutMs;
   final double pan;
   final bool normalize;
+  final AudioFadeShape fadeInShape;
+  final AudioFadeShape fadeOutShape;
 
   const AudioMixSettings({
     this.volume = 1,
@@ -704,6 +973,8 @@ class AudioMixSettings {
     this.fadeOutMs = 0,
     this.pan = 0,
     this.normalize = false,
+    this.fadeInShape = AudioFadeShape.linear,
+    this.fadeOutShape = AudioFadeShape.linear,
   });
 
   bool get hasMixAdjustment =>
@@ -721,6 +992,8 @@ class AudioMixSettings {
     int? fadeOutMs,
     double? pan,
     bool? normalize,
+    AudioFadeShape? fadeInShape,
+    AudioFadeShape? fadeOutShape,
   }) {
     return AudioMixSettings(
       volume: volume ?? this.volume,
@@ -729,6 +1002,8 @@ class AudioMixSettings {
       fadeOutMs: fadeOutMs ?? this.fadeOutMs,
       pan: pan ?? this.pan,
       normalize: normalize ?? this.normalize,
+      fadeInShape: fadeInShape ?? this.fadeInShape,
+      fadeOutShape: fadeOutShape ?? this.fadeOutShape,
     );
   }
 
@@ -740,6 +1015,8 @@ class AudioMixSettings {
       'fadeOutMs': fadeOutMs,
       'pan': pan,
       'normalize': normalize,
+      'fadeInShape': fadeInShape.name,
+      'fadeOutShape': fadeOutShape.name,
     };
   }
 
@@ -751,6 +1028,14 @@ class AudioMixSettings {
       fadeOutMs: (json['fadeOutMs'] as num?)?.toInt() ?? 0,
       pan: (json['pan'] as num?)?.toDouble() ?? 0,
       normalize: json['normalize'] as bool? ?? false,
+      fadeInShape: AudioFadeShape.values.firstWhere(
+        (shape) => shape.name == json['fadeInShape'],
+        orElse: () => AudioFadeShape.linear,
+      ),
+      fadeOutShape: AudioFadeShape.values.firstWhere(
+        (shape) => shape.name == json['fadeOutShape'],
+        orElse: () => AudioFadeShape.linear,
+      ),
     );
   }
 }
@@ -950,6 +1235,9 @@ class TimelineClip {
   final String? notes;
   final bool autoDuck;
   final double duckAmount;
+  final int duckAttackMs;
+  final int duckReleaseMs;
+  final List<String> duckSidechainTrackIds;
 
   TimelineClip({
     String? id,
@@ -989,10 +1277,16 @@ class TimelineClip {
     this.notes,
     this.autoDuck = false,
     this.duckAmount = 0.35,
+    this.duckAttackMs = 120,
+    this.duckReleaseMs = 180,
+    List<String>? duckSidechainTrackIds,
   }) : id = id ?? const Uuid().v4(),
        sourceStartTime = sourceStartTime ?? Duration.zero,
        sourceDuration = sourceDuration ?? (endTime - startTime),
-       keyframes = List.unmodifiable(keyframes ?? const []);
+       keyframes = List.unmodifiable(keyframes ?? const []),
+       duckSidechainTrackIds = List.unmodifiable(
+         duckSidechainTrackIds ?? const [],
+       );
 
   Duration get duration => endTime - startTime;
   bool get isEffect => type == TimelineTrackType.effect && effectKind != null;
@@ -1070,6 +1364,9 @@ class TimelineClip {
     bool clearNotes = false,
     bool? autoDuck,
     double? duckAmount,
+    int? duckAttackMs,
+    int? duckReleaseMs,
+    List<String>? duckSidechainTrackIds,
   }) {
     return TimelineClip(
       id: id ?? this.id,
@@ -1115,6 +1412,10 @@ class TimelineClip {
       notes: clearNotes ? null : (notes ?? this.notes),
       autoDuck: autoDuck ?? this.autoDuck,
       duckAmount: duckAmount ?? this.duckAmount,
+      duckAttackMs: duckAttackMs ?? this.duckAttackMs,
+      duckReleaseMs: duckReleaseMs ?? this.duckReleaseMs,
+      duckSidechainTrackIds:
+          duckSidechainTrackIds ?? this.duckSidechainTrackIds,
     );
   }
 
@@ -1157,6 +1458,9 @@ class TimelineClip {
       'notes': notes,
       'autoDuck': autoDuck,
       'duckAmount': duckAmount.clamp(0.0, 1.0),
+      'duckAttackMs': duckAttackMs.clamp(0, 5000),
+      'duckReleaseMs': duckReleaseMs.clamp(0, 10000),
+      'duckSidechainTrackIds': duckSidechainTrackIds,
     };
   }
 
@@ -1264,6 +1568,21 @@ class TimelineClip {
       notes: json['notes'] as String?,
       autoDuck: json['autoDuck'] as bool? ?? false,
       duckAmount: (json['duckAmount'] as num?)?.toDouble() ?? 0.35,
+      duckAttackMs: _timelineInt(
+        json['duckAttackMs'],
+        fallback: 120,
+      ).clamp(0, 5000).toInt(),
+      duckReleaseMs: _timelineInt(
+        json['duckReleaseMs'],
+        fallback: 180,
+      ).clamp(0, 10000).toInt(),
+      duckSidechainTrackIds: json['duckSidechainTrackIds'] is List
+          ? (json['duckSidechainTrackIds'] as List)
+                .whereType<String>()
+                .where((id) => id.trim().isNotEmpty)
+                .toSet()
+                .toList()
+          : const [],
     );
   }
 
@@ -1306,12 +1625,35 @@ extension TimelineClipCapabilities on TimelineClip {
           type == TimelineTrackType.gif ||
           type == TimelineTrackType.sticker);
   bool get supportsTransform => type.supportsTransform;
+  bool get supportsTransformKeyframes => type.supportsTransformKeyframes;
   bool get supportsClipAnimation => type.supportsClipAnimation;
   bool get supportsSourceTiming => type.supportsSourceTiming;
   bool get supportsReversePlayback => type.supportsReversePlayback;
   bool get canCarryAudio => type.canCarryAudio;
 
   bool get hasKeyframes => keyframes.isNotEmpty;
+
+  bool get hasTransformKeyframes =>
+      supportsTransformKeyframes &&
+      keyframes.any(
+        (keyframe) =>
+            kTimelineTransformKeyframeProperties.contains(keyframe.property),
+      );
+
+  bool get hasVolumeKeyframes => keyframes.any(
+    (keyframe) => keyframe.property == TimelineKeyframeProperty.volume,
+  );
+
+  /// Unique clip-relative state times used by previous/next navigation.
+  List<Duration> get keyframeStateTimes {
+    final times = keyframes.map((keyframe) => keyframe.time).toSet().toList()
+      ..sort();
+    return times;
+  }
+
+  bool hasKeyframeStateAt(Duration relativeTime) => keyframes.any(
+    (keyframe) => keyframe.time.inMilliseconds == relativeTime.inMilliseconds,
+  );
 
   bool get hasAdvancedProcessing =>
       freezeFrame ||
@@ -1345,8 +1687,11 @@ extension TimelineClipCapabilities on TimelineClip {
           next.time.inMilliseconds - previous.time.inMilliseconds,
         );
         final progress = ((relative - previous.time.inMilliseconds) / span)
-            .clamp(0.0, 1.0);
-        return previous.value + (next.value - previous.value) * progress;
+            .clamp(0.0, 1.0)
+            .toDouble();
+        final interpolatedProgress = previous.transformProgress(progress);
+        return previous.value +
+            (next.value - previous.value) * interpolatedProgress;
       }
     }
     return frames.last.value;
@@ -1569,6 +1914,8 @@ class TimelineTrack {
   final bool isMuted;
   final bool isHidden;
   final bool isSolo;
+  final double audioGain;
+  final double audioPan;
   final List<TimelineClip> clips;
 
   TimelineTrack({
@@ -1582,6 +1929,8 @@ class TimelineTrack {
     this.isMuted = false,
     this.isHidden = false,
     this.isSolo = false,
+    this.audioGain = 1,
+    this.audioPan = 0,
     List<TimelineClip>? clips,
   }) : id = id ?? const Uuid().v4(),
        section = section ?? _defaultSectionForType(type),
@@ -1599,6 +1948,8 @@ class TimelineTrack {
     bool? isMuted,
     bool? isHidden,
     bool? isSolo,
+    double? audioGain,
+    double? audioPan,
     List<TimelineClip>? clips,
   }) {
     return TimelineTrack(
@@ -1612,6 +1963,8 @@ class TimelineTrack {
       isMuted: isMuted ?? this.isMuted,
       isHidden: isHidden ?? this.isHidden,
       isSolo: isSolo ?? this.isSolo,
+      audioGain: audioGain ?? this.audioGain,
+      audioPan: audioPan ?? this.audioPan,
       clips: clips ?? this.clips,
     );
   }
@@ -1628,6 +1981,8 @@ class TimelineTrack {
       'isMuted': isMuted,
       'isHidden': isHidden,
       'isSolo': isSolo,
+      'audioGain': audioGain.clamp(0.0, 2.0),
+      'audioPan': audioPan.clamp(-1.0, 1.0),
       'clips': clips.map((clip) => clip.toJson()).toList(),
     };
   }
@@ -1657,6 +2012,12 @@ class TimelineTrack {
       isMuted: json['isMuted'] as bool? ?? false,
       isHidden: json['isHidden'] as bool? ?? false,
       isSolo: json['isSolo'] as bool? ?? false,
+      audioGain: ((json['audioGain'] as num?)?.toDouble() ?? 1)
+          .clamp(0.0, 2.0)
+          .toDouble(),
+      audioPan: ((json['audioPan'] as num?)?.toDouble() ?? 0)
+          .clamp(-1.0, 1.0)
+          .toDouble(),
       clips: _timelineModelsFromJson(json['clips'], TimelineClip.fromJson),
     );
   }
@@ -1913,7 +2274,7 @@ class EditorTimeline {
   final List<TimelineMarker> markers;
 
   const EditorTimeline({
-    this.schemaVersion = 6,
+    this.schemaVersion = 7,
     this.canvasSettings = const CanvasSettings(),
     this.workspaceSettings = const TimelineWorkspaceSettings(),
     this.subtitleStyle = const SubtitleStyleModel(),
@@ -2217,7 +2578,7 @@ class EditorTimeline {
       _canonicalizeTimelineTracks(tracks),
     );
     return copyWith(
-      schemaVersion: 6,
+      schemaVersion: 7,
       assets: _canonicalizeAssets(assets),
       tracks: schemaVersion < 5
           ? _migrateLegacyTrackOrder(normalizedTracks)
@@ -2766,6 +3127,9 @@ List<TimelineTrack> _foldRedundantLegacySourceAudio(
               ),
               autoDuck: audio.autoDuck,
               duckAmount: audio.duckAmount,
+              duckAttackMs: audio.duckAttackMs,
+              duckReleaseMs: audio.duckReleaseMs,
+              duckSidechainTrackIds: audio.duckSidechainTrackIds,
             );
           }).toList(),
         ),

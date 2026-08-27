@@ -248,12 +248,16 @@ class SubtitleExportService {
     String? fileName,
     int playResX = 1920,
     int playResY = 1080,
+    Map<String, double> cueRotationRadians = const {},
+    Map<String, double> cueOpacities = const {},
   }) async {
     final document = buildAssDocument(
       entries,
       globalStyle,
       playResX: playResX,
       playResY: playResY,
+      cueRotationRadians: cueRotationRadians,
+      cueOpacities: cueOpacities,
     );
     final tempDir = await getTemporaryDirectory();
     final resolvedFileName =
@@ -275,6 +279,8 @@ class SubtitleExportService {
     SubtitleStyleModel globalStyle, {
     int playResX = 1920,
     int playResY = 1080,
+    Map<String, double> cueRotationRadians = const {},
+    Map<String, double> cueOpacities = const {},
   }) {
     final buffer = StringBuffer();
     final sorted = List<SubtitleEntry>.from(entries)
@@ -317,14 +323,20 @@ class SubtitleExportService {
     );
     buffer.writeln(defaultStyle);
     for (var index = 0; index < validEntries.length; index++) {
-      final override = validEntries[index].styleOverride;
-      if (override == null) continue;
+      final entry = validEntries[index];
+      final override = entry.styleOverride;
+      final hasCueTransform =
+          cueRotationRadians.containsKey(entry.id) ||
+          cueOpacities.containsKey(entry.id);
+      if (override == null && !hasCueTransform) continue;
       buffer.writeln(
         _buildAssStyle(
           'Cue$index',
-          override,
+          override ?? globalStyle,
           playResX: playResX,
           playResY: playResY,
+          angleDegrees: (cueRotationRadians[entry.id] ?? 0) * 180 / math.pi,
+          opacity: cueOpacities[entry.id] ?? 1,
         ),
       );
     }
@@ -347,13 +359,19 @@ class SubtitleExportService {
         style,
         playResX: playResX,
         playResY: playResY,
+        opacity: cueOpacities[entry.id] ?? 1,
       );
-      final styleName = entry.styleOverride == null ? 'Default' : 'Cue$index';
+      final styleName =
+          entry.styleOverride == null &&
+              !cueRotationRadians.containsKey(entry.id) &&
+              !cueOpacities.containsKey(entry.id)
+          ? 'Default'
+          : 'Cue$index';
 
       if (style.backgroundType == SubtitleBackground.fullBar) {
         buffer.writeln(
           'Dialogue: 0,$start,$end,$styleName,,0,0,0,,'
-          '${_buildFullBarDrawing(style, playResX: playResX, playResY: playResY)}',
+          '${_buildFullBarDrawing(style, playResX: playResX, playResY: playResY, opacity: cueOpacities[entry.id] ?? 1)}',
         );
       }
       buffer.writeln('Dialogue: 1,$start,$end,$styleName,,0,0,0,,$text');
@@ -378,7 +396,9 @@ class SubtitleExportService {
     SubtitleStyleModel style, {
     required int playResX,
     required int playResY,
+    required double opacity,
   }) {
+    final safeOpacity = opacity.clamp(0.0, 1.0).toDouble();
     final horizontalAlignment = _assHorizontalAlignment(style.textAlignment);
     final boxCenterX =
         playResX / 2 + style.offsetX * (playResX / kTimelineDesignWidth);
@@ -407,11 +427,11 @@ class SubtitleExportService {
     if (style.animationPreset == SubtitleAnimationPreset.wordPop) {
       final fragments = _resolveWordAnimationFragments(renderedEntry);
       if (fragments.isNotEmpty) {
-        final primaryAlpha = _assAlpha(style.textColor.a);
+        final primaryAlpha = _assAlpha(style.textColor.a * safeOpacity);
         final secondaryAlpha = primaryAlpha;
-        final outlineAlpha = '00';
+        final outlineAlpha = _assAlpha(safeOpacity);
         final backgroundAlpha = _assAlpha(
-          style.backgroundColor.a * style.backgroundOpacity,
+          style.backgroundColor.a * style.backgroundOpacity * safeOpacity,
         );
         final pop = StringBuffer('{\\pos($x,$y)}');
         for (final fragment in fragments) {
@@ -441,6 +461,7 @@ class SubtitleExportService {
         return '{\\pos($x,$y)\\kf$durationCentiseconds}$escaped';
       }
       final karaoke = StringBuffer('{\\pos($x,$y)}');
+      final visibleAlpha = _assAlpha(style.textColor.a * safeOpacity);
       var cursor = Duration.zero;
       for (final fragment in fragments) {
         final gapCentiseconds =
@@ -449,7 +470,10 @@ class SubtitleExportService {
               9999,
             );
         if (gapCentiseconds > 0) {
-          karaoke.write('{\\alpha&HFF&\\k$gapCentiseconds}\\h{\\alpha&H00&}');
+          karaoke.write(
+            '{\\alpha&HFF&\\k$gapCentiseconds}\\h'
+            '{\\alpha&H$visibleAlpha&}',
+          );
         }
         final durationCentiseconds =
             ((fragment.endOffset - fragment.startOffset).inMilliseconds / 10)
@@ -492,16 +516,18 @@ class SubtitleExportService {
       return '{\\move($x,${y + travel},$x,$y,0,180)\\fad(180,0)}$escaped';
     }
     if (style.animationPreset == SubtitleAnimationPreset.zoomIn) {
+      final visibleAlpha = _assAlpha(style.textColor.a * safeOpacity);
       return '{\\pos($x,$y)\\alpha&HFF&\\fscx72\\fscy72'
-          '\\t(0,220,\\alpha&H00&\\fscx100\\fscy100)}$escaped';
+          '\\t(0,220,\\alpha&H$visibleAlpha&\\fscx100\\fscy100)}$escaped';
     }
     if (style.animationPreset == SubtitleAnimationPreset.slideFromLeft) {
       final travel = (28 * (playResX / kTimelineDesignWidth)).round();
       return '{\\move(${x - travel},$y,$x,$y,0,240)\\fad(180,0)}$escaped';
     }
     if (style.animationPreset == SubtitleAnimationPreset.bounceIn) {
+      final visibleAlpha = _assAlpha(style.textColor.a * safeOpacity);
       return '{\\pos($x,$y)\\alpha&HFF&\\fscx55\\fscy55'
-          '\\t(0,110,\\alpha&H00&)'
+          '\\t(0,110,\\alpha&H$visibleAlpha&)'
           '\\t(0,218,\\fscx110\\fscy110)'
           '\\t(218,320,\\fscx100\\fscy100)}$escaped';
     }
@@ -601,7 +627,10 @@ class SubtitleExportService {
     SubtitleStyleModel style, {
     required int playResX,
     required int playResY,
+    double angleDegrees = 0,
+    double opacity = 1,
   }) {
+    final safeOpacity = opacity.clamp(0.0, 1.0).toDouble();
     final fontName = CaptionFontService.resolveFamily(style.fontFamily);
     final fontSize = (style.fontSize * (playResY / kTimelineDesignHeight))
         .clamp(8, playResY * 0.24)
@@ -610,17 +639,26 @@ class SubtitleExportService {
         style.animationPreset == SubtitleAnimationPreset.karaokeHighlight;
     final isTypewriter =
         style.animationPreset == SubtitleAnimationPreset.typewriter;
-    final primaryColor = _colorToAss(isKaraoke ? kAccent : style.textColor);
-    final secondaryColor = _colorToAss(
-      isKaraoke
-          ? style.textColor.withValues(alpha: 0.4)
-          : isTypewriter
-          ? style.textColor.withValues(alpha: 0)
-          : style.textColor,
+    final primaryBase = isKaraoke ? kAccent : style.textColor;
+    final primaryColor = _colorToAss(
+      primaryBase.withValues(alpha: primaryBase.a * safeOpacity),
     );
-    final outlineColor = '&H00000000'; // Black outline
-    final backgroundAlpha = (style.backgroundColor.a * style.backgroundOpacity)
-        .clamp(0.0, 1.0);
+    final secondaryBase = isKaraoke
+        ? style.textColor.withValues(alpha: 0.4)
+        : isTypewriter
+        ? style.textColor.withValues(alpha: 0)
+        : style.textColor;
+    final secondaryColor = _colorToAss(
+      secondaryBase.withValues(alpha: secondaryBase.a * safeOpacity),
+    );
+    final outlineColor = _colorToAss(
+      Colors.black.withValues(alpha: safeOpacity),
+    );
+    final backgroundAlpha =
+        (style.backgroundColor.a * style.backgroundOpacity * safeOpacity).clamp(
+          0.0,
+          1.0,
+        );
     final backColor = _colorToAss(
       style.backgroundColor.withValues(alpha: backgroundAlpha),
     );
@@ -653,9 +691,12 @@ class SubtitleExportService {
             .round()
             .clamp(10, playResX ~/ 2);
     final verticalMargin = (playResY * 0.05).round().clamp(10, playResY ~/ 3);
+    final angle = angleDegrees.abs() < 0.0001
+        ? '0'
+        : angleDegrees.toStringAsFixed(3).replaceFirst(RegExp(r'\.?0+$'), '');
 
     return 'Style: $name,$fontName,$fontSize,$primaryColor,$secondaryColor,'
-        '$outlineColor,$backColor,$bold,$italic,0,0,100,100,0,0,'
+        '$outlineColor,$backColor,$bold,$italic,0,0,100,100,0,$angle,'
         '$borderStyle,$outline,$shadow,$alignment,$horizontalMargin,'
         '$horizontalMargin,$verticalMargin,1';
   }
@@ -678,6 +719,7 @@ class SubtitleExportService {
     SubtitleStyleModel style, {
     required int playResX,
     required int playResY,
+    required double opacity,
   }) {
     final baseY = switch (style.position) {
       SubtitlePosition.top => playResY * 0.1,
@@ -696,8 +738,11 @@ class SubtitleExportService {
         .clamp(18, playResY);
     final top = (y - barHeight / 2).round().clamp(0, playResY);
     final bottom = (top + barHeight).clamp(0, playResY);
-    final effectiveAlpha = (style.backgroundColor.a * style.backgroundOpacity)
-        .clamp(0.0, 1.0);
+    final effectiveAlpha =
+        (style.backgroundColor.a *
+                style.backgroundOpacity *
+                opacity.clamp(0.0, 1.0))
+            .clamp(0.0, 1.0);
     final alphaHex = (255 - (effectiveAlpha * 255).round())
         .clamp(0, 255)
         .toRadixString(16)

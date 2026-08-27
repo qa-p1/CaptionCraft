@@ -3,6 +3,7 @@ import 'package:caption_craft/features/editor/models/subtitle_entry.dart';
 import 'package:caption_craft/features/editor/models/subtitle_style_model.dart';
 import 'package:caption_craft/features/editor/providers/editor_provider.dart';
 import 'package:caption_craft/features/editor/providers/subtitle_provider.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -20,13 +21,17 @@ void main() {
     );
 
     notifier.beginTimelineGestureEdit();
+    expect(container.read(editorProvider).isTimelineGestureEditing, isTrue);
     notifier.setTimeline(
       original.copyWith(canvasSettings: const CanvasSettings(showGrid: true)),
       recordHistory: false,
     );
 
     expect(container.read(editorProvider).editRevision, 0);
+    expect(container.read(editorProvider).canUndo, isFalse);
+    expect(container.read(editorProvider).canRedo, isFalse);
     notifier.endTimelineGestureEdit();
+    expect(container.read(editorProvider).isTimelineGestureEditing, isFalse);
     expect(container.read(editorProvider).editRevision, 1);
     expect(container.read(editorProvider).canUndo, isTrue);
     notifier.undo();
@@ -51,6 +56,69 @@ void main() {
 
     expect(container.read(editorProvider).canUndo, isFalse);
     expect(container.read(editorProvider).editRevision, 0);
+  });
+
+  test('cancelling a gesture restores state and existing redo history', () {
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    final notifier = container.read(editorProvider.notifier);
+    notifier.loadProject(
+      videoPath: 'source.mp4',
+      projectId: 'project',
+      projectName: 'Project',
+    );
+    notifier.setTimeline(
+      const EditorTimeline(canvasSettings: CanvasSettings(showGrid: true)),
+    );
+    notifier.undo();
+    expect(container.read(editorProvider).canRedo, isTrue);
+
+    notifier.beginTimelineGestureEdit();
+    notifier.setTimeline(
+      const EditorTimeline(
+        canvasSettings: CanvasSettings(backgroundColor: Color(0xFF123456)),
+      ),
+      recordHistory: false,
+    );
+    expect(container.read(editorProvider).canRedo, isFalse);
+    notifier.cancelTimelineGestureEdit();
+
+    final restored = container.read(editorProvider);
+    expect(restored.timeline.canvasSettings.showGrid, isFalse);
+    expect(restored.timeline.canvasSettings.backgroundColor, Colors.black);
+    expect(restored.canUndo, isFalse);
+    expect(restored.canRedo, isTrue);
+    notifier.redo();
+    expect(
+      container.read(editorProvider).timeline.canvasSettings.showGrid,
+      isTrue,
+    );
+  });
+
+  test('ending a gesture twice records only one undo action', () {
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    final notifier = container.read(editorProvider.notifier);
+    notifier.loadProject(
+      videoPath: 'source.mp4',
+      projectId: 'project',
+      projectName: 'Project',
+    );
+
+    notifier.beginTimelineGestureEdit();
+    notifier.setTimeline(
+      const EditorTimeline(canvasSettings: CanvasSettings(showGrid: true)),
+      recordHistory: false,
+    );
+    notifier.endTimelineGestureEdit();
+    notifier.endTimelineGestureEdit();
+    notifier.undo();
+
+    expect(
+      container.read(editorProvider).timeline.canvasSettings.showGrid,
+      isFalse,
+    );
+    expect(container.read(editorProvider).canUndo, isFalse);
   });
 
   test('selecting another track clears an unrelated clip selection', () {

@@ -190,7 +190,7 @@ class TimelineExportService {
       }
 
       onProgress?.call(0.08);
-      assPath = await _buildAssTrack(
+      assPath = await buildAssTrack(
         timeline: timeline,
         subtitleEntries: subtitleEntries,
         globalSubtitleStyle: globalSubtitleStyle,
@@ -307,6 +307,8 @@ class TimelineExportService {
     required Duration timelineDuration,
     required String? assPath,
     String? captionFontDirectory,
+    String? videoPreset,
+    int? videoCrf,
     required String outputPath,
   }) {
     final args = <String>['-hide_banner', '-y'];
@@ -354,9 +356,9 @@ class TimelineExportService {
       '-c:v',
       'libx264',
       '-preset',
-      settings.preset,
+      videoPreset ?? settings.preset,
       '-crf',
-      '${settings.crf}',
+      '${videoCrf ?? settings.crf}',
       '-pix_fmt',
       'yuv420p',
       '-t',
@@ -365,6 +367,66 @@ class TimelineExportService {
       '+faststart',
       '-max_muxing_queue_size',
       '4096',
+      outputPath,
+    ]);
+    return args;
+  }
+
+  /// Builds an audio-only render that uses the exact same clip timing, volume
+  /// automation, fades, pan, ducking, and peak limiter as final export.
+  ///
+  /// The editor uses this for its preview mix bus. Rendering overlapping media
+  /// into one continuous audio stream prevents a large collection of platform
+  /// video players from independently owning the device audio clock.
+  static List<String> buildPreviewAudioMixArguments({
+    required EditorTimeline timeline,
+    required List<TimelineRenderInput> inputs,
+    required Duration timelineDuration,
+    required String outputPath,
+  }) {
+    if (inputs.isEmpty) {
+      throw ArgumentError.value(inputs, 'inputs', 'Must contain audio inputs.');
+    }
+    final safeDuration = timelineDuration <= Duration.zero
+        ? const Duration(milliseconds: 1)
+        : timelineDuration;
+    final args = <String>['-hide_banner', '-y'];
+    for (final input in inputs) {
+      args.addAll(_inputArguments(input));
+    }
+    final filters = <String>[];
+    final hasAudio = _appendAudioMixFilters(
+      filters: filters,
+      timeline: timeline,
+      inputs: inputs,
+      timelineDuration: safeDuration,
+      includeAudio: true,
+    );
+    if (!hasAudio) {
+      throw ArgumentError.value(
+        inputs,
+        'inputs',
+        'Must contain at least one audible input.',
+      );
+    }
+    args.addAll([
+      '-filter_complex',
+      filters.join(';'),
+      '-map',
+      '[aout]',
+      '-vn',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '192k',
+      '-ar',
+      '48000',
+      '-ac',
+      '2',
+      '-t',
+      _seconds(safeDuration),
+      '-movflags',
+      '+faststart',
       outputPath,
     ]);
     return args;
@@ -928,8 +990,27 @@ class TimelineExportService {
       'trim=duration=$durationSeconds[vout]',
     );
 
+    _appendAudioMixFilters(
+      filters: filters,
+      timeline: timeline,
+      inputs: inputs,
+      timelineDuration: timelineDuration,
+      includeAudio: settings.includeAudio,
+    );
+
+    return filters.join(';');
+  }
+
+  static bool _appendAudioMixFilters({
+    required List<String> filters,
+    required EditorTimeline timeline,
+    required List<TimelineRenderInput> inputs,
+    required Duration timelineDuration,
+    required bool includeAudio,
+  }) {
+    final durationSeconds = _seconds(timelineDuration);
     final audioLabels = <String>[];
-    if (settings.includeAudio) {
+    if (includeAudio) {
       final soloTrackIds = inputs
           .where((input) => input.track.isSolo)
           .map((input) => input.track.id)
@@ -959,16 +1040,22 @@ class TimelineExportService {
           if (mix.normalize) 'loudnorm=I=-16:LRA=11:TP=-1.5',
           _audioVolumeFilter(
             clip,
+            track: input.track,
             timeline: timeline,
             inputs: inputs,
             soloTrackIds: soloTrackIds,
           ),
-          if (mix.pan.abs() > 0.001)
-            _panFilter(mix.pan.clamp(-1, 1).toDouble()),
-          if (fadeInSeconds > 0) 'afade=t=in:st=0:d=${_number(fadeInSeconds)}',
+          if ((mix.pan + input.track.audioPan).abs() > 0.001)
+            _panFilter(
+              (mix.pan + input.track.audioPan).clamp(-1, 1).toDouble(),
+            ),
+          if (fadeInSeconds > 0)
+            'afade=t=in:st=0:d=${_number(fadeInSeconds)}:'
+                'curve=${_fadeCurve(mix.fadeInShape)}',
           if (fadeOutSeconds > 0)
             'afade=t=out:st=${_number(math.max(0, clipDurationSeconds - fadeOutSeconds))}:'
-                'd=${_number(fadeOutSeconds)}',
+                'd=${_number(fadeOutSeconds)}:'
+                'curve=${_fadeCurve(mix.fadeOutShape)}',
           'adelay=${clip.startTime.inMilliseconds}|'
               '${clip.startTime.inMilliseconds}',
           'apad',
@@ -982,7 +1069,9 @@ class TimelineExportService {
 
     if (audioLabels.length == 1) {
       filters.add(
-        '[${audioLabels.first}]anull,atrim=duration=$durationSeconds[aout]',
+        '[${audioLabels.first}]'
+        'alimiter=limit=0.95:attack=5:release=50:latency=1,'
+        'atrim=duration=$durationSeconds[aout]',
       );
     } else if (audioLabels.length > 1) {
       final inputsExpression = audioLabels.map((label) => '[$label]').join();
@@ -990,11 +1079,13 @@ class TimelineExportService {
         '$inputsExpression'
         'amix=inputs=${audioLabels.length}:duration=longest:'
         'dropout_transition=0:normalize=0,'
-        'alimiter=limit=0.95,atrim=duration=$durationSeconds[aout]',
+        // Compensating limiter latency keeps the rendered preview bus aligned
+        // to the visual timeline while protecting dense mixes from clipping.
+        'alimiter=limit=0.95:attack=5:release=50:latency=1,'
+        'atrim=duration=$durationSeconds[aout]',
       );
     }
-
-    return filters.join(';');
+    return audioLabels.isNotEmpty;
   }
 
   static ({String sourceLabel, int nextEffectIndex}) _appendTimelineEffects({
@@ -1129,17 +1220,20 @@ class TimelineExportService {
     return frames.any((frame) => frame.value.clamp(0, 30) > 0.01);
   }
 
-  /// Produces a Gaussian blur whose sigma follows the editor's linear
-  /// keyframe interpolation. `gblur` accepts runtime commands but not a sigma
-  /// expression, so `sendcmd` evaluates the interpolation once per frame and
-  /// updates the named filter instance.
+  /// Produces a Gaussian blur whose sigma follows the editor's keyframe
+  /// evaluator. `gblur` accepts runtime commands but not a sigma expression,
+  /// so curved segments are deterministically sampled into short linear
+  /// commands that use the same model values as preview.
   static List<String> _blurFilterChain(
     TimelineClip clip, {
     required String target,
     Duration timelineOffset = Duration.zero,
     String? enableExpression,
   }) {
-    final frames = _keyframesFor(clip, TimelineKeyframeProperty.blurStrength);
+    final frames = _renderKeyframesFor(
+      clip,
+      TimelineKeyframeProperty.blurStrength,
+    );
     final initialStrength = frames.isEmpty
         ? clip.blur.safeStrength
         : frames.first.value.clamp(0, 30).toDouble();
@@ -1200,8 +1294,74 @@ class TimelineExportService {
     return frames;
   }
 
-  /// Builds a piecewise-linear FFmpeg expression with the same endpoint
-  /// behavior as [TimelineClip.keyframedValue].
+  /// Expands non-linear timing into bounded linear samples for FFmpeg filters.
+  /// Hold segments receive a point one microsecond before their destination,
+  /// preserving the step without requiring filter-specific expression logic.
+  static List<TimelineKeyframe> _renderKeyframesFor(
+    TimelineClip clip,
+    TimelineKeyframeProperty property,
+  ) {
+    final frames = _keyframesFor(clip, property);
+    if (frames.length < 2) return frames;
+    final rendered = <TimelineKeyframe>[];
+    void addLinear(Duration time, double value) {
+      if (rendered.isNotEmpty && rendered.last.time == time) {
+        rendered[rendered.length - 1] = TimelineKeyframe(
+          id: rendered.last.id,
+          time: time,
+          property: property,
+          value: value,
+        );
+        return;
+      }
+      rendered.add(
+        TimelineKeyframe(
+          id: 'render_${property.name}_${time.inMicroseconds}',
+          time: time,
+          property: property,
+          value: value,
+        ),
+      );
+    }
+
+    addLinear(frames.first.time, frames.first.value);
+    for (var index = 0; index + 1 < frames.length; index++) {
+      final previous = frames[index];
+      final next = frames[index + 1];
+      final startUs = previous.time.inMicroseconds;
+      final endUs = next.time.inMicroseconds;
+      final spanUs = endUs - startUs;
+      if (spanUs <= 0) {
+        addLinear(next.time, next.value);
+        continue;
+      }
+      if (previous.interpolation == TimelineKeyframeInterpolation.hold) {
+        if (spanUs > 1) {
+          addLinear(Duration(microseconds: endUs - 1), previous.value);
+        }
+      } else if (previous.interpolation !=
+          TimelineKeyframeInterpolation.linear) {
+        final spanSeconds = spanUs / Duration.microsecondsPerSecond;
+        final sampleCount = (spanSeconds * 12).ceil().clamp(4, 48);
+        for (var sample = 1; sample < sampleCount; sample++) {
+          final progress = sample / sampleCount;
+          final value =
+              previous.value +
+              (next.value - previous.value) *
+                  previous.transformProgress(progress);
+          addLinear(
+            Duration(microseconds: startUs + (spanUs * progress).round()),
+            value,
+          );
+        }
+      }
+      addLinear(next.time, next.value);
+    }
+    return rendered;
+  }
+
+  /// Builds a piecewise-linear FFmpeg expression from values sampled through
+  /// [TimelineKeyframe.transformProgress].
   static String _keyframedValueExpression(
     TimelineClip clip,
     TimelineKeyframeProperty property, {
@@ -1210,7 +1370,7 @@ class TimelineExportService {
     double? minimum,
     double? maximum,
   }) {
-    final frames = _keyframesFor(clip, property);
+    final frames = _renderKeyframesFor(clip, property);
     if (frames.isEmpty) {
       final value = minimum == null || maximum == null
           ? fallback
@@ -1460,6 +1620,7 @@ class TimelineExportService {
 
   static String _audioVolumeFilter(
     TimelineClip clip, {
+    required TimelineTrack track,
     required EditorTimeline timeline,
     required List<TimelineRenderInput> inputs,
     required Set<String> soloTrackIds,
@@ -1487,7 +1648,13 @@ class TimelineExportService {
     if (duckingFactor != null) {
       expression = 'clip(($expression)*($duckingFactor),0,2)';
     }
-    if (!hasVolumeKeyframes && duckingFactor == null) {
+    final trackGain = track.audioGain.clamp(0.0, 2.0).toDouble();
+    if ((trackGain - 1).abs() > 0.0001) {
+      expression = 'clip(($expression)*${_number(trackGain)},0,4)';
+    }
+    if (!hasVolumeKeyframes &&
+        duckingFactor == null &&
+        (trackGain - 1).abs() <= 0.0001) {
       return 'volume=${_number(clip.audioMix.volume.clamp(0, 2))}';
     }
     return "volume='$expression':eval=frame";
@@ -1514,6 +1681,8 @@ class TimelineExportService {
 
     for (final track in timeline.tracks) {
       if (track.isHidden ||
+          (clip.duckSidechainTrackIds.isNotEmpty &&
+              !clip.duckSidechainTrackIds.contains(track.id)) ||
           (track.type != TimelineTrackType.subtitle &&
               track.type != TimelineTrackType.text)) {
         continue;
@@ -1530,6 +1699,8 @@ class TimelineExportService {
 
     for (final input in inputs) {
       if (input.clip.id == clip.id ||
+          (clip.duckSidechainTrackIds.isNotEmpty &&
+              !clip.duckSidechainTrackIds.contains(input.track.id)) ||
           !input.hasAudio ||
           input.track.isMuted ||
           input.clip.audioMix.muted ||
@@ -1541,8 +1712,8 @@ class TimelineExportService {
     if (intervals.isEmpty) return null;
 
     intervals.sort((a, b) => a.$1.compareTo(b.$1));
-    const attackMs = 120;
-    const releaseMs = 180;
+    final attackMs = clip.duckAttackMs.clamp(0, 5000);
+    final releaseMs = clip.duckReleaseMs.clamp(0, 10000);
     final merged = <(int, int)>[];
     for (final interval in intervals) {
       if (merged.isEmpty ||
@@ -1733,7 +1904,10 @@ class TimelineExportService {
     return (x, y);
   }
 
-  static Future<String?> _buildAssTrack({
+  /// Materializes the timeline's subtitle and text layers as an ASS track.
+  /// Preview render caches use the same path so dense playback remains
+  /// visually consistent with final export.
+  static Future<String?> buildAssTrack({
     required EditorTimeline timeline,
     required List<SubtitleEntry> subtitleEntries,
     required SubtitleStyleModel globalSubtitleStyle,
@@ -1741,6 +1915,8 @@ class TimelineExportService {
     required ExportCanvasSize canvasSize,
   }) async {
     final entries = <SubtitleEntry>[];
+    final cueRotationRadians = <String, double>{};
+    final cueOpacities = <String, double>{};
     if (settings.burnSubtitles) {
       entries.addAll(
         SubtitleExportService.effectiveTimelineCaptions(
@@ -1775,6 +1951,8 @@ class TimelineExportService {
             styleOverride: style,
           ),
         );
+        cueRotationRadians[clip.id] = clip.transform.rotation;
+        cueOpacities[clip.id] = clip.transform.opacity;
       }
     }
 
@@ -1785,6 +1963,8 @@ class TimelineExportService {
       fileName: 'timeline_${DateTime.now().microsecondsSinceEpoch}.ass',
       playResX: canvasSize.width,
       playResY: canvasSize.height,
+      cueRotationRadians: cueRotationRadians,
+      cueOpacities: cueOpacities,
     );
   }
 
@@ -1828,6 +2008,15 @@ class TimelineExportService {
     final right = pan >= 0 ? 1.0 : 1 + pan;
     return 'pan=stereo|c0=${_number(left)}*c0|'
         'c1=${_number(right)}*c1';
+  }
+
+  static String _fadeCurve(AudioFadeShape shape) {
+    return switch (shape) {
+      AudioFadeShape.linear => 'tri',
+      AudioFadeShape.logarithmic => 'log',
+      AudioFadeShape.exponential => 'exp',
+      AudioFadeShape.sCurve => 'qsin',
+    };
   }
 
   static Duration _sourceWindow(TimelineClip clip) {

@@ -40,6 +40,14 @@ Release builds require `android/key.properties` with `storeFile`,
 `storePassword`, `keyAlias`, and `keyPassword`; they fail instead of silently
 using a debug key.
 
+## Editor engineering documentation
+
+- [Editor architecture](docs/editor_architecture.md) — playback ownership,
+  timeline scaling, animation, proxy/waveform caches, audio semantics,
+  persistence, and undo boundaries.
+- [Editor core roadmap](docs/editor_core_roadmap.md) — audited complete,
+  partial, and outstanding timeline/editor requirements for the feature branch.
+
 ## Optional Elements libraries
 
 GIPHY, Pexels, and Pixabay search results are loaded only while their Elements
