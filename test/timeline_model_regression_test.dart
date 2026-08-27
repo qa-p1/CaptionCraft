@@ -747,7 +747,7 @@ void main() {
         ).toJson(),
       );
 
-      expect(restored.schemaVersion, 6);
+      expect(restored.schemaVersion, 7);
       expect(restored.tracks.map((track) => track.id), [
         'legacy_text',
         'legacy_high',

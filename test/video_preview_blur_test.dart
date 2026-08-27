@@ -309,6 +309,93 @@ void main() {
     expect(clamped.end, const Duration(seconds: 5));
   });
 
+  test(
+    'preview resolves validated proxies without affecting original mode',
+    () {
+      final asset = EditorAssetReference(
+        id: 'asset-video',
+        type: EditorAssetType.video,
+        label: 'Video',
+        sourcePath: '/media/original.mp4',
+        metadata: const {
+          'proxyMedia': {
+            'path': '/cache/proxy.mp4',
+            'sourceFingerprint': 'fixture-v1',
+          },
+        },
+      );
+      final clip = TimelineClip(
+        id: 'clip-video',
+        trackId: 'track-video',
+        type: TimelineTrackType.video,
+        label: 'Video',
+        assetId: asset.id,
+        startTime: Duration.zero,
+        endTime: const Duration(seconds: 2),
+      );
+      EditorTimeline timeline(PreviewMediaQuality quality) => EditorTimeline(
+        assets: [asset],
+        workspaceSettings: TimelineWorkspaceSettings(
+          previewMediaQuality: quality,
+        ),
+        tracks: [
+          TimelineTrack(
+            id: 'track-video',
+            name: 'Video',
+            type: TimelineTrackType.video,
+            section: TimelineTrackSection.baseVideo,
+            clips: [clip],
+          ),
+        ],
+      );
+      bool exists(String path) =>
+          path == '/media/original.mp4' || path == '/cache/proxy.mp4';
+
+      expect(
+        resolvePreviewSourcePathForTesting(
+          timeline: timeline(PreviewMediaQuality.auto),
+          clip: clip,
+          legacyVideoPath: '',
+          fileExists: exists,
+          sourceFingerprintSync: (_) => 'fixture-v1',
+        ),
+        '/cache/proxy.mp4',
+      );
+      expect(
+        resolvePreviewSourcePathForTesting(
+          timeline: timeline(PreviewMediaQuality.original),
+          clip: clip,
+          legacyVideoPath: '',
+          fileExists: exists,
+          sourceFingerprintSync: (_) => 'fixture-v1',
+        ),
+        '/media/original.mp4',
+      );
+      expect(
+        resolvePreviewSourcePathForTesting(
+          timeline: timeline(PreviewMediaQuality.proxy),
+          clip: clip,
+          legacyVideoPath: '',
+          fileExists: (path) => path == '/cache/proxy.mp4',
+          sourceFingerprintSync: (_) => 'missing',
+        ),
+        '/cache/proxy.mp4',
+        reason: 'an offline original remains previewable from its proxy',
+      );
+      expect(
+        resolvePreviewSourcePathForTesting(
+          timeline: timeline(PreviewMediaQuality.proxy),
+          clip: clip,
+          legacyVideoPath: '',
+          fileExists: exists,
+          sourceFingerprintSync: (_) => 'changed-source',
+        ),
+        '/media/original.mp4',
+        reason: 'relinked or modified sources invalidate stale proxies',
+      );
+    },
+  );
+
   testWidgets('preview diagnostics can be shown, reset, and hidden', (
     tester,
   ) async {

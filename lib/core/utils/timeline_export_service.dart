@@ -1040,16 +1040,22 @@ class TimelineExportService {
           if (mix.normalize) 'loudnorm=I=-16:LRA=11:TP=-1.5',
           _audioVolumeFilter(
             clip,
+            track: input.track,
             timeline: timeline,
             inputs: inputs,
             soloTrackIds: soloTrackIds,
           ),
-          if (mix.pan.abs() > 0.001)
-            _panFilter(mix.pan.clamp(-1, 1).toDouble()),
-          if (fadeInSeconds > 0) 'afade=t=in:st=0:d=${_number(fadeInSeconds)}',
+          if ((mix.pan + input.track.audioPan).abs() > 0.001)
+            _panFilter(
+              (mix.pan + input.track.audioPan).clamp(-1, 1).toDouble(),
+            ),
+          if (fadeInSeconds > 0)
+            'afade=t=in:st=0:d=${_number(fadeInSeconds)}:'
+                'curve=${_fadeCurve(mix.fadeInShape)}',
           if (fadeOutSeconds > 0)
             'afade=t=out:st=${_number(math.max(0, clipDurationSeconds - fadeOutSeconds))}:'
-                'd=${_number(fadeOutSeconds)}',
+                'd=${_number(fadeOutSeconds)}:'
+                'curve=${_fadeCurve(mix.fadeOutShape)}',
           'adelay=${clip.startTime.inMilliseconds}|'
               '${clip.startTime.inMilliseconds}',
           'apad',
@@ -1063,7 +1069,9 @@ class TimelineExportService {
 
     if (audioLabels.length == 1) {
       filters.add(
-        '[${audioLabels.first}]anull,atrim=duration=$durationSeconds[aout]',
+        '[${audioLabels.first}]'
+        'alimiter=limit=0.95:attack=5:release=50:latency=1,'
+        'atrim=duration=$durationSeconds[aout]',
       );
     } else if (audioLabels.length > 1) {
       final inputsExpression = audioLabels.map((label) => '[$label]').join();
@@ -1612,6 +1620,7 @@ class TimelineExportService {
 
   static String _audioVolumeFilter(
     TimelineClip clip, {
+    required TimelineTrack track,
     required EditorTimeline timeline,
     required List<TimelineRenderInput> inputs,
     required Set<String> soloTrackIds,
@@ -1639,7 +1648,13 @@ class TimelineExportService {
     if (duckingFactor != null) {
       expression = 'clip(($expression)*($duckingFactor),0,2)';
     }
-    if (!hasVolumeKeyframes && duckingFactor == null) {
+    final trackGain = track.audioGain.clamp(0.0, 2.0).toDouble();
+    if ((trackGain - 1).abs() > 0.0001) {
+      expression = 'clip(($expression)*${_number(trackGain)},0,4)';
+    }
+    if (!hasVolumeKeyframes &&
+        duckingFactor == null &&
+        (trackGain - 1).abs() <= 0.0001) {
       return 'volume=${_number(clip.audioMix.volume.clamp(0, 2))}';
     }
     return "volume='$expression':eval=frame";
@@ -1666,6 +1681,8 @@ class TimelineExportService {
 
     for (final track in timeline.tracks) {
       if (track.isHidden ||
+          (clip.duckSidechainTrackIds.isNotEmpty &&
+              !clip.duckSidechainTrackIds.contains(track.id)) ||
           (track.type != TimelineTrackType.subtitle &&
               track.type != TimelineTrackType.text)) {
         continue;
@@ -1682,6 +1699,8 @@ class TimelineExportService {
 
     for (final input in inputs) {
       if (input.clip.id == clip.id ||
+          (clip.duckSidechainTrackIds.isNotEmpty &&
+              !clip.duckSidechainTrackIds.contains(input.track.id)) ||
           !input.hasAudio ||
           input.track.isMuted ||
           input.clip.audioMix.muted ||
@@ -1693,8 +1712,8 @@ class TimelineExportService {
     if (intervals.isEmpty) return null;
 
     intervals.sort((a, b) => a.$1.compareTo(b.$1));
-    const attackMs = 120;
-    const releaseMs = 180;
+    final attackMs = clip.duckAttackMs.clamp(0, 5000);
+    final releaseMs = clip.duckReleaseMs.clamp(0, 10000);
     final merged = <(int, int)>[];
     for (final interval in intervals) {
       if (merged.isEmpty ||
@@ -1983,6 +2002,15 @@ class TimelineExportService {
     final right = pan >= 0 ? 1.0 : 1 + pan;
     return 'pan=stereo|c0=${_number(left)}*c0|'
         'c1=${_number(right)}*c1';
+  }
+
+  static String _fadeCurve(AudioFadeShape shape) {
+    return switch (shape) {
+      AudioFadeShape.linear => 'tri',
+      AudioFadeShape.logarithmic => 'log',
+      AudioFadeShape.exponential => 'exp',
+      AudioFadeShape.sCurve => 'qsin',
+    };
   }
 
   static Duration _sourceWindow(TimelineClip clip) {

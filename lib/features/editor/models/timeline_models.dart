@@ -114,6 +114,10 @@ enum ClipFilterPreset {
   vintage,
 }
 
+enum AudioFadeShape { linear, logarithmic, exponential, sCurve }
+
+enum PreviewMediaQuality { auto, proxy, original }
+
 enum CanvasAspectRatioPreset {
   original,
   ratio16x9,
@@ -140,6 +144,96 @@ enum TransitionType {
 }
 
 enum TimelineMarkerType { marker, chapter, beat }
+
+/// Independent magnetic targets available to timeline move/trim operations.
+///
+/// This is persisted as a set so adding a new target does not require another
+/// top-level workspace boolean or a second snapping implementation in the UI.
+enum TimelineSnapTarget {
+  frames,
+  playhead,
+  clipEdges,
+  markers,
+  beats,
+  keyframes,
+  selectionBoundaries,
+  workAreaBoundaries,
+}
+
+const Set<TimelineSnapTarget> kDefaultTimelineSnapTargets = {
+  TimelineSnapTarget.frames,
+  TimelineSnapTarget.playhead,
+  TimelineSnapTarget.clipEdges,
+  TimelineSnapTarget.markers,
+  TimelineSnapTarget.beats,
+  TimelineSnapTarget.keyframes,
+  TimelineSnapTarget.selectionBoundaries,
+  TimelineSnapTarget.workAreaBoundaries,
+};
+
+class TimelineSnapSettings {
+  final bool enabled;
+  final Set<TimelineSnapTarget> targets;
+
+  const TimelineSnapSettings({
+    this.enabled = true,
+    this.targets = kDefaultTimelineSnapTargets,
+  });
+
+  bool includes(TimelineSnapTarget target) =>
+      enabled && targets.contains(target);
+
+  TimelineSnapSettings copyWith({
+    bool? enabled,
+    Set<TimelineSnapTarget>? targets,
+  }) {
+    return TimelineSnapSettings(
+      enabled: enabled ?? this.enabled,
+      targets: Set.unmodifiable(targets ?? this.targets),
+    );
+  }
+
+  TimelineSnapSettings withTarget(
+    TimelineSnapTarget target, {
+    required bool enabled,
+  }) {
+    final next = {...targets};
+    if (enabled) {
+      next.add(target);
+    } else {
+      next.remove(target);
+    }
+    return copyWith(targets: next);
+  }
+
+  Map<String, dynamic> toJson() {
+    final ordered = targets.toList()
+      ..sort((a, b) => a.index.compareTo(b.index));
+    return {
+      'enabled': enabled,
+      'targets': ordered.map((target) => target.name).toList(),
+    };
+  }
+
+  factory TimelineSnapSettings.fromJson(Map<String, dynamic> json) {
+    final rawTargets = json['targets'];
+    final parsedTargets = rawTargets is List
+        ? rawTargets
+              .whereType<String>()
+              .map(
+                (name) => TimelineSnapTarget.values
+                    .where((target) => target.name == name)
+                    .firstOrNull,
+              )
+              .whereType<TimelineSnapTarget>()
+              .toSet()
+        : kDefaultTimelineSnapTargets;
+    return TimelineSnapSettings(
+      enabled: json['enabled'] as bool? ?? true,
+      targets: Set.unmodifiable(parsedTargets),
+    );
+  }
+}
 
 enum TimelineKeyframeProperty {
   opacity,
@@ -365,6 +459,8 @@ class TimelineWorkspaceSettings {
   final bool showClipLabels;
   final Duration? workAreaStart;
   final Duration? workAreaEnd;
+  final TimelineSnapSettings snapping;
+  final PreviewMediaQuality previewMediaQuality;
 
   const TimelineWorkspaceSettings({
     this.frameRate = 30,
@@ -377,6 +473,8 @@ class TimelineWorkspaceSettings {
     this.showClipLabels = true,
     this.workAreaStart,
     this.workAreaEnd,
+    this.snapping = const TimelineSnapSettings(),
+    this.previewMediaQuality = PreviewMediaQuality.auto,
   });
 
   TimelineWorkspaceSettings copyWith({
@@ -390,6 +488,8 @@ class TimelineWorkspaceSettings {
     bool? showClipLabels,
     Duration? workAreaStart,
     Duration? workAreaEnd,
+    TimelineSnapSettings? snapping,
+    PreviewMediaQuality? previewMediaQuality,
     bool clearWorkAreaStart = false,
     bool clearWorkAreaEnd = false,
   }) {
@@ -406,6 +506,8 @@ class TimelineWorkspaceSettings {
           ? null
           : (workAreaStart ?? this.workAreaStart),
       workAreaEnd: clearWorkAreaEnd ? null : (workAreaEnd ?? this.workAreaEnd),
+      snapping: snapping ?? this.snapping,
+      previewMediaQuality: previewMediaQuality ?? this.previewMediaQuality,
     );
   }
 
@@ -435,6 +537,8 @@ class TimelineWorkspaceSettings {
       'showClipLabels': showClipLabels,
       'workAreaStartMs': normalizedWorkAreaStart?.inMilliseconds,
       'workAreaEndMs': normalizedWorkAreaEnd?.inMilliseconds,
+      'snapping': snapping.toJson(),
+      'previewMediaQuality': previewMediaQuality.name,
     };
   }
 
@@ -454,6 +558,15 @@ class TimelineWorkspaceSettings {
       workAreaEnd: (json['workAreaEndMs'] as num?) == null
           ? null
           : Duration(milliseconds: (json['workAreaEndMs'] as num).toInt()),
+      snapping: _timelineModelFromJson(
+        json['snapping'],
+        TimelineSnapSettings.fromJson,
+        const TimelineSnapSettings(),
+      ),
+      previewMediaQuality: PreviewMediaQuality.values.firstWhere(
+        (quality) => quality.name == json['previewMediaQuality'],
+        orElse: () => PreviewMediaQuality.auto,
+      ),
     );
   }
 }
@@ -848,6 +961,8 @@ class AudioMixSettings {
   final int fadeOutMs;
   final double pan;
   final bool normalize;
+  final AudioFadeShape fadeInShape;
+  final AudioFadeShape fadeOutShape;
 
   const AudioMixSettings({
     this.volume = 1,
@@ -856,6 +971,8 @@ class AudioMixSettings {
     this.fadeOutMs = 0,
     this.pan = 0,
     this.normalize = false,
+    this.fadeInShape = AudioFadeShape.linear,
+    this.fadeOutShape = AudioFadeShape.linear,
   });
 
   bool get hasMixAdjustment =>
@@ -873,6 +990,8 @@ class AudioMixSettings {
     int? fadeOutMs,
     double? pan,
     bool? normalize,
+    AudioFadeShape? fadeInShape,
+    AudioFadeShape? fadeOutShape,
   }) {
     return AudioMixSettings(
       volume: volume ?? this.volume,
@@ -881,6 +1000,8 @@ class AudioMixSettings {
       fadeOutMs: fadeOutMs ?? this.fadeOutMs,
       pan: pan ?? this.pan,
       normalize: normalize ?? this.normalize,
+      fadeInShape: fadeInShape ?? this.fadeInShape,
+      fadeOutShape: fadeOutShape ?? this.fadeOutShape,
     );
   }
 
@@ -892,6 +1013,8 @@ class AudioMixSettings {
       'fadeOutMs': fadeOutMs,
       'pan': pan,
       'normalize': normalize,
+      'fadeInShape': fadeInShape.name,
+      'fadeOutShape': fadeOutShape.name,
     };
   }
 
@@ -903,6 +1026,14 @@ class AudioMixSettings {
       fadeOutMs: (json['fadeOutMs'] as num?)?.toInt() ?? 0,
       pan: (json['pan'] as num?)?.toDouble() ?? 0,
       normalize: json['normalize'] as bool? ?? false,
+      fadeInShape: AudioFadeShape.values.firstWhere(
+        (shape) => shape.name == json['fadeInShape'],
+        orElse: () => AudioFadeShape.linear,
+      ),
+      fadeOutShape: AudioFadeShape.values.firstWhere(
+        (shape) => shape.name == json['fadeOutShape'],
+        orElse: () => AudioFadeShape.linear,
+      ),
     );
   }
 }
@@ -1102,6 +1233,9 @@ class TimelineClip {
   final String? notes;
   final bool autoDuck;
   final double duckAmount;
+  final int duckAttackMs;
+  final int duckReleaseMs;
+  final List<String> duckSidechainTrackIds;
 
   TimelineClip({
     String? id,
@@ -1141,10 +1275,16 @@ class TimelineClip {
     this.notes,
     this.autoDuck = false,
     this.duckAmount = 0.35,
+    this.duckAttackMs = 120,
+    this.duckReleaseMs = 180,
+    List<String>? duckSidechainTrackIds,
   }) : id = id ?? const Uuid().v4(),
        sourceStartTime = sourceStartTime ?? Duration.zero,
        sourceDuration = sourceDuration ?? (endTime - startTime),
-       keyframes = List.unmodifiable(keyframes ?? const []);
+       keyframes = List.unmodifiable(keyframes ?? const []),
+       duckSidechainTrackIds = List.unmodifiable(
+         duckSidechainTrackIds ?? const [],
+       );
 
   Duration get duration => endTime - startTime;
   bool get isEffect => type == TimelineTrackType.effect && effectKind != null;
@@ -1222,6 +1362,9 @@ class TimelineClip {
     bool clearNotes = false,
     bool? autoDuck,
     double? duckAmount,
+    int? duckAttackMs,
+    int? duckReleaseMs,
+    List<String>? duckSidechainTrackIds,
   }) {
     return TimelineClip(
       id: id ?? this.id,
@@ -1267,6 +1410,10 @@ class TimelineClip {
       notes: clearNotes ? null : (notes ?? this.notes),
       autoDuck: autoDuck ?? this.autoDuck,
       duckAmount: duckAmount ?? this.duckAmount,
+      duckAttackMs: duckAttackMs ?? this.duckAttackMs,
+      duckReleaseMs: duckReleaseMs ?? this.duckReleaseMs,
+      duckSidechainTrackIds:
+          duckSidechainTrackIds ?? this.duckSidechainTrackIds,
     );
   }
 
@@ -1309,6 +1456,9 @@ class TimelineClip {
       'notes': notes,
       'autoDuck': autoDuck,
       'duckAmount': duckAmount.clamp(0.0, 1.0),
+      'duckAttackMs': duckAttackMs.clamp(0, 5000),
+      'duckReleaseMs': duckReleaseMs.clamp(0, 10000),
+      'duckSidechainTrackIds': duckSidechainTrackIds,
     };
   }
 
@@ -1416,6 +1566,21 @@ class TimelineClip {
       notes: json['notes'] as String?,
       autoDuck: json['autoDuck'] as bool? ?? false,
       duckAmount: (json['duckAmount'] as num?)?.toDouble() ?? 0.35,
+      duckAttackMs: _timelineInt(
+        json['duckAttackMs'],
+        fallback: 120,
+      ).clamp(0, 5000).toInt(),
+      duckReleaseMs: _timelineInt(
+        json['duckReleaseMs'],
+        fallback: 180,
+      ).clamp(0, 10000).toInt(),
+      duckSidechainTrackIds: json['duckSidechainTrackIds'] is List
+          ? (json['duckSidechainTrackIds'] as List)
+                .whereType<String>()
+                .where((id) => id.trim().isNotEmpty)
+                .toSet()
+                .toList()
+          : const [],
     );
   }
 
@@ -1744,6 +1909,8 @@ class TimelineTrack {
   final bool isMuted;
   final bool isHidden;
   final bool isSolo;
+  final double audioGain;
+  final double audioPan;
   final List<TimelineClip> clips;
 
   TimelineTrack({
@@ -1757,6 +1924,8 @@ class TimelineTrack {
     this.isMuted = false,
     this.isHidden = false,
     this.isSolo = false,
+    this.audioGain = 1,
+    this.audioPan = 0,
     List<TimelineClip>? clips,
   }) : id = id ?? const Uuid().v4(),
        section = section ?? _defaultSectionForType(type),
@@ -1774,6 +1943,8 @@ class TimelineTrack {
     bool? isMuted,
     bool? isHidden,
     bool? isSolo,
+    double? audioGain,
+    double? audioPan,
     List<TimelineClip>? clips,
   }) {
     return TimelineTrack(
@@ -1787,6 +1958,8 @@ class TimelineTrack {
       isMuted: isMuted ?? this.isMuted,
       isHidden: isHidden ?? this.isHidden,
       isSolo: isSolo ?? this.isSolo,
+      audioGain: audioGain ?? this.audioGain,
+      audioPan: audioPan ?? this.audioPan,
       clips: clips ?? this.clips,
     );
   }
@@ -1803,6 +1976,8 @@ class TimelineTrack {
       'isMuted': isMuted,
       'isHidden': isHidden,
       'isSolo': isSolo,
+      'audioGain': audioGain.clamp(0.0, 2.0),
+      'audioPan': audioPan.clamp(-1.0, 1.0),
       'clips': clips.map((clip) => clip.toJson()).toList(),
     };
   }
@@ -1832,6 +2007,12 @@ class TimelineTrack {
       isMuted: json['isMuted'] as bool? ?? false,
       isHidden: json['isHidden'] as bool? ?? false,
       isSolo: json['isSolo'] as bool? ?? false,
+      audioGain: ((json['audioGain'] as num?)?.toDouble() ?? 1)
+          .clamp(0.0, 2.0)
+          .toDouble(),
+      audioPan: ((json['audioPan'] as num?)?.toDouble() ?? 0)
+          .clamp(-1.0, 1.0)
+          .toDouble(),
       clips: _timelineModelsFromJson(json['clips'], TimelineClip.fromJson),
     );
   }
@@ -2088,7 +2269,7 @@ class EditorTimeline {
   final List<TimelineMarker> markers;
 
   const EditorTimeline({
-    this.schemaVersion = 6,
+    this.schemaVersion = 7,
     this.canvasSettings = const CanvasSettings(),
     this.workspaceSettings = const TimelineWorkspaceSettings(),
     this.subtitleStyle = const SubtitleStyleModel(),
@@ -2392,7 +2573,7 @@ class EditorTimeline {
       _canonicalizeTimelineTracks(tracks),
     );
     return copyWith(
-      schemaVersion: 6,
+      schemaVersion: 7,
       assets: _canonicalizeAssets(assets),
       tracks: schemaVersion < 5
           ? _migrateLegacyTrackOrder(normalizedTracks)
@@ -2941,6 +3122,9 @@ List<TimelineTrack> _foldRedundantLegacySourceAudio(
               ),
               autoDuck: audio.autoDuck,
               duckAmount: audio.duckAmount,
+              duckAttackMs: audio.duckAttackMs,
+              duckReleaseMs: audio.duckReleaseMs,
+              duckSidechainTrackIds: audio.duckSidechainTrackIds,
             );
           }).toList(),
         ),

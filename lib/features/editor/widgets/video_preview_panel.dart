@@ -8,6 +8,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:video_player/video_player.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/utils/subtitle_export_service.dart';
+import '../../../core/utils/timeline_proxy_media_service.dart';
 import '../../../core/utils/timeline_preview_audio_service.dart';
 import '../../../core/utils/timeline_preview_composite_service.dart';
 import '../models/subtitle_entry.dart';
@@ -26,13 +27,14 @@ double _previewAudioVolume({
   required bool isTrackAudible,
   double duckingGain = 1,
   double busGain = 1,
+  double trackGain = 1,
 }) {
   final mix = clip.audioMix;
   if (!isTrackAudible || mix.muted) return 0;
 
   // Loudness normalization needs analysis of the complete source and remains
   // an export-time operation. Preview only the deterministic mix envelope.
-  var volume = clip.volumeAt(position).clamp(0.0, 1.0).toDouble();
+  var volume = clip.volumeAt(position).clamp(0.0, 2.0).toDouble();
   if (clip.autoDuck) volume *= duckingGain.clamp(0.0, 1.0);
 
   final durationMs = math.max(0, clip.duration.inMilliseconds);
@@ -47,12 +49,30 @@ double _previewAudioVolume({
     durationMs,
   );
   if (fadeInMs > 0) {
-    volume *= (elapsedMs / fadeInMs).clamp(0.0, 1.0);
+    volume *= _previewFadeProgress(
+      (elapsedMs / fadeInMs).clamp(0.0, 1.0).toDouble(),
+      mix.fadeInShape,
+    );
   }
   if (fadeOutMs > 0) {
-    volume *= (remainingMs / fadeOutMs).clamp(0.0, 1.0);
+    volume *= _previewFadeProgress(
+      (remainingMs / fadeOutMs).clamp(0.0, 1.0).toDouble(),
+      mix.fadeOutShape,
+    );
   }
-  return (volume * busGain.clamp(0.0, 1.0)).clamp(0.0, 1.0).toDouble();
+  return (volume * trackGain.clamp(0.0, 2.0) * busGain.clamp(0.0, 1.0))
+      .clamp(0.0, 1.0)
+      .toDouble();
+}
+
+double _previewFadeProgress(double progress, AudioFadeShape shape) {
+  final value = progress.clamp(0.0, 1.0).toDouble();
+  return switch (shape) {
+    AudioFadeShape.linear => value,
+    AudioFadeShape.logarithmic => math.sqrt(value),
+    AudioFadeShape.exponential => value * value,
+    AudioFadeShape.sCurve => 0.5 - math.cos(math.pi * value) / 2,
+  };
 }
 
 /// Conservative fallback gain while the rendered mix bus is not ready.
@@ -505,8 +525,20 @@ String? resolvePreviewSourcePathForTesting({
   required TimelineClip clip,
   required String legacyVideoPath,
   required bool Function(String path) fileExists,
+  String Function(String path)? sourceFingerprintSync,
 }) {
   final asset = timeline.assetForClip(clip);
+  final quality = timeline.workspaceSettings.previewMediaQuality;
+  if (asset != null && quality != PreviewMediaQuality.original) {
+    final proxyPath = TimelineProxyMediaService.validProxyPath(
+      asset,
+      fileExists: fileExists,
+      sourceFingerprintSync:
+          sourceFingerprintSync ??
+          TimelineProxyMediaService.sourceFingerprintSync,
+    );
+    if (proxyPath != null) return proxyPath;
+  }
   final sourcePath = asset?.sourcePath;
   if (sourcePath != null && sourcePath.isNotEmpty && fileExists(sourcePath)) {
     return sourcePath;
@@ -2610,6 +2642,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                 (!hasSolo || monitoredTrack.isSolo),
             duckingGain: _previewDuckingGain(monitoredClip, position),
             busGain: _fallbackAudioBusGain,
+            trackGain: monitoredTrack.audioGain,
           );
     if (_lastBaseVolume != null && (_lastBaseVolume! - volume).abs() <= 0.01) {
       return;
@@ -3167,7 +3200,9 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     );
     final previewUrl =
         item.asset.metadata['previewUrl'] as String? ?? item.asset.remoteUrl;
-    final localPath = item.asset.sourcePath;
+    final localPath = item.asset.type == EditorAssetType.video
+        ? _sourcePathForClip(timeline, item.clip)
+        : item.asset.sourcePath;
     final localFile = localPath == null ? null : File(localPath);
     final hasLocalFile = localPath != null && _cachedFileExists(localPath);
     final overlayFit = switch (item.clip.fitMode) {
@@ -3253,6 +3288,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                           playbackState.position,
                         ),
                         busGain: _fallbackAudioBusGain,
+                        trackGain: item.track.audioGain,
                         // The visual controller already owns one platform decoder
                         // and audio output. Reusing it for normal overlays avoids a
                         // second hidden decoder per active video. Freeze frames keep
@@ -5388,6 +5424,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                       playbackState.position,
                                     ),
                                     busGain: _fallbackAudioBusGain,
+                                    trackGain: item.track.audioGain,
                                     isTrackAudible: true,
                                     continueFreezeFrameAudio: true,
                                   ),
@@ -5413,6 +5450,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                     playbackState.position,
                                   ),
                                   busGain: _fallbackAudioBusGain,
+                                  trackGain: item.track.audioGain,
                                   isTrackAudible: item.isActive,
                                   preloadOnly: !item.isActive,
                                 ),
@@ -5448,6 +5486,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                   playbackState.position,
                                 ),
                                 busGain: _fallbackAudioBusGain,
+                                trackGain: controllerTrack.audioGain,
                                 isTrackAudible: true,
                                 continueFreezeFrameAudio: true,
                               ),
@@ -6703,6 +6742,7 @@ class _OverlayVideoPreview extends StatefulWidget {
   final PreviewPerformanceMonitor diagnostics;
   final double duckingGain;
   final double busGain;
+  final double trackGain;
   final bool isTrackAudible;
   final double width;
   final double height;
@@ -6720,6 +6760,7 @@ class _OverlayVideoPreview extends StatefulWidget {
     required this.diagnostics,
     required this.duckingGain,
     required this.busGain,
+    required this.trackGain,
     required this.isTrackAudible,
     required this.width,
     required this.height,
@@ -6803,6 +6844,7 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
         oldWidget.isPlaying != widget.isPlaying ||
         oldWidget.playbackSpeed != widget.playbackSpeed ||
         oldWidget.busGain != widget.busGain ||
+        oldWidget.trackGain != widget.trackGain ||
         oldWidget.isTrackAudible != widget.isTrackAudible ||
         !identical(oldWidget.clip, widget.clip);
     _schedulePlaybackSync(
@@ -6934,6 +6976,7 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
       isTrackAudible: widget.isTrackAudible,
       duckingGain: widget.duckingGain,
       busGain: widget.busGain,
+      trackGain: widget.trackGain,
     );
     // Muting for a rendered-bus handoff must not wait behind a potentially
     // slow decoder seek. That ordering can otherwise double the clip and bus
@@ -7077,6 +7120,7 @@ class _TimelineAudioPreview extends StatefulWidget {
   final PreviewPerformanceMonitor diagnostics;
   final double duckingGain;
   final double busGain;
+  final double trackGain;
   final bool isTrackAudible;
   final bool continueFreezeFrameAudio;
   final bool preloadOnly;
@@ -7091,6 +7135,7 @@ class _TimelineAudioPreview extends StatefulWidget {
     required this.diagnostics,
     required this.duckingGain,
     required this.busGain,
+    required this.trackGain,
     required this.isTrackAudible,
     this.continueFreezeFrameAudio = false,
     this.preloadOnly = false,
@@ -7182,6 +7227,7 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
           oldWidget.preloadOnly != widget.preloadOnly ||
           oldWidget.playbackSpeed != widget.playbackSpeed ||
           oldWidget.busGain != widget.busGain ||
+          oldWidget.trackGain != widget.trackGain ||
           oldWidget.isTrackAudible != widget.isTrackAudible ||
           !identical(oldWidget.clip, widget.clip);
       _schedulePlaybackSync(
@@ -7312,6 +7358,7 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
       isTrackAudible: widget.isTrackAudible,
       duckingGain: widget.duckingGain,
       busGain: widget.busGain,
+      trackGain: widget.trackGain,
     );
     final now = DateTime.now();
     final lastCorrection = _lastDriftCorrectionAt;

@@ -171,6 +171,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
       projectId: projectId,
       projectName: projectName,
       timeline: normalizedTimeline,
+      isSnappingEnabled: normalizedTimeline.workspaceSettings.snapping.enabled,
       canUndo: false,
       canRedo: false,
       editRevision: 0,
@@ -211,6 +212,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
     }
     state = state.copyWith(
       timeline: normalizedTimeline,
+      isSnappingEnabled: normalizedTimeline.workspaceSettings.snapping.enabled,
       canUndo: canUndo,
       canRedo: canRedo,
       // Preview widgets still rebuild from the live timeline during a gesture,
@@ -470,6 +472,27 @@ class EditorNotifier extends StateNotifier<EditorState> {
         .toList();
     setTimeline(
       state.timeline.copyWith(tracks: tracks),
+      recordHistory: recordHistory,
+    );
+    return true;
+  }
+
+  bool updateTrack(
+    String trackId,
+    TimelineTrack Function(TimelineTrack track) mapper, {
+    bool recordHistory = true,
+  }) {
+    final current = state.timeline.tracks
+        .where((track) => track.id == trackId)
+        .firstOrNull;
+    if (current == null || current.isLocked) return false;
+    final updated = mapper(current);
+    setTimeline(
+      state.timeline.copyWith(
+        tracks: state.timeline.tracks
+            .map((track) => track.id == trackId ? updated : track)
+            .toList(),
+      ),
       recordHistory: recordHistory,
     );
     return true;
@@ -817,6 +840,8 @@ class EditorNotifier extends StateNotifier<EditorState> {
       name: '${source.name} copy',
       type: source.type,
       section: source.section,
+      audioGain: source.audioGain,
+      audioPan: source.audioPan,
       clips: source.clips
           .map(
             (clip) => clip.copyWith(
@@ -883,7 +908,11 @@ class EditorNotifier extends StateNotifier<EditorState> {
   }
 
   void setSnappingEnabled(bool enabled) {
-    state = state.copyWith(isSnappingEnabled: enabled);
+    setWorkspaceSettings(
+      (settings) => settings.copyWith(
+        snapping: settings.snapping.copyWith(enabled: enabled),
+      ),
+    );
   }
 
   void reset() {
@@ -933,6 +962,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
     );
     state = state.copyWith(
       timeline: snapshot.timeline,
+      isSnappingEnabled: snapshot.timeline.workspaceSettings.snapping.enabled,
       selectedTrackId: snapshot.selectedTrackId,
       selectedClipId: snapshot.selectedClipId,
       selectedClipIds: snapshot.selectedClipIds,

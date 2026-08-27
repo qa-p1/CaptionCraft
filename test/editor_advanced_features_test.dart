@@ -18,6 +18,7 @@ void main() {
       showClipLabels: false,
       workAreaStart: Duration(milliseconds: 500),
       workAreaEnd: Duration(milliseconds: 2500),
+      previewMediaQuality: PreviewMediaQuality.proxy,
     );
 
     final restored = TimelineWorkspaceSettings.fromJson(settings.toJson());
@@ -27,6 +28,62 @@ void main() {
     expect(restored.showWaveforms, isFalse);
     expect(restored.normalizedWorkAreaStart, const Duration(milliseconds: 500));
     expect(restored.normalizedWorkAreaEnd, const Duration(milliseconds: 2500));
+    expect(restored.previewMediaQuality, PreviewMediaQuality.proxy);
+    expect(
+      TimelineWorkspaceSettings.fromJson(const {}).previewMediaQuality,
+      PreviewMediaQuality.auto,
+    );
+  });
+
+  test('professional audio controls survive persistence with old defaults', () {
+    final clip = TimelineClip(
+      id: 'music',
+      trackId: 'music-track',
+      type: TimelineTrackType.audio,
+      label: 'Music',
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 5),
+      audioMix: const AudioMixSettings(
+        volume: 0.8,
+        fadeInMs: 500,
+        fadeOutMs: 750,
+        fadeInShape: AudioFadeShape.logarithmic,
+        fadeOutShape: AudioFadeShape.exponential,
+      ),
+      autoDuck: true,
+      duckAmount: 0.55,
+      duckAttackMs: 240,
+      duckReleaseMs: 620,
+      duckSidechainTrackIds: const ['dialogue'],
+    );
+    final timeline = EditorTimeline(
+      tracks: [
+        TimelineTrack(
+          id: 'music-track',
+          name: 'Music',
+          type: TimelineTrackType.audio,
+          section: TimelineTrackSection.audio,
+          audioGain: 0.7,
+          audioPan: -0.25,
+          clips: [clip],
+        ),
+      ],
+    );
+
+    final restored = EditorTimeline.fromJson(timeline.toJson());
+    final restoredTrack = restored.tracks.single;
+    final restoredClip = restoredTrack.clips.single;
+    final legacyMix = AudioMixSettings.fromJson({'volume': 0.5});
+
+    expect(restoredTrack.audioGain, 0.7);
+    expect(restoredTrack.audioPan, -0.25);
+    expect(restoredClip.audioMix.fadeInShape, AudioFadeShape.logarithmic);
+    expect(restoredClip.audioMix.fadeOutShape, AudioFadeShape.exponential);
+    expect(restoredClip.duckAttackMs, 240);
+    expect(restoredClip.duckReleaseMs, 620);
+    expect(restoredClip.duckSidechainTrackIds, ['dialogue']);
+    expect(legacyMix.fadeInShape, AudioFadeShape.linear);
+    expect(legacyMix.fadeOutShape, AudioFadeShape.linear);
   });
 
   test('keyframes interpolate transforms and survive persistence', () {

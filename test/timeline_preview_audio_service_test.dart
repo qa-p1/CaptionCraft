@@ -265,11 +265,104 @@ void main() {
         ),
       ],
     );
+    final trackMixed = timeline.copyWith(
+      tracks: [track.copyWith(audioGain: 0.7, audioPan: 0.2)],
+    );
 
     expect(buildPlan(transformed).fingerprint, buildPlan(timeline).fingerprint);
     expect(
       buildPlan(quieter).fingerprint,
       isNot(buildPlan(timeline).fingerprint),
     );
+    expect(
+      buildPlan(trackMixed).fingerprint,
+      isNot(buildPlan(timeline).fingerprint),
+    );
   });
+
+  test(
+    'preview bus applies track mix, shaped fades, duck timing and limiter',
+    () {
+      final asset = EditorAssetReference(
+        id: 'music-asset',
+        type: EditorAssetType.audio,
+        label: 'Music',
+        sourcePath: '/fixtures/music.m4a',
+      );
+      final music = TimelineClip(
+        id: 'music',
+        trackId: 'music-track',
+        type: TimelineTrackType.audio,
+        label: 'Music',
+        assetId: asset.id,
+        startTime: Duration.zero,
+        endTime: const Duration(seconds: 4),
+        audioMix: const AudioMixSettings(
+          volume: 0.8,
+          pan: -0.2,
+          normalize: true,
+          fadeInMs: 500,
+          fadeOutMs: 700,
+          fadeInShape: AudioFadeShape.logarithmic,
+          fadeOutShape: AudioFadeShape.exponential,
+        ),
+        autoDuck: true,
+        duckAmount: 0.5,
+        duckAttackMs: 240,
+        duckReleaseMs: 620,
+        duckSidechainTrackIds: const ['dialogue'],
+      );
+      final timeline = EditorTimeline(
+        assets: [asset],
+        tracks: [
+          TimelineTrack(
+            id: 'dialogue',
+            name: 'Dialogue',
+            type: TimelineTrackType.subtitle,
+            section: TimelineTrackSection.textSubtitle,
+            clips: [
+              TimelineClip(
+                id: 'speech',
+                trackId: 'dialogue',
+                type: TimelineTrackType.subtitle,
+                label: 'Speech',
+                startTime: const Duration(seconds: 1),
+                endTime: const Duration(seconds: 2),
+              ),
+            ],
+          ),
+          TimelineTrack(
+            id: 'music-track',
+            name: 'Music',
+            type: TimelineTrackType.audio,
+            section: TimelineTrackSection.audio,
+            audioGain: 0.5,
+            audioPan: 0.3,
+            clips: [music],
+          ),
+        ],
+      );
+      final plan = buildPlan(timeline);
+      final arguments = TimelineExportService.buildPreviewAudioMixArguments(
+        timeline: timeline,
+        inputs: plan.inputs,
+        timelineDuration: plan.timelineDuration,
+        outputPath: '/tmp/preview.m4a',
+      );
+      final graph = arguments[arguments.indexOf('-filter_complex') + 1];
+
+      expect(graph, contains('loudnorm=I=-16:LRA=11:TP=-1.5'));
+      expect(graph, contains('curve=log'));
+      expect(graph, contains('curve=exp'));
+      expect(graph, contains('pan=stereo'));
+      expect(graph, contains('clip((0.8)'));
+      expect(graph, contains('*0.5'));
+      expect(graph, contains('0.24'));
+      expect(graph, contains('0.62'));
+      expect(
+        graph,
+        contains('alimiter=limit=0.95:attack=5:release=50:latency=1'),
+      );
+    },
+  );
 }

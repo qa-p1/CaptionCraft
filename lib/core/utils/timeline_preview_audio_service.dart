@@ -189,6 +189,8 @@ class TimelinePreviewAudioService {
             'trackIndex': input.trackIndex,
             'trackMuted': input.track.isMuted,
             'trackSolo': input.track.isSolo,
+            'trackGain': input.track.audioGain,
+            'trackPan': input.track.audioPan,
             'clipId': input.clip.id,
             'assetId': input.clip.assetId,
             'linkedClipId': input.clip.linkedClipId,
@@ -202,6 +204,9 @@ class TimelinePreviewAudioService {
             'audioMix': input.clip.audioMix.toJson(),
             'autoDuck': input.clip.autoDuck,
             'duckAmount': input.clip.duckAmount,
+            'duckAttackMs': input.clip.duckAttackMs,
+            'duckReleaseMs': input.clip.duckReleaseMs,
+            'duckSidechainTrackIds': input.clip.duckSidechainTrackIds,
             'denoise': input.clip.denoise,
             'volumeKeyframes': [
               for (final keyframe in input.clip.keyframes)

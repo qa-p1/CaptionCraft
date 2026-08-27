@@ -23,6 +23,7 @@ import '../../../core/utils/remote_audio_import_service.dart';
 import '../../../core/utils/remote_media_import_service.dart';
 import '../../../core/utils/subtitle_export_service.dart';
 import '../../../core/utils/subtitle_quality_service.dart';
+import '../../../core/utils/timeline_proxy_media_service.dart';
 import '../../../shared/models/project_model.dart';
 import '../../../shared/widgets/snack_bar_helper.dart';
 import '../../auth/providers/auth_provider.dart';
@@ -42,6 +43,7 @@ import '../models/sound_effect_library_asset.dart';
 import '../providers/editor_provider.dart';
 import '../providers/playback_provider.dart';
 import '../providers/subtitle_provider.dart';
+import '../services/timeline_keyframe_editing.dart';
 import 'creator_lab_screen.dart';
 import 'export_video_screen.dart';
 import '../widgets/export_dialog.dart';
@@ -55,6 +57,15 @@ import '../widgets/video_preview_panel.dart';
 import '../widgets/resizable_editor_sheet.dart';
 import '../widgets/sfx_library_sheet.dart';
 import '../widgets/keyframe_graph_editor.dart';
+
+String _audioFadeShapeLabel(AudioFadeShape shape) {
+  return switch (shape) {
+    AudioFadeShape.linear => 'Linear',
+    AudioFadeShape.logarithmic => 'Logarithmic',
+    AudioFadeShape.exponential => 'Exponential',
+    AudioFadeShape.sCurve => 'Smooth S-curve',
+  };
+}
 
 /// Resolves the default mix for media inserted into a visual timeline lane.
 ///
@@ -143,6 +154,9 @@ TimelineClip restoreAttachedAudioForDuplicate({
     audioMix: separatedAudio.audioMix,
     autoDuck: separatedAudio.autoDuck,
     duckAmount: separatedAudio.duckAmount,
+    duckAttackMs: separatedAudio.duckAttackMs,
+    duckReleaseMs: separatedAudio.duckReleaseMs,
+    duckSidechainTrackIds: separatedAudio.duckSidechainTrackIds,
     denoise: separatedAudio.denoise,
   );
 }
@@ -163,63 +177,7 @@ TimelineClip restoreAttachedAudioForDuplicate({
   }
 
   final splitOffset = splitAt - originalVideo.startTime;
-  final leftKeyframes = <TimelineKeyframe>[];
-  final rightKeyframes = <TimelineKeyframe>[];
-  for (final property in TimelineKeyframeProperty.values) {
-    final propertyFrames =
-        audio.keyframes.where((frame) => frame.property == property).toList()
-          ..sort((a, b) => a.time.compareTo(b.time));
-    if (propertyFrames.isEmpty) continue;
-    final boundaryValue = audio.keyframedValue(
-      property,
-      splitAt,
-      fallback: propertyFrames.first.value,
-    );
-    final boundarySource = propertyFrames.lastWhere(
-      (frame) => frame.time <= splitOffset,
-      orElse: () => propertyFrames.first,
-    );
-    leftKeyframes.addAll(
-      propertyFrames.where((frame) => frame.time <= splitOffset),
-    );
-    if (!leftKeyframes.any(
-      (frame) => frame.property == property && frame.time == splitOffset,
-    )) {
-      leftKeyframes.add(
-        TimelineKeyframe(
-          time: splitOffset,
-          property: property,
-          value: boundaryValue,
-          interpolation: boundarySource.interpolation,
-          curve: boundarySource.curve,
-        ),
-      );
-    }
-    rightKeyframes.add(
-      TimelineKeyframe(
-        time: Duration.zero,
-        property: property,
-        value: boundaryValue,
-        interpolation: boundarySource.interpolation,
-        curve: boundarySource.curve,
-      ),
-    );
-    rightKeyframes.addAll(
-      propertyFrames
-          .where((frame) => frame.time > splitOffset)
-          .map(
-            (frame) => TimelineKeyframe(
-              time: frame.time - splitOffset,
-              property: property,
-              value: frame.value,
-              interpolation: frame.interpolation,
-              curve: frame.curve,
-            ),
-          ),
-    );
-  }
-  leftKeyframes.sort((a, b) => a.time.compareTo(b.time));
-  rightKeyframes.sort((a, b) => a.time.compareTo(b.time));
+  final keyframeSplit = TimelineKeyframeEditing.split(audio, splitOffset);
 
   final left =
       syncSeparatedAudioTransport(
@@ -227,7 +185,7 @@ TimelineClip restoreAttachedAudioForDuplicate({
         updatedVideo: leftVideo,
         linkedClipId: leftVideo.id,
       ).copyWith(
-        keyframes: leftKeyframes,
+        keyframes: keyframeSplit.leading,
         outroTransition: const ClipTransition(),
         audioMix: audio.audioMix.copyWith(fadeOutMs: 0),
       );
@@ -237,7 +195,7 @@ TimelineClip restoreAttachedAudioForDuplicate({
         updatedVideo: rightVideo,
         linkedClipId: rightVideo.id,
       ).copyWith(
-        keyframes: rightKeyframes,
+        keyframes: keyframeSplit.trailing,
         introTransition: const ClipTransition(),
         audioMix: audio.audioMix.copyWith(fadeInMs: 0),
       );
@@ -1917,6 +1875,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             timelineColor: source.timelineColor,
             autoDuck: copyAudio ? source.autoDuck : clip.autoDuck,
             duckAmount: copyAudio ? source.duckAmount : clip.duckAmount,
+            duckAttackMs: copyAudio ? source.duckAttackMs : clip.duckAttackMs,
+            duckReleaseMs: copyAudio
+                ? source.duckReleaseMs
+                : clip.duckReleaseMs,
+            duckSidechainTrackIds: copyAudio
+                ? source.duckSidechainTrackIds
+                : clip.duckSidechainTrackIds,
           );
         }).toList(),
       );
@@ -2144,6 +2109,111 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     mapper,
   ) {
     ref.read(editorProvider.notifier).setWorkspaceSettings(mapper);
+  }
+
+  Future<void> _choosePreviewMediaQuality() async {
+    final current = ref
+        .read(editorProvider)
+        .timeline
+        .workspaceSettings
+        .previewMediaQuality;
+    final selected = await showDialog<PreviewMediaQuality>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Preview media quality'),
+        content: RadioGroup<PreviewMediaQuality>(
+          groupValue: current,
+          onChanged: (value) => Navigator.of(dialogContext).pop(value),
+          child: const Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              RadioListTile(
+                value: PreviewMediaQuality.auto,
+                title: Text('Auto'),
+                subtitle: Text('Use a valid proxy when available'),
+              ),
+              RadioListTile(
+                value: PreviewMediaQuality.proxy,
+                title: Text('Prefer proxies'),
+                subtitle: Text('Fall back to originals while proxies build'),
+              ),
+              RadioListTile(
+                value: PreviewMediaQuality.original,
+                title: Text('Original media'),
+                subtitle: Text('Always decode the source file'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (selected == null || !mounted) return;
+    _toggleWorkspace(
+      (settings) => settings.copyWith(previewMediaQuality: selected),
+    );
+  }
+
+  Future<void> _generateProjectProxies() async {
+    final startingTimeline = ref.read(editorProvider).timeline;
+    final candidates = startingTimeline.assets.where((asset) {
+      final sourcePath = asset.sourcePath?.trim();
+      return asset.type == EditorAssetType.video &&
+          sourcePath != null &&
+          sourcePath.isNotEmpty &&
+          File(sourcePath).existsSync();
+    }).toList();
+    if (candidates.isEmpty) {
+      SnackBarHelper.showInfo(context, 'No local video sources need proxies');
+      return;
+    }
+
+    SnackBarHelper.showInfo(
+      context,
+      'Building ${candidates.length} editing ${candidates.length == 1 ? 'proxy' : 'proxies'}…',
+    );
+    final metadataByAssetId = <String, Map<String, dynamic>>{};
+    var completed = 0;
+    for (final asset in candidates) {
+      final result = await TimelineProxyMediaService.instance.ensureProxy(
+        asset,
+      );
+      if (!mounted) return;
+      if (result != null) {
+        metadataByAssetId[asset.id] = {
+          ...asset.metadata,
+          'proxyMedia': result.toMetadata(),
+        };
+        completed++;
+      }
+    }
+    if (metadataByAssetId.isNotEmpty) {
+      final current = ref.read(editorProvider).timeline;
+      ref
+          .read(editorProvider.notifier)
+          .setTimeline(
+            current.copyWith(
+              assets: current.assets
+                  .map(
+                    (asset) => metadataByAssetId.containsKey(asset.id)
+                        ? asset.copyWith(metadata: metadataByAssetId[asset.id])
+                        : asset,
+                  )
+                  .toList(),
+              workspaceSettings: current.workspaceSettings.copyWith(
+                previewMediaQuality: PreviewMediaQuality.auto,
+              ),
+            ),
+          );
+    }
+    if (!mounted) return;
+    if (completed == candidates.length) {
+      SnackBarHelper.showSuccess(context, '$completed editing proxies ready');
+    } else {
+      SnackBarHelper.showInfo(
+        context,
+        '$completed of ${candidates.length} editing proxies ready',
+      );
+    }
   }
 
   Future<void> _exportSubtitleFile(String format) async {
@@ -2944,6 +3014,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final updatedTarget = liveTarget.copyWith(
       playbackRate: safeRate,
       endTime: nextEnd,
+      keyframes: TimelineKeyframeEditing.retime(liveTarget, nextDuration),
     );
 
     final retimedTracks = timeline.tracks.map((timelineTrack) {
@@ -2959,7 +3030,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 audio: clip,
               )
               ? syncSeparatedAudioTransport(
-                  audio: clip,
+                  audio: clip.copyWith(
+                    keyframes: TimelineKeyframeEditing.retime(
+                      clip,
+                      nextDuration,
+                    ),
+                  ),
                   updatedVideo: updatedTarget,
                 )
               : clip;
@@ -3598,6 +3674,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       audioMix: liveVideo.audioMix,
       autoDuck: liveVideo.autoDuck,
       duckAmount: liveVideo.duckAmount,
+      duckAttackMs: liveVideo.duckAttackMs,
+      duckReleaseMs: liveVideo.duckReleaseMs,
+      duckSidechainTrackIds: liveVideo.duckSidechainTrackIds,
       denoise: liveVideo.denoise,
     );
     var audioTrack = timeline.tracks
@@ -3827,72 +3906,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       sourceOffsetMs + 1,
       clip.sourceDuration.inMilliseconds,
     );
-    final leftKeyframes = <TimelineKeyframe>[];
-    final rightKeyframes = <TimelineKeyframe>[];
-    for (final property in TimelineKeyframeProperty.values) {
-      final propertyFrames =
-          clip.keyframes
-              .where((keyframe) => keyframe.property == property)
-              .toList()
-            ..sort((a, b) => a.time.compareTo(b.time));
-      if (propertyFrames.isEmpty) continue;
-      final boundaryValue = clip.keyframedValue(
-        property,
-        splitPoint,
-        fallback: propertyFrames.first.value,
-      );
-      final splitOffset = Duration(milliseconds: timelineOffsetMs);
-      final boundarySource = propertyFrames.lastWhere(
-        (keyframe) => keyframe.time <= splitOffset,
-        orElse: () => propertyFrames.first,
-      );
-      leftKeyframes.addAll(
-        propertyFrames.where(
-          (keyframe) => keyframe.time.inMilliseconds <= timelineOffsetMs,
-        ),
-      );
-      if (!leftKeyframes.any(
-        (keyframe) =>
-            keyframe.property == property &&
-            keyframe.time.inMilliseconds == timelineOffsetMs,
-      )) {
-        leftKeyframes.add(
-          TimelineKeyframe(
-            time: Duration(milliseconds: timelineOffsetMs),
-            property: property,
-            value: boundaryValue,
-            interpolation: boundarySource.interpolation,
-            curve: boundarySource.curve,
-          ),
-        );
-      }
-      rightKeyframes.add(
-        TimelineKeyframe(
-          time: Duration.zero,
-          property: property,
-          value: boundaryValue,
-          interpolation: boundarySource.interpolation,
-          curve: boundarySource.curve,
-        ),
-      );
-      rightKeyframes.addAll(
-        propertyFrames
-            .where(
-              (keyframe) => keyframe.time.inMilliseconds > timelineOffsetMs,
-            )
-            .map(
-              (keyframe) => TimelineKeyframe(
-                time: keyframe.time - Duration(milliseconds: timelineOffsetMs),
-                property: property,
-                value: keyframe.value,
-                interpolation: keyframe.interpolation,
-                curve: keyframe.curve,
-              ),
-            ),
-      );
-    }
-    leftKeyframes.sort((a, b) => a.time.compareTo(b.time));
-    rightKeyframes.sort((a, b) => a.time.compareTo(b.time));
+    final keyframeSplit = TimelineKeyframeEditing.split(
+      clip,
+      Duration(milliseconds: timelineOffsetMs),
+    );
     final leftSourceStart = clip.isReversed
         ? clip.sourceStartTime +
               Duration(milliseconds: sourceDurationMs - sourceOffsetMs)
@@ -3904,7 +3921,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       endTime: splitPoint,
       sourceStartTime: leftSourceStart,
       sourceDuration: Duration(milliseconds: sourceOffsetMs),
-      keyframes: leftKeyframes,
+      keyframes: keyframeSplit.leading,
       outroTransition: const ClipTransition(),
       audioMix: clip.audioMix.copyWith(fadeOutMs: 0),
     );
@@ -3915,7 +3932,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       sourceDuration: Duration(
         milliseconds: math.max(1, sourceDurationMs - sourceOffsetMs),
       ),
-      keyframes: rightKeyframes,
+      keyframes: keyframeSplit.trailing,
       introTransition: const ClipTransition(),
       audioMix: clip.audioMix.copyWith(fadeInMs: 0),
     );
@@ -4035,6 +4052,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       sourceStartTime: Duration(milliseconds: safeStart),
       sourceDuration: sourceDuration,
       endTime: nextEnd,
+      keyframes: TimelineKeyframeEditing.forNewEnd(target, nextEnd),
     );
 
     final nextTracks = timeline.tracks.map((candidateTrack) {
@@ -7162,6 +7180,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     int? fadeOutMs,
     double? pan,
     bool? normalize,
+    AudioFadeShape? fadeInShape,
+    AudioFadeShape? fadeOutShape,
   }) {
     final editorState = ref.read(editorProvider);
     if (!editorState.timeline.clipHasAudio(clip)) {
@@ -7175,7 +7195,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         fadeInMs != null ||
         fadeOutMs != null ||
         pan != null ||
-        normalize != null;
+        normalize != null ||
+        fadeInShape != null ||
+        fadeOutShape != null;
     final ownsGesture =
         volume != null && hasMixUpdate && !editorState.isTimelineGestureEditing;
     if (ownsGesture) notifier.beginTimelineGestureEdit();
@@ -7197,6 +7219,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               fadeOutMs: fadeOutMs ?? candidate.audioMix.fadeOutMs,
               pan: pan ?? candidate.audioMix.pan,
               normalize: normalize ?? candidate.audioMix.normalize,
+              fadeInShape: fadeInShape ?? candidate.audioMix.fadeInShape,
+              fadeOutShape: fadeOutShape ?? candidate.audioMix.fadeOutShape,
             ),
           ),
         );
@@ -7204,6 +7228,111 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     } finally {
       if (ownsGesture) notifier.endTimelineGestureEdit();
     }
+  }
+
+  void _updateTrackAudioMix(String trackId, {double? gain, double? pan}) {
+    ref
+        .read(editorProvider.notifier)
+        .updateTrack(
+          trackId,
+          (track) => track.copyWith(
+            audioGain: gain ?? track.audioGain,
+            audioPan: pan ?? track.audioPan,
+          ),
+        );
+  }
+
+  void _updateSelectedClipDucking(
+    TimelineClip clip, {
+    bool? enabled,
+    double? amount,
+    int? attackMs,
+    int? releaseMs,
+    List<String>? sidechainTrackIds,
+  }) {
+    ref
+        .read(editorProvider.notifier)
+        .updateClip(
+          clip.id,
+          (current) => current.copyWith(
+            autoDuck: enabled ?? current.autoDuck,
+            duckAmount: amount ?? current.duckAmount,
+            duckAttackMs: attackMs ?? current.duckAttackMs,
+            duckReleaseMs: releaseMs ?? current.duckReleaseMs,
+            duckSidechainTrackIds:
+                sidechainTrackIds ?? current.duckSidechainTrackIds,
+          ),
+        );
+  }
+
+  Future<void> _chooseDuckingSidechains(TimelineClip clip) async {
+    final timeline = ref.read(editorProvider).timeline;
+    final candidates = timeline.tracks
+        .where(
+          (track) =>
+              track.id != clip.trackId &&
+              (track.type == TimelineTrackType.audio ||
+                  track.type == TimelineTrackType.video ||
+                  track.type == TimelineTrackType.text ||
+                  track.type == TimelineTrackType.subtitle),
+        )
+        .toList();
+    var selected = clip.duckSidechainTrackIds.toSet();
+    final result = await showDialog<Set<String>>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('Ducking sidechains'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: ListView(
+              shrinkWrap: true,
+              children: [
+                CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('All dialogue and audible tracks'),
+                  value: selected.isEmpty,
+                  onChanged: (_) => setDialogState(() => selected = {}),
+                ),
+                for (final track in candidates)
+                  CheckboxListTile(
+                    key: ValueKey('duck_sidechain_${track.id}'),
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(track.displayName),
+                    subtitle: Text(track.type.name),
+                    value: selected.contains(track.id),
+                    onChanged: (enabled) {
+                      setDialogState(() {
+                        selected = {...selected};
+                        if (enabled == true) {
+                          selected.add(track.id);
+                        } else {
+                          selected.remove(track.id);
+                        }
+                      });
+                    },
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, selected),
+              child: const Text('Apply'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (result == null || !mounted) return;
+    _updateSelectedClipDucking(
+      clip,
+      sidechainTrackIds: result.toList()..sort(),
+    );
   }
 
   TimelineTrack? _createOptionalTrack(
@@ -7810,7 +7939,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   action.group == 'Workspace' &&
                   (action.label == 'Frame Rate' ||
                       action.label == 'Timecode' ||
-                      action.label == 'Labels'),
+                      action.label == 'Labels' ||
+                      action.label == 'Preview' ||
+                      action.label == 'Proxies'),
             )
             .toList(),
     };
@@ -8565,6 +8696,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 volume: 1,
                 fadeInMs: 0,
                 fadeOutMs: 0,
+                fadeInShape: AudioFadeShape.linear,
+                fadeOutShape: AudioFadeShape.linear,
                 pan: 0,
                 normalize: false,
               )
@@ -8829,6 +8962,21 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       ),
       _ActionSpec(
         group: 'Workspace',
+        label: 'Preview',
+        tooltip: 'Choose original or proxy preview media',
+        icon: Icons.hd_outlined,
+        active: workspace.previewMediaQuality != PreviewMediaQuality.original,
+        onTap: _choosePreviewMediaQuality,
+      ),
+      _ActionSpec(
+        group: 'Workspace',
+        label: 'Proxies',
+        tooltip: 'Build bounded source-media editing proxies',
+        icon: Icons.video_settings_outlined,
+        onTap: _generateProjectProxies,
+      ),
+      _ActionSpec(
+        group: 'Workspace',
         label: 'Timecode',
         tooltip: 'Toggle frame-aware ruler labels',
         icon: Icons.access_time_rounded,
@@ -9060,6 +9208,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   Widget _buildAudioControls(TimelineClip clip) {
     final isVideoClip = clip.type == TimelineTrackType.video;
     final timeline = ref.read(editorProvider).timeline;
+    final audioOwner = _audioOwnerForClip(timeline, clip);
+    final audioTrack = audioOwner?.track;
     final asset = timeline.assetForClip(clip);
     final separatedAudio = _separatedAudioForVideo(timeline, clip.id);
     final hasSeparatedAudio = separatedAudio != null;
@@ -9076,7 +9226,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         clip.audioMix.fadeInMs != 0 ||
         clip.audioMix.fadeOutMs != 0 ||
         clip.audioMix.pan.abs() > 0.001 ||
-        clip.audioMix.normalize;
+        clip.audioMix.normalize ||
+        clip.audioMix.fadeInShape != AudioFadeShape.linear ||
+        clip.audioMix.fadeOutShape != AudioFadeShape.linear;
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
@@ -9277,9 +9429,54 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   ref.read(editorProvider.notifier).endTimelineGestureEdit(),
             ),
             const Text(
-              'Left/right routing is rendered in the export; device preview monitors centered audio.',
+              'Clip pan is applied identically to the rendered preview bus and final export.',
               style: TextStyle(color: kTextSecondary, fontSize: 10),
             ),
+            if (audioTrack != null) ...[
+              const SizedBox(height: 12),
+              Text(
+                'Track Gain',
+                style: TextStyle(color: kTextSecondary, fontSize: 12),
+              ),
+              Slider(
+                key: const ValueKey('audio_track_gain'),
+                value: audioTrack.audioGain.clamp(0.0, 2.0),
+                min: 0,
+                max: 2,
+                divisions: 40,
+                label: '${(audioTrack.audioGain * 100).round()}%',
+                onChangeStart: (_) => ref
+                    .read(editorProvider.notifier)
+                    .beginTimelineGestureEdit(),
+                onChanged: (value) =>
+                    _updateTrackAudioMix(audioTrack.id, gain: value),
+                onChangeEnd: (_) =>
+                    ref.read(editorProvider.notifier).endTimelineGestureEdit(),
+              ),
+              Text(
+                'Track Pan',
+                style: TextStyle(color: kTextSecondary, fontSize: 12),
+              ),
+              Slider(
+                key: const ValueKey('audio_track_pan'),
+                value: audioTrack.audioPan.clamp(-1.0, 1.0),
+                min: -1,
+                max: 1,
+                divisions: 40,
+                label: audioTrack.audioPan.abs() < 0.025
+                    ? 'Center'
+                    : audioTrack.audioPan < 0
+                    ? 'L ${(audioTrack.audioPan.abs() * 100).round()}'
+                    : 'R ${(audioTrack.audioPan * 100).round()}',
+                onChangeStart: (_) => ref
+                    .read(editorProvider.notifier)
+                    .beginTimelineGestureEdit(),
+                onChanged: (value) =>
+                    _updateTrackAudioMix(audioTrack.id, pan: value),
+                onChangeEnd: (_) =>
+                    ref.read(editorProvider.notifier).endTimelineGestureEdit(),
+              ),
+            ],
             SwitchListTile.adaptive(
               contentPadding: EdgeInsets.zero,
               title: const Text('Normalize loudness'),
@@ -9315,6 +9512,24 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                     ref.read(editorProvider.notifier).endTimelineGestureEdit(),
               ),
             ),
+            DropdownButtonFormField<AudioFadeShape>(
+              key: const ValueKey('audio_fade_in_shape'),
+              initialValue: clip.audioMix.fadeInShape,
+              decoration: const InputDecoration(labelText: 'Fade-in curve'),
+              items: [
+                for (final shape in AudioFadeShape.values)
+                  DropdownMenuItem(
+                    value: shape,
+                    child: Text(_audioFadeShapeLabel(shape)),
+                  ),
+              ],
+              onChanged: (shape) {
+                if (shape != null) {
+                  _updateSelectedClipAudioMix(clip, fadeInShape: shape);
+                }
+              },
+            ),
+            const SizedBox(height: 8),
             Text(
               'Fade Out',
               style: TextStyle(color: kTextSecondary, fontSize: 12),
@@ -9341,6 +9556,102 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                     ref.read(editorProvider.notifier).endTimelineGestureEdit(),
               ),
             ),
+            DropdownButtonFormField<AudioFadeShape>(
+              key: const ValueKey('audio_fade_out_shape'),
+              initialValue: clip.audioMix.fadeOutShape,
+              decoration: const InputDecoration(labelText: 'Fade-out curve'),
+              items: [
+                for (final shape in AudioFadeShape.values)
+                  DropdownMenuItem(
+                    value: shape,
+                    child: Text(_audioFadeShapeLabel(shape)),
+                  ),
+              ],
+              onChanged: (shape) {
+                if (shape != null) {
+                  _updateSelectedClipAudioMix(clip, fadeOutShape: shape);
+                }
+              },
+            ),
+            const SizedBox(height: 10),
+            SwitchListTile.adaptive(
+              key: const ValueKey('audio_ducking_enabled'),
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Automatic ducking'),
+              subtitle: const Text(
+                'Lower this clip beneath selected dialogue or audio lanes',
+              ),
+              value: clip.autoDuck,
+              onChanged: (enabled) =>
+                  _updateSelectedClipDucking(clip, enabled: enabled),
+            ),
+            if (clip.autoDuck) ...[
+              Text(
+                'Duck Amount',
+                style: TextStyle(color: kTextSecondary, fontSize: 12),
+              ),
+              Slider(
+                key: const ValueKey('audio_duck_amount'),
+                value: clip.duckAmount.clamp(0.0, 1.0),
+                min: 0,
+                max: 1,
+                divisions: 20,
+                label: '${(clip.duckAmount * 100).round()}%',
+                onChangeStart: (_) => ref
+                    .read(editorProvider.notifier)
+                    .beginTimelineGestureEdit(),
+                onChanged: (value) =>
+                    _updateSelectedClipDucking(clip, amount: value),
+                onChangeEnd: (_) =>
+                    ref.read(editorProvider.notifier).endTimelineGestureEdit(),
+              ),
+              Text(
+                'Attack ${clip.duckAttackMs}ms',
+                style: TextStyle(color: kTextSecondary, fontSize: 12),
+              ),
+              Slider(
+                key: const ValueKey('audio_duck_attack'),
+                value: clip.duckAttackMs.toDouble().clamp(0, 1000),
+                min: 0,
+                max: 1000,
+                divisions: 20,
+                onChangeStart: (_) => ref
+                    .read(editorProvider.notifier)
+                    .beginTimelineGestureEdit(),
+                onChanged: (value) =>
+                    _updateSelectedClipDucking(clip, attackMs: value.round()),
+                onChangeEnd: (_) =>
+                    ref.read(editorProvider.notifier).endTimelineGestureEdit(),
+              ),
+              Text(
+                'Release ${clip.duckReleaseMs}ms',
+                style: TextStyle(color: kTextSecondary, fontSize: 12),
+              ),
+              Slider(
+                key: const ValueKey('audio_duck_release'),
+                value: clip.duckReleaseMs.toDouble().clamp(0, 2000),
+                min: 0,
+                max: 2000,
+                divisions: 40,
+                onChangeStart: (_) => ref
+                    .read(editorProvider.notifier)
+                    .beginTimelineGestureEdit(),
+                onChanged: (value) =>
+                    _updateSelectedClipDucking(clip, releaseMs: value.round()),
+                onChangeEnd: (_) =>
+                    ref.read(editorProvider.notifier).endTimelineGestureEdit(),
+              ),
+              OutlinedButton.icon(
+                key: const ValueKey('audio_duck_sidechains'),
+                onPressed: () => _chooseDuckingSidechains(clip),
+                icon: const Icon(Icons.account_tree_outlined),
+                label: Text(
+                  clip.duckSidechainTrackIds.isEmpty
+                      ? 'Sidechain: all eligible lanes'
+                      : 'Sidechains: ${clip.duckSidechainTrackIds.length}',
+                ),
+              ),
+            ],
             Text(
               isVideoClip
                   ? 'Attached video audio can be mixed here without creating another timeline lane.'
@@ -9362,6 +9673,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                         volume: 1,
                         fadeInMs: 0,
                         fadeOutMs: 0,
+                        fadeInShape: AudioFadeShape.linear,
+                        fadeOutShape: AudioFadeShape.linear,
                         pan: 0,
                         normalize: false,
                       )

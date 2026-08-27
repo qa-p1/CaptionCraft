@@ -42,12 +42,28 @@ class KeyframeGraphEditor extends StatefulWidget {
   State<KeyframeGraphEditor> createState() => _KeyframeGraphEditorState();
 }
 
-enum _GraphDragKind { none, keyframe, firstHandle, secondHandle, pan }
+enum _GraphDragKind {
+  none,
+  keyframe,
+  firstHandle,
+  secondHandle,
+  pan,
+  boxSelect,
+}
 
 class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
   late TimelineKeyframeProperty _property;
   String? _selectedKeyframeId;
+  Set<String> _selectedKeyframeIds = <String>{};
   _GraphDragKind _dragKind = _GraphDragKind.none;
+  Map<String, TimelineKeyframe> _dragStartFrames = const {};
+  Offset? _dragStartPosition;
+  Rect? _selectionRect;
+  bool _boxSelectionMode = false;
+  List<TimelineKeyframe> _clipboard = const [];
+  final Set<TimelineKeyframeProperty> _hiddenProperties = {};
+  final Set<TimelineKeyframeProperty> _lockedProperties = {};
+  TimelineKeyframeProperty? _soloProperty;
   double _timeZoom = 1;
   double _valueZoom = 1;
   double _timeOffsetUs = 0;
@@ -68,10 +84,13 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
     if (!widget.properties.contains(_property)) {
       _property = widget.properties.first;
       _selectedKeyframeId = null;
+      _selectedKeyframeIds = <String>{};
     }
+    final liveIds = _propertyFrames.map((frame) => frame.id).toSet();
+    _selectedKeyframeIds = _selectedKeyframeIds.intersection(liveIds);
     if (_selectedKeyframeId != null &&
-        !_propertyFrames.any((frame) => frame.id == _selectedKeyframeId)) {
-      _selectedKeyframeId = null;
+        !_selectedKeyframeIds.contains(_selectedKeyframeId)) {
+      _selectedKeyframeId = _selectedKeyframeIds.firstOrNull;
     }
   }
 
@@ -88,6 +107,20 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
       if (frame.id == selectedId) return frame;
     }
     return null;
+  }
+
+  bool get _channelVisible =>
+      !_hiddenProperties.contains(_property) &&
+      (_soloProperty == null || _soloProperty == _property);
+
+  bool get _channelLocked => _lockedProperties.contains(_property);
+
+  Iterable<TimelineKeyframe> get _selectedFrames =>
+      _propertyFrames.where((frame) => _selectedKeyframeIds.contains(frame.id));
+
+  void _selectOnly(String? id) {
+    _selectedKeyframeId = id;
+    _selectedKeyframeIds = id == null ? <String>{} : <String>{id};
   }
 
   Duration get _relativePlayhead {
@@ -107,7 +140,7 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
         (b.time.inMicroseconds - target).abs(),
       ),
     );
-    _selectedKeyframeId = frames.first.id;
+    _selectOnly(frames.first.id);
   }
 
   _PropertyRange get _range => _propertyRange(_property);
@@ -161,12 +194,13 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
   }
 
   void _addAtPlayhead() {
+    if (_channelLocked) return;
     final time = _snapTime(_relativePlayhead);
     final existing = _propertyFrames
         .where((frame) => frame.time == time)
         .firstOrNull;
     if (existing != null) {
-      setState(() => _selectedKeyframeId = existing.id);
+      setState(() => _selectOnly(existing.id));
       return;
     }
     final frame = TimelineKeyframe(
@@ -176,18 +210,19 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
     );
     final frames = [..._propertyFrames, frame]
       ..sort((a, b) => a.time.compareTo(b.time));
-    setState(() => _selectedKeyframeId = frame.id);
+    setState(() => _selectOnly(frame.id));
     _emitPropertyFrames(frames, recordHistory: true);
   }
 
   void _addAtGraphPosition(_GraphGeometry geometry, Offset position) {
+    if (_channelLocked) return;
     final mapped = geometry.fromOffset(position);
     final time = _snapTime(mapped.time);
     final existing = _propertyFrames
         .where((frame) => frame.time == time)
         .firstOrNull;
     if (existing != null) {
-      setState(() => _selectedKeyframeId = existing.id);
+      setState(() => _selectOnly(existing.id));
       return;
     }
     final frame = TimelineKeyframe(
@@ -197,48 +232,48 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
     );
     final frames = [..._propertyFrames, frame]
       ..sort((a, b) => a.time.compareTo(b.time));
-    setState(() => _selectedKeyframeId = frame.id);
+    setState(() => _selectOnly(frame.id));
     _emitPropertyFrames(frames, recordHistory: true);
     widget.onSeek(widget.clip.startTime + time);
   }
 
   void _deleteSelected() {
-    final selected = _selectedFrame;
-    if (selected == null) return;
+    if (_selectedKeyframeIds.isEmpty || _channelLocked) return;
     final frames = _propertyFrames
-        .where((frame) => frame.id != selected.id)
+        .where((frame) => !_selectedKeyframeIds.contains(frame.id))
         .toList();
-    setState(() => _selectedKeyframeId = null);
+    setState(() => _selectOnly(null));
     _emitPropertyFrames(frames, recordHistory: true);
   }
 
   void _setInterpolation(TimelineKeyframeInterpolation interpolation) {
-    final selected = _selectedFrame;
-    if (selected == null) return;
-    final curve = switch (interpolation) {
-      TimelineKeyframeInterpolation.easeIn => TimelineBezierCurve.easeIn,
-      TimelineKeyframeInterpolation.easeOut => TimelineBezierCurve.easeOut,
-      TimelineKeyframeInterpolation.easeInOut => TimelineBezierCurve.easeInOut,
-      TimelineKeyframeInterpolation.cubicBezier =>
-        selected.interpolation == TimelineKeyframeInterpolation.linear ||
-                selected.interpolation == TimelineKeyframeInterpolation.hold
-            ? TimelineBezierCurve.easeInOut
-            : selected.effectiveCurve,
-      _ => TimelineBezierCurve.linear,
-    };
-    _replaceFrame(
-      selected.copyWith(interpolation: interpolation, curve: curve),
-      recordHistory: true,
-    );
+    if (_selectedKeyframeIds.isEmpty || _channelLocked) return;
+    final replacements = _selectedFrames.map((selected) {
+      final curve = switch (interpolation) {
+        TimelineKeyframeInterpolation.easeIn => TimelineBezierCurve.easeIn,
+        TimelineKeyframeInterpolation.easeOut => TimelineBezierCurve.easeOut,
+        TimelineKeyframeInterpolation.easeInOut =>
+          TimelineBezierCurve.easeInOut,
+        TimelineKeyframeInterpolation.cubicBezier =>
+          selected.interpolation == TimelineKeyframeInterpolation.linear ||
+                  selected.interpolation == TimelineKeyframeInterpolation.hold
+              ? TimelineBezierCurve.easeInOut
+              : selected.effectiveCurve,
+        _ => TimelineBezierCurve.linear,
+      };
+      return selected.copyWith(interpolation: interpolation, curve: curve);
+    });
+    _replaceFrames(replacements, recordHistory: true);
   }
 
   void _setCurvePreset(TimelineCurvePreset preset) {
-    final selected = _selectedFrame;
-    if (selected == null) return;
-    _replaceFrame(
-      selected.copyWith(
-        interpolation: preset.interpolation,
-        curve: preset.curve,
+    if (_selectedKeyframeIds.isEmpty || _channelLocked) return;
+    _replaceFrames(
+      _selectedFrames.map(
+        (selected) => selected.copyWith(
+          interpolation: preset.interpolation,
+          curve: preset.curve,
+        ),
       ),
       recordHistory: true,
     );
@@ -248,9 +283,19 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
     TimelineKeyframe replacement, {
     required bool recordHistory,
   }) {
+    _replaceFrames([replacement], recordHistory: recordHistory);
+  }
+
+  void _replaceFrames(
+    Iterable<TimelineKeyframe> replacements, {
+    required bool recordHistory,
+  }) {
+    final replacementsById = {
+      for (final replacement in replacements) replacement.id: replacement,
+    };
     final frames =
         _propertyFrames
-            .map((frame) => frame.id == replacement.id ? replacement : frame)
+            .map((frame) => replacementsById[frame.id] ?? frame)
             .toList()
           ..sort((a, b) => a.time.compareTo(b.time));
     _emitPropertyFrames(frames, recordHistory: recordHistory);
@@ -259,7 +304,7 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
   void _selectProperty(TimelineKeyframeProperty property) {
     setState(() {
       _property = property;
-      _selectedKeyframeId = null;
+      _selectOnly(null);
       _valueZoom = 1;
       _valueCenter = null;
       _selectNearestToPlayhead();
@@ -334,7 +379,10 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
     _GraphGeometry geometry,
     Offset position,
   ) {
-    for (final frame in _propertyFrames.reversed) {
+    final visibleFrames = _channelVisible
+        ? _propertyFrames
+        : const <TimelineKeyframe>[];
+    for (final frame in visibleFrames.reversed) {
       if ((position - geometry.toOffset(frame.time, frame.value)).distance <=
           18) {
         return (kind: _GraphDragKind.keyframe, id: frame.id);
@@ -362,11 +410,42 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
 
   void _onPanStart(_GraphGeometry geometry, DragStartDetails details) {
     final target = _hitTest(geometry, details.localPosition);
-    _dragKind = target.kind;
-    if (target.id != null) {
-      setState(() => _selectedKeyframeId = target.id);
+    _dragKind = _boxSelectionMode && target.kind == _GraphDragKind.pan
+        ? _GraphDragKind.boxSelect
+        : target.kind;
+    final targetId = target.id;
+    if (targetId != null) {
+      setState(() {
+        _selectedKeyframeId = targetId;
+        if (!_selectedKeyframeIds.contains(targetId)) {
+          _selectedKeyframeIds = <String>{targetId};
+        }
+      });
     }
-    if (_dragKind != _GraphDragKind.pan) widget.onEditStart();
+    if (_channelLocked &&
+        _dragKind != _GraphDragKind.pan &&
+        _dragKind != _GraphDragKind.boxSelect) {
+      _dragKind = _GraphDragKind.none;
+      return;
+    }
+    if (_dragKind == _GraphDragKind.keyframe) {
+      _dragStartFrames = {for (final frame in _selectedFrames) frame.id: frame};
+      _dragStartPosition = details.localPosition;
+    } else if (_dragKind == _GraphDragKind.boxSelect) {
+      _dragStartPosition = details.localPosition;
+      setState(() {
+        _selectionRect = Rect.fromPoints(
+          details.localPosition,
+          details.localPosition,
+        );
+        _selectOnly(null);
+      });
+    }
+    if (_dragKind != _GraphDragKind.pan &&
+        _dragKind != _GraphDragKind.boxSelect &&
+        _dragKind != _GraphDragKind.none) {
+      widget.onEditStart();
+    }
   }
 
   void _onPanUpdate(_GraphGeometry geometry, DragUpdateDetails details) {
@@ -392,6 +471,23 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
       });
       return;
     }
+    if (_dragKind == _GraphDragKind.boxSelect) {
+      final origin = _dragStartPosition ?? details.localPosition;
+      final selection = Rect.fromPoints(origin, details.localPosition);
+      final selectedIds = _propertyFrames
+          .where(
+            (frame) =>
+                selection.contains(geometry.toOffset(frame.time, frame.value)),
+          )
+          .map((frame) => frame.id)
+          .toSet();
+      setState(() {
+        _selectionRect = selection;
+        _selectedKeyframeIds = selectedIds;
+        _selectedKeyframeId = selectedIds.firstOrNull;
+      });
+      return;
+    }
     final selected = _selectedFrame;
     if (selected == null) return;
     final frames = _propertyFrames;
@@ -399,27 +495,69 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
     if (selectedIndex < 0) return;
 
     if (_dragKind == _GraphDragKind.keyframe) {
+      final baseline = _dragStartFrames[selected.id];
+      if (baseline == null) return;
       final mapped = geometry.fromOffset(details.localPosition);
       final frameUs =
           (Duration.microsecondsPerSecond / widget.frameRate.clamp(1, 120))
               .round();
-      final minimumUs = selectedIndex == 0
-          ? 0
-          : frames[selectedIndex - 1].time.inMicroseconds + frameUs;
-      final maximumUs = selectedIndex + 1 >= frames.length
-          ? widget.clip.duration.inMicroseconds
-          : frames[selectedIndex + 1].time.inMicroseconds - frameUs;
-      final time = _snapTime(mapped.time);
-      final replacement = selected.copyWith(
-        time: Duration(
-          microseconds: time.inMicroseconds
-              .clamp(minimumUs, math.max(minimumUs, maximumUs))
-              .toInt(),
-        ),
-        value: mapped.value.clamp(_range.minimum, _range.maximum).toDouble(),
+      var minimumDeltaUs = -_dragStartFrames.values
+          .map((frame) => frame.time.inMicroseconds)
+          .reduce((first, second) => first < second ? first : second);
+      var maximumDeltaUs =
+          widget.clip.duration.inMicroseconds -
+          _dragStartFrames.values
+              .map((frame) => frame.time.inMicroseconds)
+              .reduce((first, second) => first > second ? first : second);
+      final unselected = frames.where(
+        (frame) => !_dragStartFrames.containsKey(frame.id),
       );
-      _replaceFrame(replacement, recordHistory: false);
-      widget.onSeek(widget.clip.startTime + replacement.time);
+      for (final moving in _dragStartFrames.values) {
+        for (final stationary in unselected) {
+          if (stationary.time < moving.time) {
+            minimumDeltaUs = math.max(
+              minimumDeltaUs,
+              stationary.time.inMicroseconds +
+                  frameUs -
+                  moving.time.inMicroseconds,
+            );
+          } else {
+            maximumDeltaUs = math.min(
+              maximumDeltaUs,
+              stationary.time.inMicroseconds -
+                  frameUs -
+                  moving.time.inMicroseconds,
+            );
+            break;
+          }
+        }
+      }
+      final desiredTime = _snapTime(mapped.time);
+      final deltaUs =
+          (desiredTime.inMicroseconds - baseline.time.inMicroseconds)
+              .clamp(minimumDeltaUs, math.max(minimumDeltaUs, maximumDeltaUs))
+              .toInt();
+      final desiredValueDelta = mapped.value - baseline.value;
+      final minimumValueDelta = _dragStartFrames.values
+          .map((frame) => _range.minimum - frame.value)
+          .reduce((first, second) => first > second ? first : second);
+      final maximumValueDelta = _dragStartFrames.values
+          .map((frame) => _range.maximum - frame.value)
+          .reduce((first, second) => first < second ? first : second);
+      final valueDelta = desiredValueDelta
+          .clamp(minimumValueDelta, maximumValueDelta)
+          .toDouble();
+      final replacements = _dragStartFrames.values.map(
+        (frame) => frame.copyWith(
+          time: Duration(microseconds: frame.time.inMicroseconds + deltaUs),
+          value: frame.value + valueDelta,
+        ),
+      );
+      _replaceFrames(replacements, recordHistory: false);
+      widget.onSeek(
+        widget.clip.startTime +
+            Duration(microseconds: baseline.time.inMicroseconds + deltaUs),
+      );
       return;
     }
 
@@ -467,16 +605,23 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
   }
 
   void _onPanEnd() {
-    if (_dragKind != _GraphDragKind.none && _dragKind != _GraphDragKind.pan) {
+    if (_dragKind != _GraphDragKind.none &&
+        _dragKind != _GraphDragKind.pan &&
+        _dragKind != _GraphDragKind.boxSelect) {
       widget.onEditEnd();
     }
-    _dragKind = _GraphDragKind.none;
+    setState(() {
+      _dragKind = _GraphDragKind.none;
+      _dragStartFrames = const {};
+      _dragStartPosition = null;
+      _selectionRect = null;
+    });
   }
 
   void _onTap(_GraphGeometry geometry, TapUpDetails details) {
     final target = _hitTest(geometry, details.localPosition);
     if (target.id != null) {
-      setState(() => _selectedKeyframeId = target.id);
+      setState(() => _selectOnly(target.id));
       final frame = _selectedFrame;
       if (frame != null) widget.onSeek(widget.clip.startTime + frame.time);
       return;
@@ -487,12 +632,264 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
 
   void _changeSelectedValue(double value, {required bool recordHistory}) {
     final selected = _selectedFrame;
-    if (selected == null) return;
+    if (selected == null || _channelLocked) return;
     _replaceFrame(
       selected.copyWith(
         value: value.clamp(_range.minimum, _range.maximum).toDouble(),
       ),
       recordHistory: recordHistory,
+    );
+  }
+
+  void _selectAllFrames() {
+    final ids = _propertyFrames.map((frame) => frame.id).toSet();
+    setState(() {
+      _selectedKeyframeIds = ids;
+      _selectedKeyframeId = ids.firstOrNull;
+    });
+  }
+
+  void _copySelectedFrames() {
+    final selected = _selectedFrames.toList()
+      ..sort((a, b) => a.time.compareTo(b.time));
+    if (selected.isEmpty) return;
+    setState(() => _clipboard = List.unmodifiable(selected));
+  }
+
+  void _pasteFramesAtPlayhead() {
+    if (_clipboard.isEmpty || _channelLocked) return;
+    final source = [..._clipboard]..sort((a, b) => a.time.compareTo(b.time));
+    final sourceStartUs = source.first.time.inMicroseconds;
+    final sourceSpanUs = source.last.time.inMicroseconds - sourceStartUs;
+    final maximumStartUs = math.max(
+      0,
+      widget.clip.duration.inMicroseconds - sourceSpanUs,
+    );
+    final pasteStartUs = _snapTime(
+      _relativePlayhead,
+    ).inMicroseconds.clamp(0, maximumStartUs).toInt();
+    final occupied = _propertyFrames
+        .map((frame) => frame.time.inMicroseconds)
+        .toSet();
+    final pasted = <TimelineKeyframe>[];
+    for (final frame in source) {
+      final timeUs = pasteStartUs + frame.time.inMicroseconds - sourceStartUs;
+      if (!occupied.add(timeUs)) continue;
+      pasted.add(
+        TimelineKeyframe(
+          time: Duration(microseconds: timeUs),
+          property: _property,
+          value: frame.value,
+          interpolation: frame.interpolation,
+          curve: frame.curve,
+        ),
+      );
+    }
+    if (pasted.isEmpty) return;
+    final frames = [..._propertyFrames, ...pasted]
+      ..sort((a, b) => a.time.compareTo(b.time));
+    setState(() {
+      _selectedKeyframeIds = pasted.map((frame) => frame.id).toSet();
+      _selectedKeyframeId = pasted.first.id;
+    });
+    _emitPropertyFrames(frames, recordHistory: true);
+    widget.onSeek(widget.clip.startTime + pasted.first.time);
+  }
+
+  Future<void> _editSelectedNumeric() async {
+    final selected = _selectedFrame;
+    if (selected == null || _channelLocked) return;
+    final timeController = TextEditingController(
+      text: (selected.time.inMicroseconds / 1000).toStringAsFixed(3),
+    );
+    final valueController = TextEditingController(
+      text: selected.value.toStringAsFixed(4),
+    );
+    String? error;
+    final replacement = await showDialog<TimelineKeyframe>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('Edit keyframe numerically'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                key: const ValueKey('keyframe_numeric_time'),
+                controller: timeController,
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                ),
+                decoration: const InputDecoration(
+                  labelText: 'Clip-relative time (ms)',
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                key: const ValueKey('keyframe_numeric_value'),
+                controller: valueController,
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                  signed: true,
+                ),
+                decoration: InputDecoration(
+                  labelText: '${_propertyLabel(_property)} value',
+                  errorText: error,
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              key: const ValueKey('keyframe_numeric_apply'),
+              onPressed: () {
+                final timeMs = double.tryParse(timeController.text.trim());
+                final value = double.tryParse(valueController.text.trim());
+                if (timeMs == null || value == null || !value.isFinite) {
+                  setDialogState(() => error = 'Enter valid numbers.');
+                  return;
+                }
+                final time = _snapTime(
+                  Duration(microseconds: (timeMs * 1000).round()),
+                );
+                final collision = _propertyFrames.any(
+                  (frame) => frame.id != selected.id && frame.time == time,
+                );
+                if (collision) {
+                  setDialogState(
+                    () => error = 'Another keyframe already uses this frame.',
+                  );
+                  return;
+                }
+                Navigator.pop(
+                  dialogContext,
+                  selected.copyWith(
+                    time: time,
+                    value: value
+                        .clamp(_range.minimum, _range.maximum)
+                        .toDouble(),
+                  ),
+                );
+              },
+              child: const Text('Apply'),
+            ),
+          ],
+        ),
+      ),
+    );
+    timeController.dispose();
+    valueController.dispose();
+    if (replacement == null || !mounted) return;
+    _replaceFrame(replacement, recordHistory: true);
+    widget.onSeek(widget.clip.startTime + replacement.time);
+  }
+
+  Future<void> _showChannelControls() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (context, setSheetState) => SafeArea(
+          child: ListView(
+            shrinkWrap: true,
+            padding: const EdgeInsets.fromLTRB(14, 0, 14, 20),
+            children: [
+              const Text(
+                'Animation channels',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                'Visibility, solo and locking affect this graph session only; animation data is never removed.',
+                style: TextStyle(color: kTextSecondary, fontSize: 12),
+              ),
+              const SizedBox(height: 8),
+              for (final property in widget.properties)
+                ListTile(
+                  key: ValueKey('keyframe_channel_${property.name}'),
+                  title: Text(_propertyLabel(property)),
+                  selected: property == _property,
+                  onTap: () {
+                    _selectProperty(property);
+                    Navigator.pop(sheetContext);
+                  },
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        key: ValueKey(
+                          'keyframe_channel_visibility_${property.name}',
+                        ),
+                        tooltip: _hiddenProperties.contains(property)
+                            ? 'Show channel'
+                            : 'Hide channel',
+                        onPressed: () {
+                          setState(() {
+                            if (!_hiddenProperties.add(property)) {
+                              _hiddenProperties.remove(property);
+                            }
+                          });
+                          setSheetState(() {});
+                        },
+                        icon: Icon(
+                          _hiddenProperties.contains(property)
+                              ? Icons.visibility_off_rounded
+                              : Icons.visibility_rounded,
+                        ),
+                      ),
+                      IconButton(
+                        key: ValueKey('keyframe_channel_solo_${property.name}'),
+                        tooltip: _soloProperty == property
+                            ? 'Clear solo'
+                            : 'Solo channel',
+                        onPressed: () {
+                          setState(() {
+                            _soloProperty = _soloProperty == property
+                                ? null
+                                : property;
+                            if (_soloProperty != null) {
+                              _property = property;
+                              _selectOnly(null);
+                              _selectNearestToPlayhead();
+                            }
+                          });
+                          setSheetState(() {});
+                        },
+                        icon: Icon(
+                          Icons.headphones_rounded,
+                          color: _soloProperty == property ? kAccent : null,
+                        ),
+                      ),
+                      IconButton(
+                        key: ValueKey('keyframe_channel_lock_${property.name}'),
+                        tooltip: _lockedProperties.contains(property)
+                            ? 'Unlock channel'
+                            : 'Lock channel',
+                        onPressed: () {
+                          setState(() {
+                            if (!_lockedProperties.add(property)) {
+                              _lockedProperties.remove(property);
+                            }
+                          });
+                          setSheetState(() {});
+                        },
+                        icon: Icon(
+                          _lockedProperties.contains(property)
+                              ? Icons.lock_rounded
+                              : Icons.lock_open_rounded,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 
@@ -531,13 +928,59 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
               tooltip: 'Add keyframe at playhead',
               icon: Icons.add_rounded,
               label: 'Add',
-              onPressed: _addAtPlayhead,
+              onPressed: _channelLocked ? null : _addAtPlayhead,
             ),
             _GraphButton(
               tooltip: 'Delete selected keyframe',
               icon: Icons.delete_outline_rounded,
-              label: 'Delete',
-              onPressed: selected == null ? null : _deleteSelected,
+              label: _selectedKeyframeIds.length > 1
+                  ? 'Delete ${_selectedKeyframeIds.length}'
+                  : 'Delete',
+              onPressed: selected == null || _channelLocked
+                  ? null
+                  : _deleteSelected,
+            ),
+            _GraphButton(
+              tooltip: 'Drag a box around multiple keyframes',
+              icon: Icons.crop_free_rounded,
+              label: 'Box',
+              onPressed: () {
+                setState(() => _boxSelectionMode = !_boxSelectionMode);
+              },
+            ),
+            _GraphButton(
+              tooltip: 'Select every keyframe in this channel',
+              icon: Icons.select_all_rounded,
+              label: 'All',
+              onPressed: frames.isEmpty ? null : _selectAllFrames,
+            ),
+            _GraphButton(
+              tooltip: 'Copy selected keyframes',
+              icon: Icons.copy_rounded,
+              label: 'Copy',
+              onPressed: selected == null ? null : _copySelectedFrames,
+            ),
+            _GraphButton(
+              tooltip: 'Paste copied keyframes at the playhead',
+              icon: Icons.content_paste_rounded,
+              label: 'Paste',
+              onPressed: _clipboard.isEmpty || _channelLocked
+                  ? null
+                  : _pasteFramesAtPlayhead,
+            ),
+            _GraphButton(
+              tooltip: 'Enter exact keyframe time and value',
+              icon: Icons.pin_rounded,
+              label: 'Numeric',
+              onPressed: selected == null || _channelLocked
+                  ? null
+                  : _editSelectedNumeric,
+            ),
+            _GraphButton(
+              tooltip: 'Show, solo or lock animation channels',
+              icon: Icons.tune_rounded,
+              label: 'Channels',
+              onPressed: _showChannelControls,
             ),
             _GraphButton(
               tooltip: 'Show the whole clip and value range',
@@ -591,8 +1034,12 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
                   child: CustomPaint(
                     painter: _KeyframeGraphPainter(
                       geometry: geometry,
-                      frames: frames,
+                      frames: _channelVisible
+                          ? frames
+                          : const <TimelineKeyframe>[],
                       selectedKeyframeId: _selectedKeyframeId,
+                      selectedKeyframeIds: _selectedKeyframeIds,
+                      selectionRect: _selectionRect,
                       playhead: _relativePlayhead,
                       fallbackValue: _fallbackValue,
                       valueFormatter: _range.format,
@@ -614,7 +1061,9 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
           Row(
             children: [
               Text(
-                '${_formatTime(selected.time)}  •  ${_range.format(selected.value)}',
+                _selectedKeyframeIds.length > 1
+                    ? '${_selectedKeyframeIds.length} keys selected  •  Primary ${_formatTime(selected.time)}'
+                    : '${_formatTime(selected.time)}  •  ${_range.format(selected.value)}',
                 style: const TextStyle(
                   color: kTextPrimary,
                   fontWeight: FontWeight.w700,
@@ -634,10 +1083,11 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
             min: _range.minimum,
             max: _range.maximum,
             label: _range.format(selected.value),
-            onChangeStart: (_) => widget.onEditStart(),
-            onChanged: (value) =>
-                _changeSelectedValue(value, recordHistory: false),
-            onChangeEnd: (_) => widget.onEditEnd(),
+            onChangeStart: _channelLocked ? null : (_) => widget.onEditStart(),
+            onChanged: _channelLocked
+                ? null
+                : (value) => _changeSelectedValue(value, recordHistory: false),
+            onChangeEnd: _channelLocked ? null : (_) => widget.onEditEnd(),
           ),
           SingleChildScrollView(
             scrollDirection: Axis.horizontal,
@@ -650,7 +1100,9 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
                       key: ValueKey('keyframe_curve_${preset.id}'),
                       label: Text(preset.label),
                       selected: preset.matches(selected),
-                      onSelected: (_) => _setCurvePreset(preset),
+                      onSelected: _channelLocked
+                          ? null
+                          : (_) => _setCurvePreset(preset),
                     ),
                   ),
                 Padding(
@@ -664,9 +1116,11 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
                         !timelineCurvePresets.any(
                           (preset) => preset.matches(selected),
                         ),
-                    onSelected: (_) => _setInterpolation(
-                      TimelineKeyframeInterpolation.cubicBezier,
-                    ),
+                    onSelected: _channelLocked
+                        ? null
+                        : (_) => _setInterpolation(
+                            TimelineKeyframeInterpolation.cubicBezier,
+                          ),
                   ),
                 ),
               ],
@@ -674,7 +1128,7 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
           ),
           const SizedBox(height: 4),
           const Text(
-            'Drag a point to change time and value. Drag either tangent handle to create a custom curve.',
+            'Drag selected points together to change time and value. Use Box for marquee selection; tangent handles edit the primary key.',
             style: TextStyle(color: kTextSecondary, fontSize: 11),
           ),
         ],
@@ -793,6 +1247,8 @@ class _KeyframeGraphPainter extends CustomPainter {
   final _GraphGeometry geometry;
   final List<TimelineKeyframe> frames;
   final String? selectedKeyframeId;
+  final Set<String> selectedKeyframeIds;
+  final Rect? selectionRect;
   final Duration playhead;
   final double fallbackValue;
   final String Function(double value) valueFormatter;
@@ -801,6 +1257,8 @@ class _KeyframeGraphPainter extends CustomPainter {
     required this.geometry,
     required this.frames,
     required this.selectedKeyframeId,
+    required this.selectedKeyframeIds,
+    required this.selectionRect,
     required this.playhead,
     required this.fallbackValue,
     required this.valueFormatter,
@@ -930,7 +1388,7 @@ class _KeyframeGraphPainter extends CustomPainter {
 
     for (final frame in frames) {
       final point = geometry.toOffset(frame.time, frame.value);
-      final selected = frame.id == selectedKeyframeId;
+      final selected = selectedKeyframeIds.contains(frame.id);
       final diamond = Path()
         ..moveTo(point.dx, point.dy - (selected ? 8 : 6))
         ..lineTo(point.dx + (selected ? 8 : 6), point.dy)
@@ -958,6 +1416,22 @@ class _KeyframeGraphPainter extends CustomPainter {
         ..color = kAccent.withValues(alpha: 0.9)
         ..strokeWidth = 1.2,
     );
+    final marquee = selectionRect;
+    if (marquee != null) {
+      canvas.drawRect(
+        marquee,
+        Paint()
+          ..color = kAccent.withValues(alpha: 0.12)
+          ..style = PaintingStyle.fill,
+      );
+      canvas.drawRect(
+        marquee,
+        Paint()
+          ..color = kAccent
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.2,
+      );
+    }
     canvas.restore();
   }
 
@@ -989,6 +1463,8 @@ class _KeyframeGraphPainter extends CustomPainter {
     return oldDelegate.geometry != geometry ||
         oldDelegate.frames != frames ||
         oldDelegate.selectedKeyframeId != selectedKeyframeId ||
+        oldDelegate.selectedKeyframeIds != selectedKeyframeIds ||
+        oldDelegate.selectionRect != selectionRect ||
         oldDelegate.playhead != playhead ||
         oldDelegate.fallbackValue != fallbackValue;
   }
