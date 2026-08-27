@@ -101,4 +101,25 @@ void main() {
     expect(snapshot.videoDecoderCount, 0);
     expect(snapshot.audibleDecoderCount, 1);
   });
+
+  test('dense composite is one silent video decoder', () {
+    final monitor = PreviewPerformanceMonitor();
+    monitor.updateDecoder(
+      id: 'dense-composite',
+      label: 'Optimized composite',
+      kind: PreviewDecoderKind.denseCompositeVideo,
+      initialized: true,
+      buffering: false,
+      audible: false,
+      playing: true,
+      warm: false,
+      drift: const Duration(milliseconds: 20),
+    );
+
+    final snapshot = monitor.snapshot();
+    expect(snapshot.decoderCount, 1);
+    expect(snapshot.videoDecoderCount, 1);
+    expect(snapshot.audioDecoderCount, 0);
+    expect(snapshot.audibleDecoderCount, 0);
+  });
 }

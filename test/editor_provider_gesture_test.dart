@@ -20,6 +20,7 @@ void main() {
     );
 
     notifier.beginTimelineGestureEdit();
+    expect(container.read(editorProvider).isTimelineGestureEditing, isTrue);
     notifier.setTimeline(
       original.copyWith(canvasSettings: const CanvasSettings(showGrid: true)),
       recordHistory: false,
@@ -27,6 +28,7 @@ void main() {
 
     expect(container.read(editorProvider).editRevision, 0);
     notifier.endTimelineGestureEdit();
+    expect(container.read(editorProvider).isTimelineGestureEditing, isFalse);
     expect(container.read(editorProvider).editRevision, 1);
     expect(container.read(editorProvider).canUndo, isTrue);
     notifier.undo();

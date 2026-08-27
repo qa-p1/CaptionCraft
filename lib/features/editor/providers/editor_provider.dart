@@ -23,6 +23,7 @@ class EditorState {
   final bool canUndo;
   final bool canRedo;
   final int editRevision;
+  final bool isTimelineGestureEditing;
   final Set<String> selectedClipIds;
 
   const EditorState({
@@ -39,6 +40,7 @@ class EditorState {
     this.canUndo = false,
     this.canRedo = false,
     this.editRevision = 0,
+    this.isTimelineGestureEditing = false,
     this.selectedClipIds = const <String>{},
   });
 
@@ -56,6 +58,7 @@ class EditorState {
     bool? canUndo,
     bool? canRedo,
     int? editRevision,
+    bool? isTimelineGestureEditing,
     Set<String>? selectedClipIds,
     bool clearTrackSelection = false,
     bool clearClipSelection = false,
@@ -78,6 +81,8 @@ class EditorState {
       canUndo: canUndo ?? this.canUndo,
       canRedo: canRedo ?? this.canRedo,
       editRevision: editRevision ?? this.editRevision,
+      isTimelineGestureEditing:
+          isTimelineGestureEditing ?? this.isTimelineGestureEditing,
       selectedClipIds: selectedClipIds ?? this.selectedClipIds,
     );
   }
@@ -169,6 +174,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
       canUndo: false,
       canRedo: false,
       editRevision: 0,
+      isTimelineGestureEditing: false,
       clearTrackSelection: true,
       clearClipSelection: true,
       selectedClipIds: const <String>{},
@@ -274,6 +280,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
       timeline: normalizedTimeline,
       canUndo: canUndo,
       canRedo: canRedo,
+      isTimelineGestureEditing: false,
       editRevision: state.editRevision + 1,
     );
   }
@@ -282,6 +289,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
     if (_isTimelineGestureEditing) return;
     _isTimelineGestureEditing = true;
     _timelineChangedDuringGesture = false;
+    state = state.copyWith(isTimelineGestureEditing: true);
   }
 
   void endTimelineGestureEdit() {
@@ -291,6 +299,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
     state = state.copyWith(
       canUndo: canUndo,
       canRedo: canRedo,
+      isTimelineGestureEditing: false,
       editRevision: shouldNotifyPreview
           ? state.editRevision + 1
           : state.editRevision,
@@ -679,12 +688,17 @@ class EditorNotifier extends StateNotifier<EditorState> {
       clearClipSelection: snapshot.selectedClipId == null,
       canUndo: canUndo,
       canRedo: canRedo,
+      isTimelineGestureEditing: false,
       editRevision: state.editRevision + 1,
     );
   }
 
   void _refreshHistoryFlags() {
-    state = state.copyWith(canUndo: canUndo, canRedo: canRedo);
+    state = state.copyWith(
+      canUndo: canUndo,
+      canRedo: canRedo,
+      isTimelineGestureEditing: _isTimelineGestureEditing,
+    );
   }
 
   void _restoreEditorSubtitleState({

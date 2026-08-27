@@ -5,6 +5,7 @@ enum PreviewDecoderKind {
   baseVideo,
   preparedVideo,
   overlayVideo,
+  denseCompositeVideo,
   timelineAudio,
   previewAudioMix,
 }

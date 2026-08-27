@@ -190,7 +190,7 @@ class TimelineExportService {
       }
 
       onProgress?.call(0.08);
-      assPath = await _buildAssTrack(
+      assPath = await buildAssTrack(
         timeline: timeline,
         subtitleEntries: subtitleEntries,
         globalSubtitleStyle: globalSubtitleStyle,
@@ -307,6 +307,8 @@ class TimelineExportService {
     required Duration timelineDuration,
     required String? assPath,
     String? captionFontDirectory,
+    String? videoPreset,
+    int? videoCrf,
     required String outputPath,
   }) {
     final args = <String>['-hide_banner', '-y'];
@@ -354,9 +356,9 @@ class TimelineExportService {
       '-c:v',
       'libx264',
       '-preset',
-      settings.preset,
+      videoPreset ?? settings.preset,
       '-crf',
-      '${settings.crf}',
+      '${videoCrf ?? settings.crf}',
       '-pix_fmt',
       'yuv420p',
       '-t',
@@ -1883,7 +1885,10 @@ class TimelineExportService {
     return (x, y);
   }
 
-  static Future<String?> _buildAssTrack({
+  /// Materializes the timeline's subtitle and text layers as an ASS track.
+  /// Preview render caches use the same path so dense playback remains
+  /// visually consistent with final export.
+  static Future<String?> buildAssTrack({
     required EditorTimeline timeline,
     required List<SubtitleEntry> subtitleEntries,
     required SubtitleStyleModel globalSubtitleStyle,
