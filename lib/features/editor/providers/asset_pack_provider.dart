@@ -145,6 +145,7 @@ class AssetPackManagerState {
     AssetPackConstants.backgroundVideosId,
     AssetPackConstants.overlaysId,
     AssetPackConstants.soundEffectsId,
+    AssetPackConstants.lutsId,
   ];
 
   AssetPackManagerState({

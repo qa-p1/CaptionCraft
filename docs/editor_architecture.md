@@ -9,7 +9,7 @@ remain stable as unfinished roadmap work is added.
 
 | Concern | Primary implementation | Responsibility |
 | --- | --- | --- |
-| Persistent timeline model | `lib/features/editor/models/timeline_models.dart` | Clips, tracks, assets, workspace settings, transforms, animation, audio controls, schema defaults, and JSON compatibility |
+| Persistent timeline model | `lib/features/editor/models/timeline_models.dart`, `lib/features/editor/models/editor_effect_models.dart` | Clips, tracks, assets, transforms, effect stacks, color/LUT state, audio controls, schema defaults, and JSON compatibility |
 | Editor state and history | `lib/features/editor/providers/editor_provider.dart` | Immutable timeline updates, selection, playhead, edit/commit revisions, and undo/redo transactions |
 | Timeline interaction | `lib/features/editor/widgets/timeline_panel.dart` | Virtualized lanes, clip gestures, trim, zoom, ruler, frame navigation, snapping, waveforms, and keyframe lanes |
 | Timeline indexes and edit math | `lib/features/editor/services/` | Sorted snapping targets and pure curve-preserving split/trim/retime operations |
@@ -111,6 +111,21 @@ bus is unavailable; exact pan and complete mix parity come from the rendered
 bus. Per-track/master meters and signal-threshold ducking remain unfinished and
 are documented as partial roadmap items.
 
+## Effects, color, and LUT delivery
+
+Effect stacks are ordered persistent values resolved by project, track,
+compound set, group, adjustment-layer, and clip scope. Provider mutations own
+copy/paste, presets, drag ordering, enable state, parameter keyframes, and one
+undo transaction. Preview composite rendering and export consume the same
+resolved stack order. The full boundary audit is maintained in
+[Effects, color, and audio status](editor_effects_audio_status.md).
+
+Color delivery supports standard scalar controls, RGB channels/curve, wheels,
+and LUT intensity. A selected pack or custom LUT is copied to durable project
+media before the timeline stores its path. Selective HSL/qualifier state and
+non-SDR project spaces are rejected at delivery until a real implementation
+exists; they are never silently ignored or flattened to SDR.
+
 ## Persistence and compatibility
 
 New persistent fields use safe defaults when absent: preview quality defaults
@@ -145,7 +160,7 @@ flutter analyze
 flutter test
 ```
 
-The latest local implementation audit has a clean analyzer and 433 passing
-tests on Windows with Flutter 3.41.2. Historical Linux visual-golden baseline
+The latest local implementation audit runs the complete test suite on Windows
+with Flutter 3.41.2. Historical Linux visual-golden baseline
 differences still require CI verification. Physical iOS long-GOP 4K/60 stress
 validation has not been performed and remains an explicit release gate.

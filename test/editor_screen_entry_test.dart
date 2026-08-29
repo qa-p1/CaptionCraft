@@ -174,7 +174,9 @@ void main() {
 
     await tapDock('dock_category_effects');
     for (final subgroup in const [
+      'effectsStack',
       'effectsColor',
+      'effectsLuts',
       'effectsBlur',
       'effectsMotion',
       'effectsEnhance',
@@ -185,6 +187,14 @@ void main() {
     for (final tool in const ['chroma_key', 'filters', 'adjust']) {
       expect(
         find.byKey(ValueKey('dock_tool_effects_effectsColor_$tool')),
+        findsOneWidget,
+      );
+    }
+    await tapDock('dock_back_button');
+    await tapDock('dock_subgroup_effectsLuts');
+    for (final tool in const ['library', 'import', 'strength', 'clear']) {
+      expect(
+        find.byKey(ValueKey('dock_tool_effects_effectsLuts_$tool')),
         findsOneWidget,
       );
     }

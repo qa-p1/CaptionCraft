@@ -6,6 +6,7 @@ import 'package:uuid/uuid.dart';
 import 'subtitle_entry.dart';
 import 'subtitle_style_model.dart';
 import 'word_timing.dart';
+import 'editor_effect_models.dart';
 
 /// Stable editor-space coordinates used by preview gestures and export.
 ///
@@ -755,74 +756,250 @@ class ClipBlurSettings {
 }
 
 class ClipColorAdjustments {
+  final double exposure;
   final double brightness;
   final double contrast;
+  final double highlights;
+  final double shadows;
+  final double whites;
+  final double blacks;
   final double saturation;
+  final double vibrance;
   final double temperature;
+  final double tint;
+  final double gamma;
+  final double hue;
+  final double redGain;
+  final double greenGain;
+  final double blueGain;
   final double fade;
   final double vignette;
   final double sharpen;
+  final EditorColorCurve rgbCurve;
+  final EditorColorCurve hueVsHueCurve;
+  final EditorColorCurve hueVsSaturationCurve;
+  final EditorColorCurve hueVsLuminanceCurve;
+  final EditorColorCurve luminanceVsSaturationCurve;
+  final EditorColorCurve saturationVsSaturationCurve;
+  final EditorColorWheels wheels;
+  final EditorColorQualifier qualifier;
+  final String? lutPath;
+  final double lutIntensity;
+  final EditorColorSpace inputColorSpace;
 
   const ClipColorAdjustments({
+    this.exposure = 0,
     this.brightness = 0,
     this.contrast = 1,
+    this.highlights = 0,
+    this.shadows = 0,
+    this.whites = 0,
+    this.blacks = 0,
     this.saturation = 1,
+    this.vibrance = 0,
     this.temperature = 0,
+    this.tint = 0,
+    this.gamma = 1,
+    this.hue = 0,
+    this.redGain = 1,
+    this.greenGain = 1,
+    this.blueGain = 1,
     this.fade = 0,
     this.vignette = 0,
     this.sharpen = 0,
+    this.rgbCurve = const EditorColorCurve(),
+    this.hueVsHueCurve = const EditorColorCurve(),
+    this.hueVsSaturationCurve = const EditorColorCurve(),
+    this.hueVsLuminanceCurve = const EditorColorCurve(),
+    this.luminanceVsSaturationCurve = const EditorColorCurve(),
+    this.saturationVsSaturationCurve = const EditorColorCurve(),
+    this.wheels = const EditorColorWheels(),
+    this.qualifier = const EditorColorQualifier(),
+    this.lutPath,
+    this.lutIntensity = 1,
+    this.inputColorSpace = EditorColorSpace.sdr709,
   });
 
   bool get isNeutral =>
+      exposure == 0 &&
       brightness == 0 &&
       contrast == 1 &&
+      highlights == 0 &&
+      shadows == 0 &&
+      whites == 0 &&
+      blacks == 0 &&
       saturation == 1 &&
+      vibrance == 0 &&
       temperature == 0 &&
+      tint == 0 &&
+      gamma == 1 &&
+      hue == 0 &&
+      redGain == 1 &&
+      greenGain == 1 &&
+      blueGain == 1 &&
       fade == 0 &&
       vignette == 0 &&
-      sharpen == 0;
+      sharpen == 0 &&
+      rgbCurve.isIdentity &&
+      hueVsHueCurve.isIdentity &&
+      hueVsSaturationCurve.isIdentity &&
+      hueVsLuminanceCurve.isIdentity &&
+      luminanceVsSaturationCurve.isIdentity &&
+      saturationVsSaturationCurve.isIdentity &&
+      wheels.isIdentity &&
+      !qualifier.enabled &&
+      (lutPath == null || lutPath!.trim().isEmpty || lutIntensity <= 0) &&
+      inputColorSpace == EditorColorSpace.sdr709;
 
   ClipColorAdjustments copyWith({
+    double? exposure,
     double? brightness,
     double? contrast,
+    double? highlights,
+    double? shadows,
+    double? whites,
+    double? blacks,
     double? saturation,
+    double? vibrance,
     double? temperature,
+    double? tint,
+    double? gamma,
+    double? hue,
+    double? redGain,
+    double? greenGain,
+    double? blueGain,
     double? fade,
     double? vignette,
     double? sharpen,
+    EditorColorCurve? rgbCurve,
+    EditorColorCurve? hueVsHueCurve,
+    EditorColorCurve? hueVsSaturationCurve,
+    EditorColorCurve? hueVsLuminanceCurve,
+    EditorColorCurve? luminanceVsSaturationCurve,
+    EditorColorCurve? saturationVsSaturationCurve,
+    EditorColorWheels? wheels,
+    EditorColorQualifier? qualifier,
+    String? lutPath,
+    bool clearLutPath = false,
+    double? lutIntensity,
+    EditorColorSpace? inputColorSpace,
   }) {
     return ClipColorAdjustments(
+      exposure: exposure ?? this.exposure,
       brightness: brightness ?? this.brightness,
       contrast: contrast ?? this.contrast,
+      highlights: highlights ?? this.highlights,
+      shadows: shadows ?? this.shadows,
+      whites: whites ?? this.whites,
+      blacks: blacks ?? this.blacks,
       saturation: saturation ?? this.saturation,
+      vibrance: vibrance ?? this.vibrance,
       temperature: temperature ?? this.temperature,
+      tint: tint ?? this.tint,
+      gamma: gamma ?? this.gamma,
+      hue: hue ?? this.hue,
+      redGain: redGain ?? this.redGain,
+      greenGain: greenGain ?? this.greenGain,
+      blueGain: blueGain ?? this.blueGain,
       fade: fade ?? this.fade,
       vignette: vignette ?? this.vignette,
       sharpen: sharpen ?? this.sharpen,
+      rgbCurve: rgbCurve ?? this.rgbCurve,
+      hueVsHueCurve: hueVsHueCurve ?? this.hueVsHueCurve,
+      hueVsSaturationCurve: hueVsSaturationCurve ?? this.hueVsSaturationCurve,
+      hueVsLuminanceCurve: hueVsLuminanceCurve ?? this.hueVsLuminanceCurve,
+      luminanceVsSaturationCurve:
+          luminanceVsSaturationCurve ?? this.luminanceVsSaturationCurve,
+      saturationVsSaturationCurve:
+          saturationVsSaturationCurve ?? this.saturationVsSaturationCurve,
+      wheels: wheels ?? this.wheels,
+      qualifier: qualifier ?? this.qualifier,
+      lutPath: clearLutPath ? null : (lutPath ?? this.lutPath),
+      lutIntensity: lutIntensity ?? this.lutIntensity,
+      inputColorSpace: inputColorSpace ?? this.inputColorSpace,
     );
   }
 
   Map<String, dynamic> toJson() {
     return {
+      'exposure': exposure,
       'brightness': brightness,
       'contrast': contrast,
+      'highlights': highlights,
+      'shadows': shadows,
+      'whites': whites,
+      'blacks': blacks,
       'saturation': saturation,
+      'vibrance': vibrance,
       'temperature': temperature,
+      'tint': tint,
+      'gamma': gamma,
+      'hue': hue,
+      'redGain': redGain,
+      'greenGain': greenGain,
+      'blueGain': blueGain,
       'fade': fade,
       'vignette': vignette,
       'sharpen': sharpen,
+      'rgbCurve': rgbCurve.toJson(),
+      'hueVsHueCurve': hueVsHueCurve.toJson(),
+      'hueVsSaturationCurve': hueVsSaturationCurve.toJson(),
+      'hueVsLuminanceCurve': hueVsLuminanceCurve.toJson(),
+      'luminanceVsSaturationCurve': luminanceVsSaturationCurve.toJson(),
+      'saturationVsSaturationCurve': saturationVsSaturationCurve.toJson(),
+      'wheels': wheels.toJson(),
+      'qualifier': qualifier.toJson(),
+      'lutPath': lutPath,
+      'lutIntensity': lutIntensity.clamp(0.0, 1.0),
+      'inputColorSpace': inputColorSpace.name,
     };
   }
 
   factory ClipColorAdjustments.fromJson(Map<String, dynamic> json) {
     return ClipColorAdjustments(
+      exposure: (json['exposure'] as num?)?.toDouble() ?? 0,
       brightness: (json['brightness'] as num?)?.toDouble() ?? 0,
       contrast: (json['contrast'] as num?)?.toDouble() ?? 1,
+      highlights: (json['highlights'] as num?)?.toDouble() ?? 0,
+      shadows: (json['shadows'] as num?)?.toDouble() ?? 0,
+      whites: (json['whites'] as num?)?.toDouble() ?? 0,
+      blacks: (json['blacks'] as num?)?.toDouble() ?? 0,
       saturation: (json['saturation'] as num?)?.toDouble() ?? 1,
+      vibrance: (json['vibrance'] as num?)?.toDouble() ?? 0,
       temperature: (json['temperature'] as num?)?.toDouble() ?? 0,
+      tint: (json['tint'] as num?)?.toDouble() ?? 0,
+      gamma: (json['gamma'] as num?)?.toDouble() ?? 1,
+      hue: (json['hue'] as num?)?.toDouble() ?? 0,
+      redGain: (json['redGain'] as num?)?.toDouble() ?? 1,
+      greenGain: (json['greenGain'] as num?)?.toDouble() ?? 1,
+      blueGain: (json['blueGain'] as num?)?.toDouble() ?? 1,
       fade: (json['fade'] as num?)?.toDouble() ?? 0,
       vignette: (json['vignette'] as num?)?.toDouble() ?? 0,
       sharpen: (json['sharpen'] as num?)?.toDouble() ?? 0,
+      rgbCurve: EditorColorCurve.fromJson(json['rgbCurve']),
+      hueVsHueCurve: EditorColorCurve.fromJson(json['hueVsHueCurve']),
+      hueVsSaturationCurve: EditorColorCurve.fromJson(
+        json['hueVsSaturationCurve'],
+      ),
+      hueVsLuminanceCurve: EditorColorCurve.fromJson(
+        json['hueVsLuminanceCurve'],
+      ),
+      luminanceVsSaturationCurve: EditorColorCurve.fromJson(
+        json['luminanceVsSaturationCurve'],
+      ),
+      saturationVsSaturationCurve: EditorColorCurve.fromJson(
+        json['saturationVsSaturationCurve'],
+      ),
+      wheels: EditorColorWheels.fromJson(json['wheels']),
+      qualifier: EditorColorQualifier.fromJson(json['qualifier']),
+      lutPath: json['lutPath'] as String?,
+      lutIntensity: ((json['lutIntensity'] as num?)?.toDouble() ?? 1)
+          .clamp(0.0, 1.0)
+          .toDouble(),
+      inputColorSpace: EditorColorSpace.values.firstWhere(
+        (space) => space.name == json['inputColorSpace'],
+        orElse: () => EditorColorSpace.sdr709,
+      ),
     );
   }
 
@@ -965,6 +1142,14 @@ class AudioMixSettings {
   final bool normalize;
   final AudioFadeShape fadeInShape;
   final AudioFadeShape fadeOutShape;
+  final EditorAudioChannelMode channelMode;
+  final double leftGain;
+  final double rightGain;
+  final double targetLufs;
+  final double peakLimitDb;
+  final double pitchSemitones;
+  final double timeStretch;
+  final bool preservePitch;
 
   const AudioMixSettings({
     this.volume = 1,
@@ -975,6 +1160,14 @@ class AudioMixSettings {
     this.normalize = false,
     this.fadeInShape = AudioFadeShape.linear,
     this.fadeOutShape = AudioFadeShape.linear,
+    this.channelMode = EditorAudioChannelMode.stereo,
+    this.leftGain = 1,
+    this.rightGain = 1,
+    this.targetLufs = -16,
+    this.peakLimitDb = -1.5,
+    this.pitchSemitones = 0,
+    this.timeStretch = 1,
+    this.preservePitch = true,
   });
 
   bool get hasMixAdjustment =>
@@ -983,7 +1176,14 @@ class AudioMixSettings {
       normalize ||
       muted ||
       fadeInMs > 0 ||
-      fadeOutMs > 0;
+      fadeOutMs > 0 ||
+      channelMode != EditorAudioChannelMode.stereo ||
+      (leftGain - 1).abs() > 0.0001 ||
+      (rightGain - 1).abs() > 0.0001 ||
+      (targetLufs + 16).abs() > 0.0001 ||
+      (peakLimitDb + 1.5).abs() > 0.0001 ||
+      pitchSemitones.abs() > 0.0001 ||
+      (timeStretch - 1).abs() > 0.0001;
 
   AudioMixSettings copyWith({
     double? volume,
@@ -994,6 +1194,14 @@ class AudioMixSettings {
     bool? normalize,
     AudioFadeShape? fadeInShape,
     AudioFadeShape? fadeOutShape,
+    EditorAudioChannelMode? channelMode,
+    double? leftGain,
+    double? rightGain,
+    double? targetLufs,
+    double? peakLimitDb,
+    double? pitchSemitones,
+    double? timeStretch,
+    bool? preservePitch,
   }) {
     return AudioMixSettings(
       volume: volume ?? this.volume,
@@ -1004,6 +1212,14 @@ class AudioMixSettings {
       normalize: normalize ?? this.normalize,
       fadeInShape: fadeInShape ?? this.fadeInShape,
       fadeOutShape: fadeOutShape ?? this.fadeOutShape,
+      channelMode: channelMode ?? this.channelMode,
+      leftGain: leftGain ?? this.leftGain,
+      rightGain: rightGain ?? this.rightGain,
+      targetLufs: targetLufs ?? this.targetLufs,
+      peakLimitDb: peakLimitDb ?? this.peakLimitDb,
+      pitchSemitones: pitchSemitones ?? this.pitchSemitones,
+      timeStretch: timeStretch ?? this.timeStretch,
+      preservePitch: preservePitch ?? this.preservePitch,
     );
   }
 
@@ -1017,6 +1233,14 @@ class AudioMixSettings {
       'normalize': normalize,
       'fadeInShape': fadeInShape.name,
       'fadeOutShape': fadeOutShape.name,
+      'channelMode': channelMode.name,
+      'leftGain': leftGain.clamp(0.0, 2.0),
+      'rightGain': rightGain.clamp(0.0, 2.0),
+      'targetLufs': targetLufs.clamp(-60.0, 0.0),
+      'peakLimitDb': peakLimitDb.clamp(-24.0, 0.0),
+      'pitchSemitones': pitchSemitones.clamp(-24.0, 24.0),
+      'timeStretch': timeStretch.clamp(0.25, 4.0),
+      'preservePitch': preservePitch,
     };
   }
 
@@ -1036,6 +1260,29 @@ class AudioMixSettings {
         (shape) => shape.name == json['fadeOutShape'],
         orElse: () => AudioFadeShape.linear,
       ),
+      channelMode: EditorAudioChannelMode.values.firstWhere(
+        (mode) => mode.name == json['channelMode'],
+        orElse: () => EditorAudioChannelMode.stereo,
+      ),
+      leftGain: ((json['leftGain'] as num?)?.toDouble() ?? 1)
+          .clamp(0.0, 2.0)
+          .toDouble(),
+      rightGain: ((json['rightGain'] as num?)?.toDouble() ?? 1)
+          .clamp(0.0, 2.0)
+          .toDouble(),
+      targetLufs: ((json['targetLufs'] as num?)?.toDouble() ?? -16)
+          .clamp(-60.0, 0.0)
+          .toDouble(),
+      peakLimitDb: ((json['peakLimitDb'] as num?)?.toDouble() ?? -1.5)
+          .clamp(-24.0, 0.0)
+          .toDouble(),
+      pitchSemitones: ((json['pitchSemitones'] as num?)?.toDouble() ?? 0)
+          .clamp(-24.0, 24.0)
+          .toDouble(),
+      timeStretch: ((json['timeStretch'] as num?)?.toDouble() ?? 1)
+          .clamp(0.25, 4.0)
+          .toDouble(),
+      preservePitch: json['preservePitch'] as bool? ?? true,
     );
   }
 }
@@ -1196,6 +1443,10 @@ class TimelineClip {
   final String trackId;
   final TimelineTrackType type;
   final TimelineEffectKind? effectKind;
+  final EditorEffectStack effectStack;
+  final bool isAdjustmentLayer;
+  final String? groupId;
+  final String? compoundId;
   final String label;
   final String? assetId;
   final String? linkedClipId;
@@ -1244,6 +1495,10 @@ class TimelineClip {
     required this.trackId,
     required this.type,
     this.effectKind,
+    this.effectStack = const EditorEffectStack(),
+    this.isAdjustmentLayer = false,
+    this.groupId,
+    this.compoundId,
     required this.label,
     required this.startTime,
     required this.endTime,
@@ -1289,17 +1544,24 @@ class TimelineClip {
        );
 
   Duration get duration => endTime - startTime;
-  bool get isEffect => type == TimelineTrackType.effect && effectKind != null;
+  bool get isEffect =>
+      type == TimelineTrackType.effect &&
+      (effectKind != null || isAdjustmentLayer);
+  bool get hasEffectStack => effectStack.isNotEmpty;
 
   factory TimelineClip.effect({
     String? id,
     required String trackId,
-    required TimelineEffectKind effectKind,
+    TimelineEffectKind? effectKind,
     required String label,
     required Duration startTime,
     required Duration endTime,
     ClipBlurSettings blur = const ClipBlurSettings(),
     ClipColorAdjustments colorAdjustments = const ClipColorAdjustments(),
+    EditorEffectStack effectStack = const EditorEffectStack(),
+    bool isAdjustmentLayer = false,
+    String? groupId,
+    String? compoundId,
     int layer = 0,
     bool enabled = true,
   }) {
@@ -1308,6 +1570,10 @@ class TimelineClip {
       trackId: trackId,
       type: TimelineTrackType.effect,
       effectKind: effectKind,
+      effectStack: effectStack,
+      isAdjustmentLayer: isAdjustmentLayer,
+      groupId: groupId,
+      compoundId: compoundId,
       label: label,
       startTime: startTime,
       endTime: endTime,
@@ -1326,6 +1592,12 @@ class TimelineClip {
     TimelineTrackType? type,
     TimelineEffectKind? effectKind,
     bool clearEffectKind = false,
+    EditorEffectStack? effectStack,
+    bool? isAdjustmentLayer,
+    String? groupId,
+    bool clearGroupId = false,
+    String? compoundId,
+    bool clearCompoundId = false,
     String? label,
     String? assetId,
     bool clearAssetId = false,
@@ -1373,6 +1645,10 @@ class TimelineClip {
       trackId: trackId ?? this.trackId,
       type: type ?? this.type,
       effectKind: clearEffectKind ? null : (effectKind ?? this.effectKind),
+      effectStack: effectStack ?? this.effectStack,
+      isAdjustmentLayer: isAdjustmentLayer ?? this.isAdjustmentLayer,
+      groupId: clearGroupId ? null : (groupId ?? this.groupId),
+      compoundId: clearCompoundId ? null : (compoundId ?? this.compoundId),
       label: label ?? this.label,
       assetId: clearAssetId ? null : (assetId ?? this.assetId),
       linkedClipId: clearLinkedClipId
@@ -1425,6 +1701,10 @@ class TimelineClip {
       'trackId': trackId,
       'type': type.name,
       'effectKind': effectKind?.name,
+      'effectStack': effectStack.toJson(),
+      'isAdjustmentLayer': isAdjustmentLayer,
+      'groupId': groupId,
+      'compoundId': compoundId,
       'label': label,
       'assetId': assetId,
       'linkedClipId': linkedClipId,
@@ -1489,6 +1769,10 @@ class TimelineClip {
       effectKind: TimelineEffectKind.values
           .where((value) => value.name == json['effectKind'])
           .firstOrNull,
+      effectStack: EditorEffectStack.fromJson(json['effectStack']),
+      isAdjustmentLayer: json['isAdjustmentLayer'] as bool? ?? false,
+      groupId: json['groupId'] as String?,
+      compoundId: json['compoundId'] as String?,
       label: json['label'] as String? ?? 'Untitled clip',
       assetId: json['assetId'] as String?,
       linkedClipId: json['linkedClipId'] as String?,
@@ -1660,6 +1944,7 @@ extension TimelineClipCapabilities on TimelineClip {
       stabilize ||
       denoise ||
       chromaKeyEnabled ||
+      effectStack.isNotEmpty ||
       autoDuck ||
       notes?.trim().isNotEmpty == true;
 
@@ -1916,6 +2201,9 @@ class TimelineTrack {
   final bool isSolo;
   final double audioGain;
   final double audioPan;
+  final String? audioBusId;
+  final bool syncLocked;
+  final EditorEffectStack effectStack;
   final List<TimelineClip> clips;
 
   TimelineTrack({
@@ -1931,6 +2219,9 @@ class TimelineTrack {
     this.isSolo = false,
     this.audioGain = 1,
     this.audioPan = 0,
+    this.audioBusId,
+    this.syncLocked = false,
+    this.effectStack = const EditorEffectStack(),
     List<TimelineClip>? clips,
   }) : id = id ?? const Uuid().v4(),
        section = section ?? _defaultSectionForType(type),
@@ -1950,6 +2241,10 @@ class TimelineTrack {
     bool? isSolo,
     double? audioGain,
     double? audioPan,
+    String? audioBusId,
+    bool clearAudioBusId = false,
+    bool? syncLocked,
+    EditorEffectStack? effectStack,
     List<TimelineClip>? clips,
   }) {
     return TimelineTrack(
@@ -1965,6 +2260,9 @@ class TimelineTrack {
       isSolo: isSolo ?? this.isSolo,
       audioGain: audioGain ?? this.audioGain,
       audioPan: audioPan ?? this.audioPan,
+      audioBusId: clearAudioBusId ? null : (audioBusId ?? this.audioBusId),
+      syncLocked: syncLocked ?? this.syncLocked,
+      effectStack: effectStack ?? this.effectStack,
       clips: clips ?? this.clips,
     );
   }
@@ -1983,6 +2281,9 @@ class TimelineTrack {
       'isSolo': isSolo,
       'audioGain': audioGain.clamp(0.0, 2.0),
       'audioPan': audioPan.clamp(-1.0, 1.0),
+      'audioBusId': audioBusId,
+      'syncLocked': syncLocked,
+      'effectStack': effectStack.toJson(),
       'clips': clips.map((clip) => clip.toJson()).toList(),
     };
   }
@@ -2018,6 +2319,9 @@ class TimelineTrack {
       audioPan: ((json['audioPan'] as num?)?.toDouble() ?? 0)
           .clamp(-1.0, 1.0)
           .toDouble(),
+      audioBusId: json['audioBusId'] as String?,
+      syncLocked: json['syncLocked'] as bool? ?? false,
+      effectStack: EditorEffectStack.fromJson(json['effectStack']),
       clips: _timelineModelsFromJson(json['clips'], TimelineClip.fromJson),
     );
   }
@@ -2265,6 +2569,8 @@ class CanvasSettings {
 }
 
 class EditorTimeline {
+  static const int currentSchemaVersion = 8;
+
   final int schemaVersion;
   final CanvasSettings canvasSettings;
   final TimelineWorkspaceSettings workspaceSettings;
@@ -2272,15 +2578,29 @@ class EditorTimeline {
   final List<EditorAssetReference> assets;
   final List<TimelineTrack> tracks;
   final List<TimelineMarker> markers;
+  final EditorEffectStack projectEffectStack;
+  final List<EditorEffectContainer> effectContainers;
+  final List<EditorEffectPreset> effectPresets;
+  final List<TimelineGroup> groups;
+  final List<TimelineCompoundClip> compoundClips;
+  final List<TimelineAudioBus> audioBuses;
+  final EditorColorManagementSettings colorManagement;
 
   const EditorTimeline({
-    this.schemaVersion = 7,
+    this.schemaVersion = currentSchemaVersion,
     this.canvasSettings = const CanvasSettings(),
     this.workspaceSettings = const TimelineWorkspaceSettings(),
     this.subtitleStyle = const SubtitleStyleModel(),
     this.assets = const [],
     this.tracks = const [],
     this.markers = const [],
+    this.projectEffectStack = const EditorEffectStack(),
+    this.effectContainers = const [],
+    this.effectPresets = const [],
+    this.groups = const [],
+    this.compoundClips = const [],
+    this.audioBuses = const [],
+    this.colorManagement = const EditorColorManagementSettings(),
   });
 
   TimelineTrack? get primarySubtitleTrack {
@@ -2472,6 +2792,66 @@ class EditorTimeline {
   /// base-video terminology internally.
   Duration get baseVideoDuration => baseLayerDuration;
 
+  EditorEffectStack effectStackForClip(
+    TimelineClip clip, {
+    TimelineTrack? track,
+  }) {
+    final scopedStacks = effectStacksForClip(clip, track: track);
+    return EditorEffectStack(
+      effects: [for (final scoped in scopedStacks) ...scoped.stack.effects],
+    );
+  }
+
+  List<({EditorEffectScope scope, EditorEffectStack stack})>
+  effectStacksForClip(TimelineClip clip, {TimelineTrack? track}) {
+    final resolvedTrack =
+        track ??
+        tracks.where((candidate) => candidate.id == clip.trackId).firstOrNull ??
+        tracks.where((candidate) {
+          return candidate.clips.any(
+            (candidateClip) => candidateClip.id == clip.id,
+          );
+        }).firstOrNull;
+    final stacks = <({EditorEffectScope scope, EditorEffectStack stack})>[
+      if (clip.effectStack.isNotEmpty)
+        (scope: EditorEffectScope.clip, stack: clip.effectStack),
+    ];
+    void appendContainer(EditorEffectScope scope, String? targetId) {
+      if (targetId == null) return;
+      final targetEnabled = switch (scope) {
+        EditorEffectScope.group =>
+          groups.where((group) => group.id == targetId).firstOrNull?.enabled,
+        EditorEffectScope.compound =>
+          compoundClips
+              .where((compound) => compound.id == targetId)
+              .firstOrNull
+              ?.enabled,
+        EditorEffectScope.audioBus => true,
+        _ => true,
+      };
+      if (targetEnabled != true) return;
+      for (final container in effectContainers) {
+        if (container.enabled &&
+            container.scope == scope &&
+            container.targetId == targetId) {
+          if (container.stack.isNotEmpty) {
+            stacks.add((scope: scope, stack: container.stack));
+          }
+        }
+      }
+    }
+
+    appendContainer(EditorEffectScope.compound, clip.compoundId);
+    appendContainer(EditorEffectScope.group, clip.groupId);
+    if (resolvedTrack?.effectStack.isNotEmpty == true) {
+      stacks.add((
+        scope: EditorEffectScope.track,
+        stack: resolvedTrack!.effectStack,
+      ));
+    }
+    return stacks;
+  }
+
   List<TimelineClip> get visualMediaClips {
     return tracks
         .where(
@@ -2561,6 +2941,13 @@ class EditorTimeline {
     List<EditorAssetReference>? assets,
     List<TimelineTrack>? tracks,
     List<TimelineMarker>? markers,
+    EditorEffectStack? projectEffectStack,
+    List<EditorEffectContainer>? effectContainers,
+    List<EditorEffectPreset>? effectPresets,
+    List<TimelineGroup>? groups,
+    List<TimelineCompoundClip>? compoundClips,
+    List<TimelineAudioBus>? audioBuses,
+    EditorColorManagementSettings? colorManagement,
   }) {
     return EditorTimeline(
       schemaVersion: schemaVersion ?? this.schemaVersion,
@@ -2570,6 +2957,13 @@ class EditorTimeline {
       assets: assets ?? this.assets,
       tracks: tracks ?? this.tracks,
       markers: markers ?? this.markers,
+      projectEffectStack: projectEffectStack ?? this.projectEffectStack,
+      effectContainers: effectContainers ?? this.effectContainers,
+      effectPresets: effectPresets ?? this.effectPresets,
+      groups: groups ?? this.groups,
+      compoundClips: compoundClips ?? this.compoundClips,
+      audioBuses: audioBuses ?? this.audioBuses,
+      colorManagement: colorManagement ?? this.colorManagement,
     );
   }
 
@@ -2577,13 +2971,48 @@ class EditorTimeline {
     final normalizedTracks = _foldRedundantLegacySourceAudio(
       _canonicalizeTimelineTracks(tracks),
     );
+    final orderedTracks = schemaVersion < 5
+        ? _migrateLegacyTrackOrder(normalizedTracks)
+        : normalizedTracks;
+    final relationships = _canonicalizeTimelineRelationships(
+      tracks: orderedTracks,
+      groups: groups,
+      compoundClips: compoundClips,
+      audioBuses: audioBuses,
+      effectContainers: effectContainers,
+      projectEffectStack: projectEffectStack,
+    );
     return copyWith(
-      schemaVersion: 7,
+      schemaVersion: currentSchemaVersion,
       assets: _canonicalizeAssets(assets),
-      tracks: schemaVersion < 5
-          ? _migrateLegacyTrackOrder(normalizedTracks)
-          : normalizedTracks,
+      tracks: relationships.tracks,
+      projectEffectStack: relationships.projectEffectStack,
+      effectContainers: relationships.effectContainers,
+      effectPresets: _canonicalizeEffectPresets(effectPresets),
+      groups: relationships.groups,
+      compoundClips: relationships.compoundClips,
+      audioBuses: relationships.audioBuses,
+      colorManagement: _canonicalizeColorManagement(colorManagement),
     ).withoutTrackOverlaps();
+  }
+
+  EditorTimeline prunedRelationships() {
+    final relationships = _canonicalizeTimelineRelationships(
+      tracks: tracks,
+      groups: groups,
+      compoundClips: compoundClips,
+      audioBuses: audioBuses,
+      effectContainers: effectContainers,
+      projectEffectStack: projectEffectStack,
+    );
+    return copyWith(
+      tracks: relationships.tracks,
+      groups: relationships.groups,
+      compoundClips: relationships.compoundClips,
+      audioBuses: relationships.audioBuses,
+      effectContainers: relationships.effectContainers,
+      projectEffectStack: relationships.projectEffectStack,
+    );
   }
 
   EditorTimeline syncLegacySubtitles({
@@ -2744,6 +3173,17 @@ class EditorTimeline {
       'assets': assets.map((asset) => asset.toJson()).toList(),
       'tracks': tracks.map((track) => track.toJson()).toList(),
       'markers': markers.map((marker) => marker.toJson()).toList(),
+      'projectEffectStack': projectEffectStack.toJson(),
+      'effectContainers': effectContainers
+          .map((container) => container.toJson())
+          .toList(),
+      'effectPresets': effectPresets.map((preset) => preset.toJson()).toList(),
+      'groups': groups.map((group) => group.toJson()).toList(),
+      'compoundClips': compoundClips
+          .map((compound) => compound.toJson())
+          .toList(),
+      'audioBuses': audioBuses.map((bus) => bus.toJson()).toList(),
+      'colorManagement': colorManagement.toJson(),
     };
   }
 
@@ -2773,6 +3213,29 @@ class EditorTimeline {
       markers: _timelineModelsFromJson(
         json['markers'],
         TimelineMarker.fromJson,
+      ),
+      projectEffectStack: EditorEffectStack.fromJson(
+        json['projectEffectStack'],
+      ),
+      effectContainers: _timelineModelsFromJson(
+        json['effectContainers'],
+        EditorEffectContainer.fromJson,
+      ),
+      effectPresets: _timelineModelsFromJson(
+        json['effectPresets'],
+        EditorEffectPreset.fromJson,
+      ),
+      groups: _timelineModelsFromJson(json['groups'], TimelineGroup.fromJson),
+      compoundClips: _timelineModelsFromJson(
+        json['compoundClips'],
+        TimelineCompoundClip.fromJson,
+      ),
+      audioBuses: _timelineModelsFromJson(
+        json['audioBuses'],
+        TimelineAudioBus.fromJson,
+      ),
+      colorManagement: EditorColorManagementSettings.fromJson(
+        json['colorManagement'],
       ),
     );
     return parsed.canonicalized();
@@ -2922,6 +3385,9 @@ TimelineTrack _coalesceTrackGroup(
     isMuted: tracks.any((track) => track.isMuted),
     isHidden: tracks.any((track) => track.isHidden),
     isSolo: tracks.any((track) => track.isSolo),
+    audioBusId: primary.audioBusId,
+    syncLocked: tracks.any((track) => track.syncLocked),
+    effectStack: primary.effectStack,
     clips: clips,
   );
 }
@@ -2976,6 +3442,297 @@ List<EditorAssetReference> _canonicalizeAssets(
     byId.putIfAbsent(asset.id, () => asset);
   }
   return byId.values.toList();
+}
+
+({
+  List<TimelineTrack> tracks,
+  List<TimelineGroup> groups,
+  List<TimelineCompoundClip> compoundClips,
+  List<TimelineAudioBus> audioBuses,
+  List<EditorEffectContainer> effectContainers,
+  EditorEffectStack projectEffectStack,
+})
+_canonicalizeTimelineRelationships({
+  required List<TimelineTrack> tracks,
+  required List<TimelineGroup> groups,
+  required List<TimelineCompoundClip> compoundClips,
+  required List<TimelineAudioBus> audioBuses,
+  required List<EditorEffectContainer> effectContainers,
+  required EditorEffectStack projectEffectStack,
+}) {
+  final clipsById = <String, TimelineClip>{
+    for (final track in tracks)
+      for (final clip in track.clips) clip.id: clip,
+  };
+  final trackIds = tracks.map((track) => track.id).toSet();
+
+  final busesById = <String, TimelineAudioBus>{};
+  for (final bus in audioBuses) {
+    busesById.putIfAbsent(
+      bus.id,
+      () => bus.copyWith(
+        effectStack: _canonicalizeEffectStack(
+          bus.effectStack,
+          domain: EditorEffectDomain.audio,
+        ),
+      ),
+    );
+  }
+
+  final groupsById = <String, TimelineGroup>{};
+  for (final group in groups) {
+    groupsById.putIfAbsent(group.id, () => group);
+  }
+  final groupForClip = <String, String>{};
+  for (final clip in clipsById.values) {
+    final groupId = clip.groupId;
+    if (groupId != null && groupsById.containsKey(groupId)) {
+      groupForClip[clip.id] = groupId;
+    }
+  }
+  for (final group in groupsById.values) {
+    for (final clipId in group.clipIds) {
+      if (clipsById.containsKey(clipId)) {
+        groupForClip.putIfAbsent(clipId, () => group.id);
+      }
+    }
+  }
+  final canonicalGroups = <TimelineGroup>[];
+  for (final group in groupsById.values) {
+    final declaredClipIds = group.clipIds.toSet();
+    final clipIds = <String>[
+      ...group.clipIds.where((clipId) => groupForClip[clipId] == group.id),
+      ...clipsById.keys.where(
+        (clipId) =>
+            groupForClip[clipId] == group.id &&
+            !declaredClipIds.contains(clipId),
+      ),
+    ];
+    if (clipIds.isNotEmpty) {
+      canonicalGroups.add(group.copyWith(clipIds: clipIds));
+    }
+  }
+  final validGroupIds = canonicalGroups.map((group) => group.id).toSet();
+  groupForClip.removeWhere((_, groupId) => !validGroupIds.contains(groupId));
+
+  final compoundsById = <String, TimelineCompoundClip>{};
+  for (final compound in compoundClips) {
+    compoundsById.putIfAbsent(compound.id, () => compound);
+  }
+  final compoundForClip = <String, String>{};
+  for (final clip in clipsById.values.where(
+    (candidate) => candidate.type.isVisualMedia,
+  )) {
+    final compoundId = clip.compoundId;
+    if (compoundId != null && compoundsById.containsKey(compoundId)) {
+      compoundForClip[clip.id] = compoundId;
+    }
+  }
+  for (final compound in compoundsById.values) {
+    for (final clipId in compound.clipIds) {
+      if (clipsById[clipId]?.type.isVisualMedia == true) {
+        compoundForClip.putIfAbsent(clipId, () => compound.id);
+      }
+    }
+  }
+  final canonicalCompounds = <TimelineCompoundClip>[];
+  for (final compound in compoundsById.values) {
+    final declaredClipIds = compound.clipIds.toSet();
+    final clipIds = <String>[
+      ...compound.clipIds.where(
+        (clipId) => compoundForClip[clipId] == compound.id,
+      ),
+      ...clipsById.keys.where(
+        (clipId) =>
+            compoundForClip[clipId] == compound.id &&
+            !declaredClipIds.contains(clipId),
+      ),
+    ];
+    if (clipIds.isNotEmpty) {
+      canonicalCompounds.add(compound.copyWith(clipIds: clipIds));
+    }
+  }
+  final validCompoundIds = canonicalCompounds
+      .map((compound) => compound.id)
+      .toSet();
+  compoundForClip.removeWhere(
+    (_, compoundId) => !validCompoundIds.contains(compoundId),
+  );
+
+  final clipContainerStacks = <String, EditorEffectStack>{};
+  final trackContainerStacks = <String, EditorEffectStack>{};
+  final busContainerStacks = <String, EditorEffectStack>{};
+  var canonicalProjectStack = _canonicalizeEffectStack(projectEffectStack);
+  final scopedContainers = <String, EditorEffectContainer>{};
+  for (final container in effectContainers) {
+    final stack = _canonicalizeEffectStack(
+      container.enabled
+          ? container.stack
+          : EditorEffectStack(
+              effects: container.stack.effects
+                  .map((effect) => effect.copyWith(enabled: false))
+                  .toList(),
+            ),
+    );
+    switch (container.scope) {
+      case EditorEffectScope.project:
+        canonicalProjectStack = _mergeEffectStacks(
+          canonicalProjectStack,
+          stack,
+        );
+      case EditorEffectScope.clip:
+        if (clipsById.containsKey(container.targetId)) {
+          clipContainerStacks[container.targetId] = _mergeEffectStacks(
+            clipContainerStacks[container.targetId] ??
+                const EditorEffectStack(),
+            stack,
+          );
+        }
+      case EditorEffectScope.adjustmentLayer:
+        if (clipsById[container.targetId]?.isAdjustmentLayer == true) {
+          clipContainerStacks[container.targetId] = _mergeEffectStacks(
+            clipContainerStacks[container.targetId] ??
+                const EditorEffectStack(),
+            stack,
+          );
+        }
+      case EditorEffectScope.track:
+        if (trackIds.contains(container.targetId)) {
+          trackContainerStacks[container.targetId] = _mergeEffectStacks(
+            trackContainerStacks[container.targetId] ??
+                const EditorEffectStack(),
+            stack,
+          );
+        }
+      case EditorEffectScope.audioBus:
+        if (busesById.containsKey(container.targetId)) {
+          busContainerStacks[container.targetId] = _mergeEffectStacks(
+            busContainerStacks[container.targetId] ?? const EditorEffectStack(),
+            stack,
+          );
+        }
+      case EditorEffectScope.group:
+      case EditorEffectScope.compound:
+        final targetExists = container.scope == EditorEffectScope.group
+            ? validGroupIds.contains(container.targetId)
+            : validCompoundIds.contains(container.targetId);
+        if (!targetExists) continue;
+        final key = '${container.scope.name}:${container.targetId}';
+        final existing = scopedContainers[key];
+        scopedContainers[key] = EditorEffectContainer(
+          id: existing?.id ?? container.id,
+          scope: container.scope,
+          targetId: container.targetId,
+          label: existing?.label ?? container.label,
+          stack: _mergeEffectStacks(
+            existing?.stack ?? const EditorEffectStack(),
+            stack,
+          ),
+        );
+    }
+  }
+
+  final canonicalTracks = tracks.map((track) {
+    final containerStack = trackContainerStacks[track.id];
+    final trackStack = _mergeEffectStacks(
+      _canonicalizeEffectStack(track.effectStack),
+      containerStack ?? const EditorEffectStack(),
+    );
+    return track.copyWith(
+      clearAudioBusId:
+          track.audioBusId != null && !busesById.containsKey(track.audioBusId),
+      effectStack: trackStack,
+      clips: track.clips.map((clip) {
+        final groupId = groupForClip[clip.id];
+        final compoundId = compoundForClip[clip.id];
+        return clip.copyWith(
+          groupId: groupId,
+          clearGroupId: groupId == null,
+          compoundId: compoundId,
+          clearCompoundId: compoundId == null,
+          effectStack: _mergeEffectStacks(
+            _canonicalizeEffectStack(clip.effectStack),
+            clipContainerStacks[clip.id] ?? const EditorEffectStack(),
+          ),
+        );
+      }).toList(),
+    );
+  }).toList();
+
+  final canonicalBuses = busesById.values.map((bus) {
+    return bus.copyWith(
+      effectStack: _mergeEffectStacks(
+        bus.effectStack,
+        busContainerStacks[bus.id] ?? const EditorEffectStack(),
+        domain: EditorEffectDomain.audio,
+      ),
+    );
+  }).toList();
+
+  return (
+    tracks: canonicalTracks,
+    groups: canonicalGroups,
+    compoundClips: canonicalCompounds,
+    audioBuses: canonicalBuses,
+    effectContainers: scopedContainers.values.toList(),
+    projectEffectStack: canonicalProjectStack,
+  );
+}
+
+EditorEffectStack _mergeEffectStacks(
+  EditorEffectStack first,
+  EditorEffectStack second, {
+  EditorEffectDomain? domain,
+}) {
+  return _canonicalizeEffectStack(
+    EditorEffectStack(effects: [...first.effects, ...second.effects]),
+    domain: domain,
+  );
+}
+
+EditorEffectStack _canonicalizeEffectStack(
+  EditorEffectStack stack, {
+  EditorEffectDomain? domain,
+}) {
+  final ids = <String>{};
+  final effects = <EditorEffect>[];
+  for (final effect in stack.effects) {
+    if (domain != null && effect.domain != domain) continue;
+    final normalized = ids.add(effect.id) ? effect : effect.cloneWithNewId();
+    ids.add(normalized.id);
+    effects.add(normalized);
+  }
+  return EditorEffectStack(effects: effects);
+}
+
+List<EditorEffectPreset> _canonicalizeEffectPresets(
+  Iterable<EditorEffectPreset> presets,
+) {
+  final byId = <String, EditorEffectPreset>{};
+  for (final preset in presets) {
+    byId.putIfAbsent(
+      preset.id,
+      () => EditorEffectPreset(
+        id: preset.id,
+        name: preset.name.trim().isEmpty ? 'Preset' : preset.name.trim(),
+        description: preset.description,
+        stack: _canonicalizeEffectStack(preset.stack),
+        createdAt: preset.createdAt,
+      ),
+    );
+  }
+  return byId.values.toList();
+}
+
+EditorColorManagementSettings _canonicalizeColorManagement(
+  EditorColorManagementSettings settings,
+) {
+  final lutsById = <String, EditorLutAsset>{};
+  for (final lut in settings.luts) {
+    if (lut.path.trim().isEmpty) continue;
+    lutsById.putIfAbsent(lut.id, () => lut);
+  }
+  return settings.copyWith(luts: lutsById.values.toList());
 }
 
 List<TimelineTrack> _canonicalizeTimelineTracks(

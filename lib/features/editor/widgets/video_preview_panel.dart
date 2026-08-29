@@ -13,6 +13,7 @@ import '../../../core/utils/timeline_preview_audio_service.dart';
 import '../../../core/utils/timeline_preview_composite_service.dart';
 import '../models/subtitle_entry.dart';
 import '../models/subtitle_style_model.dart';
+import '../models/editor_effect_models.dart';
 import '../models/timeline_models.dart';
 import '../providers/editor_provider.dart';
 import '../providers/playback_provider.dart';
@@ -628,23 +629,38 @@ String? resolvePreviewSourcePathForTesting({
 List<double> buildPreviewColorMatrixForTesting(
   ClipColorAdjustments adjustments,
 ) {
-  final saturation = adjustments.saturation.clamp(0.0, 3.0);
-  final contrast = (adjustments.contrast * (1 - adjustments.fade * 0.22)).clamp(
-    0.1,
-    3.0,
-  );
-  final brightness = (adjustments.brightness + adjustments.fade * 0.05).clamp(
-    -1.0,
-    1.0,
-  );
+  final saturation =
+      (adjustments.saturation +
+              adjustments.vibrance * (1 - adjustments.saturation) * 0.6)
+          .clamp(0.0, 3.0);
+  final contrast =
+      (adjustments.contrast *
+              (1 - adjustments.fade * 0.22) *
+              (1 + (1 - adjustments.gamma) * 0.15))
+          .clamp(0.1, 3.0);
+  final brightness =
+      (adjustments.brightness +
+              adjustments.fade * 0.05 +
+              adjustments.exposure * 0.08 +
+              (adjustments.shadows + adjustments.highlights) * 0.04 +
+              (adjustments.blacks + adjustments.whites) * 0.025)
+          .clamp(-1.0, 1.0);
   final warmth = (adjustments.temperature * 0.16).clamp(-0.2, 0.2);
+  final tint = (adjustments.tint * 0.12).clamp(-0.2, 0.2);
   const redLuma = 0.2126;
   const greenLuma = 0.7152;
   const blueLuma = 0.0722;
   final inverseSaturation = 1 - saturation;
   final offset = 128 * (1 - contrast) + brightness * 255;
-  final redWarmth = 1 + warmth;
-  final blueWarmth = 1 - warmth;
+  final wheels = adjustments.wheels;
+  final redWarmth = (adjustments.redGain + warmth + tint + wheels.globalRed)
+      .clamp(0.0, 3.0);
+  final greenWarmth = (adjustments.greenGain - tint + wheels.globalGreen).clamp(
+    0.0,
+    3.0,
+  );
+  final blueWarmth = (adjustments.blueGain - warmth + tint + wheels.globalBlue)
+      .clamp(0.0, 3.0);
 
   // Export applies eq first, then colorchannelmixer. Scale the complete
   // post-eq red/blue rows, including their offsets, to preserve that order.
@@ -654,9 +670,9 @@ List<double> buildPreviewColorMatrixForTesting(
     blueLuma * inverseSaturation * contrast * redWarmth,
     0,
     offset * redWarmth,
-    redLuma * inverseSaturation * contrast,
-    (greenLuma * inverseSaturation + saturation) * contrast,
-    blueLuma * inverseSaturation * contrast,
+    redLuma * inverseSaturation * contrast * greenWarmth,
+    (greenLuma * inverseSaturation + saturation) * contrast * greenWarmth,
+    blueLuma * inverseSaturation * contrast * greenWarmth,
     0,
     offset,
     redLuma * inverseSaturation * contrast * blueWarmth,
@@ -3202,8 +3218,9 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   Widget _applyClipMediaEffects(
     Widget child,
     TimelineClip clip,
-    Duration playbackPosition,
-  ) {
+    Duration playbackPosition, {
+    EditorTimeline? timeline,
+  }) {
     if (!clip.colorAdjustments.isNeutral) {
       child = ColorFiltered(
         colorFilter: ColorFilter.matrix(
@@ -3214,7 +3231,380 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     }
     child = _applyVignettePreview(child, clip.colorAdjustments);
     child = _applyChromaKeyPreview(child, clip);
-    return _applyBlurPreview(child, _resolvedBlurAt(clip, playbackPosition));
+    child = _applyBlurPreview(child, _resolvedBlurAt(clip, playbackPosition));
+    if (timeline == null) {
+      return _applyEditorEffectStackPreview(
+        child,
+        clip.effectStack,
+        playbackPosition - clip.startTime,
+      );
+    }
+    var effected = child;
+    for (final scoped in timeline.effectStacksForClip(clip)) {
+      effected = _applyEditorEffectStackPreview(
+        effected,
+        scoped.stack,
+        scoped.scope == EditorEffectScope.clip
+            ? playbackPosition - clip.startTime
+            : playbackPosition,
+      );
+    }
+    return effected;
+  }
+
+  Widget _applyEditorEffectStackPreview(
+    Widget child,
+    EditorEffectStack stack,
+    Duration time,
+  ) {
+    var effected = child;
+    for (final effect in stack.effects) {
+      if (!effect.enabled || effect.intensity <= 0.0001) continue;
+      final before = effected;
+      double value(String name, [double fallback = 0]) {
+        return effect.parameterAt(name, time, fallback: fallback);
+      }
+
+      final amount = value('amount', 1).clamp(0.0, 1.0).toDouble();
+      final radius = value('radius', 12).clamp(0.0, 80.0).toDouble();
+      effected = switch (effect.type) {
+        EditorEffectType.gaussianBlur => ImageFiltered(
+          imageFilter: ui.ImageFilter.blur(
+            sigmaX: radius,
+            sigmaY: radius,
+            tileMode: TileMode.clamp,
+          ),
+          child: effected,
+        ),
+        EditorEffectType.directionalBlur => () {
+          final angle = value('angle') * math.pi / 180;
+          return ImageFiltered(
+            imageFilter: ui.ImageFilter.blur(
+              sigmaX: (radius * math.cos(angle)).abs(),
+              sigmaY: (radius * math.sin(angle)).abs(),
+              tileMode: TileMode.clamp,
+            ),
+            child: effected,
+          );
+        }(),
+        EditorEffectType.motionBlur => ImageFiltered(
+          imageFilter: ui.ImageFilter.blur(
+            sigmaX: amount * 10,
+            sigmaY: amount * 10,
+            tileMode: TileMode.clamp,
+          ),
+          child: effected,
+        ),
+        EditorEffectType.glow ||
+        EditorEffectType.bloom ||
+        EditorEffectType.cinematicGlow ||
+        EditorEffectType.flare ||
+        EditorEffectType.glare ||
+        EditorEffectType.bokeh ||
+        EditorEffectType.lightLeak ||
+        EditorEffectType.prism => Stack(
+          fit: StackFit.passthrough,
+          children: [
+            Opacity(
+              opacity: (amount * 0.7).clamp(0.0, 0.8),
+              child: ImageFiltered(
+                imageFilter: ui.ImageFilter.blur(
+                  sigmaX: radius.clamp(2.0, 80.0),
+                  sigmaY: radius.clamp(2.0, 80.0),
+                ),
+                child: effected,
+              ),
+            ),
+            effected,
+          ],
+        ),
+        EditorEffectType.vignette => _applyVignettePreview(
+          effected,
+          ClipColorAdjustments(vignette: amount),
+        ),
+        EditorEffectType.grain || EditorEffectType.noise => Stack(
+          fit: StackFit.passthrough,
+          children: [
+            effected,
+            IgnorePointer(
+              child: ColoredBox(
+                color: Colors.white.withValues(alpha: amount * 0.08),
+              ),
+            ),
+          ],
+        ),
+        EditorEffectType.scanLines || EditorEffectType.crt => Stack(
+          fit: StackFit.passthrough,
+          children: [
+            effected,
+            IgnorePointer(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    tileMode: TileMode.repeated,
+                    colors: [
+                      Colors.transparent,
+                      Colors.black.withValues(alpha: amount * 0.28),
+                      Colors.transparent,
+                    ],
+                    stops: const [0, 0.45, 1],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+        EditorEffectType.vhs || EditorEffectType.glitch => ColorFiltered(
+          colorFilter: ColorFilter.matrix([
+            1,
+            0,
+            0,
+            0,
+            amount * 12,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            -amount * 12,
+            0,
+            0,
+            0,
+            1,
+            0,
+          ]),
+          child: effected,
+        ),
+        EditorEffectType.shake => Transform.translate(
+          offset: Offset(
+            math.sin(time.inMilliseconds / 70) * amount * 6,
+            math.cos(time.inMilliseconds / 53) * amount * 6,
+          ),
+          child: effected,
+        ),
+        EditorEffectType.lensDistortion ||
+        EditorEffectType.fisheye ||
+        EditorEffectType.warp ||
+        EditorEffectType.ripple ||
+        EditorEffectType.wave => Transform.scale(
+          scale: 1 + amount * 0.04,
+          child: effected,
+        ),
+        EditorEffectType.dropShadow ||
+        EditorEffectType.outline ||
+        EditorEffectType.stroke => DecoratedBox(
+          decoration: BoxDecoration(
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: amount * 0.75),
+                blurRadius: value('blur', 10),
+                offset: Offset(value('offsetX', 4), value('offsetY', 4)),
+              ),
+            ],
+          ),
+          child: effected,
+        ),
+        EditorEffectType.reflection => Opacity(
+          opacity: (1 - amount * 0.18).clamp(0.0, 1.0),
+          child: effected,
+        ),
+        EditorEffectType.posterize ||
+        EditorEffectType.emboss ||
+        EditorEffectType.edgeDetection ||
+        EditorEffectType.halftone ||
+        EditorEffectType.comic ||
+        EditorEffectType.sketch ||
+        EditorEffectType.stylized ||
+        EditorEffectType.pixelate ||
+        EditorEffectType.mosaic ||
+        EditorEffectType.sharpen ||
+        EditorEffectType.chromaticAberration ||
+        EditorEffectType.rgbSplit => ColorFiltered(
+          colorFilter: ColorFilter.matrix([
+            1 + amount * 0.18,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1 + amount * 0.18,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1 + amount * 0.18,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+          ]),
+          child: effected,
+        ),
+        EditorEffectType.colorGrade => ColorFiltered(
+          colorFilter: ColorFilter.matrix(
+            _colorMatrixForAdjustments(
+              ClipColorAdjustments(
+                brightness: value('brightness'),
+                contrast: value('contrast', 1),
+                saturation: value('saturation', 1),
+              ),
+            ),
+          ),
+          child: effected,
+        ),
+        EditorEffectType.lut => ColorFiltered(
+          colorFilter: ColorFilter.matrix([
+            1,
+            0,
+            0,
+            0,
+            amount * 8,
+            0,
+            1,
+            0,
+            0,
+            amount * 4,
+            0,
+            0,
+            1,
+            0,
+            -amount * 6,
+            0,
+            0,
+            0,
+            1,
+            0,
+          ]),
+          child: effected,
+        ),
+        EditorEffectType.equalizer ||
+        EditorEffectType.compressor ||
+        EditorEffectType.limiter ||
+        EditorEffectType.noiseGate ||
+        EditorEffectType.deEsser ||
+        EditorEffectType.noiseReduction ||
+        EditorEffectType.humReduction ||
+        EditorEffectType.reverb ||
+        EditorEffectType.delay ||
+        EditorEffectType.distortion ||
+        EditorEffectType.pitch ||
+        EditorEffectType.timeStretch => effected,
+      };
+      final mask = effect.mask;
+      if (mask != null) {
+        effected = _applyMaskedEffectPreview(
+          before,
+          effected,
+          mask,
+          key: effect.id,
+          opacity: effect.intensity,
+        );
+      } else if (effect.intensity < 0.999) {
+        effected = Stack(
+          fit: StackFit.expand,
+          children: [
+            before,
+            Opacity(opacity: effect.intensity, child: effected),
+          ],
+        );
+      }
+    }
+    return effected;
+  }
+
+  Widget _applyMaskedEffectPreview(
+    Widget original,
+    Widget effected,
+    EditorEffectMask mask, {
+    required String key,
+    required double opacity,
+  }) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (!constraints.hasBoundedWidth || !constraints.hasBoundedHeight) {
+          return effected;
+        }
+        final left = constraints.maxWidth * mask.safeX;
+        final top = constraints.maxHeight * mask.safeY;
+        final width = constraints.maxWidth * mask.safeWidth;
+        final height = constraints.maxHeight * mask.safeHeight;
+        Widget region = ClipRect(
+          child: OverflowBox(
+            alignment: Alignment.topLeft,
+            minWidth: constraints.maxWidth,
+            maxWidth: constraints.maxWidth,
+            minHeight: constraints.maxHeight,
+            maxHeight: constraints.maxHeight,
+            child: Transform.translate(
+              offset: Offset(-left, -top),
+              child: SizedBox(
+                width: constraints.maxWidth,
+                height: constraints.maxHeight,
+                child: effected,
+              ),
+            ),
+          ),
+        );
+        if (mask.shape == EditorEffectMaskShape.ellipse) {
+          region = ClipOval(child: region);
+        }
+        Widget originalRegion = ClipRect(
+          child: OverflowBox(
+            alignment: Alignment.topLeft,
+            minWidth: constraints.maxWidth,
+            maxWidth: constraints.maxWidth,
+            minHeight: constraints.maxHeight,
+            maxHeight: constraints.maxHeight,
+            child: Transform.translate(
+              offset: Offset(-left, -top),
+              child: SizedBox(
+                width: constraints.maxWidth,
+                height: constraints.maxHeight,
+                child: original,
+              ),
+            ),
+          ),
+        );
+        if (mask.shape == EditorEffectMaskShape.ellipse) {
+          originalRegion = ClipOval(child: originalRegion);
+        }
+        final mixedEffect = opacity >= 0.999
+            ? effected
+            : Stack(
+                fit: StackFit.expand,
+                children: [
+                  original,
+                  Opacity(opacity: opacity.clamp(0.0, 1.0), child: effected),
+                ],
+              );
+        return Stack(
+          key: ValueKey('masked_effect_$key'),
+          fit: StackFit.expand,
+          children: [
+            mask.inverted ? mixedEffect : original,
+            Positioned(
+              left: left,
+              top: top,
+              width: width,
+              height: height,
+              child: mask.inverted
+                  ? originalRegion
+                  : Opacity(opacity: opacity.clamp(0.0, 1.0), child: region),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   Widget _buildOverlayAsset(
@@ -3285,8 +3675,12 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         fitMode: item.clip.fitMode,
         crop: item.clip.crop,
         label: item.clip.label,
-        mediaEffectsBuilder: (media) =>
-            _applyClipMediaEffects(media, item.clip, playbackState.position),
+        mediaEffectsBuilder: (media) => _applyClipMediaEffects(
+          media,
+          item.clip,
+          playbackState.position,
+          timeline: timeline,
+        ),
       );
     } else {
       child = switch (item.asset.type) {
@@ -3358,6 +3752,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                           media,
                           item.clip,
                           playbackState.position,
+                          timeline: timeline,
                         ),
                       )
                     : _buildDeferredMediaPreview(item.clip.label)
@@ -3398,7 +3793,12 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     // space fallback as well would crop video overlays twice.
     if (item.asset.type != EditorAssetType.video && !isAnimatedImage) {
       child = _applyNormalizedCropPreview(child, item.clip.crop);
-      child = _applyClipMediaEffects(child, item.clip, playbackState.position);
+      child = _applyClipMediaEffects(
+        child,
+        item.clip,
+        playbackState.position,
+        timeline: timeline,
+      );
       // The bitmap/effect subtree is static while only its outer transition
       // transform changes. Isolating it avoids repainting color and blur work
       // for every animation tick.
@@ -3605,6 +4005,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     required TimelineClip clip,
     required BoxConstraints constraints,
     required Duration playbackPosition,
+    required EditorTimeline timeline,
   }) {
     final animation = _resolveOverlayAnimation(
       clip,
@@ -3635,7 +4036,12 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     Widget child = SizedBox.expand(
       child: FittedBox(fit: fit, clipBehavior: Clip.hardEdge, child: source),
     );
-    child = _applyClipMediaEffects(child, clip, playbackPosition);
+    child = _applyClipMediaEffects(
+      child,
+      clip,
+      playbackPosition,
+      timeline: timeline,
+    );
     child = Transform(
       alignment: Alignment.center,
       transform: Matrix4.diagonal3Values(
@@ -3718,8 +4124,12 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         crop: clip.crop,
         label: clip.label,
         borderRadius: BorderRadius.zero,
-        mediaEffectsBuilder: (media) =>
-            _applyClipMediaEffects(media, clip, playbackPosition),
+        mediaEffectsBuilder: (media) => _applyClipMediaEffects(
+          media,
+          clip,
+          playbackPosition,
+          timeline: timeline,
+        ),
       );
     } else if (hasLocalFile) {
       child = Image.file(
@@ -3734,7 +4144,12 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         errorBuilder: (_, _, _) => _buildMissingOverlay(clip.label),
       );
       child = _applyNormalizedCropPreview(child, clip.crop);
-      child = _applyClipMediaEffects(child, clip, playbackPosition);
+      child = _applyClipMediaEffects(
+        child,
+        clip,
+        playbackPosition,
+        timeline: timeline,
+      );
     } else if (previewUrl != null) {
       child = Image.network(
         previewUrl,
@@ -3748,7 +4163,12 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         errorBuilder: (_, _, _) => _buildMissingOverlay(clip.label),
       );
       child = _applyNormalizedCropPreview(child, clip.crop);
-      child = _applyClipMediaEffects(child, clip, playbackPosition);
+      child = _applyClipMediaEffects(
+        child,
+        clip,
+        playbackPosition,
+        timeline: timeline,
+      );
     } else {
       child = _buildMissingOverlay(clip.label);
     }
@@ -3915,6 +4335,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                       clip: activeBaseClip,
                       constraints: constraints,
                       playbackPosition: playbackState.position,
+                      timeline: timeline,
                     )
                   : null
             : _buildBaseAssetLayer(
@@ -4003,6 +4424,11 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       }
     }
 
+    composed = _applyEditorEffectStackPreview(
+      composed,
+      timeline.projectEffectStack,
+      playbackState.position,
+    );
     return KeyedSubtree(
       key: const ValueKey('preview-composed-effect-output'),
       child: composed,
@@ -4042,6 +4468,11 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         case null:
           break;
       }
+      effected = _applyEditorEffectStackPreview(
+        effected,
+        effect.clip.effectStack,
+        playbackPosition - effect.clip.startTime,
+      );
     }
     return effected;
   }

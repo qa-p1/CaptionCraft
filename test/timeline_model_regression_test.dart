@@ -765,7 +765,7 @@ void main() {
         ).toJson(),
       );
 
-      expect(restored.schemaVersion, 7);
+      expect(restored.schemaVersion, EditorTimeline.currentSchemaVersion);
       expect(restored.tracks.map((track) => track.id), [
         'legacy_text',
         'legacy_high',

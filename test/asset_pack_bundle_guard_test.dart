@@ -25,6 +25,10 @@ void main() {
         _forbiddenBundleReason('assets/sound-effects/'),
         'local downloadable pack directory',
       );
+      expect(
+        _forbiddenBundleReason('assets/luts/'),
+        'local downloadable pack directory',
+      );
       for (final entry in assetEntries) {
         expect(
           _forbiddenBundleReason(entry),
@@ -102,6 +106,8 @@ String? _forbiddenBundleReason(String value) {
       'sfx',
       'sound-effects',
       'sound_effects',
+      'lut',
+      'luts',
     }.contains,
   )) {
     return 'local downloadable pack directory';

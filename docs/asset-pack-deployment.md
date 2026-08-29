@@ -1,6 +1,6 @@
 # Optional asset-pack deployment
 
-CaptionCraft's background-video and overlay libraries are deployment artifacts, not Flutter assets. Never add `tool/asset_pack_staging`, `tool/asset_pack_dist`, or either source media directory to `pubspec.yaml`.
+CaptionCraft's background-video, overlay, sound-effect, and LUT libraries are deployment artifacts, not Flutter assets. Never add `tool/asset_pack_staging`, `tool/asset_pack_dist`, or a source-pack directory to `pubspec.yaml`.
 
 ## Prepare a release
 
@@ -44,7 +44,7 @@ the generated sub-450 MiB parts stay cacheable while the old 0.7–1.0 GB
 schema-v1 ZIPs bypass edge cache. Set the manifest to a short cache lifetime and
 the content-addressed parts to `public, max-age=31536000, immutable`.
 
-Keep `preparation-report.json` private if exposing local source paths is undesirable. The app needs only the manifest and the two paths beneath `packs/`.
+Keep `preparation-report.json` private if exposing local source paths is undesirable. The app needs only the public manifest and the immutable files referenced beneath `packs/`.
 
 ### Recommended host: Cloudflare R2
 
@@ -123,7 +123,8 @@ redistribution. The source folders contain no retained license or creator
 provenance, so technical preparation alone does not establish publishing
 rights.
 
-The optional SFX installer contract is documented separately in
-`docs/sfx-library.md`. Do not add the inspected Fairlight-based SFX folder to
-this deployment: its included license prohibits raw redistribution. A future
-rights-cleared `sound-effects` pack may use the same manifest and R2 layout.
+The optional SFX installer contract is documented in `docs/sfx-library.md` and
+`docs/sfx-pack-preparation.md`. Do not add the inspected Fairlight-based SFX
+folder to this deployment: its included license prohibits raw redistribution.
+LUT preparation and preview generation are documented in `docs/lut-pack.md`.
+Both optional release rows use the same verified manifest and R2 layout.

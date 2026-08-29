@@ -668,8 +668,20 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       if (replacement != null) await _showLastVisualGuard(replacement);
       return;
     }
+    final removedClipIds = track.clips.map((clip) => clip.id).toSet();
     final nextTracks = timeline.tracks
         .where((candidate) => candidate.id != track.id)
+        .map(
+          (candidate) => candidate.copyWith(
+            clips: candidate.clips
+                .where(
+                  (clip) =>
+                      clip.linkedClipId == null ||
+                      !removedClipIds.contains(clip.linkedClipId),
+                )
+                .toList(),
+          ),
+        )
         .toList();
     final removedAssetIds = track.clips
         .map((clip) => clip.assetId)
@@ -690,7 +702,11 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
 
     ref
         .read(editorProvider.notifier)
-        .setTimeline(timeline.copyWith(tracks: nextTracks, assets: nextAssets));
+        .setTimeline(
+          timeline
+              .copyWith(tracks: nextTracks, assets: nextAssets)
+              .prunedRelationships(),
+        );
 
     if (editorState.selectedTrackId == track.id) {
       ref.read(editorProvider.notifier).selectTrack(null);
@@ -1049,6 +1065,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       trackId: targetTrack.id,
       startTime: resolvedStart,
       endTime: resolvedStart + sourceClip.duration,
+      effectStack: sourceClip.effectStack.cloneWithNewIds(),
+      clearGroupId: true,
+      clearCompoundId: true,
     );
     if (!targetTrack.canPlaceClip(pasted)) {
       SnackBarHelper.showInfo(context, 'There is no free space in this track.');
@@ -1693,6 +1712,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         clip,
         Duration(milliseconds: newStartMs),
       ),
+      effectStack: clip.effectStack.trimmedFromStart(
+        Duration(milliseconds: newStartMs - clip.startTime.inMilliseconds),
+      ),
     );
     if (!track.canPlaceClip(updatedClip, ignoringClipId: clip.id)) return;
 
@@ -1725,6 +1747,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
             keyframes: TimelineKeyframeEditing.forNewStart(
               candidate,
               updatedClip.startTime,
+            ),
+            effectStack: candidate.effectStack.trimmedFromStart(
+              updatedClip.startTime - candidate.startTime,
             ),
           );
         }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
@@ -1824,6 +1849,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         clip,
         Duration(milliseconds: newEndMs),
       ),
+      effectStack: clip.effectStack.trimmedToDuration(
+        Duration(milliseconds: newEndMs) - clip.startTime,
+      ),
     );
     if (!track.canPlaceClip(updatedClip, ignoringClipId: clip.id)) return;
 
@@ -1856,6 +1884,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
             keyframes: TimelineKeyframeEditing.forNewEnd(
               candidate,
               updatedClip.endTime,
+            ),
+            effectStack: candidate.effectStack.trimmedToDuration(
+              updatedClip.endTime - candidate.startTime,
             ),
           );
         }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
@@ -1967,6 +1998,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         clip,
         Duration(milliseconds: newStartMs),
       ),
+      effectStack: clip.effectStack.trimmedFromStart(
+        Duration(milliseconds: newStartMs - clip.startTime.inMilliseconds),
+      ),
     );
     if (!track.canPlaceClip(updatedClip, ignoringClipId: clip.id)) return;
     final nextStart = Duration(milliseconds: newStartMs);
@@ -1998,6 +2032,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
             keyframes: TimelineKeyframeEditing.forNewStart(
               candidate,
               updatedClip.startTime,
+            ),
+            effectStack: candidate.effectStack.trimmedFromStart(
+              updatedClip.startTime - candidate.startTime,
             ),
           );
         }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
@@ -2088,6 +2125,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         clip,
         Duration(milliseconds: newEndMs),
       ),
+      effectStack: clip.effectStack.trimmedToDuration(newDuration),
     );
     if (!track.canPlaceClip(updatedClip, ignoringClipId: clip.id)) return;
     final nextEnd = Duration(milliseconds: newEndMs);
@@ -2119,6 +2157,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
             keyframes: TimelineKeyframeEditing.forNewEnd(
               candidate,
               updatedClip.endTime,
+            ),
+            effectStack: candidate.effectStack.trimmedToDuration(
+              updatedClip.endTime - candidate.startTime,
             ),
           );
         }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
@@ -2296,17 +2337,25 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       clip,
       Duration(milliseconds: leftTimelineDurationMs),
     );
+    final effectStackSplit = clip.effectStack.splitAt(
+      Duration(milliseconds: leftTimelineDurationMs),
+    );
     final firstClip = clip.copyWith(
       endTime: splitPoint,
       sourceStartTime: firstSourceStart,
       sourceDuration: Duration(milliseconds: leftSourceDurationMs),
       outroTransition: const ClipTransition(),
       keyframes: keyframeSplit.leading,
+      effectStack: effectStackSplit.leading,
     );
     final secondClip = TimelineClip(
       trackId: clip.trackId,
       type: clip.type,
       effectKind: clip.effectKind,
+      effectStack: effectStackSplit.trailing,
+      isAdjustmentLayer: clip.isAdjustmentLayer,
+      groupId: clip.groupId,
+      compoundId: clip.compoundId,
       label: clip.label,
       assetId: clip.assetId,
       linkedClipId: clip.linkedClipId,
@@ -2422,7 +2471,25 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       return track;
     }).toList();
 
-    final nextTimeline = timeline.copyWith(tracks: nextTracks);
+    final nextTimeline = timeline.copyWith(
+      tracks: nextTracks,
+      groups: timeline.groups
+          .map(
+            (group) => group.id == clip!.groupId
+                ? group.copyWith(clipIds: [...group.clipIds, secondClip.id])
+                : group,
+          )
+          .toList(),
+      compoundClips: timeline.compoundClips
+          .map(
+            (compound) => compound.id == clip!.compoundId
+                ? compound.copyWith(
+                    clipIds: [...compound.clipIds, secondClip.id],
+                  )
+                : compound,
+          )
+          .toList(),
+    );
     _applyTimeline(nextTimeline);
     ref.read(editorProvider.notifier).selectClip(secondClip.id);
   }
@@ -2436,6 +2503,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       audio,
       firstSource.duration,
     );
+    final effectStackSplit = audio.effectStack.splitAt(firstSource.duration);
     final first = audio.copyWith(
       linkedClipId: firstSource.id,
       endTime: firstSource.endTime,
@@ -2444,10 +2512,14 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       audioMix: audio.audioMix.copyWith(fadeOutMs: 0),
       outroTransition: const ClipTransition(),
       keyframes: keyframeSplit.leading,
+      effectStack: effectStackSplit.leading,
     );
     final second = TimelineClip(
       trackId: audio.trackId,
       type: TimelineTrackType.audio,
+      effectStack: effectStackSplit.trailing,
+      groupId: audio.groupId,
+      compoundId: audio.compoundId,
       label: audio.label,
       assetId: audio.assetId,
       linkedClipId: secondSource.id,
@@ -2689,7 +2761,11 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
             );
           }).toList();
 
-    _applyTimeline(timeline.copyWith(tracks: nextTracks, assets: nextAssets));
+    _applyTimeline(
+      timeline
+          .copyWith(tracks: nextTracks, assets: nextAssets)
+          .prunedRelationships(),
+    );
     ref.read(editorProvider.notifier).selectClip(null);
     ref.read(subtitleProvider.notifier).selectEntry(null);
   }
@@ -2714,45 +2790,14 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       latestEnd: Duration(milliseconds: timelineEndMs),
     );
     final nextStartMs = nextStart.inMilliseconds;
-    final duplicate = TimelineClip(
+    final duplicate = clip.copyWith(
+      id: const Uuid().v4(),
       trackId: track.id,
-      type: clip.type,
-      effectKind: clip.effectKind,
-      label: clip.label,
-      assetId: clip.assetId,
-      linkedClipId: clip.linkedClipId,
       startTime: Duration(milliseconds: nextStartMs),
       endTime: Duration(milliseconds: nextStartMs + durationMs),
-      sourceStartTime: clip.sourceStartTime,
-      sourceDuration: clip.sourceDuration,
-      layer: clip.layer,
-      enabled: clip.enabled,
-      transform: clip.transform,
-      audioMix: clip.audioMix,
-      fitMode: clip.fitMode,
-      playbackRate: clip.playbackRate,
-      isReversed: clip.isReversed,
-      crop: clip.crop,
-      blur: clip.blur,
-      colorAdjustments: clip.colorAdjustments,
-      text: clip.text,
-      subtitleStyle: clip.subtitleStyle,
-      introTransition: clip.introTransition,
-      outroTransition: clip.outroTransition,
-      keyframes: clip.keyframes,
-      freezeFrame: clip.freezeFrame,
-      stabilize: clip.stabilize,
-      denoise: clip.denoise,
-      chromaKeyEnabled: clip.chromaKeyEnabled,
-      chromaKeyColor: clip.chromaKeyColor,
-      chromaKeySimilarity: clip.chromaKeySimilarity,
-      timelineColor: clip.timelineColor,
-      notes: clip.notes,
-      autoDuck: clip.autoDuck,
-      duckAmount: clip.duckAmount,
-      duckAttackMs: clip.duckAttackMs,
-      duckReleaseMs: clip.duckReleaseMs,
-      duckSidechainTrackIds: clip.duckSidechainTrackIds,
+      effectStack: clip.effectStack.cloneWithNewIds(),
+      clearGroupId: true,
+      clearCompoundId: true,
     );
     if (!track.canPlaceClip(duplicate)) {
       SnackBarHelper.showInfo(
@@ -2811,17 +2856,25 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       clip,
       Duration(milliseconds: leftTimelineDurationMs),
     );
+    final effectStackSplit = clip.effectStack.splitAt(
+      Duration(milliseconds: leftTimelineDurationMs),
+    );
     final firstClip = clip.copyWith(
       endTime: splitPoint,
       sourceStartTime: firstSourceStart,
       sourceDuration: Duration(milliseconds: leftSourceDurationMs),
       outroTransition: const ClipTransition(),
       keyframes: keyframeSplit.leading,
+      effectStack: effectStackSplit.leading,
     );
     final secondClip = TimelineClip(
       trackId: track.id,
       type: clip.type,
       effectKind: clip.effectKind,
+      effectStack: effectStackSplit.trailing,
+      isAdjustmentLayer: clip.isAdjustmentLayer,
+      groupId: clip.groupId,
+      compoundId: clip.compoundId,
       label: clip.label,
       assetId: clip.assetId,
       linkedClipId: clip.linkedClipId,
@@ -2875,7 +2928,27 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       return candidateTrack.copyWith(clips: nextClips);
     }).toList();
 
-    _applyTimeline(timeline.copyWith(tracks: nextTracks));
+    _applyTimeline(
+      timeline.copyWith(
+        tracks: nextTracks,
+        groups: timeline.groups
+            .map(
+              (group) => group.id == clip.groupId
+                  ? group.copyWith(clipIds: [...group.clipIds, secondClip.id])
+                  : group,
+            )
+            .toList(),
+        compoundClips: timeline.compoundClips
+            .map(
+              (compound) => compound.id == clip.compoundId
+                  ? compound.copyWith(
+                      clipIds: [...compound.clipIds, secondClip.id],
+                    )
+                  : compound,
+            )
+            .toList(),
+      ),
+    );
     ref.read(editorProvider.notifier).selectTrack(track.id);
     ref.read(editorProvider.notifier).selectClip(secondClip.id);
   }

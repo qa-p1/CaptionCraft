@@ -1,3 +1,4 @@
+import 'package:caption_craft/features/editor/models/editor_effect_models.dart';
 import 'package:caption_craft/features/editor/models/timeline_models.dart';
 import 'package:caption_craft/features/editor/models/subtitle_entry.dart';
 import 'package:caption_craft/features/editor/models/subtitle_style_model.dart';
@@ -833,6 +834,100 @@ void main() {
       expect(audios.single.toJson(), originalAudio);
       container.dispose();
     }
+  });
+
+  testWidgets('splitting an adjustment layer preserves animated stack state', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(844, 420));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final adjustment = TimelineClip.effect(
+      id: 'adjustment',
+      trackId: 'adjustments',
+      label: 'Adjustment',
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 4),
+      isAdjustmentLayer: true,
+      groupId: 'adjustment-group',
+      effectStack: EditorEffectStack(
+        effects: [
+          EditorEffect(
+            id: 'blur-effect',
+            type: EditorEffectType.gaussianBlur,
+            keyframes: [
+              EditorEffectParameterKeyframe(
+                parameter: 'radius',
+                time: Duration.zero,
+                value: 0,
+              ),
+              EditorEffectParameterKeyframe(
+                parameter: 'radius',
+                time: const Duration(seconds: 4),
+                value: 40,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+    final initial = _testTimeline();
+    final timeline = initial.copyWith(
+      tracks: [
+        TimelineTrack(
+          id: 'adjustments',
+          name: 'Adjustments',
+          type: TimelineTrackType.video,
+          section: TimelineTrackSection.overlay,
+          clips: [adjustment],
+        ),
+        ...initial.tracks,
+      ],
+      groups: [
+        TimelineGroup(
+          id: 'adjustment-group',
+          name: 'Adjustment group',
+          clipIds: const ['adjustment'],
+        ),
+      ],
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    container
+        .read(editorProvider.notifier)
+        .loadProject(
+          videoPath: 'missing.mp4',
+          projectId: 'adjustment-split-test',
+          projectName: 'Adjustment split test',
+          timeline: timeline,
+        );
+    container.read(editorProvider.notifier)
+      ..selectTrack('adjustments')
+      ..selectClip('adjustment');
+    container
+        .read(playbackProvider.notifier)
+        .updatePosition(const Duration(seconds: 2));
+
+    await tester.pumpWidget(_timelineHarness(container));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Split'));
+    await tester.pumpAndSettle();
+
+    final restored = container.read(editorProvider).timeline;
+    final clips = restored.tracks
+        .singleWhere((track) => track.id == 'adjustments')
+        .clips;
+    expect(clips, hasLength(2));
+    expect(clips.every((clip) => clip.isAdjustmentLayer), isTrue);
+    final leading = clips.first.effectStack.effects.single;
+    final trailing = clips.last.effectStack.effects.single;
+    expect(leading.id, 'blur-effect');
+    expect(trailing.id, isNot(leading.id));
+    expect(trailing.parameterAt('radius', Duration.zero), closeTo(20, 0.001));
+    expect(
+      restored.groups.single.clipIds.toSet(),
+      clips.map((clip) => clip.id).toSet(),
+    );
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('overlay-video audio follows moves and both trim edges', (

@@ -89,6 +89,11 @@ class TimelinePreviewAudioService {
                 clip.type != TimelineTrackType.effect,
           ),
     );
+    final audioBusesById = {for (final bus in timeline.audioBuses) bus.id: bus};
+    final soloBusIds = timeline.audioBuses
+        .where((bus) => bus.solo)
+        .map((bus) => bus.id)
+        .toSet();
 
     final selected =
         <
@@ -106,12 +111,18 @@ class TimelinePreviewAudioService {
       trackIndex++
     ) {
       final track = timeline.tracks[trackIndex];
+      final bus = track.audioBusId == null
+          ? null
+          : audioBusesById[track.audioBusId];
       if (track.section != TimelineTrackSection.baseVideo &&
           track.section != TimelineTrackSection.overlay &&
           track.section != TimelineTrackSection.audio) {
         continue;
       }
       if (track.isMuted ||
+          bus?.muted == true ||
+          (soloBusIds.isNotEmpty &&
+              (bus == null || !soloBusIds.contains(bus.id))) ||
           (track.isHidden && track.section != TimelineTrackSection.audio) ||
           (hasSoloMediaTrack && !track.isSolo)) {
         continue;
@@ -195,6 +206,11 @@ class TimelinePreviewAudioService {
             'trackSolo': input.track.isSolo,
             'trackGain': input.track.audioGain,
             'trackPan': input.track.audioPan,
+            'trackEffectStack': input.track.effectStack.toJson(),
+            'audioBusId': input.track.audioBusId,
+            'audioBus': input.track.audioBusId == null
+                ? null
+                : audioBusesById[input.track.audioBusId]?.toJson(),
             'clipId': input.clip.id,
             'assetId': input.clip.assetId,
             'linkedClipId': input.clip.linkedClipId,
@@ -211,6 +227,9 @@ class TimelinePreviewAudioService {
             'duckReleaseMs': input.clip.duckReleaseMs,
             'duckSidechainTrackIds': input.clip.duckSidechainTrackIds,
             'denoise': input.clip.denoise,
+            'resolvedEffectStack': timeline
+                .effectStackForClip(input.clip, track: input.track)
+                .toJson(),
             'volumeKeyframes': [
               for (final keyframe in input.clip.keyframes)
                 if (keyframe.property == TimelineKeyframeProperty.volume)
@@ -218,6 +237,7 @@ class TimelinePreviewAudioService {
             ],
           },
       ],
+      'projectEffectStack': timeline.projectEffectStack.toJson(),
       // Automatic ducking depends on dialogue/text timing even when those
       // clips do not own an audio stream themselves.
       'dialogueWindows': [

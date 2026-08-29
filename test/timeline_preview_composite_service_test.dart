@@ -1,5 +1,6 @@
 import 'package:caption_craft/core/utils/timeline_export_service.dart';
 import 'package:caption_craft/core/utils/timeline_preview_composite_service.dart';
+import 'package:caption_craft/features/editor/models/editor_effect_models.dart';
 import 'package:caption_craft/features/editor/models/export_settings.dart';
 import 'package:caption_craft/features/editor/models/subtitle_style_model.dart';
 import 'package:caption_craft/features/editor/models/timeline_models.dart';
@@ -148,6 +149,92 @@ void main() {
         const Duration(seconds: 1),
       ),
       1,
+    );
+  });
+
+  test('advanced visual stacks use an export-parity proxy at low density', () {
+    final plain = overlappingVideos(1);
+    expect(
+      TimelinePreviewCompositeService.buildPlan(
+        timeline: plain,
+        subtitleEntries: const [],
+        globalSubtitleStyle: const SubtitleStyleModel(),
+        fileExists: (_) => true,
+      ),
+      isNull,
+    );
+
+    final track = plain.tracks.single;
+    final clip = track.clips.single;
+    final effected = plain.copyWith(
+      tracks: [
+        track.copyWith(
+          clips: [
+            clip.copyWith(
+              effectStack: EditorEffectStack(
+                effects: [
+                  EditorEffect(
+                    type: EditorEffectType.gaussianBlur,
+                    mask: const EditorEffectMask(
+                      shape: EditorEffectMaskShape.ellipse,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+    final plan = TimelinePreviewCompositeService.buildPlan(
+      timeline: effected,
+      subtitleEntries: const [],
+      globalSubtitleStyle: const SubtitleStyleModel(),
+      fileExists: (_) => true,
+      sourceVersion: (_) => 'fixture-v1',
+    );
+
+    expect(plan, isNotNull);
+    expect(plan!.maximumConcurrentDecoders, 1);
+    expect(plan.inputs, hasLength(1));
+    expect(
+      TimelinePreviewCompositeService.requiresRenderedEffectPreview(effected),
+      isTrue,
+    );
+  });
+
+  test('standard color controls request an export-parity preview proxy', () {
+    final plain = overlappingVideos(1);
+    final track = plain.tracks.single;
+    final clip = track.clips.single;
+    final corrected = plain.copyWith(
+      tracks: [
+        track.copyWith(
+          clips: [
+            clip.copyWith(
+              colorAdjustments: const ClipColorAdjustments(
+                exposure: 0.4,
+                highlights: 0.2,
+                whites: 0.15,
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+
+    expect(
+      TimelinePreviewCompositeService.requiresRenderedEffectPreview(corrected),
+      isTrue,
+    );
+    expect(
+      TimelinePreviewCompositeService.buildPlan(
+        timeline: corrected,
+        subtitleEntries: const [],
+        globalSubtitleStyle: const SubtitleStyleModel(),
+        fileExists: (_) => true,
+      ),
+      isNotNull,
     );
   });
 

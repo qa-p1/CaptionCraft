@@ -47,6 +47,8 @@ using a debug key.
   persistence, and undo boundaries.
 - [Editor core roadmap](docs/editor_core_roadmap.md) — audited complete,
   partial, and outstanding timeline/editor requirements for the feature branch.
+- [Effects, color, and audio status](docs/editor_effects_audio_status.md) —
+  implemented delivery paths and explicit unsupported boundaries.
 
 ## Optional Elements libraries
 
@@ -54,7 +56,7 @@ GIPHY, Pexels, and Pixabay search results are loaded only while their Elements
 tab is active. A selected Pexels or Pixabay item is copied into durable project
 media before it is placed on the timeline.
 
-The CaptionCraft Background Videos and Overlays packs are separate downloads;
+The CaptionCraft Background Videos, Overlays, and LUT packs are separate downloads;
 their media is never included in the app bundle. Opening Elements checks local
 state and fetches only the small public release descriptor. Media transfer
 starts only after **Download pack** is tapped. Downloads belong to an app-scoped
@@ -62,6 +64,11 @@ queue, continue when the sheet is closed, resume verified partial data after a
 Stop/network interruption, and can be stopped only with the visible **Stop
 download** action. See `docs/asset-pack-deployment.md` for staging, Cloudflare
 R2 publishing, checksum, multipart, and manifest instructions.
+
+LUTs also have a dedicated **Effects → LUTs** section with a previewable pack,
+custom CUBE/3DL import, strength control, and multi-clip application. Selected
+looks are copied into durable project media before persistence. See
+`docs/lut-pack.md` for the rights manifest, preparation tool, and release flow.
 
 ## Sound-effects library
 

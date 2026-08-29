@@ -47,6 +47,7 @@ enum ElementLibraryDestination {
   pixabay,
   backgroundVideos,
   overlays,
+  luts,
 }
 
 /// A single resizable Elements library with a persistent provider menu.
@@ -62,6 +63,9 @@ class ElementLibrarySheet extends ConsumerStatefulWidget {
   final ExternalUrlLauncher? externalUrlLauncher;
   final ElementLibraryDestination initialDestination;
   final Duration searchDebounce;
+  final String title;
+  final String subtitle;
+  final bool showNavigation;
 
   const ElementLibrarySheet({
     super.key,
@@ -76,6 +80,9 @@ class ElementLibrarySheet extends ConsumerStatefulWidget {
     this.externalUrlLauncher,
     this.initialDestination = ElementLibraryDestination.giphy,
     this.searchDebounce = const Duration(milliseconds: 300),
+    this.title = 'Elements',
+    this.subtitle = 'Stock media and verified on-demand packs',
+    this.showNavigation = true,
   });
 
   @override
@@ -112,13 +119,15 @@ class _ElementLibrarySheetState extends ConsumerState<ElementLibrarySheet> {
     ElementLibraryDestination.pexels ||
     ElementLibraryDestination.pixabay => true,
     ElementLibraryDestination.backgroundVideos ||
-    ElementLibraryDestination.overlays => false,
+    ElementLibraryDestination.overlays ||
+    ElementLibraryDestination.luts => false,
   };
 
   String? get _activePackId => switch (_destination) {
     ElementLibraryDestination.backgroundVideos =>
       AssetPackConstants.backgroundVideosId,
     ElementLibraryDestination.overlays => AssetPackConstants.overlaysId,
+    ElementLibraryDestination.luts => AssetPackConstants.lutsId,
     _ => null,
   };
 
@@ -151,8 +160,8 @@ class _ElementLibrarySheetState extends ConsumerState<ElementLibrarySheet> {
   Widget build(BuildContext context) {
     final packState = ref.watch(assetPackProvider);
     return ResizableEditorSheet(
-      title: 'Elements',
-      subtitle: 'Stock media and verified on-demand packs',
+      title: widget.title,
+      subtitle: widget.subtitle,
       initialHeightFactor: 0.78,
       minHeightFactor: 0.52,
       maxHeightFactor: 0.92,
@@ -175,8 +184,10 @@ class _ElementLibrarySheetState extends ConsumerState<ElementLibrarySheet> {
               ),
             ),
           ),
-          const Divider(height: 1, color: kBorder),
-          _buildNavigationBar(packState),
+          if (widget.showNavigation) ...[
+            const Divider(height: 1, color: kBorder),
+            _buildNavigationBar(packState),
+          ],
         ],
       ),
     );
@@ -236,6 +247,19 @@ class _ElementLibrarySheetState extends ConsumerState<ElementLibrarySheet> {
             selected: true,
           ),
           label: 'Overlays',
+        ),
+        NavigationDestination(
+          key: const ValueKey('element-library-nav-luts'),
+          icon: _packNavigationIcon(
+            Icons.color_lens_outlined,
+            packState.pack(AssetPackConstants.lutsId),
+          ),
+          selectedIcon: _packNavigationIcon(
+            Icons.color_lens_rounded,
+            packState.pack(AssetPackConstants.lutsId),
+            selected: true,
+          ),
+          label: 'LUTs',
         ),
       ],
     );
@@ -843,9 +867,12 @@ class _ElementLibrarySheetState extends ConsumerState<ElementLibrarySheet> {
       partIndex: progress?.partIndex,
       partCount: progress?.partCount,
       errorMessage: packState.errorMessage,
-      icon: packId == AssetPackConstants.backgroundVideosId
-          ? Icons.video_collection_outlined
-          : Icons.layers_outlined,
+      icon: switch (packId) {
+        AssetPackConstants.backgroundVideosId =>
+          Icons.video_collection_outlined,
+        AssetPackConstants.lutsId => Icons.color_lens_outlined,
+        _ => Icons.layers_outlined,
+      },
     );
     return AssetPackDownloadPanel(
       key: ValueKey('element-library-pack-download-panel-$packId'),
@@ -1190,9 +1217,11 @@ class _ElementLibrarySheetState extends ConsumerState<ElementLibrarySheet> {
                 children: [
                   if (previewPath == null)
                     _brokenPreview(
-                      icon: item.mediaKind == AssetPackMediaKind.video
-                          ? Icons.movie_outlined
-                          : Icons.image_outlined,
+                      icon: switch (item.mediaKind) {
+                        AssetPackMediaKind.video => Icons.movie_outlined,
+                        AssetPackMediaKind.lut => Icons.color_lens_outlined,
+                        _ => Icons.image_outlined,
+                      },
                     )
                   else
                     Image.file(
@@ -1211,6 +1240,15 @@ class _ElementLibrarySheetState extends ConsumerState<ElementLibrarySheet> {
                       child: _MediaBadge(
                         icon: Icons.play_arrow_rounded,
                         label: 'Video',
+                      ),
+                    ),
+                  if (item.mediaKind == AssetPackMediaKind.lut)
+                    const Positioned(
+                      top: 8,
+                      right: 8,
+                      child: _MediaBadge(
+                        icon: Icons.color_lens_outlined,
+                        label: 'LUT',
                       ),
                     ),
                   if (selecting)
@@ -1330,17 +1368,24 @@ class _ElementLibrarySheetState extends ConsumerState<ElementLibrarySheet> {
   }
 
   String _packTitle(String packId) {
-    return packId == AssetPackConstants.backgroundVideosId
-        ? 'Background videos'
-        : 'Overlays';
+    return switch (packId) {
+      AssetPackConstants.backgroundVideosId => 'Background videos',
+      AssetPackConstants.lutsId => 'LUTs',
+      _ => 'Overlays',
+    };
   }
 
   String _packDescription(String packId) {
-    return packId == AssetPackConstants.backgroundVideosId
-        ? 'Curated motion backgrounds that stay available offline after a '
-              'verified download.'
-        : 'Curated image and video overlays, verified before they are added '
-              'to your local library.';
+    return switch (packId) {
+      AssetPackConstants.backgroundVideosId =>
+        'Curated motion backgrounds that stay available offline after a '
+            'verified download.',
+      AssetPackConstants.lutsId =>
+        'Previewable color looks stored locally after a verified download.',
+      _ =>
+        'Curated image and video overlays, verified before they are added '
+            'to your local library.',
+    };
   }
 
   AssetPackPanelStage _panelStage(AssetPackDownloadStatus status) {

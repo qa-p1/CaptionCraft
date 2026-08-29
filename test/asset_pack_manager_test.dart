@@ -116,6 +116,7 @@ void main() {
       );
       final overlays = manager.enqueue(AssetPackConstants.overlaysId);
       final sounds = manager.enqueue(AssetPackConstants.soundEffectsId);
+      final luts = manager.enqueue(AssetPackConstants.lutsId);
 
       expect(identical(backgroundFirst, backgroundSecond), isTrue);
       await _eventually(() => facade.installCalls.length == 1);
@@ -131,6 +132,7 @@ void main() {
         manager.state.pack(AssetPackConstants.soundEffectsId).queuePosition,
         2,
       );
+      expect(manager.state.pack(AssetPackConstants.lutsId).queuePosition, 3);
 
       facade.installCalls[0].complete();
       await backgroundFirst;
@@ -140,6 +142,7 @@ void main() {
         manager.state.pack(AssetPackConstants.soundEffectsId).queuePosition,
         1,
       );
+      expect(manager.state.pack(AssetPackConstants.lutsId).queuePosition, 2);
 
       facade.installCalls[1].complete();
       await overlays;
@@ -147,9 +150,13 @@ void main() {
       expect(facade.installCalls[2].packId, AssetPackConstants.soundEffectsId);
       facade.installCalls[2].complete();
       await sounds;
+      await _eventually(() => facade.installCalls.length == 4);
+      expect(facade.installCalls[3].packId, AssetPackConstants.lutsId);
+      facade.installCalls[3].complete();
+      await luts;
 
-      expect(facade.getReleaseCalls, hasLength(3));
-      expect(facade.installCalls, hasLength(3));
+      expect(facade.getReleaseCalls, hasLength(4));
+      expect(facade.installCalls, hasLength(4));
       for (final packId in AssetPackManagerState.supportedPackIds) {
         expect(
           manager.state.pack(packId).status,

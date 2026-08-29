@@ -6,11 +6,13 @@ import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit_config.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:ffmpeg_kit_flutter_new/statistics.dart';
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import '../../features/editor/models/export_settings.dart';
+import '../../features/editor/models/editor_effect_models.dart';
 import '../../features/editor/models/subtitle_entry.dart';
 import '../../features/editor/models/subtitle_style_model.dart';
 import '../../features/editor/models/timeline_models.dart';
@@ -76,6 +78,7 @@ class TimelineExportService {
     void Function(double progress)? onProgress,
     void Function(String stage)? onStage,
   }) async {
+    _validateRenderableColorPipeline(timeline);
     final visualClips = _visibleVisualClips(timeline);
     if (visualClips.isEmpty) {
       throw Exception('The timeline has no visible image or video clips.');
@@ -311,6 +314,7 @@ class TimelineExportService {
     int? videoCrf,
     required String outputPath,
   }) {
+    _validateRenderableColorPipeline(timeline);
     final args = <String>['-hide_banner', '-y'];
     for (final input in inputs) {
       args.addAll(_inputArguments(input));
@@ -336,7 +340,7 @@ class TimelineExportService {
       ..addAll(['-filter_complex', filterGraph])
       ..addAll(['-map', '[vout]']);
 
-    final hasAudioOutput = _hasAudibleInput(inputs, settings);
+    final hasAudioOutput = _hasAudibleInput(timeline, inputs, settings);
     if (hasAudioOutput) {
       args.addAll([
         '-map',
@@ -914,6 +918,7 @@ class TimelineExportService {
               "h='max(2,trunc(ih*($scaleExpression)/2)*2)':eval=frame",
         'setpts=PTS-STARTPTS+${_seconds(clip.startTime)}/TB',
       ];
+      String effectSource;
       if (clip.blur.mode == ClipBlurMode.region && _blurIsEnabled(clip)) {
         final clean = 'clean$visualIndex';
         final blurredSource = 'blurSource$visualIndex';
@@ -940,16 +945,46 @@ class TimelineExportService {
           'eof_action=pass:shortest=1:format=auto'
           '[$effected]',
         );
-        filters.add('[$effected]${finishing.join(',')}[$visualLabel]');
+        effectSource = effected;
       } else {
         final chain = <String>[
           ...preparation,
           if (clip.blur.mode == ClipBlurMode.full && _blurIsEnabled(clip))
             ..._blurFilterChain(clip, target: 'clipFullBlur$visualIndex'),
-          ...finishing,
         ];
-        filters.add('[$visualInputIndex:v]${chain.join(',')}[$visualLabel]');
+        final preparedLabel = 'preparedVisual$visualIndex';
+        filters.add('[$visualInputIndex:v]${chain.join(',')}[$preparedLabel]');
+        effectSource = preparedLabel;
       }
+
+      final clipLutResult = _appendEditorEffectStackGraph(
+        filters: filters,
+        sourceLabel: effectSource,
+        stack: _colorAdjustmentLutStack(clip.colorAdjustments),
+        labelPrefix: 'clipLut$visualIndex',
+      );
+      effectSource = clipLutResult.sourceLabel;
+
+      var stackSource = effectSource;
+      var scopedStackIndex = 0;
+      for (final scoped in timeline.effectStacksForClip(
+        clip,
+        track: input.track,
+      )) {
+        final stackResult = _appendEditorEffectStackGraph(
+          filters: filters,
+          sourceLabel: stackSource,
+          stack: scoped.stack,
+          labelPrefix: 'clipStack${visualIndex}_$scopedStackIndex',
+          parameterTimeOffset: scoped.scope == EditorEffectScope.clip
+              ? Duration.zero
+              : clip.startTime,
+          animationDuration: clip.duration,
+        );
+        stackSource = stackResult.sourceLabel;
+        scopedStackIndex++;
+      }
+      filters.add('[$stackSource]${finishing.join(',')}[$visualLabel]');
 
       final nextCanvas = 'canvas${canvasIndex + 1}';
       final position = _overlayPosition(clip, canvasSize: canvasSize);
@@ -984,6 +1019,13 @@ class TimelineExportService {
       );
       videoSource = assOutput;
     }
+    videoSource = _appendEditorEffectStackGraph(
+      filters: filters,
+      sourceLabel: videoSource,
+      stack: timeline.projectEffectStack,
+      labelPrefix: 'projectStack',
+      animationDuration: timelineDuration,
+    ).sourceLabel;
     filters.add(
       '[$videoSource]format=yuv420p,'
       'fps=${canvasSize.framesPerSecond},'
@@ -1009,19 +1051,31 @@ class TimelineExportService {
     required bool includeAudio,
   }) {
     final durationSeconds = _seconds(timelineDuration);
-    final audioLabels = <String>[];
+    final clipLabelsByBusId = <String?, List<String>>{};
     if (includeAudio) {
       final soloTrackIds = inputs
           .where((input) => input.track.isSolo)
           .map((input) => input.track.id)
           .toSet();
+      final soloBusIds = timeline.audioBuses
+          .where((bus) => bus.solo)
+          .map((bus) => bus.id)
+          .toSet();
       var audioIndex = 0;
       for (final input in inputs) {
+        final bus = input.track.audioBusId == null
+            ? null
+            : timeline.audioBuses
+                  .where((candidate) => candidate.id == input.track.audioBusId)
+                  .firstOrNull;
         if (!input.hasAudio ||
             input.track.isMuted ||
+            bus?.muted == true ||
             input.clip.audioMix.muted ||
             (soloTrackIds.isNotEmpty &&
-                !soloTrackIds.contains(input.track.id))) {
+                !soloTrackIds.contains(input.track.id)) ||
+            (soloBusIds.isNotEmpty &&
+                (bus == null || !soloBusIds.contains(bus.id)))) {
           continue;
         }
         final label = 'audio$audioIndex';
@@ -1034,10 +1088,30 @@ class TimelineExportService {
           if (clip.isReversed) 'areverse',
           'asetpts=PTS-STARTPTS',
           ..._atempoFilters(clip.playbackRate),
+          ..._timeStretchFilters(
+            mix.timeStretch,
+            preservePitch: mix.preservePitch,
+          ),
+          ..._pitchShiftFilters(mix.pitchSemitones),
           'atrim=duration=${_seconds(clip.duration)}',
           'aformat=sample_rates=48000:channel_layouts=stereo',
+          if (mix.channelMode == EditorAudioChannelMode.mono)
+            'pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1',
+          if (mix.channelMode == EditorAudioChannelMode.leftOnly)
+            'pan=stereo|c0=c0|c1=c0',
+          if (mix.channelMode == EditorAudioChannelMode.rightOnly)
+            'pan=stereo|c0=c1|c1=c1',
+          if ((mix.leftGain - 1).abs() > 0.001 ||
+              (mix.rightGain - 1).abs() > 0.001)
+            'pan=stereo|c0=${_number(mix.leftGain.clamp(0, 2))}*c0|'
+                'c1=${_number(mix.rightGain.clamp(0, 2))}*c1',
           if (clip.denoise) 'afftdn=nr=12:nf=-45',
-          if (mix.normalize) 'loudnorm=I=-16:LRA=11:TP=-1.5',
+          if (mix.normalize)
+            'loudnorm=I=${_number(mix.targetLufs.clamp(-60, 0))}:'
+                'LRA=11:TP=${_number(mix.peakLimitDb.clamp(-24, 0))}',
+          ..._audioEffectFilters(
+            timeline.effectStackForClip(clip, track: input.track),
+          ),
           _audioVolumeFilter(
             clip,
             track: input.track,
@@ -1062,30 +1136,73 @@ class TimelineExportService {
           'atrim=duration=$durationSeconds',
         ];
         filters.add('[${input.index}:a]${audioChain.join(',')}[$label]');
-        audioLabels.add(label);
+        (clipLabelsByBusId[bus?.id] ??= <String>[]).add(label);
         audioIndex++;
       }
     }
 
-    if (audioLabels.length == 1) {
+    final masterLabels = <String>[];
+    var busIndex = 0;
+    for (final entry in clipLabelsByBusId.entries) {
+      final clipLabels = entry.value;
+      if (clipLabels.isEmpty) continue;
+      final bus = entry.key == null
+          ? null
+          : timeline.audioBuses
+                .where((candidate) => candidate.id == entry.key)
+                .firstOrNull;
+      var sourceLabel = clipLabels.first;
+      if (clipLabels.length > 1) {
+        final mixedLabel = 'busMix$busIndex';
+        filters.add(
+          '${clipLabels.map((label) => '[$label]').join()}'
+          'amix=inputs=${clipLabels.length}:duration=longest:'
+          'dropout_transition=0:normalize=0[$mixedLabel]',
+        );
+        sourceLabel = mixedLabel;
+      }
+      if (bus != null) {
+        final busChain = <String>[
+          ..._audioEffectFilters(bus.effectStack),
+          if ((bus.gain - 1).abs() > 0.0001)
+            'volume=${_number(bus.gain.clamp(0, 2))}',
+          if (bus.pan.abs() > 0.0001)
+            _panFilter(bus.pan.clamp(-1, 1).toDouble()),
+        ];
+        if (busChain.isNotEmpty) {
+          final processedLabel = 'busProcessed$busIndex';
+          filters.add('[$sourceLabel]${busChain.join(',')}[$processedLabel]');
+          sourceLabel = processedLabel;
+        }
+      }
+      masterLabels.add(sourceLabel);
+      busIndex++;
+    }
+
+    final masterEffectFilters = _audioEffectFilters(
+      timeline.projectEffectStack,
+    );
+    if (masterLabels.length == 1) {
       filters.add(
-        '[${audioLabels.first}]'
+        '[${masterLabels.first}]'
+        '${masterEffectFilters.isEmpty ? '' : '${masterEffectFilters.join(',')},'}'
         'alimiter=limit=0.95:attack=5:release=50:latency=1,'
         'atrim=duration=$durationSeconds[aout]',
       );
-    } else if (audioLabels.length > 1) {
-      final inputsExpression = audioLabels.map((label) => '[$label]').join();
+    } else if (masterLabels.length > 1) {
+      final inputsExpression = masterLabels.map((label) => '[$label]').join();
       filters.add(
         '$inputsExpression'
-        'amix=inputs=${audioLabels.length}:duration=longest:'
+        'amix=inputs=${masterLabels.length}:duration=longest:'
         'dropout_transition=0:normalize=0,'
+        '${masterEffectFilters.isEmpty ? '' : '${masterEffectFilters.join(',')},'}'
         // Compensating limiter latency keeps the rendered preview bus aligned
         // to the visual timeline while protecting dense mixes from clipping.
         'alimiter=limit=0.95:attack=5:release=50:latency=1,'
         'atrim=duration=$durationSeconds[aout]',
       );
     }
-    return audioLabels.isNotEmpty;
+    return masterLabels.isNotEmpty;
   }
 
   static ({String sourceLabel, int nextEffectIndex}) _appendTimelineEffects({
@@ -1121,12 +1238,14 @@ class TimelineExportService {
       final enableExpression =
           'gte(t,${_seconds(clip.startTime)})*'
           'lt(t,${_seconds(clip.endTime)})';
-      final outputLabel = 'timelineEffect$appliedEffectIndex';
+      var effectSource = currentSource;
+      var producedEffect = false;
 
-      switch (clip.effectKind!) {
+      switch (clip.effectKind) {
         case TimelineEffectKind.blur:
           final blur = clip.blur;
-          if (!_blurIsEnabled(clip)) continue;
+          if (!_blurIsEnabled(clip)) break;
+          final outputLabel = 'timelineEffect$appliedEffectIndex';
           if (blur.mode == ClipBlurMode.region) {
             final cleanLabel = 'effectClean$appliedEffectIndex';
             final blurSourceLabel = 'effectBlurSource$appliedEffectIndex';
@@ -1189,19 +1308,55 @@ class TimelineExportService {
               '[$outputLabel]',
             );
           }
+          effectSource = outputLabel;
+          producedEffect = true;
+          appliedEffectIndex++;
           break;
         case TimelineEffectKind.filter:
           final colorFilters = _colorFilters(clip.colorAdjustments);
-          if (colorFilters.isEmpty) continue;
-          final timedFilters = colorFilters
-              .map((filter) => "$filter:enable='$enableExpression'")
-              .join(',');
-          filters.add('[$currentSource]$timedFilters[$outputLabel]');
+          if (colorFilters.isNotEmpty) {
+            final outputLabel = 'timelineEffect$appliedEffectIndex';
+            final timedFilters = colorFilters
+                .map((filter) => "$filter:enable='$enableExpression'")
+                .join(',');
+            filters.add('[$currentSource]$timedFilters[$outputLabel]');
+            effectSource = outputLabel;
+            producedEffect = true;
+            appliedEffectIndex++;
+          }
+          final lutResult = _appendEditorEffectStackGraph(
+            filters: filters,
+            sourceLabel: effectSource,
+            stack: _colorAdjustmentLutStack(clip.colorAdjustments),
+            labelPrefix: 'adjustmentLut$appliedEffectIndex',
+            enableExpression: enableExpression,
+          );
+          if (lutResult.appliedEffects > 0) {
+            effectSource = lutResult.sourceLabel;
+            producedEffect = true;
+            appliedEffectIndex += lutResult.appliedEffects;
+          }
+          break;
+        case null:
           break;
       }
 
-      currentSource = outputLabel;
-      appliedEffectIndex++;
+      final stackResult = _appendEditorEffectStackGraph(
+        filters: filters,
+        sourceLabel: effectSource,
+        stack: clip.effectStack,
+        labelPrefix: 'adjustmentStack$appliedEffectIndex',
+        enableExpression: enableExpression,
+        animationDuration: clip.duration,
+        filterTimeOffset: clip.startTime,
+      );
+      if (stackResult.appliedEffects > 0) {
+        effectSource = stackResult.sourceLabel;
+        producedEffect = true;
+        appliedEffectIndex += stackResult.appliedEffects;
+      }
+      if (!producedEffect) continue;
+      currentSource = effectSource;
     }
     return (sourceLabel: currentSource, nextEffectIndex: appliedEffectIndex);
   }
@@ -1660,6 +1815,81 @@ class TimelineExportService {
     return "volume='$expression':eval=frame";
   }
 
+  @visibleForTesting
+  static List<String> buildAudioEffectFiltersForTesting(
+    EditorEffectStack stack,
+  ) => _audioEffectFilters(stack);
+
+  static List<String> _audioEffectFilters(EditorEffectStack stack) {
+    final filters = <String>[];
+    for (final effect in stack.effects) {
+      if (!effect.enabled ||
+          effect.intensity <= 0.0001 ||
+          effect.domain != EditorEffectDomain.audio) {
+        continue;
+      }
+      double value(String name, double fallback) {
+        return effect
+            .parameter(name, fallback)
+            .clamp(-100000.0, 100000.0)
+            .toDouble();
+      }
+
+      final intensity = effect.intensity.clamp(0.0, 1.0).toDouble();
+      final amount = (value('amount', 1) * intensity)
+          .clamp(0.0, 1.0)
+          .toDouble();
+      final filter = switch (effect.type) {
+        EditorEffectType.equalizer =>
+          'equalizer=f=${value('frequency', 1000).clamp(20, 20000)}:'
+              'width_type=o:width=${value('width', 1).clamp(0.1, 10)}:'
+              'g=${_number(value('gain', 0).clamp(-24, 24) * intensity)}',
+        EditorEffectType.compressor =>
+          'acompressor=threshold=${_number(_dbToLinear(value('threshold', -18)))}:'
+              'ratio=${_number(1 + (value('ratio', 3).clamp(1, 20) - 1) * intensity)}:'
+              'attack=${_number(value('attack', 20).clamp(0.01, 2000))}:'
+              'release=${_number(value('release', 250).clamp(0.01, 5000))}',
+        EditorEffectType.limiter =>
+          'alimiter=limit=${_number(_dbToLinear(value('limit', -1)))}:'
+              'attack=${_number(value('attack', 5).clamp(0.01, 2000))}:'
+              'release=${_number(value('release', 50).clamp(0.01, 5000))}',
+        EditorEffectType.noiseGate =>
+          'agate=threshold=${_number(_dbToLinear(value('threshold', -45)))}:'
+              'range=${_number(_dbToLinear(value('range', -18) * intensity))}',
+        EditorEffectType.deEsser =>
+          'deesser=i=${_number(amount.clamp(0.01, 1))}:'
+              'm=${_number(amount.clamp(0.01, 1))}:'
+              'f=${_number((value('frequency', 5500).clamp(1000, 12000) / 24000).clamp(0.0, 1.0))}',
+        EditorEffectType.noiseReduction =>
+          'afftdn=nr=${_number((amount * 24).clamp(1, 24))}:nf=-45',
+        EditorEffectType.humReduction =>
+          'equalizer=f=${value('frequency', 60).clamp(20, 20000)}:'
+              'width_type=o:width=1:g=${_number(-amount * 18)}',
+        EditorEffectType.reverb =>
+          'aecho=0.8:${_number((0.25 + amount * 0.65).clamp(0.25, 0.9))}:'
+              '${_number(value('room', 0.35).clamp(0.05, 1) * 1000)}:'
+              '${_number((value('damping', 0.5) * amount).clamp(0.01, 0.95))}',
+        EditorEffectType.delay =>
+          'aecho=1:1:${value('delayMs', 180).round().clamp(1, 2000)}:'
+              '${_number((value('decay', 0.35) * intensity).clamp(0.01, 0.95))}',
+        EditorEffectType.distortion =>
+          'acrusher=bits=${_number((16 - amount * 8).clamp(4, 16))}:'
+              'mix=${_number(amount)}',
+        EditorEffectType.pitch => () {
+          return _pitchShiftFilters(
+            value('semitones', 0).clamp(-24, 24) * intensity,
+          ).join(',');
+        }(),
+        EditorEffectType.timeStretch => _atempoFilters(
+          1 + (value('rate', 1).clamp(0.25, 4) - 1) * intensity,
+        ).join(','),
+        _ => '',
+      };
+      if (filter.isNotEmpty) filters.add(filter);
+    }
+    return filters;
+  }
+
   static String? _duckingVolumeExpression(
     TimelineClip clip, {
     required EditorTimeline timeline,
@@ -1793,21 +2023,66 @@ class TimelineExportService {
 
   static List<String> _colorFilters(ClipColorAdjustments adjustments) {
     if (adjustments.isNeutral) return const [];
+    final exposure = adjustments.exposure.clamp(-4.0, 4.0).toDouble();
     final effectiveBrightness =
-        (adjustments.brightness + adjustments.fade * 0.05).clamp(-1, 1);
+        (adjustments.brightness + adjustments.fade * 0.05 + exposure * 0.08)
+            .clamp(-1, 1);
     final effectiveContrast =
         (adjustments.contrast * (1 - adjustments.fade * 0.22)).clamp(0.1, 3);
+    final effectiveGamma = adjustments.gamma.clamp(0.1, 4.0).toDouble();
     final filters = <String>[
       'eq=brightness=${_number(effectiveBrightness)}:'
           'contrast=${_number(effectiveContrast)}:'
-          'saturation=${_number(adjustments.saturation.clamp(0, 3))}',
+          'saturation=${_number(adjustments.saturation.clamp(0, 3))}:'
+          'gamma=${_number(effectiveGamma)}',
     ];
-    if (adjustments.temperature.abs() > 0.001) {
+    if (adjustments.temperature.abs() > 0.001 ||
+        adjustments.tint.abs() > 0.001 ||
+        (adjustments.redGain - 1).abs() > 0.001 ||
+        (adjustments.greenGain - 1).abs() > 0.001 ||
+        (adjustments.blueGain - 1).abs() > 0.001 ||
+        adjustments.wheels.globalRed.abs() > 0.001 ||
+        adjustments.wheels.globalGreen.abs() > 0.001 ||
+        adjustments.wheels.globalBlue.abs() > 0.001) {
       final warmth = (adjustments.temperature * 0.16).clamp(-0.2, 0.2);
+      final tint = (adjustments.tint * 0.12).clamp(-0.2, 0.2);
+      final wheels = adjustments.wheels;
       filters.add(
-        'colorchannelmixer=rr=${_number(1 + warmth)}:'
-        'bb=${_number(1 - warmth)}',
+        'colorchannelmixer='
+        'rr=${_number((adjustments.redGain + warmth + tint + wheels.globalRed).clamp(0, 3))}:'
+        'gg=${_number((adjustments.greenGain - tint + wheels.globalGreen).clamp(0, 3))}:'
+        'bb=${_number((adjustments.blueGain - warmth + tint + wheels.globalBlue).clamp(0, 3))}',
       );
+    }
+    if (adjustments.vibrance.abs() > 0.001) {
+      filters.add(
+        'vibrance=intensity=${_number(adjustments.vibrance.clamp(-1, 1))}',
+      );
+    }
+    if (adjustments.hue.abs() > 0.001) {
+      filters.add('hue=h=${_number(adjustments.hue.clamp(-180, 180))}');
+    }
+    if (adjustments.highlights.abs() > 0.001 ||
+        adjustments.shadows.abs() > 0.001 ||
+        adjustments.whites.abs() > 0.001 ||
+        adjustments.blacks.abs() > 0.001 ||
+        !adjustments.wheels.isIdentity) {
+      final wheels = adjustments.wheels;
+      filters.add(
+        'colorbalance='
+        'rs=${_number((adjustments.blacks + wheels.shadowsRed).clamp(-1, 1))}:'
+        'gs=${_number((adjustments.blacks + wheels.shadowsGreen).clamp(-1, 1))}:'
+        'bs=${_number((adjustments.blacks + wheels.shadowsBlue).clamp(-1, 1))}:'
+        'rm=${_number((adjustments.shadows + wheels.midtonesRed).clamp(-1, 1))}:'
+        'gm=${_number((adjustments.shadows + wheels.midtonesGreen).clamp(-1, 1))}:'
+        'bm=${_number((adjustments.shadows + wheels.midtonesBlue).clamp(-1, 1))}:'
+        'rh=${_number((adjustments.highlights + adjustments.whites + wheels.highlightsRed).clamp(-1, 1))}:'
+        'gh=${_number((adjustments.highlights + adjustments.whites + wheels.highlightsGreen).clamp(-1, 1))}:'
+        'bh=${_number((adjustments.highlights + adjustments.whites + wheels.highlightsBlue).clamp(-1, 1))}',
+      );
+    }
+    if (!adjustments.rgbCurve.isIdentity) {
+      filters.add("curves=all='${_curveExpression(adjustments.rgbCurve)}'");
     }
     if (adjustments.vignette > 0.001) {
       final angle =
@@ -1817,6 +2092,526 @@ class TimelineExportService {
     if (adjustments.sharpen > 0.001) {
       final amount = 0.2 + adjustments.sharpen.clamp(0, 1) * 1.3;
       filters.add('unsharp=5:5:${_number(amount)}:5:5:0');
+    }
+    return filters;
+  }
+
+  @visibleForTesting
+  static List<String> buildColorFiltersForTesting(
+    ClipColorAdjustments adjustments,
+  ) => _colorFilters(adjustments);
+
+  @visibleForTesting
+  static void validateColorPipelineForTesting(EditorTimeline timeline) {
+    _validateRenderableColorPipeline(timeline);
+  }
+
+  static void _validateRenderableColorPipeline(EditorTimeline timeline) {
+    final management = timeline.colorManagement;
+    if (management.workingSpace != EditorColorSpace.sdr709 ||
+        management.outputSpace != EditorColorSpace.sdr709 ||
+        management.preserveHdr) {
+      throw UnsupportedError(
+        'This renderer currently supports SDR Rec.709 output only. HDR, HLG, '
+        'PQ, Log, and wide-gamut projects are blocked instead of being '
+        'silently converted to SDR.',
+      );
+    }
+    for (final clip in timeline.tracks.expand((track) => track.clips)) {
+      final adjustments = clip.colorAdjustments;
+      if (adjustments.inputColorSpace != EditorColorSpace.sdr709) {
+        throw UnsupportedError(
+          'Clip "${clip.label}" is tagged ${adjustments.inputColorSpace.name}. '
+          'Automatic camera-Log and HDR transforms are not available in the '
+          'SDR renderer.',
+        );
+      }
+      if (!adjustments.hueVsHueCurve.isIdentity ||
+          !adjustments.hueVsSaturationCurve.isIdentity ||
+          !adjustments.hueVsLuminanceCurve.isIdentity ||
+          !adjustments.luminanceVsSaturationCurve.isIdentity ||
+          !adjustments.saturationVsSaturationCurve.isIdentity ||
+          adjustments.qualifier.enabled) {
+        throw UnsupportedError(
+          'Clip "${clip.label}" contains selective HSL correction data that '
+          'the current renderer cannot reproduce. Export was stopped to avoid '
+          'a preview-delivery mismatch.',
+        );
+      }
+    }
+  }
+
+  static EditorEffectStack _colorAdjustmentLutStack(
+    ClipColorAdjustments adjustments,
+  ) {
+    final lutPath = adjustments.lutPath?.trim();
+    if (lutPath == null ||
+        lutPath.isEmpty ||
+        adjustments.lutIntensity <= 0.0001) {
+      return const EditorEffectStack();
+    }
+    return EditorEffectStack(
+      effects: [
+        EditorEffect(
+          type: EditorEffectType.lut,
+          intensity: adjustments.lutIntensity,
+          parameters: {'path': lutPath},
+        ),
+      ],
+    );
+  }
+
+  static String _curveExpression(EditorColorCurve curve) {
+    final points = curve.points
+        .map(
+          (point) =>
+              '${_number(point.input.clamp(0.0, 1.0))}/${_number(point.output.clamp(0.0, 1.0))}',
+        )
+        .join(' ');
+    return points.isEmpty ? '0/0 1/1' : points;
+  }
+
+  static List<String> _animatedEditorEffectFilters(
+    EditorEffect effect, {
+    required Duration fallbackTime,
+    required Duration parameterTimeOffset,
+    required Duration filterTimeOffset,
+    required Duration? duration,
+    String? outerEnableExpression,
+  }) {
+    if (duration == null ||
+        duration <= Duration.zero ||
+        effect.keyframes.length < 2) {
+      return _editorEffectFilters(
+        EditorEffectStack(effects: [effect]),
+        time: fallbackTime,
+        enableExpression: outerEnableExpression,
+      );
+    }
+
+    final durationUs = duration.inMicroseconds;
+    final segmentCount = (durationUs / 83333).ceil().clamp(1, 180);
+    final segments = <({int startUs, int endUs, List<String> filters})>[];
+    for (var index = 0; index < segmentCount; index++) {
+      final startUs = (durationUs * index / segmentCount).round();
+      final endUs = (durationUs * (index + 1) / segmentCount).round();
+      final sampleUs = startUs + ((endUs - startUs) / 2).round();
+      final rawFilters = _editorEffectFilters(
+        EditorEffectStack(effects: [effect]),
+        time: parameterTimeOffset + Duration(microseconds: sampleUs),
+      );
+      if (rawFilters.isEmpty) continue;
+      if (segments.isNotEmpty &&
+          listEquals(segments.last.filters, rawFilters) &&
+          segments.last.endUs == startUs) {
+        final previous = segments.removeLast();
+        segments.add((
+          startUs: previous.startUs,
+          endUs: endUs,
+          filters: previous.filters,
+        ));
+      } else {
+        segments.add((startUs: startUs, endUs: endUs, filters: rawFilters));
+      }
+    }
+
+    final animated = <String>[];
+    for (final segment in segments) {
+      final start = filterTimeOffset + Duration(microseconds: segment.startUs);
+      final end = filterTimeOffset + Duration(microseconds: segment.endUs);
+      final interval = 'gte(t,${_seconds(start)})*lt(t,${_seconds(end)})';
+      final enable = outerEnableExpression == null
+          ? interval
+          : '($outerEnableExpression)*($interval)';
+      animated.addAll(
+        segment.filters.map((filter) => "$filter:enable='$enable'"),
+      );
+    }
+    return animated;
+  }
+
+  static ({String sourceLabel, int appliedEffects})
+  _appendEditorEffectStackGraph({
+    required List<String> filters,
+    required String sourceLabel,
+    required EditorEffectStack stack,
+    required String labelPrefix,
+    Duration time = Duration.zero,
+    Duration parameterTimeOffset = Duration.zero,
+    Duration? animationDuration,
+    Duration filterTimeOffset = Duration.zero,
+    String? enableExpression,
+  }) {
+    var currentSource = sourceLabel;
+    var appliedEffects = 0;
+    for (final effect in stack.effects) {
+      if (!effect.enabled ||
+          effect.domain != EditorEffectDomain.visual ||
+          effect.intensity <= 0.0001) {
+        continue;
+      }
+      final effectFilters = _animatedEditorEffectFilters(
+        effect,
+        fallbackTime: time + parameterTimeOffset,
+        parameterTimeOffset: parameterTimeOffset,
+        filterTimeOffset: filterTimeOffset,
+        duration: animationDuration,
+        outerEnableExpression: effect.mask == null && effect.intensity >= 0.999
+            ? enableExpression
+            : null,
+      );
+      if (effectFilters.isEmpty) continue;
+      final outputLabel = '${labelPrefix}Output$appliedEffects';
+      if (effect.mask == null && effect.intensity >= 0.999) {
+        filters.add('[$currentSource]${effectFilters.join(',')}[$outputLabel]');
+        currentSource = outputLabel;
+        appliedEffects++;
+        continue;
+      }
+
+      final originalLabel = '${labelPrefix}Original$appliedEffects';
+      final effectInputLabel = '${labelPrefix}Input$appliedEffects';
+      final maskInputLabel = '${labelPrefix}MaskInput$appliedEffects';
+      final processedLabel = '${labelPrefix}Processed$appliedEffects';
+      final maskLabel = '${labelPrefix}Mask$appliedEffects';
+      filters.add(
+        '[$currentSource]split=3'
+        '[$originalLabel][$effectInputLabel][$maskInputLabel]',
+      );
+      filters.add(
+        '[$effectInputLabel]${effectFilters.join(',')}[$processedLabel]',
+      );
+      final maskExpression = _editorEffectMaskExpression(
+        effect.mask,
+        intensity: effect.intensity,
+        enableExpression: enableExpression,
+      );
+      filters.add(
+        '[$maskInputLabel]format=gray,'
+        "geq=lum='$maskExpression'[$maskLabel]",
+      );
+      filters.add(
+        '[$originalLabel][$processedLabel][$maskLabel]'
+        'maskedmerge=planes=15[$outputLabel]',
+      );
+      currentSource = outputLabel;
+      appliedEffects++;
+    }
+    return (sourceLabel: currentSource, appliedEffects: appliedEffects);
+  }
+
+  static String _editorEffectMaskExpression(
+    EditorEffectMask? mask, {
+    required double intensity,
+    String? enableExpression,
+  }) {
+    var expression = '255';
+    if (mask != null) {
+      final left = _number(mask.safeX);
+      final top = _number(mask.safeY);
+      final right = _number(mask.safeX + mask.safeWidth);
+      final bottom = _number(mask.safeY + mask.safeHeight);
+      final feather = mask.safeFeather;
+      if (mask.shape == EditorEffectMaskShape.ellipse) {
+        final centerX = _number(mask.safeX + mask.safeWidth / 2);
+        final centerY = _number(mask.safeY + mask.safeHeight / 2);
+        final radiusX = _number(mask.safeWidth / 2);
+        final radiusY = _number(mask.safeHeight / 2);
+        final distance =
+            'sqrt(pow((X-W*$centerX)/(W*$radiusX),2)+'
+            'pow((Y-H*$centerY)/(H*$radiusY),2))';
+        if (feather <= 0.0001) {
+          expression = "if(lte($distance,1),255,0)";
+        } else {
+          final edge = _number((feather * 0.5).clamp(0.001, 0.5));
+          expression = '255*clip((1+$edge-($distance))/(2*$edge),0,1)';
+        }
+      } else {
+        final inside =
+            'between(X,W*$left,W*$right)*'
+            'between(Y,H*$top,H*$bottom)';
+        if (feather <= 0.0001) {
+          expression = '255*($inside)';
+        } else {
+          final distance =
+              'min(min(X-W*$left,W*$right-X),'
+              'min(Y-H*$top,H*$bottom-Y))';
+          final featherPixels = 'max(1,min(W,H)*${_number(feather * 0.25)})';
+          expression =
+              '255*clip((($distance)+$featherPixels)/'
+              '(2*$featherPixels),0,1)';
+        }
+      }
+      if (mask.inverted) expression = '255-($expression)';
+    }
+    final safeIntensity = intensity.clamp(0.0, 1.0).toDouble();
+    expression = '($expression)*${_number(safeIntensity)}';
+    if (enableExpression != null) {
+      final frameExpression = enableExpression.replaceAll(
+        RegExp(r'\bt\b'),
+        'T',
+      );
+      expression = '($expression)*($frameExpression)';
+    }
+    return expression;
+  }
+
+  @visibleForTesting
+  static List<String> buildEditorEffectFiltersForTesting(
+    EditorEffect effect, {
+    Duration time = Duration.zero,
+    String? enableExpression,
+  }) {
+    return _editorEffectFilters(
+      EditorEffectStack(effects: [effect]),
+      time: time,
+      enableExpression: enableExpression,
+    );
+  }
+
+  static List<String> _editorEffectFilters(
+    EditorEffectStack stack, {
+    Duration time = Duration.zero,
+    String? enableExpression,
+  }) {
+    final filters = <String>[];
+    for (final effect in stack.effects) {
+      if (!effect.enabled || effect.intensity <= 0.0001) continue;
+      double value(String name, double fallback) {
+        return effect
+            .parameterAt(name, time, fallback: fallback)
+            .clamp(-1000.0, 1000.0)
+            .toDouble();
+      }
+
+      final amount = value('amount', 1).clamp(0.0, 1.0).toDouble();
+      final radius = value('radius', 12).clamp(0.0, 80.0).toDouble();
+      double wrappedScrollPosition(double offset, double extent) {
+        final fraction = (offset / extent).clamp(-0.49, 0.49).toDouble();
+        return fraction < 0 ? 1 + fraction : fraction;
+      }
+
+      String highlightIsolation(double threshold) {
+        final cutoff = (threshold.clamp(0.0, 1.0) * 255).round();
+        return "lutrgb=r='if(lt(val,$cutoff),0,val)':"
+            "g='if(lt(val,$cutoff),0,val)':"
+            "b='if(lt(val,$cutoff),0,val)'";
+      }
+
+      final filter = switch (effect.type) {
+        EditorEffectType.gaussianBlur =>
+          'gblur=sigma=${_number(radius.clamp(0.0, 80.0))}',
+        EditorEffectType.directionalBlur => () {
+          final direction = value('angle', 0) * math.pi / 180;
+          final horizontal = (radius * math.cos(direction)).abs().round().clamp(
+            1,
+            80,
+          );
+          final vertical = (radius * math.sin(direction)).abs().round().clamp(
+            1,
+            80,
+          );
+          return 'avgblur=sizeX=$horizontal:sizeY=$vertical';
+        }(),
+        EditorEffectType.motionBlur => () {
+          final frameCount = (2 + amount * 5).round().clamp(2, 7);
+          final direction = value('angle', 0) * math.pi / 180;
+          final directionalRadius = (1 + amount * 14).round();
+          final horizontal = (directionalRadius * math.cos(direction))
+              .abs()
+              .round()
+              .clamp(1, 16);
+          final vertical = (directionalRadius * math.sin(direction))
+              .abs()
+              .round()
+              .clamp(1, 16);
+          return 'tmix=frames=$frameCount:'
+              "weights='${List.filled(frameCount, '1').join(' ')}'||"
+              'avgblur=sizeX=$horizontal:sizeY=$vertical';
+        }(),
+        EditorEffectType.sharpen =>
+          'unsharp=5:5:${_number(0.2 + amount * 1.8)}:5:5:0',
+        EditorEffectType.glow || EditorEffectType.bloom => () {
+          final threshold = value('threshold', 0.65).clamp(0.0, 1.0);
+          return '${highlightIsolation(threshold.toDouble())}||'
+              'gblur=sigma=${_number(radius.clamp(1.0, 80.0))}';
+        }(),
+        EditorEffectType.cinematicGlow =>
+          'eq=brightness=${_number(amount * 0.08)}:'
+              'contrast=${_number(1 + amount * 0.35)}:'
+              'saturation=${_number(1 + amount * 0.18)}||'
+              'gblur=sigma=${_number(radius.clamp(1.0, 80.0))}',
+        EditorEffectType.bokeh => () {
+          final size = value('size', 12).round().clamp(2, 64);
+          return 'pixelize=w=$size:h=$size||'
+              'gblur=sigma=${_number((1 + amount * size * 0.45).clamp(1.0, 32.0))}';
+        }(),
+        EditorEffectType.glare => () {
+          final threshold = (0.9 - amount * 0.55).clamp(0.2, 0.9);
+          return '${highlightIsolation(threshold.toDouble())}||'
+              'gblur=sigma=${_number(2 + amount * 18)}';
+        }(),
+        EditorEffectType.flare => () {
+          final positionX = value('positionX', 0.7).clamp(0.0, 1.0);
+          final positionY = value('positionY', 0.25).clamp(0.0, 1.0);
+          final angle = (math.pi / 2) * (1 - amount * 0.72);
+          return 'vignette=mode=backward:angle=${_number(angle)}:'
+              'x0=w*${_number(positionX)}:y0=h*${_number(positionY)}';
+        }(),
+        EditorEffectType.lightLeak => () {
+          final position = value('position', 0.5).clamp(0.0, 1.0);
+          final angle = (math.pi / 2) * (1 - amount * 0.65);
+          return 'vignette=mode=backward:angle=${_number(angle)}:'
+              'x0=w*${_number(position)}:y0=h*0.35||'
+              'colorchannelmixer=rr=${_number(1 + amount * 0.35)}:'
+              'gg=${_number(1 + amount * 0.12)}:'
+              'bb=${_number(1 - amount * 0.22)}';
+        }(),
+        EditorEffectType.prism => () {
+          final shift = (amount * 24).round().clamp(0, 24);
+          return 'chromashift=cbh=$shift:crh=${-shift}:'
+              'cbv=${(shift / 3).round()}:crv=${-(shift / 3).round()}';
+        }(),
+        EditorEffectType.vignette => () {
+          final vignette = value('amount', 0.35).clamp(0.0, 1.0).toDouble();
+          final softness = value('softness', 0.7).clamp(0.0, 1.0);
+          final angle =
+              (math.pi / 2) * (1 - vignette * (0.3 + (1 - softness) * 0.45));
+          return 'vignette=angle=${_number(angle)}';
+        }(),
+        EditorEffectType.grain || EditorEffectType.noise =>
+          'noise=alls=${_number((amount * 48).clamp(0.0, 100.0))}:allf=t+u',
+        EditorEffectType.pixelate || EditorEffectType.mosaic =>
+          'pixelize=w=${value('size', 12).round().clamp(2, 64)}:'
+              'h=${value('size', 12).round().clamp(2, 64)}',
+        EditorEffectType.posterize => () {
+          final levels = value('levels', 6).round().clamp(2, 32);
+          final step = 255 / (levels - 1);
+          final halfStep = step / 2;
+          return "lutrgb=r='floor((val+${_number(halfStep)})/${_number(step)})*${_number(step)}':"
+              "g='floor((val+${_number(halfStep)})/${_number(step)})*${_number(step)}':"
+              "b='floor((val+${_number(halfStep)})/${_number(step)})*${_number(step)}'";
+        }(),
+        EditorEffectType.emboss => () {
+          final strength = value('amount', 0.65).clamp(0.0, 1.0);
+          return 'convolution='
+              '${_number(-2 * strength)} ${_number(-strength)} 0 '
+              '${_number(-strength)} 1 ${_number(strength)} '
+              '0 ${_number(strength)} ${_number(2 * strength)}';
+        }(),
+        EditorEffectType.edgeDetection || EditorEffectType.sketch =>
+          'edgedetect=mode=colormix:high=${_number(amount.clamp(0.01, 1.0))}',
+        EditorEffectType.chromaticAberration || EditorEffectType.rgbSplit =>
+          'chromashift=cbh=${value('amount', 3).round().clamp(0, 24)}:'
+              'crh=${-value('amount', 3).round().clamp(0, 24)}',
+        EditorEffectType.lensDistortion || EditorEffectType.fisheye =>
+          'lenscorrection=k1=${_number(value('amount', 0.2).clamp(-1.0, 1.0))}:'
+              'k2=${_number(value('amount', 0.2).clamp(-1.0, 1.0) * 0.35)}',
+        EditorEffectType.warp =>
+          'lenscorrection=k1=${_number(value('amount', 0.2).clamp(-0.8, 0.8))}:'
+              'k2=${_number(value('amount', 0.2).clamp(-0.8, 0.8) * 0.2)}',
+        EditorEffectType.ripple => () {
+          final strength = value('amount', 0.2).clamp(-0.8, 0.8);
+          final frequency = value('frequency', 4).clamp(0.0, 30.0);
+          return 'lenscorrection=k1=${_number(strength)}:'
+              'k2=${_number(strength * (0.08 + frequency / 35))}';
+        }(),
+        EditorEffectType.wave => () {
+          final strength = value('amount', 0.15).clamp(0.0, 1.0);
+          final frequency = value('frequency', 3).clamp(0.0, 30.0);
+          return "rotate=angle='${_number(strength * 0.035)}*"
+              "sin(2*PI*t*${_number(frequency)})':ow=iw:oh=ih:c=black@0";
+        }(),
+        EditorEffectType.shake => () {
+          final strength = value('amount', 0.25).clamp(0.0, 1.0);
+          final frequency = value('frequency', 8).clamp(0.0, 30.0);
+          return "rotate=angle='${_number(strength * 0.055)}*"
+              "sin(2*PI*t*${_number(frequency)})':ow=iw:oh=ih:c=black@0";
+        }(),
+        EditorEffectType.glitch ||
+        EditorEffectType.vhs ||
+        EditorEffectType.crt =>
+          'noise=alls=${_number((amount * 36).clamp(0.0, 100.0))}:allf=t+u||'
+              'chromashift=cbh=${(amount * 4).round().clamp(0, 12)}:'
+              'crh=${-(amount * 4).round().clamp(0, 12)}',
+        EditorEffectType.scanLines =>
+          'drawgrid=w=iw:h=${value('spacing', 4).round().clamp(2, 24)}:'
+              't=1:c=black@${_number((amount * 0.7).clamp(0.05, 0.9))}',
+        EditorEffectType.halftone => () {
+          final size = value('size', 5).round().clamp(2, 64);
+          return 'pixelize=w=$size:h=$size||'
+              'drawgrid=w=$size:h=$size:t=1:'
+              'c=black@${_number((amount * 0.75).clamp(0.05, 0.9))}';
+        }(),
+        EditorEffectType.comic || EditorEffectType.stylized =>
+          'edgedetect=mode=colormix:high=${_number((amount * 0.8).clamp(0.05, 1.0))}',
+        EditorEffectType.dropShadow => () {
+          final blur = value('blur', 10).clamp(0.0, 80.0);
+          final horizontal = wrappedScrollPosition(
+            value('offsetX', 8),
+            kTimelineDesignWidth,
+          );
+          final vertical = wrappedScrollPosition(
+            value('offsetY', 8),
+            kTimelineDesignHeight,
+          );
+          final channel = (1 - amount * 0.88).clamp(0.05, 1.0);
+          return 'gblur=sigma=${_number(blur)}||'
+              'colorchannelmixer=rr=${_number(channel)}:'
+              'gg=${_number(channel)}:bb=${_number(channel)}||'
+              'scroll=h=0:v=0:hpos=${_number(horizontal)}:'
+              'vpos=${_number(vertical)}';
+        }(),
+        EditorEffectType.outline || EditorEffectType.stroke => () {
+          final width = value(
+            'width',
+            effect.type == EditorEffectType.outline ? 4 : 3,
+          ).clamp(0.0, 80.0);
+          return 'edgedetect=mode=colormix:'
+              'high=${_number(amount.clamp(0.05, 1.0))}||'
+              'gblur=sigma=${_number((width / 2).clamp(0.1, 40.0))}';
+        }(),
+        EditorEffectType.reflection => () {
+          final offset = value('offset', 0.1).clamp(0.0, 1.0);
+          return 'vflip||'
+              'scroll=h=0:v=0:hpos=0:vpos=${_number(offset)}||'
+              'eq=brightness=${_number(-amount * 0.2)}:'
+              'saturation=${_number(1 - amount * 0.45)}';
+        }(),
+        EditorEffectType.colorGrade =>
+          'eq=brightness=${_number(value('brightness', 0).clamp(-1, 1))}:'
+              'contrast=${_number(value('contrast', 1).clamp(0.1, 3))}:'
+              'saturation=${_number(value('saturation', 1).clamp(0, 3))}:'
+              'gamma=${_number(value('gamma', 1).clamp(0.1, 4))}',
+        EditorEffectType.lut => () {
+          final lutPath = effect.parameters['path'];
+          if (lutPath is! String || lutPath.trim().isEmpty) return '';
+          return "lut3d=file='${_escapeFilterPath(lutPath)}'";
+        }(),
+        EditorEffectType.equalizer ||
+        EditorEffectType.compressor ||
+        EditorEffectType.limiter ||
+        EditorEffectType.noiseGate ||
+        EditorEffectType.deEsser ||
+        EditorEffectType.noiseReduction ||
+        EditorEffectType.humReduction ||
+        EditorEffectType.reverb ||
+        EditorEffectType.delay ||
+        EditorEffectType.distortion ||
+        EditorEffectType.pitch ||
+        EditorEffectType.timeStretch => '',
+      };
+      if (filter.isEmpty) continue;
+      final expanded = filter.split('||');
+      for (final candidate in expanded) {
+        filters.add(
+          enableExpression == null
+              ? candidate
+              : candidate.contains('=')
+              ? "$candidate:enable='$enableExpression'"
+              : "$candidate=enable='$enableExpression'",
+        );
+      }
     }
     return filters;
   }
@@ -1969,6 +2764,7 @@ class TimelineExportService {
   }
 
   static bool _hasAudibleInput(
+    EditorTimeline timeline,
     List<TimelineRenderInput> inputs,
     ExportSettings settings,
   ) {
@@ -1977,13 +2773,23 @@ class TimelineExportService {
         .where((input) => input.track.isSolo)
         .map((input) => input.track.id)
         .toSet();
-    return inputs.any(
-      (input) =>
-          input.hasAudio &&
+    final soloBusIds = timeline.audioBuses
+        .where((bus) => bus.solo)
+        .map((bus) => bus.id)
+        .toSet();
+    return inputs.any((input) {
+      final bus = input.track.audioBusId == null
+          ? null
+          : timeline.audioBuses
+                .where((candidate) => candidate.id == input.track.audioBusId)
+                .firstOrNull;
+      return input.hasAudio &&
           !input.track.isMuted &&
+          bus?.muted != true &&
           !input.clip.audioMix.muted &&
-          (soloTrackIds.isEmpty || soloTrackIds.contains(input.track.id)),
-    );
+          (soloTrackIds.isEmpty || soloTrackIds.contains(input.track.id)) &&
+          (soloBusIds.isEmpty || (bus != null && soloBusIds.contains(bus.id)));
+    });
   }
 
   static List<String> _atempoFilters(double playbackRate) {
@@ -2001,6 +2807,27 @@ class TimelineExportService {
       filters.add('atempo=${_number(remaining)}');
     }
     return filters;
+  }
+
+  static List<String> _timeStretchFilters(
+    double rate, {
+    required bool preservePitch,
+  }) {
+    final safeRate = rate.clamp(0.25, 4).toDouble();
+    if ((safeRate - 1).abs() <= 0.0001) return const [];
+    if (preservePitch) return _atempoFilters(safeRate);
+    return ['asetrate=48000*${_number(safeRate)}', 'aresample=48000'];
+  }
+
+  static List<String> _pitchShiftFilters(double semitones) {
+    final safeSemitones = semitones.clamp(-24.0, 24.0).toDouble();
+    if (safeSemitones.abs() <= 0.0001) return const [];
+    final ratio = math.pow(2, safeSemitones / 12).toDouble();
+    return [
+      'asetrate=48000*${_number(ratio)}',
+      'aresample=48000',
+      ..._atempoFilters(1 / ratio),
+    ];
   }
 
   static String _panFilter(double pan) {
@@ -2099,6 +2926,10 @@ class TimelineExportService {
   static String _number(num value) {
     final text = value.toStringAsFixed(6);
     return text.replaceFirst(RegExp(r'\.?0+$'), '');
+  }
+
+  static double _dbToLinear(double decibels) {
+    return math.pow(10, decibels.clamp(-80.0, 12.0) / 20).toDouble();
   }
 
   static String _ffmpegColor(Color color) {

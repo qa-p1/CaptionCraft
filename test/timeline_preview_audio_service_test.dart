@@ -1,5 +1,6 @@
 import 'package:caption_craft/core/utils/timeline_export_service.dart';
 import 'package:caption_craft/core/utils/timeline_preview_audio_service.dart';
+import 'package:caption_craft/features/editor/models/editor_effect_models.dart';
 import 'package:caption_craft/features/editor/models/timeline_models.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -290,6 +291,63 @@ void main() {
     expect(
       buildPlan(trackMixed).fingerprint,
       isNot(buildPlan(timeline).fingerprint),
+    );
+  });
+
+  test('bus and project processing invalidate preview audio safely', () {
+    final asset = EditorAssetReference(
+      id: 'audio-asset',
+      type: EditorAssetType.audio,
+      label: 'Dialogue',
+      sourcePath: '/fixtures/dialogue.wav',
+    );
+    final clip = TimelineClip(
+      id: 'dialogue',
+      trackId: 'dialogue-track',
+      type: TimelineTrackType.audio,
+      label: 'Dialogue',
+      assetId: asset.id,
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 2),
+    );
+    final bus = TimelineAudioBus(
+      id: 'dialogue-bus',
+      name: 'Dialogue',
+      effectStack: EditorEffectStack(
+        effects: [EditorEffect(type: EditorEffectType.compressor)],
+      ),
+    );
+    final track = TimelineTrack(
+      id: 'dialogue-track',
+      name: 'Dialogue',
+      type: TimelineTrackType.audio,
+      section: TimelineTrackSection.audio,
+      audioBusId: bus.id,
+      clips: [clip],
+    );
+    final timeline = EditorTimeline(
+      assets: [asset],
+      tracks: [track],
+      audioBuses: [bus],
+    );
+    final baseline = buildPlan(timeline).fingerprint;
+    final busChanged = timeline.copyWith(
+      audioBuses: [bus.copyWith(gain: 0.7, pan: 0.2)],
+    );
+    final projectChanged = timeline.copyWith(
+      projectEffectStack: EditorEffectStack(
+        effects: [EditorEffect(type: EditorEffectType.limiter)],
+      ),
+    );
+
+    expect(buildPlan(busChanged).fingerprint, isNot(baseline));
+    expect(buildPlan(projectChanged).fingerprint, isNot(baseline));
+    expect(
+      TimelinePreviewAudioService.buildPlan(
+        timeline: timeline.copyWith(audioBuses: [bus.copyWith(muted: true)]),
+        fileExists: (_) => true,
+      ),
+      isNull,
     );
   });
 

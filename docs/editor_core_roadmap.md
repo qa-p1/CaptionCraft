@@ -108,12 +108,22 @@ preview/export semantics, caching, and known limitations.
 - [x] Apply an outgoing preset to every channel in the current state in one operation.
 - [x] Preserve individual-channel editing as an advanced workflow in the graph editor.
 
+## Current feature branch — effects, color, LUT, and audio audit
+
+- [x] Persist ordered effect/color/audio foundations and make mutations undoable.
+- [x] Share effect ordering and standard color/audio filters across preview and export.
+- [x] Validate every exposed effect filter and parameter with focused FFmpeg tests.
+- [x] Add adjustment layers plus clip, track, group, compound-set, and project scopes.
+- [x] Add a durable previewable LUT pack and dedicated bottom-control section.
+- [x] Reject dormant selective-color and unsupported HDR/Log delivery instead of silently ignoring it.
+- [ ] Complete the unsupported boundaries listed in [Effects, color, and audio status](editor_effects_audio_status.md).
+
 ## Verification snapshot
 
 - [x] `flutter pub get --enforce-lockfile` succeeds on GitHub Actions with Flutter 3.41.2.
 - [x] `flutter analyze` is clean on Flutter 3.41.2.
 - [x] All editor, timeline, preview, proxy, waveform, audio, animation, persistence, and undo tests pass.
-- [x] The complete local `flutter test` invocation is green with 433 passing tests on Windows.
+- [x] The complete local `flutter test` invocation is green on Windows.
 - [ ] Reverify the three historical Linux visual-golden baseline differences in CI; no golden was changed to mask them.
 - [x] Preview/export parity tests cover every interpolation mode and the shared audio filter graph.
 - [ ] Stress playback is verified on a real iOS device.

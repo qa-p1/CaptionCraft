@@ -16,11 +16,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  testWidgets('shows all five destinations in a persistent bottom menu', (
+  testWidgets('shows all six destinations on a phone without overflow', (
     tester,
   ) async {
     final packs = _FakeAssetPackFacade();
-    await _pumpSheet(tester, packs: packs);
+    await _pumpSheet(tester, packs: packs, surfaceSize: const Size(390, 800));
 
     expect(find.byKey(const ValueKey('element-library-navigation')), findsOne);
     expect(find.byKey(const ValueKey('element-library-nav-giphy')), findsOne);
@@ -34,11 +34,81 @@ void main() {
       find.byKey(const ValueKey('element-library-nav-overlays')),
       findsOne,
     );
+    expect(find.byKey(const ValueKey('element-library-nav-luts')), findsOne);
     expect(find.text('GIPHY'), findsOne);
     expect(find.text('Pexels'), findsOne);
     expect(find.text('Pixabay'), findsOne);
     expect(find.text('BG Videos'), findsOne);
     expect(find.text('Overlays'), findsOne);
+    expect(find.text('LUTs'), findsOne);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('dedicated LUT library previews and returns installed looks', (
+    tester,
+  ) async {
+    final item = AssetPackCatalogItem(
+      packId: AssetPackConstants.lutsId,
+      packVersion: 'test',
+      id: 'cinematic-look',
+      title: 'Cinematic Look',
+      categoryId: 'film',
+      categoryName: 'Film',
+      mediaKind: AssetPackMediaKind.lut,
+      relativePath: 'luts/cinematic-look.cube',
+      previewRelativePath: 'previews/cinematic-look.jpg',
+      sizeBytes: 128,
+      width: null,
+      height: null,
+      duration: null,
+      hasAudio: false,
+      tags: const ['film'],
+      metadata: const {'gridSize': 17},
+      installationDirectory: Directory.systemTemp,
+    );
+    final packs = _FakeAssetPackFacade(
+      installedPackIds: const {AssetPackConstants.lutsId},
+      installedItems: {
+        AssetPackConstants.lutsId: [item],
+      },
+    );
+    AssetPackCatalogItem? selected;
+
+    await _pumpSheet(
+      tester,
+      packs: packs,
+      initialDestination: ElementLibraryDestination.luts,
+      showNavigation: false,
+      title: 'LUT Library',
+      subtitle: 'Preview and apply a look',
+      surfaceSize: const Size(390, 800),
+      onPackAssetSelected: (item) async => selected = item,
+    );
+
+    expect(find.text('LUT Library'), findsOne);
+    expect(
+      find.byKey(const ValueKey('element-library-navigation')),
+      findsNothing,
+    );
+    expect(
+      find.byKey(const ValueKey('element-library-pack-grid-luts')),
+      findsOne,
+    );
+    expect(
+      find.byKey(const ValueKey('element-library-pack-result-cinematic-look')),
+      findsOne,
+    );
+    expect(find.text('Cinematic Look'), findsOne);
+    expect(find.text('LUT'), findsOne);
+    expect(packs.getReleaseCalls, [AssetPackConstants.lutsId]);
+    expect(tester.takeException(), isNull);
+
+    await tester.tap(
+      find.byKey(const ValueKey('element-library-pack-result-cinematic-look')),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 250));
+    expect(selected?.id, item.id);
   });
 
   testWidgets('shows and applies each online provider filter set', (
@@ -256,8 +326,13 @@ Future<void> _pumpSheet(
   ElementLibraryDestination initialDestination =
       ElementLibraryDestination.giphy,
   bool settle = true,
+  bool showNavigation = true,
+  String title = 'Elements',
+  String subtitle = 'Stock media and verified on-demand packs',
+  Size surfaceSize = const Size(430, 800),
+  PackElementAssetSelected? onPackAssetSelected,
 }) async {
-  await tester.binding.setSurfaceSize(const Size(430, 800));
+  await tester.binding.setSurfaceSize(surfaceSize);
   addTearDown(() => tester.binding.setSurfaceSize(null));
   final app = MaterialApp(
     theme: AppTheme.darkTheme,
@@ -268,8 +343,11 @@ Future<void> _pumpSheet(
         pixabaySearch: pixabaySearch ?? (query, filter) async => const [],
         externalUrlLauncher: (_) async => true,
         initialDestination: initialDestination,
+        title: title,
+        subtitle: subtitle,
+        showNavigation: showNavigation,
         onOnlineAssetSelected: (_) async {},
-        onPackAssetSelected: (_) async {},
+        onPackAssetSelected: onPackAssetSelected ?? (_) async {},
       ),
     ),
   );
@@ -292,10 +370,12 @@ class _FakeAssetPackFacade implements AssetPackFacade {
   _FakeAssetPackFacade({
     this.holdInstallOpen = false,
     this.installedPackIds = const <String>{},
+    this.installedItems = const <String, List<AssetPackCatalogItem>>{},
   });
 
   final bool holdInstallOpen;
   final Set<String> installedPackIds;
+  final Map<String, List<AssetPackCatalogItem>> installedItems;
   final List<String> getInstalledCalls = <String>[];
   final List<String> getReleaseCalls = <String>[];
   final List<String> installCalls = <String>[];
@@ -309,14 +389,18 @@ class _FakeAssetPackFacade implements AssetPackFacade {
     if (!installedPackIds.contains(packId)) return null;
     return AssetPackCatalog(
       id: packId,
-      title: packId == AssetPackConstants.backgroundVideosId
-          ? 'Background videos'
-          : 'Overlays',
+      title: _fakePackTitle(packId),
       version: 'test',
       installationDirectory: Directory.systemTemp,
-      items: const [],
-      categoryIds: const [],
-      categoryNames: const {},
+      items: installedItems[packId] ?? const [],
+      categoryIds: (installedItems[packId] ?? const [])
+          .map((item) => item.categoryId)
+          .toSet()
+          .toList(),
+      categoryNames: {
+        for (final item in installedItems[packId] ?? const [])
+          item.categoryId: item.categoryName,
+      },
     );
   }
 
@@ -335,9 +419,7 @@ class _FakeAssetPackFacade implements AssetPackFacade {
       archiveBytes: 1024 * 1024,
       installedBytes: 2 * 1024 * 1024,
       catalogPath: 'db.json',
-      title: packId == AssetPackConstants.backgroundVideosId
-          ? 'Background videos'
-          : 'Overlays',
+      title: _fakePackTitle(packId),
       description: 'A test media pack.',
       assetCount: 1,
     );
@@ -364,9 +446,7 @@ class _FakeAssetPackFacade implements AssetPackFacade {
     );
     final catalog = AssetPackCatalog(
       id: packId,
-      title: packId == AssetPackConstants.backgroundVideosId
-          ? 'Background videos'
-          : 'Overlays',
+      title: _fakePackTitle(packId),
       version: 'test',
       installationDirectory: Directory.systemTemp,
       items: const [],
@@ -394,3 +474,10 @@ class _FakeAssetPackFacade implements AssetPackFacade {
     }
   }
 }
+
+String _fakePackTitle(String packId) => switch (packId) {
+  AssetPackConstants.backgroundVideosId => 'Background videos',
+  AssetPackConstants.soundEffectsId => 'Sound effects',
+  AssetPackConstants.lutsId => 'LUTs',
+  _ => 'Overlays',
+};
