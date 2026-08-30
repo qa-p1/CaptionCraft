@@ -8,9 +8,10 @@ import '../models/discover_models.dart';
 import '../providers/discover_provider.dart';
 import 'discover_browser_tab.dart';
 import 'discover_downloads_tab.dart';
+import 'discover_instagram_tab.dart';
 import 'discover_youtube_tab.dart';
 
-enum DiscoverDestination { browser, youtube, downloads }
+enum DiscoverDestination { browser, youtube, instagram, downloads }
 
 typedef DiscoverTimelineImportCallback =
     Future<void> Function(DiscoverDownloadItem item);
@@ -18,8 +19,8 @@ typedef DiscoverTimelineImportCallback =
 /// Full-screen Discover workspace.
 ///
 /// The tab bodies are kept alive in an [IndexedStack], so browser navigation,
-/// an inspected YouTube video, and download scroll position survive tab
-/// changes. Browser and YouTube actions only enqueue downloads; a completed
+/// inspected social media, and download scroll position survive tab changes.
+/// Browser, YouTube, and Instagram actions only enqueue downloads; a completed
 /// item enters the timeline solely through Downloads, then closes Discover.
 class DiscoverSheet extends ConsumerStatefulWidget {
   final DiscoverTimelineImportCallback onAddToTimeline;
@@ -160,6 +161,40 @@ class _DiscoverSheetState extends ConsumerState<DiscoverSheet> {
                         notifier.setPermittedContentAcknowledged,
                     onCancel: notifier.cancel,
                   ),
+                  DiscoverInstagramTab(
+                    postInfo: state.instagramInfo,
+                    downloads: state.downloads,
+                    isInspecting: state.isInspectingInstagram,
+                    isEnqueuing: state.isEnqueuing,
+                    permittedContentAcknowledged:
+                        state.permittedContentAcknowledged,
+                    errorMessage: state.errorMessage,
+                    onInspect: (url) async {
+                      final info = await notifier.inspectInstagram(url);
+                      if (info == null) {
+                        throw StateError(
+                          ref.read(discoverProvider).errorMessage ??
+                              'This Instagram link could not be inspected.',
+                        );
+                      }
+                    },
+                    onEnqueue: (info, media, outputFileName) async {
+                      final item = await notifier.enqueueInstagram(
+                        info: info,
+                        media: media,
+                        outputFileName: outputFileName,
+                      );
+                      if (item == null) {
+                        throw StateError(
+                          ref.read(discoverProvider).errorMessage ??
+                              'The Instagram download could not be started.',
+                        );
+                      }
+                    },
+                    onAcknowledgementChanged:
+                        notifier.setPermittedContentAcknowledged,
+                    onCancel: notifier.cancel,
+                  ),
                   DiscoverDownloadsTab(
                     downloads: state.downloads,
                     isInitialized: state.isInitialized,
@@ -199,6 +234,12 @@ class _DiscoverSheetState extends ConsumerState<DiscoverSheet> {
                     color: kAccent,
                   ),
                   label: 'YouTube',
+                ),
+                const NavigationDestination(
+                  key: ValueKey('discover-nav-instagram'),
+                  icon: Icon(Icons.camera_alt_outlined),
+                  selectedIcon: Icon(Icons.camera_alt_rounded, color: kAccent),
+                  label: 'Instagram',
                 ),
                 NavigationDestination(
                   key: const ValueKey('discover-nav-downloads'),

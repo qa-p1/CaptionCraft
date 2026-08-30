@@ -72,9 +72,12 @@ class TimelinePreviewAudioService {
         if (track.section == TimelineTrackSection.audio)
           for (final clip in track.clips)
             if (clip.type == TimelineTrackType.audio &&
-                clip.linkedClipId != null &&
+                clip.separatedAudioSourceClipId != null &&
                 clip.assetId != null)
-              (visualClipId: clip.linkedClipId!, assetId: clip.assetId!),
+              (
+                visualClipId: clip.separatedAudioSourceClipId!,
+                assetId: clip.assetId!,
+              ),
     };
     final hasSoloMediaTrack = timeline.tracks.any(
       (track) =>
@@ -138,6 +141,10 @@ class TimelinePreviewAudioService {
         // An explicit separated audio clip owns the source even if an older or
         // malformed project forgot to mute the corresponding visual clip.
         if (clip.type == TimelineTrackType.video &&
+            clip.embeddedAudioSeparated) {
+          continue;
+        }
+        if (clip.type == TimelineTrackType.video &&
             clip.assetId != null &&
             explicitVisualAudioOwners.contains((
               visualClipId: clip.id,
@@ -194,6 +201,8 @@ class TimelinePreviewAudioService {
               selected[index].asset?.metadata['colorTransfer'] as String?,
           colorSpace: selected[index].asset?.metadata['colorSpace'] as String?,
           colorRange: selected[index].asset?.metadata['colorRange'] as String?,
+          pixelFormat:
+              selected[index].asset?.metadata['pixelFormat'] as String?,
           bitDepth: selected[index].asset?.metadata['bitDepth'] as int?,
           audioStreamCount:
               selected[index].asset?.metadata['audioStreamCount'] as int?,
@@ -230,6 +239,7 @@ class TimelinePreviewAudioService {
             'clipId': input.clip.id,
             'assetId': input.clip.assetId,
             'linkedClipId': input.clip.linkedClipId,
+            'separatedFromClipId': input.clip.separatedAudioSourceClipId,
             'startUs': input.clip.startTime.inMicroseconds,
             'endUs': input.clip.endTime.inMicroseconds,
             'sourceStartUs': input.clip.sourceStartTime.inMicroseconds,
@@ -426,6 +436,7 @@ class TimelinePreviewAudioService {
           colorTransfer: readable[index].colorTransfer,
           colorSpace: readable[index].colorSpace,
           colorRange: readable[index].colorRange,
+          pixelFormat: readable[index].pixelFormat,
           bitDepth: readable[index].bitDepth,
           audioStreamCount: readable[index].audioStreamCount,
           audioChannels: readable[index].audioChannels,

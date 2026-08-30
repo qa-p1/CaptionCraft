@@ -11,6 +11,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../features/editor/models/discover_models.dart';
+import 'instagram_download_service.dart';
 import 'youtube_download_service.dart';
 
 typedef DiscoverCatalogWriter =
@@ -27,9 +28,18 @@ abstract class DiscoverDownloadFacade {
 
   Future<YoutubeVideoInfo> inspectYoutube(String url);
 
+  Future<InstagramPostInfo> inspectInstagram(String url);
+
   Future<DiscoverDownloadItem> enqueueYoutube({
     required YoutubeVideoInfo info,
     required YoutubeFormatOption format,
+    required bool permittedContentAcknowledged,
+    String? outputFileName,
+  });
+
+  Future<DiscoverDownloadItem> enqueueInstagram({
+    required InstagramPostInfo info,
+    required InstagramMediaOption media,
     required bool permittedContentAcknowledged,
     String? outputFileName,
   });
@@ -49,6 +59,7 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
   DiscoverDownloadManager({
     Dio? dio,
     YoutubeMediaService? youtubeService,
+    InstagramMediaService? instagramService,
     Directory? storageDirectory,
     Future<Directory> Function()? documentsDirectoryProvider,
     DateTime Function()? clock,
@@ -59,6 +70,7 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
     this.maxYoutubeBytes = YoutubeDownloadService.defaultMaxBytes,
   }) : _dio = dio ?? Dio(),
        _youtubeService = youtubeService ?? YoutubeDownloadService(),
+       _instagramService = instagramService ?? InstagramDownloadService(),
        _storageDirectoryOverride = storageDirectory,
        _documentsDirectoryProvider =
            documentsDirectoryProvider ?? getApplicationDocumentsDirectory,
@@ -71,6 +83,7 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
 
   final Dio _dio;
   final YoutubeMediaService _youtubeService;
+  final InstagramMediaService _instagramService;
   final Directory? _storageDirectoryOverride;
   final Future<Directory> Function() _documentsDirectoryProvider;
   final DateTime Function() _clock;
@@ -183,6 +196,12 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
   }
 
   @override
+  Future<InstagramPostInfo> inspectInstagram(String url) {
+    _ensureNotDisposed();
+    return _instagramService.inspect(url);
+  }
+
+  @override
   Future<DiscoverDownloadItem> enqueueYoutube({
     required YoutubeVideoInfo info,
     required YoutubeFormatOption format,
@@ -245,6 +264,90 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
     );
     await _addAndPersist(item);
     _startJob(id, () => _runYoutube(id, info, selectedFormat));
+    return item;
+  }
+
+  @override
+  Future<DiscoverDownloadItem> enqueueInstagram({
+    required InstagramPostInfo info,
+    required InstagramMediaOption media,
+    required bool permittedContentAcknowledged,
+    String? outputFileName,
+  }) async {
+    await initialize();
+    if (!permittedContentAcknowledged) {
+      throw StateError(
+        'Confirm that you own the content or have permission to download it.',
+      );
+    }
+    final parsed = InstagramDownloadService.parseUrl(info.canonicalUrl);
+    if (parsed == null || parsed.shortcode != info.shortcode) {
+      throw const FormatException(
+        'The inspected Instagram URL and post identifier do not match.',
+      );
+    }
+    final selected = info.media.where(
+      (candidate) => candidate.id == media.id && candidate.url == media.url,
+    );
+    if (selected.isEmpty) {
+      throw ArgumentError('The selected media does not belong to this post.');
+    }
+    final selectedMedia = selected.first;
+    if (selectedMedia.kind != DiscoverMediaKind.video &&
+        selectedMedia.kind != DiscoverMediaKind.image) {
+      throw ArgumentError('Instagram downloads must be an image or video.');
+    }
+    final id = _uniqueId();
+    final sourceUri = _validatedHttpsUri(selectedMedia.url);
+    final canonicalUri = _validatedHttpsUri(info.canonicalUrl);
+    final requestedName = outputFileName?.trim().isNotEmpty == true
+        ? outputFileName!.trim()
+        : info.title;
+    final fileName = _fileNameFor(
+      id: id,
+      requestedName: requestedName,
+      sourceUri: sourceUri,
+      kind: selectedMedia.kind,
+      mimeType: selectedMedia.mimeType,
+      preferredExtension: _instagramExtension(selectedMedia),
+    );
+    final now = _clock().toUtc();
+    final request = DiscoverDownloadRequest(
+      url: sourceUri.toString(),
+      displayName: _boundedDisplayName(requestedName),
+      kind: selectedMedia.kind,
+      pageUrl: canonicalUri.toString(),
+      headers: InstagramDownloadService.downloadHeaders(
+        canonicalUri.toString(),
+      ),
+      mimeType: selectedMedia.mimeType,
+      metadata: <String, dynamic>{
+        'instagramShortcode': info.shortcode,
+        'instagramMediaId': selectedMedia.id,
+      },
+    );
+    final item = DiscoverDownloadItem(
+      id: id,
+      source: DiscoverDownloadSource.instagram,
+      status: DiscoverDownloadStatus.queued,
+      sourceUrl: canonicalUri.toString(),
+      pageUrl: canonicalUri.toString(),
+      displayName: request.displayName,
+      fileName: fileName,
+      mimeType: selectedMedia.mimeType,
+      kind: selectedMedia.kind,
+      receivedBytes: 0,
+      createdAt: now,
+      updatedAt: now,
+      metadata: <String, dynamic>{
+        'instagramInfo': info.toJson(),
+        'instagramMedia': selectedMedia.toJson(),
+        'permittedContentAcknowledged': true,
+      },
+    );
+    _directRequests[id] = request;
+    await _addAndPersist(item);
+    _startJob(id, () => _runDirect(id, request));
     return item;
   }
 
@@ -593,7 +696,7 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
       status: DiscoverDownloadStatus.queued,
       receivedBytes: 0,
       updatedAt: _clock().toUtc(),
-      clearTotalBytes: item.source == DiscoverDownloadSource.direct,
+      clearTotalBytes: item.source != DiscoverDownloadSource.youtube,
       clearLocalPath: true,
       clearErrorMessage: true,
     );
@@ -612,6 +715,52 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
           );
       _directRequests[id] = request;
       _startJob(id, () => _runDirect(id, request));
+      return;
+    }
+    if (item.source == DiscoverDownloadSource.instagram) {
+      final infoJson = item.metadata['instagramInfo'];
+      final mediaJson = item.metadata['instagramMedia'];
+      final acknowledged =
+          item.metadata['permittedContentAcknowledged'] == true;
+      if (infoJson is! Map || mediaJson is! Map || !acknowledged) {
+        await _markFailed(
+          id,
+          'This Instagram download cannot be safely retried.',
+        );
+        return;
+      }
+      try {
+        final storedMedia = InstagramMediaOption.fromJson(
+          _stringKeyedMap(mediaJson),
+        );
+        final refreshed = await _instagramService.inspect(item.sourceUrl);
+        final mediaIndex = int.tryParse(storedMedia.id.split('-').last);
+        final refreshedMedia = refreshed.media.firstWhere(
+          (candidate) =>
+              candidate.id == storedMedia.id ||
+              (mediaIndex != null &&
+                  refreshed.media.indexOf(candidate) == mediaIndex &&
+                  candidate.kind == storedMedia.kind),
+          orElse: () => refreshed.media.firstWhere(
+            (candidate) => candidate.kind == storedMedia.kind,
+          ),
+        );
+        final request = DiscoverDownloadRequest(
+          url: refreshedMedia.url,
+          displayName: item.displayName,
+          kind: refreshedMedia.kind,
+          pageUrl: refreshed.canonicalUrl,
+          headers: InstagramDownloadService.downloadHeaders(
+            refreshed.canonicalUrl,
+          ),
+          mimeType: refreshedMedia.mimeType,
+          metadata: item.metadata,
+        );
+        _directRequests[id] = request;
+        _startJob(id, () => _runDirect(id, request));
+      } catch (error) {
+        await _markFailed(id, _friendlyError(error));
+      }
       return;
     }
     final infoJson = item.metadata['youtubeInfo'];
@@ -1163,6 +1312,15 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
     return format.container == 'webm' ? 'video/webm' : 'video/mp4';
   }
 
+  static String _instagramExtension(InstagramMediaOption media) {
+    final uri = Uri.tryParse(media.url);
+    final extension = uri == null
+        ? ''
+        : p.extension(uri.path).replaceFirst('.', '');
+    if (_safeExtension(extension) != null) return extension;
+    return media.kind == DiscoverMediaKind.video ? 'mp4' : 'jpg';
+  }
+
   static List<DiscoverDownloadItem> _sortItems(
     Iterable<DiscoverDownloadItem> items,
   ) {
@@ -1250,6 +1408,7 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
       }
     }
     _youtubeService.dispose();
+    _instagramService.dispose();
     _lastProgressEmitMicros.clear();
     _progressClock.stop();
     unawaited(_itemsController.close());

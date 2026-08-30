@@ -286,7 +286,10 @@ EditorTimeline unlinkSeparatedAudioForTesting({
               clip.linkedClipId == null) {
             return clip;
           }
-          return clip.copyWith(clearLinkedClipId: true);
+          return clip.copyWith(
+            separatedFromClipId: clip.separatedAudioSourceClipId,
+            clearLinkedClipId: true,
+          );
         }).toList(),
       );
     }).toList(),
@@ -330,9 +333,17 @@ EditorTimeline relinkSeparatedAudioForTesting({
       audio.assetId != video.assetId) {
     throw StateError('Audio can only be relinked to its source video asset.');
   }
+  final sourceVideoId = audio.separatedAudioSourceClipId;
+  if (sourceVideoId != null && sourceVideoId != video.id) {
+    throw StateError(
+      'Audio can only be relinked to its original source video.',
+    );
+  }
   for (final track in timeline.tracks) {
     for (final candidate in track.clips) {
-      if (candidate.id != audio.id && candidate.linkedClipId == video.id) {
+      if (candidate.id != audio.id &&
+          candidate.type == TimelineTrackType.audio &&
+          candidate.separatedAudioSourceClipId == video.id) {
         throw StateError('That video already has a separated audio clip.');
       }
     }
@@ -348,7 +359,10 @@ EditorTimeline relinkSeparatedAudioForTesting({
         clips: track.clips.map((clip) {
           if (clip.id == audio!.id) return linkedAudio;
           if (clip.id == video!.id) {
-            return clip.copyWith(audioMix: clip.audioMix.copyWith(muted: true));
+            return clip.copyWith(
+              embeddedAudioSeparated: true,
+              audioMix: clip.audioMix.copyWith(muted: true),
+            );
           }
           return clip;
         }).toList(),
@@ -374,9 +388,9 @@ EditorTimeline reattachSeparatedAudioForTesting({
       break;
     }
   }
-  final videoId = audio?.linkedClipId;
+  final videoId = audio?.separatedAudioSourceClipId;
   if (audioTrack == null || audio == null || videoId == null) {
-    throw StateError('Relink this audio to its source video first.');
+    throw StateError('The original source-video relationship is unavailable.');
   }
   TimelineTrack? videoTrack;
   TimelineClip? video;
@@ -431,6 +445,7 @@ EditorTimeline reattachSeparatedAudioForTesting({
     clearLoudnessAnalysis: true,
   );
   final restoredVideo = video.copyWith(
+    embeddedAudioSeparated: false,
     audioMix: restoredMix,
     effectStack: EditorEffectStack(
       effects: [
@@ -573,6 +588,7 @@ bool isExactSeparatedAudioTransportMirror({
   return video.type == TimelineTrackType.video &&
       audio.type == TimelineTrackType.audio &&
       audio.linkedClipId == video.id &&
+      audio.separatedAudioSourceClipId == video.id &&
       audio.assetId == video.assetId &&
       audio.startTime == video.startTime &&
       audio.endTime == video.endTime &&
@@ -590,7 +606,7 @@ bool isExactSeparatedAudioTransportMirror({
     for (final track in timeline.tracks) {
       for (final candidate in track.clips) {
         if (candidate.type == TimelineTrackType.audio &&
-            candidate.linkedClipId == clip.id) {
+            candidate.separatedAudioSourceClipId == clip.id) {
           return (track: track, clip: candidate);
         }
       }
@@ -610,6 +626,7 @@ TimelineClip syncSeparatedAudioTransport({
 }) {
   return audio.copyWith(
     linkedClipId: linkedClipId ?? updatedVideo.id,
+    separatedFromClipId: updatedVideo.id,
     startTime: updatedVideo.startTime,
     endTime: updatedVideo.endTime,
     sourceStartTime: updatedVideo.sourceStartTime,
@@ -624,6 +641,7 @@ TimelineClip restoreAttachedAudioForDuplicate({
   required TimelineClip separatedAudio,
 }) {
   return duplicateVideo.copyWith(
+    embeddedAudioSeparated: false,
     audioMix: separatedAudio.audioMix,
     autoDuck: separatedAudio.autoDuck,
     duckAmount: separatedAudio.duckAmount,
@@ -4312,7 +4330,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           .where(
             (candidate) =>
                 candidate.type == TimelineTrackType.audio &&
-                candidate.linkedClipId == liveVideo.id,
+                candidate.separatedAudioSourceClipId == liveVideo.id,
           )
           .firstOrNull;
       if (existing != null) {
@@ -4326,6 +4344,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         return false;
       }
     }
+    if (liveVideo.embeddedAudioSeparated) {
+      SnackBarHelper.showInfo(
+        context,
+        'This video audio was already separated and is no longer attached.',
+      );
+      return false;
+    }
 
     final audioProbe = TimelineClip(
       trackId: '',
@@ -4333,6 +4358,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       label: '${liveVideo.label} audio',
       assetId: liveVideo.assetId,
       linkedClipId: liveVideo.id,
+      separatedFromClipId: liveVideo.id,
       startTime: liveVideo.startTime,
       endTime: liveVideo.endTime,
       sourceStartTime: liveVideo.sourceStartTime,
@@ -4382,6 +4408,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               .map(
                 (candidate) => candidate.id == liveVideo.id
                     ? candidate.copyWith(
+                        embeddedAudioSeparated: true,
                         audioMix: candidate.audioMix.copyWith(muted: true),
                         effectStack: EditorEffectStack(
                           effects: candidate.effectStack.effects
@@ -4475,6 +4502,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       startTime: newStart,
       endTime: newStart + clip.duration,
       clearLinkedClipId: true,
+      clearSeparatedFromClipId: true,
+      embeddedAudioSeparated: false,
       effectStack: clip.effectStack.cloneWithNewIds(),
       clearGroupId: true,
       clearCompoundId: true,
@@ -4542,7 +4571,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final nextTracks = timeline.tracks.map((candidate) {
       if (candidate.id != track.id && candidate.isLocked) {
         final dependentClips = candidate.clips
-            .where((item) => item.linkedClipId != clip.id)
+            .where(
+              (item) =>
+                  item.linkedClipId != clip.id &&
+                  item.separatedAudioSourceClipId != clip.id,
+            )
             .toList();
         return dependentClips.length == candidate.clips.length
             ? candidate
@@ -4552,7 +4585,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           .where(
             (item) =>
                 item.id != clip.id &&
-                (item.linkedClipId == null || item.linkedClipId != clip.id),
+                (item.linkedClipId == null || item.linkedClipId != clip.id) &&
+                item.separatedAudioSourceClipId != clip.id,
           )
           .toList();
       return candidate.copyWith(clips: clips);
@@ -9204,13 +9238,22 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
 
   Future<void> _relinkSeparatedAudio(TimelineClip audio) async {
     final timeline = ref.read(editorProvider).timeline;
+    final sourceVideoId = audio.separatedAudioSourceClipId;
     final candidates = <TimelineClip>[];
     for (final track in timeline.tracks) {
       for (final clip in track.clips) {
         if (clip.type == TimelineTrackType.video &&
             clip.assetId != null &&
             clip.assetId == audio.assetId &&
-            _separatedAudioForVideo(timeline, clip.id) == null) {
+            (sourceVideoId == null || clip.id == sourceVideoId) &&
+            !timeline.tracks.any(
+              (candidateTrack) => candidateTrack.clips.any(
+                (candidate) =>
+                    candidate.id != audio.id &&
+                    candidate.type == TimelineTrackType.audio &&
+                    candidate.separatedAudioSourceClipId == clip.id,
+              ),
+            )) {
           candidates.add(clip);
         }
       }
@@ -9253,7 +9296,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   void _reattachSeparatedAudio(TimelineClip audio) {
-    final linkedVideoId = audio.linkedClipId;
+    final linkedVideoId = audio.separatedAudioSourceClipId;
     try {
       final next = reattachSeparatedAudioForTesting(
         timeline: ref.read(editorProvider).timeline,
@@ -11488,7 +11531,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final audioTrack = audioOwner?.track;
     final asset = timeline.assetForClip(clip);
     final separatedAudio = _separatedAudioForVideo(timeline, clip.id);
-    final hasSeparatedAudio = separatedAudio != null;
+    final hasSeparatedAudio =
+        separatedAudio != null || clip.embeddedAudioSeparated;
     final provenance = asset?.metadata['provenance'];
     final rawAttribution =
         asset?.metadata['attribution'] ??
@@ -11595,27 +11639,35 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               width: double.infinity,
               child: OutlinedButton.icon(
                 key: ValueKey(
-                  hasSeparatedAudio
+                  separatedAudio != null
                       ? 'edit-separated-video-audio'
+                      : clip.embeddedAudioSeparated
+                      ? 'video-audio-already-separated'
                       : 'separate-video-audio',
                 ),
-                onPressed: hasSeparatedAudio
+                onPressed: separatedAudio != null
                     ? () {
                         ref.read(editorProvider.notifier)
                           ..selectTrack(separatedAudio.track.id)
                           ..selectClip(separatedAudio.clip.id);
                         Navigator.of(context).maybePop();
                       }
+                    : clip.embeddedAudioSeparated
+                    ? null
                     : () => _separateVideoAudio(clip),
                 icon: Icon(
-                  hasSeparatedAudio
+                  separatedAudio != null
                       ? Icons.graphic_eq_rounded
+                      : clip.embeddedAudioSeparated
+                      ? Icons.check_circle_outline_rounded
                       : Icons.call_split_rounded,
                   size: 18,
                 ),
                 label: Text(
-                  hasSeparatedAudio
+                  separatedAudio != null
                       ? 'Edit separated audio'
+                      : clip.embeddedAudioSeparated
+                      ? 'Audio already separated'
                       : 'Separate audio to its own track',
                 ),
               ),
@@ -11623,7 +11675,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             const SizedBox(height: 4),
             Text(
               hasSeparatedAudio
-                  ? 'This video is muted to prevent duplicate playback. Volume, fades, pan, and mute now belong to the linked audio clip.'
+                  ? separatedAudio != null
+                        ? 'This video is muted to prevent duplicate playback. Volume, fades, pan, and effects belong to its separated audio clip.'
+                        : 'The original audio was separated and is no longer attached to this video.'
                   : 'Video audio stays attached by default. Separate it only when you need independent timeline controls.',
               style: TextStyle(
                 color: kTextSecondary,
@@ -11633,7 +11687,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             ),
             const SizedBox(height: 8),
           ],
-          if (clip.type == TimelineTrackType.audio) ...[
+          if (clip.type == TimelineTrackType.audio &&
+              clip.separatedAudioSourceClipId != null) ...[
             Row(
               children: [
                 Expanded(
@@ -11656,7 +11711,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                     ),
                   ),
                 ),
-                if (clip.linkedClipId != null) ...[
+                if (clip.separatedAudioSourceClipId != null) ...[
                   const SizedBox(width: 8),
                   Expanded(
                     child: OutlinedButton.icon(
@@ -11673,7 +11728,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               padding: const EdgeInsets.only(bottom: 8),
               child: Text(
                 clip.linkedClipId == null
-                    ? 'Relinking restores synchronized transport with the original video.'
+                    ? 'Relink to restore synchronized transport, or reattach the processed audio to its original video.'
                     : 'Unlink to edit transport independently, or reattach the processed audio to the video clip.',
                 style: const TextStyle(color: kTextSecondary, fontSize: 9),
               ),
@@ -12670,7 +12725,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     for (final track in timeline.tracks) {
       for (final clip in track.clips) {
         if (clip.type == TimelineTrackType.audio &&
-            clip.linkedClipId == videoClipId) {
+            clip.separatedAudioSourceClipId == videoClipId) {
           return (track: track, clip: clip);
         }
       }

@@ -8,9 +8,10 @@ enum DiscoverMediaOrigin {
   link,
   direct,
   youtube,
+  instagram,
 }
 
-enum DiscoverDownloadSource { direct, youtube }
+enum DiscoverDownloadSource { direct, youtube, instagram }
 
 enum DiscoverDownloadStatus {
   queued,
@@ -299,6 +300,104 @@ class YoutubeVideoInfo {
                 )
                 .toList(growable: false)
           : const <YoutubeFormatOption>[],
+    );
+  }
+}
+
+class InstagramMediaOption {
+  const InstagramMediaOption({
+    required this.id,
+    required this.url,
+    required this.kind,
+    this.mimeType,
+    this.thumbnailUrl,
+    this.width,
+    this.height,
+  });
+
+  final String id;
+  final String url;
+  final DiscoverMediaKind kind;
+  final String? mimeType;
+  final String? thumbnailUrl;
+  final int? width;
+  final int? height;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'id': id,
+    'url': url,
+    'kind': kind.name,
+    if (mimeType != null) 'mimeType': mimeType,
+    if (thumbnailUrl != null) 'thumbnailUrl': thumbnailUrl,
+    if (width != null) 'width': width,
+    if (height != null) 'height': height,
+  };
+
+  factory InstagramMediaOption.fromJson(Map<String, dynamic> json) {
+    return InstagramMediaOption(
+      id: json['id']?.toString() ?? '',
+      url: json['url']?.toString() ?? '',
+      kind: _enumValue(
+        DiscoverMediaKind.values,
+        json['kind'],
+        DiscoverMediaKind.unknown,
+      ),
+      mimeType: json['mimeType']?.toString(),
+      thumbnailUrl: json['thumbnailUrl']?.toString(),
+      width: _nullableInt(json['width']),
+      height: _nullableInt(json['height']),
+    );
+  }
+}
+
+class InstagramPostInfo {
+  const InstagramPostInfo({
+    required this.shortcode,
+    required this.canonicalUrl,
+    required this.title,
+    required this.author,
+    required this.isReel,
+    required this.media,
+    this.thumbnailUrl,
+  });
+
+  final String shortcode;
+  final String canonicalUrl;
+  final String title;
+  final String author;
+  final bool isReel;
+  final String? thumbnailUrl;
+  final List<InstagramMediaOption> media;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'shortcode': shortcode,
+    'canonicalUrl': canonicalUrl,
+    'title': title,
+    'author': author,
+    'isReel': isReel,
+    if (thumbnailUrl != null) 'thumbnailUrl': thumbnailUrl,
+    'media': media.map((item) => item.toJson()).toList(),
+  };
+
+  factory InstagramPostInfo.fromJson(Map<String, dynamic> json) {
+    final rawMedia = json['media'];
+    return InstagramPostInfo(
+      shortcode: json['shortcode']?.toString() ?? '',
+      canonicalUrl: json['canonicalUrl']?.toString() ?? '',
+      title: json['title']?.toString() ?? 'Instagram media',
+      author: json['author']?.toString() ?? 'Instagram',
+      isReel: json['isReel'] as bool? ?? false,
+      thumbnailUrl: json['thumbnailUrl']?.toString(),
+      media: rawMedia is List
+          ? rawMedia
+                .whereType<Map>()
+                .map(
+                  (value) => InstagramMediaOption.fromJson(
+                    value.map((key, entry) => MapEntry(key.toString(), entry)),
+                  ),
+                )
+                .toList(growable: false)
+          : const <InstagramMediaOption>[],
     );
   }
 }

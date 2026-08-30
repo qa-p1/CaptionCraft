@@ -59,6 +59,37 @@ void main() {
     notifier.clearError();
     expect(notifier.state.errorMessage, isNull);
   });
+
+  test(
+    'DiscoverNotifier inspects and queues Instagram media with permission',
+    () async {
+      final facade = _FakeDiscoverFacade();
+      final notifier = DiscoverNotifier(facade);
+      addTearDown(() {
+        notifier.dispose();
+        facade.dispose();
+      });
+
+      final info = await notifier.inspectInstagram(
+        'https://www.instagram.com/reel/Caption123/',
+      );
+
+      expect(info, same(facade.instagramInfo));
+      expect(notifier.state.instagramInfo, same(facade.instagramInfo));
+      expect(notifier.state.permittedContentAcknowledged, isFalse);
+
+      notifier.setPermittedContentAcknowledged(true);
+      final queued = await notifier.enqueueInstagram(
+        info: facade.instagramInfo,
+        media: facade.instagramInfo.media.single,
+      );
+
+      expect(queued, isNotNull);
+      expect(facade.lastAcknowledgement, isTrue);
+      expect(notifier.state.permittedContentAcknowledged, isFalse);
+      expect(notifier.state.downloads.single.id, 'queued-instagram');
+    },
+  );
 }
 
 class _FakeDiscoverFacade implements DiscoverDownloadFacade {
@@ -85,6 +116,22 @@ class _FakeDiscoverFacade implements DiscoverDownloadFacade {
     ],
   );
 
+  final InstagramPostInfo instagramInfo = const InstagramPostInfo(
+    shortcode: 'Caption123',
+    canonicalUrl: 'https://www.instagram.com/reel/Caption123/',
+    title: 'Example Reel',
+    author: 'Creator',
+    isReel: true,
+    media: <InstagramMediaOption>[
+      InstagramMediaOption(
+        id: 'Caption123-0',
+        url: 'https://cdn.example.test/reel.mp4',
+        kind: DiscoverMediaKind.video,
+        mimeType: 'video/mp4',
+      ),
+    ],
+  );
+
   @override
   Stream<List<DiscoverDownloadItem>> get items => _controller.stream;
 
@@ -100,6 +147,13 @@ class _FakeDiscoverFacade implements DiscoverDownloadFacade {
     final error = inspectionError;
     if (error != null) throw error;
     return info;
+  }
+
+  @override
+  Future<InstagramPostInfo> inspectInstagram(String url) async {
+    final error = inspectionError;
+    if (error != null) throw error;
+    return instagramInfo;
   }
 
   @override
@@ -130,6 +184,25 @@ class _FakeDiscoverFacade implements DiscoverDownloadFacade {
       source: DiscoverDownloadSource.youtube,
       sourceUrl: info.canonicalUrl,
       kind: DiscoverMediaKind.video,
+    );
+    _replace(item);
+    return item;
+  }
+
+  @override
+  Future<DiscoverDownloadItem> enqueueInstagram({
+    required InstagramPostInfo info,
+    required InstagramMediaOption media,
+    required bool permittedContentAcknowledged,
+    String? outputFileName,
+  }) async {
+    lastAcknowledgement = permittedContentAcknowledged;
+    if (!permittedContentAcknowledged) throw StateError('permission required');
+    final item = _item(
+      id: 'queued-instagram',
+      source: DiscoverDownloadSource.instagram,
+      sourceUrl: info.canonicalUrl,
+      kind: media.kind,
     );
     _replace(item);
     return item;

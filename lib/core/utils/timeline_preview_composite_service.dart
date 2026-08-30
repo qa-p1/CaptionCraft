@@ -231,6 +231,8 @@ class TimelinePreviewCompositeService {
               selected[index].asset?.metadata['colorTransfer'] as String?,
           colorSpace: selected[index].asset?.metadata['colorSpace'] as String?,
           colorRange: selected[index].asset?.metadata['colorRange'] as String?,
+          pixelFormat:
+              selected[index].asset?.metadata['pixelFormat'] as String?,
           bitDepth: selected[index].asset?.metadata['bitDepth'] as int?,
           audioStreamCount:
               selected[index].asset?.metadata['audioStreamCount'] as int?,

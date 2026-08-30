@@ -156,6 +156,31 @@ VideoPlayerOptions buildPreviewVideoPlayerOptions() {
   return VideoPlayerOptions(mixWithOthers: true);
 }
 
+@visibleForTesting
+bool previewTransportCanPlayForTesting({
+  required int requestRevision,
+  required int currentRevision,
+  required bool requestedPlaying,
+  required bool playRequested,
+  required bool suspendedByLifecycle,
+}) {
+  return requestRevision == currentRevision &&
+      requestedPlaying &&
+      playRequested &&
+      !suspendedByLifecycle;
+}
+
+Future<void> _pausePreviewController(VideoPlayerController? controller) async {
+  try {
+    if (controller?.value.isInitialized == true &&
+        controller!.value.isPlaying) {
+      await controller.pause();
+    }
+  } catch (_) {
+    // Controller ownership can change while a platform pause is pending.
+  }
+}
+
 const int _maxPreviewDecodeDimension = 2048;
 const int _maxGifDecodeDimension = 1280;
 const int _maxGifDecodedBytes = 24 * 1024 * 1024;
@@ -358,7 +383,7 @@ bool previewHasExplicitLinkedAudioForTesting({
         track.clips.any(
           (candidate) =>
               candidate.type == TimelineTrackType.audio &&
-              candidate.linkedClipId == visualClip.id &&
+              candidate.separatedAudioSourceClipId == visualClip.id &&
               candidate.assetId != null &&
               candidate.assetId == visualClip.assetId,
         ),
@@ -380,6 +405,7 @@ bool previewVisualUsesEmbeddedAudioForTesting({
 }) {
   if (!visualClip.enabled ||
       visualClip.type != TimelineTrackType.video ||
+      visualClip.embeddedAudioSeparated ||
       visualClip.audioMix.muted ||
       visualTrack.isMuted ||
       (hasSoloMediaTrack && !visualTrack.isSolo) ||
@@ -869,6 +895,8 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   bool? _queuedSeekAutoplay;
   bool _queuedSeekForce = false;
   bool _queuedSeekPreserveClock = true;
+  int? _queuedSeekTransportRevision;
+  int _transportRevision = 0;
   String? _previewError;
   Timer? _playbackTicker;
   final Stopwatch _timelineClock = Stopwatch();
@@ -893,6 +921,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   Timer? _previewAudioMixDebounce;
   int _previewAudioMixGeneration = 0;
   bool _previewAudioMixBuilding = false;
+  bool _previewAudioMixPending = false;
   bool _previewAudioMixSyncInFlight = false;
   bool _previewAudioMixSyncQueued = false;
   bool _previewAudioMixForceSeekQueued = false;
@@ -1032,6 +1061,11 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         _activePreviewAudioMixFingerprint == _plannedPreviewAudioMixFingerprint;
   }
 
+  bool get _previewAudioShouldMuteFallback =>
+      _previewAudioMixPending ||
+      _previewAudioMixBuilding ||
+      _previewAudioMixLiveEditPending;
+
   void _ensurePreviewAudioMixPlan(
     EditorTimeline timeline,
     int editRevision,
@@ -1047,11 +1081,16 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         !identical(_previewAudioPlanTimeline, timeline)) {
       if (!_previewAudioMixLiveEditPending) {
         _previewAudioMixLiveEditPending = true;
+        _previewAudioMixPending = true;
         _previewAudioMixDebounce?.cancel();
         final generation = ++_previewAudioMixGeneration;
         if (_previewAudioMixController != null || _previewAudioMixBuilding) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted) unawaited(_clearPreviewAudioMix(generation));
+            if (mounted) {
+              unawaited(
+                _clearPreviewAudioMix(generation, preservePending: true),
+              );
+            }
           });
         }
       }
@@ -1070,6 +1109,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       fileExists: _cachedFileExists,
     );
     if (plan == null) {
+      _previewAudioMixPending = false;
       _plannedPreviewAudioMixFingerprint = null;
       _previewAudioMixFailureFingerprint = null;
       _previewAudioMixFailureCount = 0;
@@ -1091,6 +1131,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         _previewAudioMixError = null;
       }
       _plannedPreviewAudioMixFingerprint = plan.fingerprint;
+      _previewAudioMixPending = false;
       return;
     }
     if (plan.fingerprint == _plannedPreviewAudioMixFingerprint) return;
@@ -1100,13 +1141,16 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     }
 
     _plannedPreviewAudioMixFingerprint = plan.fingerprint;
+    _previewAudioMixPending = true;
     _previewAudioMixDebounce?.cancel();
     final generation = ++_previewAudioMixGeneration;
     // Never keep an out-of-date rendered bus audible while an audio edit is
     // being rebuilt. The per-clip fallback resumes for this short window.
     if (_previewAudioMixController != null || _previewAudioMixBuilding) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) unawaited(_clearPreviewAudioMix(generation));
+        if (mounted) {
+          unawaited(_clearPreviewAudioMix(generation, preservePending: true));
+        }
       });
     }
     _previewAudioMixDebounce = Timer(const Duration(milliseconds: 650), () {
@@ -1114,7 +1158,10 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     });
   }
 
-  Future<void> _clearPreviewAudioMix(int generation) async {
+  Future<void> _clearPreviewAudioMix(
+    int generation, {
+    bool preservePending = false,
+  }) async {
     if (!mounted || generation != _previewAudioMixGeneration) return;
     final previous = _previewAudioMixController;
     if (previous != null) {
@@ -1124,6 +1171,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     _activePreviewAudioMixFingerprint = null;
     _previewAudioMixResult = null;
     _previewAudioMixBuilding = false;
+    if (!preservePending) _previewAudioMixPending = false;
     _previewAudioMixSyncInFlight = false;
     _previewAudioMixSyncQueued = false;
     _previewAudioMixForceSeekQueued = false;
@@ -1146,6 +1194,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     if (!mounted || generation != _previewAudioMixGeneration) return;
     setState(() {
       _previewAudioMixBuilding = true;
+      _previewAudioMixPending = true;
       _previewAudioMixError = null;
     });
     VideoPlayerController? created;
@@ -1168,6 +1217,9 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       await created.setPlaybackSpeed(_playbackSpeed);
       if (_playRequested && !_playbackSuspendedByLifecycle) {
         await created.play();
+        if (!_playRequested || _playbackSuspendedByLifecycle) {
+          await _pausePreviewController(created);
+        }
       }
       if (!mounted || generation != _previewAudioMixGeneration) {
         await created.dispose();
@@ -1180,6 +1232,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       _activePreviewAudioMixFingerprint = result.fingerprint;
       _previewAudioMixResult = result;
       _previewAudioMixBuilding = false;
+      _previewAudioMixPending = false;
       _previewAudioMixError = null;
       _previewAudioMixFailureFingerprint = null;
       _previewAudioMixFailureCount = 0;
@@ -1248,6 +1301,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       _activePreviewAudioMixFingerprint = null;
       _previewAudioMixResult = null;
       _previewAudioMixBuilding = false;
+      _previewAudioMixPending = false;
       _previewAudioMixSyncInFlight = false;
       _previewAudioMixSyncQueued = false;
       _previewAudioMixForceSeekQueued = false;
@@ -1333,13 +1387,21 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
           .clamp(0, controller.value.duration.inMilliseconds)
           .toInt(),
     );
-    final shouldPlay = _playRequested && !_playbackSuspendedByLifecycle;
+    final requestTransportRevision = _transportRevision;
+    final requestedPlaying = _playRequested;
+    bool shouldPlayNow() => previewTransportCanPlayForTesting(
+      requestRevision: requestTransportRevision,
+      currentRevision: _transportRevision,
+      requestedPlaying: requestedPlaying,
+      playRequested: _playRequested,
+      suspendedByLifecycle: _playbackSuspendedByLifecycle,
+    );
     final now = DateTime.now();
     final lastCorrection = _lastPreviewAudioMixDriftCorrectionAt;
     final decision = decidePreviewMediaSync(
       timelineTarget: target,
       decoderPosition: controller.value.position,
-      isPlaying: shouldPlay,
+      isPlaying: shouldPlayNow(),
       isAudible: true,
       isBuffering: controller.value.isBuffering,
       forceSeek: forceSeek,
@@ -1365,10 +1427,15 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       if (!stillOwnsController()) return;
       _lastPreviewAudioMixPlaybackSpeed = _playbackSpeed;
     }
-    if (shouldPlay && !controller.value.isPlaying) {
+    if (shouldPlayNow() && !controller.value.isPlaying) {
       await controller.play();
-    } else if (!shouldPlay && controller.value.isPlaying) {
+    } else if (!shouldPlayNow() && controller.value.isPlaying) {
       await controller.pause();
+    }
+    if (stillOwnsController() &&
+        !shouldPlayNow() &&
+        controller.value.isPlaying) {
+      await _pausePreviewController(controller);
     }
     if (stillOwnsController()) _reportPreviewAudioMixDiagnostics(controller);
   }
@@ -1735,10 +1802,16 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         if (!_playbackSuspendedByLifecycle) return;
         _playbackSuspendedByLifecycle = false;
         if (!_playRequested || !mounted) return;
+        final transportRevision = ++_transportRevision;
         final position = ref.read(playbackProvider).position;
         _anchorTimelineClock(position);
         unawaited(
-          _seekTimelinePosition(position, autoplay: true, forceSeek: true),
+          _seekTimelinePosition(
+            position,
+            autoplay: true,
+            forceSeek: true,
+            transportRevision: transportRevision,
+          ),
         );
         break;
       case AppLifecycleState.inactive:
@@ -1746,6 +1819,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       case AppLifecycleState.paused:
       case AppLifecycleState.detached:
         if (_playbackSuspendedByLifecycle || !_playRequested) return;
+        _transportRevision++;
         _playbackSuspendedByLifecycle = true;
         final timeline = ref.read(editorProvider).timeline;
         final position = _timelineClockPosition(timeline);
@@ -1892,6 +1966,15 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     _lastBaseFollowerSyncAt = now;
     _baseFollowerSyncInFlight = true;
     final generation = _controllerGeneration;
+    final requestTransportRevision = _transportRevision;
+    final requestedPlaying = _playRequested;
+    bool shouldPlayNow() => previewTransportCanPlayForTesting(
+      requestRevision: requestTransportRevision,
+      currentRevision: _transportRevision,
+      requestedPlaying: requestedPlaying,
+      playRequested: _playRequested,
+      suspendedByLifecycle: _playbackSuspendedByLifecycle,
+    );
     try {
       final target = _sourceTargetForClip(clip, timelinePosition);
       final lastCorrection = _lastBaseDriftCorrectionAt;
@@ -1915,10 +1998,11 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
           !identical(controller, _controller)) {
         return;
       }
-      if (_playRequested &&
-          !_playbackSuspendedByLifecycle &&
-          !controller.value.isPlaying) {
+      if (shouldPlayNow() && !controller.value.isPlaying) {
         await controller.play();
+      }
+      if (!shouldPlayNow() && controller.value.isPlaying) {
+        await _pausePreviewController(controller);
       }
     } catch (_) {
       // A follower may be replaced while a platform seek is in flight.
@@ -1983,15 +2067,15 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   void _togglePlayPause() {
     final playback = ref.read(playbackProvider);
     if (_playRequested) {
+      _transportRevision++;
       final current = _timelineClockPosition(ref.read(editorProvider).timeline);
       _playRequested = false;
       _anchorTimelineClock(current);
-      unawaited(_controller?.pause());
-      unawaited(_previewAudioMixController?.pause());
       _stopPlaybackTicker();
       ref.read(playbackProvider.notifier)
         ..updatePosition(current)
         ..setPlaying(false);
+      unawaited(_pauseOwnedTransportControllers());
       _schedulePreviewAudioMixSync(
         target: current,
         forceSeek: true,
@@ -2007,6 +2091,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       final startPosition = playback.position >= playback.duration
           ? Duration.zero
           : playback.position;
+      final transportRevision = ++_transportRevision;
       _playRequested = true;
       _anchorTimelineClock(startPosition);
       _startPlaybackTicker();
@@ -2015,13 +2100,33 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
           startPosition,
           autoplay: true,
           forceSeek: playback.position >= playback.duration,
+          transportRevision: transportRevision,
         ),
       );
     }
   }
 
+  Future<void> _pauseOwnedTransportControllers() async {
+    final controllers = <VideoPlayerController?>[
+      _controller,
+      _previewAudioMixController,
+    ];
+    await Future.wait(
+      controllers.whereType<VideoPlayerController>().map((controller) async {
+        try {
+          if (controller.value.isInitialized && controller.value.isPlaying) {
+            await controller.pause();
+          }
+        } catch (_) {
+          // A clip switch can replace a platform controller while pausing.
+        }
+      }),
+    );
+  }
+
   void _seekTo(Duration position) {
     if (!_initialized) return;
+    _transportRevision++;
     ref.read(playbackProvider.notifier).requestSeek(position);
   }
 
@@ -2229,14 +2334,18 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     bool? autoplay,
     bool forceSeek = false,
     bool preserveTimelineClock = false,
+    int? transportRevision,
   }) async {
     if (!_initialized || !mounted) return;
+    final requestTransportRevision = transportRevision ?? _transportRevision;
+    if (requestTransportRevision != _transportRevision) return;
     if (_isSwitchingClip) {
       _queuedSeekPosition = requested;
       _queuedSeekAutoplay = autoplay;
       _queuedSeekForce = _queuedSeekForce || forceSeek;
       _queuedSeekPreserveClock =
           _queuedSeekPreserveClock && preserveTimelineClock;
+      _queuedSeekTransportRevision = requestTransportRevision;
       return;
     }
     final timeline = ref.read(editorProvider).timeline;
@@ -2255,6 +2364,14 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         ? playbackRange.start
         : requestedTarget;
     _playRequested = shouldPlay;
+    bool shouldPlayNow() => previewTransportCanPlayForTesting(
+      requestRevision: requestTransportRevision,
+      currentRevision: _transportRevision,
+      requestedPlaying: shouldPlay,
+      playRequested: _playRequested,
+      suspendedByLifecycle: _playbackSuspendedByLifecycle,
+    );
+    bool requestIsCurrent() => requestTransportRevision == _transportRevision;
     _schedulePreviewAudioMixSync(
       target: target,
       forceSeek: forceSeek || !shouldPlay,
@@ -2277,15 +2394,19 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       if (controller?.value.isPlaying == true) {
         await controller!.pause();
       }
-      final playNow = shouldPlay && !_playbackSuspendedByLifecycle;
-      final publishedPosition = playNow && preserveTimelineClock
+      final playNow = shouldPlayNow();
+      final publishedPosition = !requestIsCurrent()
+          ? ref.read(playbackProvider).position
+          : playNow && preserveTimelineClock
           ? _timelineClockPosition(timeline)
           : target;
-      playbackNotifier
-        ..updateDuration(duration)
-        ..updatePosition(publishedPosition)
-        ..setPlaying(playNow)
-        ..setReady(true);
+      if (requestIsCurrent()) {
+        playbackNotifier
+          ..updateDuration(duration)
+          ..updatePosition(publishedPosition)
+          ..setPlaying(playNow)
+          ..setReady(true);
+      }
       if (mounted) setState(() {});
       if (playNow) _startPlaybackTicker();
       return;
@@ -2316,15 +2437,19 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         _previewError =
             'Media is missing for "${clip.label}". Relink it first.';
       }
-      final playNow = shouldPlay && !_playbackSuspendedByLifecycle;
-      final publishedPosition = playNow && preserveTimelineClock
+      final playNow = shouldPlayNow();
+      final publishedPosition = !requestIsCurrent()
+          ? ref.read(playbackProvider).position
+          : playNow && preserveTimelineClock
           ? _timelineClockPosition(timeline)
           : target;
-      playbackNotifier
-        ..updateDuration(duration)
-        ..updatePosition(publishedPosition)
-        ..setPlaying(playNow)
-        ..setReady(true);
+      if (requestIsCurrent()) {
+        playbackNotifier
+          ..updateDuration(duration)
+          ..updatePosition(publishedPosition)
+          ..setPlaying(playNow)
+          ..setReady(true);
+      }
       if (mounted) setState(() {});
       if (previous != null) {
         unawaited(() async {
@@ -2354,15 +2479,19 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       _lastBasePlaybackSpeed = null;
       _lastBaseDriftCorrectionAt = null;
       _previewError = 'Media is missing for "${clip.label}". Relink it first.';
-      final playNow = shouldPlay && !_playbackSuspendedByLifecycle;
-      final publishedPosition = playNow && preserveTimelineClock
+      final playNow = shouldPlayNow();
+      final publishedPosition = !requestIsCurrent()
+          ? ref.read(playbackProvider).position
+          : playNow && preserveTimelineClock
           ? _timelineClockPosition(timeline)
           : target;
-      playbackNotifier
-        ..updateDuration(duration)
-        ..updatePosition(publishedPosition)
-        ..setPlaying(playNow)
-        ..setReady(true);
+      if (requestIsCurrent()) {
+        playbackNotifier
+          ..updateDuration(duration)
+          ..updatePosition(publishedPosition)
+          ..setPlaying(playNow)
+          ..setReady(true);
+      }
       if (mounted) setState(() {});
       if (unavailableController != null) {
         try {
@@ -2398,7 +2527,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       final decision = decidePreviewMediaSync(
         timelineTarget: sourceTarget,
         decoderPosition: currentController.value.position,
-        isPlaying: shouldPlay,
+        isPlaying: shouldPlayNow(),
         isAudible: (_lastBaseVolume ?? 0) > 0.001,
         isBuffering: currentController.value.isBuffering,
         forceSeek: forceSeek,
@@ -2422,28 +2551,32 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         }
       }
       await _applyBaseAudioVolume(target);
-      var playNow = shouldPlay && !_playbackSuspendedByLifecycle;
+      var playNow = shouldPlayNow();
       if (clip.isReversed || clip.freezeFrame) {
         if (currentController.value.isPlaying) {
           await currentController.pause();
         }
-        playNow = shouldPlay && !_playbackSuspendedByLifecycle;
+        playNow = shouldPlayNow();
       } else if (playNow && !currentController.value.isPlaying) {
         await currentController.play();
       } else if (!playNow && currentController.value.isPlaying) {
         await currentController.pause();
       }
-      playNow = shouldPlay && !_playbackSuspendedByLifecycle;
+      playNow = shouldPlayNow();
       if (!playNow && currentController.value.isPlaying) {
         await currentController.pause();
       }
-      final publishedPosition = playNow && preserveTimelineClock
+      final publishedPosition = !requestIsCurrent()
+          ? ref.read(playbackProvider).position
+          : playNow && preserveTimelineClock
           ? _timelineClockPosition(timeline)
           : target;
-      playbackNotifier
-        ..updateDuration(duration)
-        ..updatePosition(publishedPosition)
-        ..setPlaying(playNow);
+      if (requestIsCurrent()) {
+        playbackNotifier
+          ..updateDuration(duration)
+          ..updatePosition(publishedPosition)
+          ..setPlaying(playNow);
+      }
       if (playNow) _startPlaybackTicker();
       return;
     }
@@ -2491,7 +2624,8 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         nextController = null;
         return;
       }
-      final synchronizedTimelineTarget = shouldPlay && preserveTimelineClock
+      final synchronizedTimelineTarget =
+          shouldPlayNow() && preserveTimelineClock
           ? _timelineClockPosition(timeline)
           : target;
       final synchronizedSelection = _baseSelectionAt(
@@ -2539,22 +2673,26 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       _controllerPath = sourcePath;
       nextController.addListener(_onPlaybackUpdate);
       await _applyBaseAudioVolume(synchronizedTimelineTarget);
-      var playNow = shouldPlay && !_playbackSuspendedByLifecycle;
+      var playNow = shouldPlayNow();
       if (!clip.isReversed && !clip.freezeFrame) {
         if (playNow) await nextController.play();
       }
-      playNow = shouldPlay && !_playbackSuspendedByLifecycle;
+      playNow = shouldPlayNow();
       if (!playNow && nextController.value.isPlaying) {
         await nextController.pause();
       }
-      final publishedPosition = playNow && preserveTimelineClock
+      final publishedPosition = !requestIsCurrent()
+          ? ref.read(playbackProvider).position
+          : playNow && preserveTimelineClock
           ? _timelineClockPosition(timeline)
           : synchronizedTimelineTarget;
-      playbackNotifier
-        ..updateDuration(duration)
-        ..updatePosition(publishedPosition)
-        ..setPlaying(playNow)
-        ..setReady(true);
+      if (requestIsCurrent()) {
+        playbackNotifier
+          ..updateDuration(duration)
+          ..updatePosition(publishedPosition)
+          ..setPlaying(playNow)
+          ..setReady(true);
+      }
       setState(() {});
       if (playNow) _startPlaybackTicker();
     } catch (_) {
@@ -2581,15 +2719,19 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       _lastBaseVolume = null;
       _lastBasePlaybackSpeed = null;
       _previewError = 'This clip could not be decoded on this device.';
-      final playNow = shouldPlay && !_playbackSuspendedByLifecycle;
-      final publishedPosition = playNow && preserveTimelineClock
+      final playNow = shouldPlayNow();
+      final publishedPosition = !requestIsCurrent()
+          ? ref.read(playbackProvider).position
+          : playNow && preserveTimelineClock
           ? _timelineClockPosition(timeline)
           : target;
-      playbackNotifier
-        ..updateDuration(duration)
-        ..updatePosition(publishedPosition)
-        ..setPlaying(playNow)
-        ..setReady(true);
+      if (requestIsCurrent()) {
+        playbackNotifier
+          ..updateDuration(duration)
+          ..updatePosition(publishedPosition)
+          ..setPlaying(playNow)
+          ..setReady(true);
+      }
       setState(() {});
       if (playNow) _startPlaybackTicker();
     } finally {
@@ -2600,10 +2742,12 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       final queuedAutoplay = _queuedSeekAutoplay;
       final queuedForce = _queuedSeekForce;
       final queuedPreserveClock = _queuedSeekPreserveClock;
+      final queuedTransportRevision = _queuedSeekTransportRevision;
       _queuedSeekPosition = null;
       _queuedSeekAutoplay = null;
       _queuedSeekForce = false;
       _queuedSeekPreserveClock = true;
+      _queuedSeekTransportRevision = null;
       if (queuedPosition != null && mounted && !_isSwitchingClip) {
         unawaited(
           _seekTimelinePosition(
@@ -2611,6 +2755,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
             autoplay: queuedAutoplay,
             forceSeek: queuedForce,
             preserveTimelineClock: queuedPreserveClock,
+            transportRevision: queuedTransportRevision,
           ),
         );
       }
@@ -2631,19 +2776,23 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     final playbackRange = _playbackRange(timeline);
     if (timeline.workspaceSettings.loopPlayback &&
         playbackRange.end > playbackRange.start) {
+      final transportRevision = ++_transportRevision;
       await _seekTimelinePosition(
         playbackRange.start,
         autoplay: true,
         forceSeek: true,
+        transportRevision: transportRevision,
       );
       return;
     }
 
+    final transportRevision = ++_transportRevision;
     _playRequested = false;
     await _seekTimelinePosition(
       playbackRange.end,
       autoplay: false,
       forceSeek: true,
+      transportRevision: transportRevision,
     );
     _stopPlaybackTicker();
   }
@@ -2719,7 +2868,8 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     );
     final monitoredClip = linkedAudio?.clip ?? clip;
     final monitoredTrack = linkedAudio?.track ?? track;
-    final volume = _hasRenderedPreviewAudioMix
+    final volume =
+        _hasRenderedPreviewAudioMix || _previewAudioShouldMuteFallback
         ? 0.0
         : _previewAudioVolume(
             clip: monitoredClip,
@@ -3558,10 +3708,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
               clipper: _EditorEffectMaskClipper(mask),
               child: mask.inverted
                   ? original
-                  : Opacity(
-                      opacity: opacity.clamp(0.0, 1.0),
-                      child: effected,
-                    ),
+                  : Opacity(opacity: opacity.clamp(0.0, 1.0), child: effected),
             ),
           ],
         );
@@ -3698,6 +3845,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                         // on while the visual frame is held.
                         isTrackAudible:
                             !_hasRenderedPreviewAudioMix &&
+                            !_previewAudioShouldMuteFallback &&
                             !item.clip.freezeFrame &&
                             previewVisualUsesEmbeddedAudioForTesting(
                               timeline: timeline,
@@ -5047,6 +5195,95 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                 },
                               ),
                             ),
+                          if (_previewAudioShouldMuteFallback)
+                            Positioned(
+                              key: const ValueKey(
+                                'preview-audio-processing-state',
+                              ),
+                              right: 10,
+                              top: 10,
+                              child: IgnorePointer(
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                    vertical: 7,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: kBackground.withValues(alpha: 0.88),
+                                    borderRadius: BorderRadius.circular(999),
+                                    border: Border.all(
+                                      color: kAccent.withValues(alpha: 0.45),
+                                    ),
+                                  ),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      const SizedBox.square(
+                                        dimension: 13,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                          color: kAccent,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 7),
+                                      Text(
+                                        _previewAudioMixBuilding
+                                            ? 'Processing audio effects…'
+                                            : 'Preparing audio preview…',
+                                        style: const TextStyle(
+                                          color: kTextPrimary,
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
+                          if (_previewAudioMixError != null &&
+                              !_previewAudioShouldMuteFallback)
+                            Positioned(
+                              key: const ValueKey(
+                                'preview-audio-processing-error',
+                              ),
+                              right: 10,
+                              top: 10,
+                              child: IgnorePointer(
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                    vertical: 7,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: kBackground.withValues(alpha: 0.9),
+                                    borderRadius: BorderRadius.circular(999),
+                                    border: Border.all(
+                                      color: kWarning.withValues(alpha: 0.5),
+                                    ),
+                                  ),
+                                  child: const Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(
+                                        Icons.warning_amber_rounded,
+                                        size: 14,
+                                        color: kWarning,
+                                      ),
+                                      SizedBox(width: 7),
+                                      Text(
+                                        'Audio effects preview unavailable',
+                                        style: TextStyle(
+                                          color: kTextPrimary,
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
                           if (_previewError != null)
                             _CanvasBoundLayer(
                               aspectRatio: previewAspectRatio,
@@ -5825,7 +6062,8 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                 ),
                               ),
                             ),
-                          if (!_hasRenderedPreviewAudioMix)
+                          if (!_hasRenderedPreviewAudioMix &&
+                              !_previewAudioShouldMuteFallback)
                             for (final item in activeOverlayItems)
                               if (item.asset.type == EditorAssetType.video &&
                                   item.clip.freezeFrame &&
@@ -5867,7 +6105,8 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                     continueFreezeFrameAudio: true,
                                   ),
                                 ),
-                          if (!_hasRenderedPreviewAudioMix)
+                          if (!_hasRenderedPreviewAudioMix &&
+                              !_previewAudioShouldMuteFallback)
                             for (final item in activeAudioItems)
                               Positioned(
                                 left: 0,
@@ -5894,6 +6133,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                 ),
                               ),
                           if (!_hasRenderedPreviewAudioMix &&
+                              !_previewAudioShouldMuteFallback &&
                               controllerReady &&
                               activeBaseClip.freezeFrame &&
                               !activeBaseClip.isReversed &&
@@ -6926,6 +7166,9 @@ class _DenseCompositePreviewState extends State<_DenseCompositePreview> {
   @override
   void didUpdateWidget(covariant _DenseCompositePreview oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.isPlaying && !widget.isPlaying) {
+      unawaited(_pausePreviewController(_controller));
+    }
     if (oldWidget.videoPath != widget.videoPath) {
       unawaited(_loadController(widget.videoPath));
       return;
@@ -7092,6 +7335,11 @@ class _DenseCompositePreviewState extends State<_DenseCompositePreview> {
       await controller.play();
     } else if (!shouldPlay && controller.value.isPlaying) {
       await controller.pause();
+    }
+    if (stillOwnsController() &&
+        !widget.isPlaying &&
+        controller.value.isPlaying) {
+      await _pausePreviewController(controller);
     }
     if (stillOwnsController()) _reportDiagnostics(controller);
   }
@@ -7265,6 +7513,9 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
   @override
   void didUpdateWidget(covariant _OverlayVideoPreview oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.isPlaying && !widget.isPlaying) {
+      unawaited(_pausePreviewController(_controller));
+    }
     if (oldWidget.clip.id != widget.clip.id) {
       oldWidget.diagnostics.removeDecoder('overlay:${oldWidget.clip.id}');
     }
@@ -7473,6 +7724,13 @@ class _OverlayVideoPreviewState extends State<_OverlayVideoPreview> {
         await controller.pause();
       }
     }
+    if (stillOwnsController() &&
+        (!widget.isPlaying ||
+            widget.clip.isReversed ||
+            widget.clip.freezeFrame) &&
+        controller.value.isPlaying) {
+      await _pausePreviewController(controller);
+    }
     if (stillOwnsController()) {
       _reportDiagnostics(controller, target, volume);
     }
@@ -7637,6 +7895,9 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
   @override
   void didUpdateWidget(covariant _TimelineAudioPreview oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.isPlaying && !widget.isPlaying) {
+      unawaited(_pausePreviewController(_controller));
+    }
     if (oldWidget.clip.id != widget.clip.id) {
       oldWidget.diagnostics.removeDecoder('audio:${oldWidget.clip.id}');
     }
@@ -7846,6 +8107,11 @@ class _TimelineAudioPreviewState extends State<_TimelineAudioPreview> {
     } else if (!widget.isPlaying && controller.value.isPlaying) {
       await controller.pause();
     }
+    if (stillOwnsController() &&
+        (!widget.isPlaying || !canPlayForward) &&
+        controller.value.isPlaying) {
+      await _pausePreviewController(controller);
+    }
     if (stillOwnsController()) {
       _reportDiagnostics(controller, target, safeVolume);
     }
@@ -7932,16 +8198,14 @@ class _EditorEffectMaskClipper extends CustomClipper<Path> {
             ),
           );
         }
-        return Path()
-          ..addPolygon(
-            points
-                .map(
-                  (point) =>
-                      Offset(size.width * point.x, size.height * point.y),
-                )
-                .toList(),
-            true,
-          );
+        return Path()..addPolygon(
+          points
+              .map(
+                (point) => Offset(size.width * point.x, size.height * point.y),
+              )
+              .toList(),
+          true,
+        );
     }
   }
 

@@ -329,7 +329,8 @@ void main() {
     expect(find.byKey(const ValueKey('resizable_sheet_handle')), findsNothing);
     await tester.tap(find.text('Add Text'));
     // The add menu closes before the persistent text editor animates in.
-    await tester.pumpAndSettle();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
     expect(find.byKey(const ValueKey('text_editor_field')), findsOneWidget);
     await tester.enterText(
       find.byKey(const ValueKey('text_editor_field')),
@@ -338,7 +339,7 @@ void main() {
     await tester.pump();
     expect(find.text('Direct canvas title'), findsWidgets);
     tester.testTextInput.hide();
-    await tester.pumpAndSettle();
+    await tester.pump(const Duration(milliseconds: 100));
     await tester.tap(find.byKey(const ValueKey('text_editor_done')));
     await tester.pumpAndSettle();
 

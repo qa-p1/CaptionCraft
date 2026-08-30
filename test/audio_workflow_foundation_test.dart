@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:caption_craft/core/utils/audio_meter_service.dart';
 import 'package:caption_craft/core/utils/timeline_export_service.dart';
+import 'package:caption_craft/core/utils/timeline_preview_audio_service.dart';
 import 'package:caption_craft/features/editor/models/editor_effect_models.dart';
 import 'package:caption_craft/features/editor/models/timeline_models.dart';
 import 'package:caption_craft/features/editor/screens/editor_screen.dart';
@@ -310,6 +311,7 @@ void main() {
       endTime: const Duration(seconds: 9),
       sourceStartTime: const Duration(seconds: 1),
       sourceDuration: const Duration(seconds: 4),
+      embeddedAudioSeparated: true,
       audioMix: const AudioMixSettings(muted: true),
       effectStack: EditorEffectStack(
         effects: [EditorEffect(type: EditorEffectType.glow)],
@@ -322,6 +324,7 @@ void main() {
       label: 'Audio',
       assetId: 'asset',
       linkedClipId: video.id,
+      separatedFromClipId: video.id,
       startTime: video.startTime,
       endTime: video.endTime,
       sourceStartTime: video.sourceStartTime,
@@ -362,6 +365,47 @@ void main() {
           .byId(audio.id)
           ?.linkedClipId,
       isNull,
+    );
+    final unlinkedAudio = unlinked.tracks
+        .expand((track) => track.clips)
+        .singleWhere((clip) => clip.id == audio.id);
+    expect(unlinkedAudio.separatedAudioSourceClipId, video.id);
+    expect(
+      resolveEffectiveAudioOwner(timeline: unlinked, clip: video)?.clip.id,
+      audio.id,
+    );
+
+    final reloaded = EditorTimeline.fromJson(unlinked.toJson());
+    final reloadedVideo = reloaded.tracks
+        .expand((track) => track.clips)
+        .singleWhere((clip) => clip.id == video.id);
+    final reloadedAudio = reloaded.tracks
+        .expand((track) => track.clips)
+        .singleWhere((clip) => clip.id == audio.id);
+    expect(reloadedVideo.embeddedAudioSeparated, isTrue);
+    expect(reloadedAudio.linkedClipId, isNull);
+    expect(reloadedAudio.separatedAudioSourceClipId, video.id);
+    expect(
+      resolveEffectiveAudioOwner(
+        timeline: reloaded,
+        clip: reloadedVideo,
+      )?.clip.id,
+      audio.id,
+    );
+
+    final directlyReattached = reattachSeparatedAudioForTesting(
+      timeline: unlinked,
+      audioClipId: audio.id,
+    );
+    final directlyRestoredVideo = directlyReattached.tracks
+        .expand((track) => track.clips)
+        .singleWhere((clip) => clip.id == video.id);
+    expect(directlyRestoredVideo.embeddedAudioSeparated, isFalse);
+    expect(
+      directlyReattached.tracks
+          .expand((track) => track.clips)
+          .any((clip) => clip.id == audio.id),
+      isFalse,
     );
     final movedTimeline = unlinked.copyWith(
       tracks: unlinked.tracks.map((track) {
@@ -408,6 +452,198 @@ void main() {
       containsAll([EditorEffectType.glow, EditorEffectType.compressor]),
     );
   });
+
+  test('legacy separated audio upgrades to persistent ownership on reload', () {
+    final video = TimelineClip(
+      id: 'video',
+      trackId: 'video-track',
+      type: TimelineTrackType.video,
+      label: 'Video',
+      assetId: 'asset',
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 2),
+      audioMix: const AudioMixSettings(muted: true),
+    );
+    final audio = TimelineClip(
+      id: 'audio',
+      trackId: 'audio-track',
+      type: TimelineTrackType.audio,
+      label: 'Video audio',
+      assetId: 'asset',
+      linkedClipId: video.id,
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 2),
+    );
+    final legacyJson = EditorTimeline(
+      schemaVersion: 9,
+      tracks: [
+        TimelineTrack(
+          id: 'video-track',
+          name: 'Video',
+          type: TimelineTrackType.video,
+          section: TimelineTrackSection.baseVideo,
+          clips: [video],
+        ),
+        TimelineTrack(
+          id: 'audio-track',
+          name: 'Audio',
+          type: TimelineTrackType.audio,
+          section: TimelineTrackSection.audio,
+          clips: [audio],
+        ),
+      ],
+    ).toJson();
+    legacyJson['schemaVersion'] = 9;
+    final tracks = legacyJson['tracks'] as List<dynamic>;
+    final videoJson = (tracks[0] as Map<String, dynamic>)['clips'] as List;
+    final audioJson = (tracks[1] as Map<String, dynamic>)['clips'] as List;
+    (videoJson.single as Map<String, dynamic>).remove('embeddedAudioSeparated');
+    (audioJson.single as Map<String, dynamic>).remove('separatedFromClipId');
+
+    final restored = EditorTimeline.fromJson(legacyJson);
+    final restoredVideo = restored.tracks
+        .expand((track) => track.clips)
+        .singleWhere((clip) => clip.id == video.id);
+    final restoredAudio = restored.tracks
+        .expand((track) => track.clips)
+        .singleWhere((clip) => clip.id == audio.id);
+
+    expect(restored.schemaVersion, EditorTimeline.currentSchemaVersion);
+    expect(restoredVideo.embeddedAudioSeparated, isTrue);
+    expect(restoredAudio.separatedAudioSourceClipId, video.id);
+  });
+
+  test(
+    'equalizer processes attached video audio and extracted audio identically',
+    () async {
+      if (!await _commandExists('ffmpeg')) {
+        markTestSkipped('Desktop FFmpeg is not installed.');
+        return;
+      }
+      final directory = await Directory.systemTemp.createTemp(
+        'cc_attached_audio_fx_',
+      );
+      addTearDown(() async {
+        if (await directory.exists()) await directory.delete(recursive: true);
+      });
+      final source = path.join(directory.path, 'source.mp4');
+      final generated = await Process.run('ffmpeg', [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-y',
+        '-f',
+        'lavfi',
+        '-i',
+        'color=c=black:size=160x120:rate=24:duration=1',
+        '-f',
+        'lavfi',
+        '-i',
+        'sine=frequency=1000:sample_rate=48000:duration=1',
+        '-shortest',
+        '-c:v',
+        'mpeg4',
+        '-c:a',
+        'aac',
+        source,
+      ]);
+      expect(generated.exitCode, 0, reason: '${generated.stderr}');
+
+      final effect = EditorEffect(
+        type: EditorEffectType.equalizer,
+        parameters: const <String, dynamic>{
+          'frequency': 1000,
+          'gain': -18,
+          'width': 2,
+        },
+      );
+
+      Future<double> render({
+        required String name,
+        required TimelineTrackType type,
+        required bool withEffect,
+      }) async {
+        final asset = EditorAssetReference(
+          id: 'asset-$name',
+          type: EditorAssetType.video,
+          label: name,
+          sourcePath: source,
+          metadata: const <String, dynamic>{
+            'hasAudio': true,
+            'audioStreamCount': 1,
+            'audioChannels': 1,
+          },
+        );
+        final track = TimelineTrack(
+          id: 'track-$name',
+          name: name,
+          type: type,
+          section: type == TimelineTrackType.video
+              ? TimelineTrackSection.baseVideo
+              : TimelineTrackSection.audio,
+          clips: [
+            TimelineClip(
+              id: 'clip-$name',
+              trackId: 'track-$name',
+              type: type,
+              label: name,
+              assetId: asset.id,
+              separatedFromClipId: type == TimelineTrackType.audio
+                  ? 'source-video'
+                  : null,
+              startTime: Duration.zero,
+              endTime: const Duration(seconds: 1),
+              sourceDuration: const Duration(seconds: 1),
+              effectStack: withEffect
+                  ? EditorEffectStack(effects: [effect])
+                  : const EditorEffectStack(),
+            ),
+          ],
+        );
+        final timeline = EditorTimeline(assets: [asset], tracks: [track]);
+        final plan = TimelinePreviewAudioService.buildPlan(
+          timeline: timeline,
+          fileExists: (_) => true,
+          sourceVersion: (_) => 'source-v1',
+        );
+        expect(plan, isNotNull);
+        final output = path.join(directory.path, '$name.m4a');
+        final arguments = TimelineExportService.buildPreviewAudioMixArguments(
+          timeline: timeline,
+          inputs: plan!.inputs,
+          timelineDuration: plan.timelineDuration,
+          outputPath: output,
+        );
+        if (withEffect) {
+          expect(arguments.join(' '), contains('equalizer=f=1000'));
+        }
+        final result = await Process.run('ffmpeg', arguments);
+        expect(result.exitCode, 0, reason: '${result.stderr}');
+        return _rmsLevelDb(output);
+      }
+
+      final baseline = await render(
+        name: 'baseline',
+        type: TimelineTrackType.video,
+        withEffect: false,
+      );
+      final attached = await render(
+        name: 'attached',
+        type: TimelineTrackType.video,
+        withEffect: true,
+      );
+      final extracted = await render(
+        name: 'extracted',
+        type: TimelineTrackType.audio,
+        withEffect: true,
+      );
+
+      expect(attached, lessThan(baseline - 10));
+      expect(extracted, lessThan(baseline - 10));
+      expect(attached, closeTo(extracted, 0.5));
+    },
+    timeout: const Timeout(Duration(minutes: 2)),
+  );
 
   test('real analysis graph executes through desktop FFmpeg', () async {
     if (!await _commandExists('ffmpeg')) {
@@ -589,6 +825,26 @@ Future<int> _zeroCrossings(String sourcePath, {required int channel}) async {
   ).allMatches('${result.stdout}\n${result.stderr}');
   expect(matches, isNotEmpty, reason: '${result.stderr}');
   return int.parse(matches.last.group(1)!);
+}
+
+Future<double> _rmsLevelDb(String sourcePath) async {
+  final result = await Process.run('ffmpeg', [
+    '-hide_banner',
+    '-i',
+    sourcePath,
+    '-af',
+    'astats=metadata=0:reset=0',
+    '-f',
+    'null',
+    '-',
+  ]);
+  expect(result.exitCode, 0, reason: '${result.stderr}');
+  final matches = RegExp(
+    r'RMS level dB:\s*(-?(?:\d+(?:\.\d+)?|inf))',
+    caseSensitive: false,
+  ).allMatches('${result.stdout}\n${result.stderr}');
+  expect(matches, isNotEmpty, reason: '${result.stderr}');
+  return double.parse(matches.last.group(1)!);
 }
 
 extension on Iterable<TimelineClip> {

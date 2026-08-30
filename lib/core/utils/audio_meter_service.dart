@@ -110,6 +110,7 @@ class AudioMeterService {
       colorTransfer: metadata['colorTransfer'] as String?,
       colorSpace: metadata['colorSpace'] as String?,
       colorRange: metadata['colorRange'] as String?,
+      pixelFormat: metadata['pixelFormat'] as String?,
       bitDepth: metadata['bitDepth'] as int?,
       audioStreamCount: metadata['audioStreamCount'] as int?,
       audioChannels: metadata['audioChannels'] as int?,

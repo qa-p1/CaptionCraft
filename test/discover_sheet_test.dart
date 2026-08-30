@@ -31,6 +31,7 @@ void main() {
     expect(find.byKey(const ValueKey('discover-navigation')), findsOne);
     expect(find.byKey(const ValueKey('discover-nav-browser')), findsOne);
     expect(find.byKey(const ValueKey('discover-nav-youtube')), findsOne);
+    expect(find.byKey(const ValueKey('discover-nav-instagram')), findsOne);
     expect(find.byKey(const ValueKey('discover-nav-downloads')), findsOne);
     expect(find.byKey(const ValueKey('fake-browser-surface')), findsOne);
 
@@ -273,6 +274,72 @@ void main() {
     );
   });
 
+  testWidgets('Instagram inspection exposes media and requires permission', (
+    tester,
+  ) async {
+    final facade = _FakeDiscoverFacade(instagramInfo: _instagramInfo());
+    await _pumpSheet(
+      tester,
+      facade: facade,
+      browser: _FakeBrowserController(),
+      initialDestination: DiscoverDestination.instagram,
+    );
+
+    await tester.enterText(
+      find.byKey(const ValueKey('discover-instagram-url')),
+      'https://www.instagram.com/reel/Caption123/',
+    );
+    await tester.tap(find.byKey(const ValueKey('discover-instagram-inspect')));
+    await tester.pumpAndSettle();
+
+    expect(facade.inspectedInstagramUrls, hasLength(1));
+    expect(
+      find.byWidgetPredicate(
+        (widget) => widget is Text && widget.data == 'A test Reel',
+      ),
+      findsOne,
+    );
+    expect(
+      find.byKey(const ValueKey('discover-instagram-media-Caption123-0')),
+      findsOne,
+    );
+
+    final download = find.byKey(const ValueKey('discover-instagram-download'));
+    await tester.scrollUntilVisible(
+      download,
+      220,
+      scrollable: find
+          .descendant(
+            of: find.byKey(const ValueKey('discover-instagram-tab')),
+            matching: find.byType(Scrollable),
+          )
+          .first,
+    );
+    expect(tester.widget<ButtonStyleButton>(download).onPressed, isNull);
+    final permission = find.byKey(
+      const ValueKey('discover-instagram-permission'),
+    );
+    await tester.ensureVisible(permission);
+    await tester.tap(permission);
+    await tester.pump();
+    await tester.ensureVisible(download);
+    expect(tester.widget<ButtonStyleButton>(download).onPressed, isNotNull);
+    await tester.tap(download);
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(facade.instagramRequests, hasLength(1));
+    expect(facade.instagramRequests.single.acknowledged, isTrue);
+    expect(facade.instagramRequests.single.media.id, 'Caption123-0');
+    expect(
+      find.text('Instagram download added. Track it in Downloads.'),
+      findsOne,
+    );
+    expect(
+      find.byKey(const ValueKey('discover-instagram-active-download')),
+      findsOne,
+    );
+  });
+
   testWidgets('download actions work and timeline import closes Discover', (
     tester,
   ) async {
@@ -489,20 +556,39 @@ class _YoutubeRequestRecord {
   final String? outputFileName;
 }
 
+class _InstagramRequestRecord {
+  const _InstagramRequestRecord({
+    required this.info,
+    required this.media,
+    required this.acknowledged,
+    this.outputFileName,
+  });
+
+  final InstagramPostInfo info;
+  final InstagramMediaOption media;
+  final bool acknowledged;
+  final String? outputFileName;
+}
+
 class _FakeDiscoverFacade implements DiscoverDownloadFacade {
   _FakeDiscoverFacade({
     List<DiscoverDownloadItem> initialItems = const [],
     YoutubeVideoInfo? youtubeInfo,
+    InstagramPostInfo? instagramInfo,
   }) : _items = [...initialItems],
-       youtubeInfo = youtubeInfo ?? _youtubeInfo();
+       youtubeInfo = youtubeInfo ?? _youtubeInfo(),
+       instagramInfo = instagramInfo ?? _instagramInfo();
 
   final StreamController<List<DiscoverDownloadItem>> _controller =
       StreamController<List<DiscoverDownloadItem>>.broadcast(sync: true);
   List<DiscoverDownloadItem> _items;
   final YoutubeVideoInfo youtubeInfo;
+  final InstagramPostInfo instagramInfo;
   final List<DiscoverDownloadRequest> directRequests = [];
   final List<String> inspectedUrls = [];
+  final List<String> inspectedInstagramUrls = [];
   final List<_YoutubeRequestRecord> youtubeRequests = [];
+  final List<_InstagramRequestRecord> instagramRequests = [];
   final List<String> cancelledIds = [];
   final List<String> retriedIds = [];
   final List<String> deletedIds = [];
@@ -549,6 +635,12 @@ class _FakeDiscoverFacade implements DiscoverDownloadFacade {
   }
 
   @override
+  Future<InstagramPostInfo> inspectInstagram(String url) async {
+    inspectedInstagramUrls.add(url);
+    return instagramInfo;
+  }
+
+  @override
   Future<DiscoverDownloadItem> enqueueYoutube({
     required YoutubeVideoInfo info,
     required YoutubeFormatOption format,
@@ -577,6 +669,45 @@ class _FakeDiscoverFacade implements DiscoverDownloadFacade {
       kind: format.kind == YoutubeDownloadKind.audioOnly
           ? DiscoverMediaKind.audio
           : DiscoverMediaKind.video,
+      receivedBytes: 25,
+      totalBytes: 100,
+      createdAt: now,
+      updatedAt: now,
+    );
+    _replace(items: [item, ..._items]);
+    return item;
+  }
+
+  @override
+  Future<DiscoverDownloadItem> enqueueInstagram({
+    required InstagramPostInfo info,
+    required InstagramMediaOption media,
+    required bool permittedContentAcknowledged,
+    String? outputFileName,
+  }) async {
+    if (!permittedContentAcknowledged) {
+      throw StateError('Permission acknowledgement is required.');
+    }
+    instagramRequests.add(
+      _InstagramRequestRecord(
+        info: info,
+        media: media,
+        acknowledged: permittedContentAcknowledged,
+        outputFileName: outputFileName,
+      ),
+    );
+    final now = DateTime.utc(2026, 8, 11, 14, 0, _counter++);
+    final item = DiscoverDownloadItem(
+      id: 'instagram-$_counter',
+      source: DiscoverDownloadSource.instagram,
+      status: DiscoverDownloadStatus.downloading,
+      sourceUrl: info.canonicalUrl,
+      pageUrl: info.canonicalUrl,
+      displayName: info.title,
+      fileName:
+          '${outputFileName ?? info.title}.${media.kind == DiscoverMediaKind.video ? 'mp4' : 'jpg'}',
+      mimeType: media.mimeType,
+      kind: media.kind,
       receivedBytes: 25,
       totalBytes: 100,
       createdAt: now,
@@ -687,6 +818,24 @@ YoutubeVideoInfo _youtubeInfo() {
         audioFormatTag: 140,
         bitrate: 128000,
         estimatedBytes: 2 * 1024 * 1024,
+      ),
+    ],
+  );
+}
+
+InstagramPostInfo _instagramInfo() {
+  return const InstagramPostInfo(
+    shortcode: 'Caption123',
+    canonicalUrl: 'https://www.instagram.com/reel/Caption123/',
+    title: 'A test Reel',
+    author: 'Test creator',
+    isReel: true,
+    media: <InstagramMediaOption>[
+      InstagramMediaOption(
+        id: 'Caption123-0',
+        url: 'https://cdn.example.test/reel.mp4',
+        kind: DiscoverMediaKind.video,
+        mimeType: 'video/mp4',
       ),
     ],
   );

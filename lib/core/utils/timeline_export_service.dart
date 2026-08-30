@@ -189,6 +189,7 @@ class TimelineExportService {
               colorTransfer: mediaInfo['colorTransfer'] as String?,
               colorSpace: mediaInfo['colorSpace'] as String?,
               colorRange: mediaInfo['colorRange'] as String?,
+              pixelFormat: mediaInfo['pixelFormat'] as String?,
               bitDepth: mediaInfo['bitDepth'] as int?,
               audioStreamCount: mediaInfo['audioStreamCount'] as int?,
               audioChannels: mediaInfo['audioChannels'] as int?,
@@ -829,24 +830,35 @@ class TimelineExportService {
     Future<Map<String, dynamic>> Function(String sourcePath)? mediaInfoLoader,
   }) async {
     final metadata = asset?.metadata ?? const <String, dynamic>{};
-    if (metadata['durationMs'] is num &&
+    final needsStreamProbe =
+        asset == null ||
+        asset.type == EditorAssetType.video ||
+        asset.type == EditorAssetType.audio;
+    if (!needsStreamProbe &&
+        metadata['durationMs'] is num &&
         (metadata['hasAudio'] is bool ||
-            asset?.type == EditorAssetType.audio ||
-            asset?.type == EditorAssetType.image ||
-            asset?.type == EditorAssetType.gif ||
-            asset?.type == EditorAssetType.sticker)) {
+            asset.type == EditorAssetType.image ||
+            asset.type == EditorAssetType.gif ||
+            asset.type == EditorAssetType.sticker)) {
+      return {
+        ...metadata,
+        'hasAudio':
+            asset.type == EditorAssetType.audio ||
+            (metadata['hasAudio'] as bool? ?? false),
+      };
+    }
+    try {
+      final probed =
+          await (mediaInfoLoader?.call(sourcePath) ??
+              FFmpegService.getMediaInfo(sourcePath));
+      return <String, dynamic>{...metadata, ...probed};
+    } catch (_) {
       return {
         ...metadata,
         'hasAudio':
             asset?.type == EditorAssetType.audio ||
             (metadata['hasAudio'] as bool? ?? false),
       };
-    }
-    try {
-      return await (mediaInfoLoader?.call(sourcePath) ??
-          FFmpegService.getMediaInfo(sourcePath));
-    } catch (_) {
-      return {...metadata, 'hasAudio': asset?.type == EditorAssetType.audio};
     }
   }
 
@@ -1215,6 +1227,7 @@ class TimelineExportService {
   }) {
     final durationSeconds = _seconds(timelineDuration);
     final clipLabelsByBusId = <String?, List<String>>{};
+    final separatedVideoIds = _separatedVideoAudioOwnerIds(timeline);
     if (includeAudio) {
       final soloTrackIds = inputs
           .where((input) => input.track.isSolo)
@@ -1232,6 +1245,9 @@ class TimelineExportService {
                   .where((candidate) => candidate.id == input.track.audioBusId)
                   .firstOrNull;
         if (!input.hasAudio ||
+            (input.clip.type == TimelineTrackType.video &&
+                (input.clip.embeddedAudioSeparated ||
+                    separatedVideoIds.contains(input.clip.id))) ||
             input.track.isMuted ||
             bus?.muted == true ||
             input.clip.audioMix.muted ||
@@ -2352,6 +2368,11 @@ class TimelineExportService {
   })
   _detectedColorTags(TimelineRenderInput input, EditorColorSpace detected) {
     final fallback = _colorTagsForSpace(detected);
+    final pixelFormat = input.pixelFormat?.trim().toLowerCase() ?? '';
+    final rgbPixels =
+        pixelFormat.startsWith('gbr') ||
+        pixelFormat.startsWith('rgb') ||
+        pixelFormat.startsWith('bgr');
     String supported(
       String? value,
       Set<String> supportedValues,
@@ -2379,12 +2400,13 @@ class TimelineExportService {
         'arib-std-b67',
         'smpte2084',
       }, fallback.transfer),
-      matrix: supported(input.colorSpace, const {
-        'bt709',
-        'bt2020nc',
-        'bt2020c',
-        'gbr',
-      }, fallback.matrix),
+      matrix: supported(
+        input.colorSpace,
+        rgbPixels
+            ? const {'bt709', 'bt2020nc', 'bt2020c', 'gbr'}
+            : const {'bt709', 'bt2020nc', 'bt2020c'},
+        fallback.matrix,
+      ),
       range: supported(input.colorRange, const {
         'tv',
         'pc',
@@ -2473,12 +2495,14 @@ class TimelineExportService {
         'm=${targetTags.matrix}:r=${targetTags.range}';
     final linearOutput =
         'p=${sourceTags.primaries}:'
-        't=linear:m=gbr:r=pc';
+        't=linear';
     final linearInput =
         'pin=${sourceTags.primaries}:'
         'tin=linear:min=gbr:rin=pc';
     if (toneMapHdrToSdr) {
       return [
+        _evenFrameGeometryFilter,
+        _setColorTagsFilter(sourceTags),
         'zscale=$input:$linearOutput:'
             'npl=${_number(management.peakLuminanceNits)}',
         'format=gbrpf32le',
@@ -2488,12 +2512,28 @@ class TimelineExportService {
       ];
     }
     return [
+      _evenFrameGeometryFilter,
+      _setColorTagsFilter(sourceTags),
       'zscale=$input:$linearOutput:'
           'npl=${_number(management.peakLuminanceNits)}',
       'format=gbrpf32le',
       'zscale=$linearInput:$output:'
           'npl=${_number(management.peakLuminanceNits)}',
     ];
+  }
+
+  static const String _evenFrameGeometryFilter =
+      "scale=w='max(2,ceil(iw/2)*2)':h='max(2,ceil(ih/2)*2)':flags=lanczos";
+
+  static String _setColorTagsFilter(
+    ({String primaries, String transfer, String matrix, String range, bool hdr})
+    tags,
+  ) {
+    final range = tags.range == 'pc' ? 'full' : 'limited';
+    return 'setparams=range=$range:'
+        'color_primaries=${tags.primaries}:'
+        'color_trc=${tags.transfer}:'
+        'colorspace=${tags.matrix}';
   }
 
   static List<String> _colorFilters(ClipColorAdjustments adjustments) {
@@ -3953,6 +3993,7 @@ class TimelineExportService {
         .where((bus) => bus.solo)
         .map((bus) => bus.id)
         .toSet();
+    final separatedVideoIds = _separatedVideoAudioOwnerIds(timeline);
     return inputs.any((input) {
       final bus = input.track.audioBusId == null
           ? null
@@ -3960,12 +4001,25 @@ class TimelineExportService {
                 .where((candidate) => candidate.id == input.track.audioBusId)
                 .firstOrNull;
       return input.hasAudio &&
+          !(input.clip.type == TimelineTrackType.video &&
+              (input.clip.embeddedAudioSeparated ||
+                  separatedVideoIds.contains(input.clip.id))) &&
           !input.track.isMuted &&
           bus?.muted != true &&
           !input.clip.audioMix.muted &&
           (soloTrackIds.isEmpty || soloTrackIds.contains(input.track.id)) &&
           (soloBusIds.isEmpty || (bus != null && soloBusIds.contains(bus.id)));
     });
+  }
+
+  static Set<String> _separatedVideoAudioOwnerIds(EditorTimeline timeline) {
+    return {
+      for (final track in timeline.tracks)
+        for (final clip in track.clips)
+          if (clip.type == TimelineTrackType.audio &&
+              clip.separatedAudioSourceClipId != null)
+            clip.separatedAudioSourceClipId!,
+    };
   }
 
   static List<String> _atempoFilters(double playbackRate) {
@@ -4163,6 +4217,7 @@ class TimelineRenderInput {
   final String? colorTransfer;
   final String? colorSpace;
   final String? colorRange;
+  final String? pixelFormat;
   final int? bitDepth;
   final int? audioStreamCount;
   final int? audioChannels;
@@ -4181,6 +4236,7 @@ class TimelineRenderInput {
     this.colorTransfer,
     this.colorSpace,
     this.colorRange,
+    this.pixelFormat,
     this.bitDepth,
     this.audioStreamCount,
     this.audioChannels,

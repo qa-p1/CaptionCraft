@@ -869,115 +869,155 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          crossAxisAlignment: WrapCrossAlignment.center,
+        Row(
           children: [
-            DropdownButton<TimelineKeyframeProperty>(
-              value: _property,
-              dropdownColor: kSurfaceElevated,
-              underline: const SizedBox.shrink(),
-              borderRadius: BorderRadius.circular(12),
-              items: [
-                for (final property in widget.properties)
-                  DropdownMenuItem(
-                    value: property,
-                    child: Text(
-                      _propertyLabel(property),
-                      style: const TextStyle(color: kTextPrimary),
+            Expanded(
+              child: DropdownButton<TimelineKeyframeProperty>(
+                value: _property,
+                isExpanded: true,
+                dropdownColor: kSurfaceElevated,
+                underline: const SizedBox.shrink(),
+                borderRadius: BorderRadius.circular(12),
+                items: [
+                  for (final property in widget.properties)
+                    DropdownMenuItem(
+                      value: property,
+                      child: Text(
+                        _propertyLabel(property),
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(color: kTextPrimary),
+                      ),
                     ),
-                  ),
-              ],
-              onChanged: (property) {
-                if (property != null) _selectProperty(property);
-              },
+                ],
+                onChanged: (property) {
+                  if (property != null) _selectProperty(property);
+                },
+              ),
             ),
+            const SizedBox(width: 8),
             _GraphButton(
               tooltip: 'Add keyframe at playhead',
               icon: Icons.add_rounded,
               label: 'Add',
+              compact: true,
               onPressed: _channelLocked ? null : _addAtPlayhead,
             ),
+            const SizedBox(width: 8),
             _GraphButton(
               tooltip: 'Delete selected keyframe',
               icon: Icons.delete_outline_rounded,
               label: _selectedKeyframeIds.length > 1
                   ? 'Delete ${_selectedKeyframeIds.length}'
                   : 'Delete',
+              compact: true,
               onPressed: selected == null || _channelLocked
                   ? null
                   : _deleteSelected,
             ),
-            _GraphButton(
-              tooltip: 'Drag a box around multiple keyframes',
-              icon: Icons.crop_free_rounded,
-              label: 'Box',
-              onPressed: () {
-                setState(() => _boxSelectionMode = !_boxSelectionMode);
-              },
-            ),
-            _GraphButton(
-              tooltip: 'Select every keyframe in this channel',
-              icon: Icons.select_all_rounded,
-              label: 'All',
-              onPressed: frames.isEmpty ? null : _selectAllFrames,
-            ),
-            _GraphButton(
-              tooltip: 'Copy selected keyframes',
-              icon: Icons.copy_rounded,
-              label: 'Copy',
-              onPressed: selected == null ? null : _copySelectedFrames,
-            ),
-            _GraphButton(
-              tooltip: 'Paste copied keyframes at the playhead',
-              icon: Icons.content_paste_rounded,
-              label: 'Paste',
-              onPressed: _clipboard.isEmpty || _channelLocked
-                  ? null
-                  : _pasteFramesAtPlayhead,
-            ),
-            _GraphButton(
-              tooltip: 'Enter exact keyframe time and value',
-              icon: Icons.pin_rounded,
-              label: 'Numeric',
-              onPressed: selected == null || _channelLocked
-                  ? null
-                  : _editSelectedNumeric,
-            ),
-            _GraphButton(
-              tooltip: 'Show, solo or lock animation channels',
-              icon: Icons.tune_rounded,
-              label: 'Channels',
-              onPressed: _showChannelControls,
-            ),
-            _GraphButton(
-              tooltip: 'Show the whole clip and value range',
-              icon: Icons.fit_screen_rounded,
-              label: 'Fit',
-              onPressed: _fitGraph,
-            ),
-            IconButton(
-              tooltip: 'Zoom out in time',
-              onPressed: _timeZoom <= 1 ? null : () => _changeTimeZoom(0.7),
-              icon: const Icon(Icons.zoom_out_rounded),
-            ),
-            IconButton(
-              tooltip: 'Zoom in in time',
-              onPressed: _timeZoom >= 16 ? null : () => _changeTimeZoom(1.4),
-              icon: const Icon(Icons.zoom_in_rounded),
-            ),
-            IconButton(
-              tooltip: 'Compress value range',
-              onPressed: _valueZoom <= 1 ? null : () => _changeValueZoom(0.7),
-              icon: const Icon(Icons.unfold_more_rounded),
-            ),
-            IconButton(
-              tooltip: 'Expand value range',
-              onPressed: _valueZoom >= 12 ? null : () => _changeValueZoom(1.4),
-              icon: const Icon(Icons.unfold_less_rounded),
-            ),
           ],
+        ),
+        const SizedBox(height: 8),
+        SizedBox(
+          height: 40,
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                _GraphButton(
+                  tooltip: 'Drag a box around multiple keyframes',
+                  icon: Icons.crop_free_rounded,
+                  label: 'Box',
+                  compact: true,
+                  selected: _boxSelectionMode,
+                  onPressed: () {
+                    setState(() => _boxSelectionMode = !_boxSelectionMode);
+                  },
+                ),
+                const SizedBox(width: 7),
+                _GraphButton(
+                  tooltip: 'Select every keyframe in this channel',
+                  icon: Icons.select_all_rounded,
+                  label: 'All',
+                  compact: true,
+                  onPressed: frames.isEmpty ? null : _selectAllFrames,
+                ),
+                const SizedBox(width: 7),
+                _GraphButton(
+                  tooltip: 'Copy selected keyframes',
+                  icon: Icons.copy_rounded,
+                  label: 'Copy',
+                  compact: true,
+                  onPressed: selected == null ? null : _copySelectedFrames,
+                ),
+                const SizedBox(width: 7),
+                _GraphButton(
+                  tooltip: 'Paste copied keyframes at the playhead',
+                  icon: Icons.content_paste_rounded,
+                  label: 'Paste',
+                  compact: true,
+                  onPressed: _clipboard.isEmpty || _channelLocked
+                      ? null
+                      : _pasteFramesAtPlayhead,
+                ),
+                const SizedBox(width: 7),
+                _GraphButton(
+                  tooltip: 'Enter exact keyframe time and value',
+                  icon: Icons.pin_rounded,
+                  label: 'Numeric',
+                  compact: true,
+                  onPressed: selected == null || _channelLocked
+                      ? null
+                      : _editSelectedNumeric,
+                ),
+                const SizedBox(width: 7),
+                _GraphButton(
+                  tooltip: 'Show, solo or lock animation channels',
+                  icon: Icons.tune_rounded,
+                  label: 'Channels',
+                  compact: true,
+                  onPressed: _showChannelControls,
+                ),
+                const SizedBox(width: 7),
+                _GraphButton(
+                  tooltip: 'Show the whole clip and value range',
+                  icon: Icons.fit_screen_rounded,
+                  label: 'Fit',
+                  compact: true,
+                  onPressed: _fitGraph,
+                ),
+                const SizedBox(width: 7),
+                _GraphIconButton(
+                  tooltip: 'Zoom out in time',
+                  icon: Icons.zoom_out_rounded,
+                  onPressed: _timeZoom <= 1 ? null : () => _changeTimeZoom(0.7),
+                ),
+                const SizedBox(width: 7),
+                _GraphIconButton(
+                  tooltip: 'Zoom in in time',
+                  icon: Icons.zoom_in_rounded,
+                  onPressed: _timeZoom >= 16
+                      ? null
+                      : () => _changeTimeZoom(1.4),
+                ),
+                const SizedBox(width: 7),
+                _GraphIconButton(
+                  tooltip: 'Compress value range',
+                  icon: Icons.unfold_more_rounded,
+                  onPressed: _valueZoom <= 1
+                      ? null
+                      : () => _changeValueZoom(0.7),
+                ),
+                const SizedBox(width: 7),
+                _GraphIconButton(
+                  tooltip: 'Expand value range',
+                  icon: Icons.unfold_less_rounded,
+                  onPressed: _valueZoom >= 12
+                      ? null
+                      : () => _changeValueZoom(1.4),
+                ),
+              ],
+            ),
+          ),
         ),
         const SizedBox(height: 10),
         Expanded(
@@ -1213,12 +1253,16 @@ class _GraphButton extends StatelessWidget {
   final IconData icon;
   final String label;
   final VoidCallback? onPressed;
+  final bool compact;
+  final bool selected;
 
   const _GraphButton({
     required this.tooltip,
     required this.icon,
     required this.label,
     required this.onPressed,
+    this.compact = false,
+    this.selected = false,
   });
 
   @override
@@ -1226,9 +1270,54 @@ class _GraphButton extends StatelessWidget {
     return Tooltip(
       message: tooltip,
       child: OutlinedButton.icon(
+        style: OutlinedButton.styleFrom(
+          minimumSize: Size(0, compact ? 38 : 44),
+          padding: EdgeInsets.symmetric(
+            horizontal: compact ? 11 : 15,
+            vertical: 0,
+          ),
+          backgroundColor: selected
+              ? kAccent.withValues(alpha: 0.14)
+              : Colors.transparent,
+          foregroundColor: selected ? kAccent : null,
+          side: BorderSide(color: selected ? kAccent : kBorder),
+          visualDensity: VisualDensity.compact,
+        ),
         onPressed: onPressed,
         icon: Icon(icon, size: 16),
         label: Text(label),
+      ),
+    );
+  }
+}
+
+class _GraphIconButton extends StatelessWidget {
+  final String tooltip;
+  final IconData icon;
+  final VoidCallback? onPressed;
+
+  const _GraphIconButton({
+    required this.tooltip,
+    required this.icon,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: SizedBox.square(
+        dimension: 38,
+        child: OutlinedButton(
+          style: OutlinedButton.styleFrom(
+            minimumSize: const Size.square(38),
+            padding: EdgeInsets.zero,
+            side: const BorderSide(color: kBorder),
+            visualDensity: VisualDensity.compact,
+          ),
+          onPressed: onPressed,
+          child: Icon(icon, size: 18),
+        ),
       ),
     );
   }
@@ -1340,30 +1429,48 @@ class _KeyframeGraphPainter extends CustomPainter {
     final gridPaint = Paint()
       ..color = kBorder.withValues(alpha: 0.7)
       ..strokeWidth = 1;
-    for (var index = 0; index <= 4; index++) {
-      final x = geometry.plot.left + geometry.plot.width * index / 4;
-      final y = geometry.plot.top + geometry.plot.height * index / 4;
+    final timeDivisions = geometry.plot.width < 260
+        ? 2
+        : geometry.plot.width < 380
+        ? 3
+        : 4;
+    for (var index = 0; index <= timeDivisions; index++) {
+      final x =
+          geometry.plot.left + geometry.plot.width * index / timeDivisions;
       canvas.drawLine(
         Offset(x, geometry.plot.top),
         Offset(x, geometry.plot.bottom),
         gridPaint,
       );
+      final timeUs =
+          geometry.startUs +
+          (geometry.endUs - geometry.startUs) * index / timeDivisions;
+      _paintLabel(
+        canvas,
+        _formatTime(Duration(microseconds: timeUs.round())),
+        Offset(x, geometry.plot.bottom + 7),
+        center: index > 0 && index < timeDivisions,
+        alignRight: index == timeDivisions,
+      );
+    }
+    final valueDivisions = geometry.plot.height < 90
+        ? 1
+        : geometry.plot.height < 150
+        ? 2
+        : 4;
+    for (var index = 0; index <= valueDivisions; index++) {
+      final y =
+          geometry.plot.top + geometry.plot.height * index / valueDivisions;
       canvas.drawLine(
         Offset(geometry.plot.left, y),
         Offset(geometry.plot.right, y),
         gridPaint,
       );
-      final timeUs =
-          geometry.startUs + (geometry.endUs - geometry.startUs) * index / 4;
-      _paintLabel(
-        canvas,
-        _formatTime(Duration(microseconds: timeUs.round())),
-        Offset(x, geometry.plot.bottom + 7),
-        center: true,
-      );
       final value =
           geometry.maximumValue -
-          (geometry.maximumValue - geometry.minimumValue) * index / 4;
+          (geometry.maximumValue - geometry.minimumValue) *
+              index /
+              valueDivisions;
       _paintLabel(
         canvas,
         valueFormatter(value),

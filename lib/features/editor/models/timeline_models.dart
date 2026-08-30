@@ -1489,6 +1489,8 @@ class TimelineClip {
   final String label;
   final String? assetId;
   final String? linkedClipId;
+  final String? separatedFromClipId;
+  final bool embeddedAudioSeparated;
   final Duration startTime;
   final Duration endTime;
   final Duration sourceStartTime;
@@ -1543,6 +1545,8 @@ class TimelineClip {
     required this.endTime,
     this.assetId,
     this.linkedClipId,
+    this.separatedFromClipId,
+    this.embeddedAudioSeparated = false,
     Duration? sourceStartTime,
     Duration? sourceDuration,
     this.layer = 0,
@@ -1583,6 +1587,9 @@ class TimelineClip {
        );
 
   Duration get duration => endTime - startTime;
+  String? get separatedAudioSourceClipId => type == TimelineTrackType.audio
+      ? separatedFromClipId ?? linkedClipId
+      : null;
   bool get isEffect =>
       type == TimelineTrackType.effect &&
       (effectKind != null || isAdjustmentLayer);
@@ -1642,6 +1649,9 @@ class TimelineClip {
     bool clearAssetId = false,
     String? linkedClipId,
     bool clearLinkedClipId = false,
+    String? separatedFromClipId,
+    bool clearSeparatedFromClipId = false,
+    bool? embeddedAudioSeparated,
     Duration? startTime,
     Duration? endTime,
     Duration? sourceStartTime,
@@ -1693,6 +1703,11 @@ class TimelineClip {
       linkedClipId: clearLinkedClipId
           ? null
           : (linkedClipId ?? this.linkedClipId),
+      separatedFromClipId: clearSeparatedFromClipId
+          ? null
+          : (separatedFromClipId ?? this.separatedFromClipId),
+      embeddedAudioSeparated:
+          embeddedAudioSeparated ?? this.embeddedAudioSeparated,
       startTime: startTime ?? this.startTime,
       endTime: endTime ?? this.endTime,
       sourceStartTime: sourceStartTime ?? this.sourceStartTime,
@@ -1747,6 +1762,8 @@ class TimelineClip {
       'label': label,
       'assetId': assetId,
       'linkedClipId': linkedClipId,
+      'separatedFromClipId': separatedFromClipId,
+      'embeddedAudioSeparated': embeddedAudioSeparated,
       'startTimeMs': startTime.inMilliseconds,
       'endTimeMs': endTime.inMilliseconds,
       'sourceStartTimeMs': sourceStartTime.inMilliseconds,
@@ -1815,6 +1832,12 @@ class TimelineClip {
       label: json['label'] as String? ?? 'Untitled clip',
       assetId: json['assetId'] as String?,
       linkedClipId: json['linkedClipId'] as String?,
+      separatedFromClipId:
+          json['separatedFromClipId'] as String? ??
+          (json['type'] == TimelineTrackType.audio.name
+              ? json['linkedClipId'] as String?
+              : null),
+      embeddedAudioSeparated: json['embeddedAudioSeparated'] as bool? ?? false,
       startTime: Duration(milliseconds: startTimeMs),
       endTime: Duration(milliseconds: endTimeMs),
       sourceStartTime: Duration(
@@ -2608,7 +2631,7 @@ class CanvasSettings {
 }
 
 class EditorTimeline {
-  static const int currentSchemaVersion = 9;
+  static const int currentSchemaVersion = 10;
 
   final int schemaVersion;
   final CanvasSettings canvasSettings;
@@ -3013,7 +3036,8 @@ class EditorTimeline {
                 (track) => track.copyWith(
                   clips: track.clips
                       .map(
-                        (clip) => clip.colorAdjustments.inputColorSpace ==
+                        (clip) =>
+                            clip.colorAdjustments.inputColorSpace ==
                                 EditorColorSpace.sdr709
                             ? clip.copyWith(
                                 colorAdjustments: clip.colorAdjustments
@@ -3035,8 +3059,11 @@ class EditorTimeline {
     final orderedTracks = schemaVersion < 5
         ? _migrateLegacyTrackOrder(normalizedTracks)
         : normalizedTracks;
+    final separationAwareTracks = _restoreSeparatedAudioOwnership(
+      orderedTracks,
+    );
     final relationships = _canonicalizeTimelineRelationships(
-      tracks: orderedTracks,
+      tracks: separationAwareTracks,
       groups: groups,
       compoundClips: compoundClips,
       audioBuses: audioBuses,
@@ -3315,6 +3342,31 @@ class EditorTimeline {
       durationMs: durationMs,
     );
   }
+}
+
+List<TimelineTrack> _restoreSeparatedAudioOwnership(
+  List<TimelineTrack> tracks,
+) {
+  final separatedVideoIds = <String>{
+    for (final track in tracks)
+      for (final clip in track.clips)
+        if (clip.type == TimelineTrackType.audio &&
+            clip.separatedAudioSourceClipId != null)
+          clip.separatedAudioSourceClipId!,
+  };
+  if (separatedVideoIds.isEmpty) return tracks;
+  return tracks.map((track) {
+    return track.copyWith(
+      clips: track.clips.map((clip) {
+        if (clip.type != TimelineTrackType.video ||
+            !separatedVideoIds.contains(clip.id) ||
+            clip.embeddedAudioSeparated) {
+          return clip;
+        }
+        return clip.copyWith(embeddedAudioSeparated: true);
+      }).toList(),
+    );
+  }).toList();
 }
 
 List<TimelineTrack> _mergedSubtitleTracks(
@@ -3797,8 +3849,8 @@ EditorColorManagementSettings _canonicalizeColorManagement(
       ? EditorColorSpace.sdr709
       : settings.workingSpace;
   final outputSpace = switch (settings.outputSpace) {
-    EditorColorSpace.automatic || EditorColorSpace.log =>
-      EditorColorSpace.sdr709,
+    EditorColorSpace.automatic ||
+    EditorColorSpace.log => EditorColorSpace.sdr709,
     _ => settings.outputSpace,
   };
   return settings.copyWith(
