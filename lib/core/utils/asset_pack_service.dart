@@ -1141,6 +1141,7 @@ class AssetPackService {
       AssetPackConstants.backgroundVideosId,
       AssetPackConstants.overlaysId,
       AssetPackConstants.soundEffectsId,
+      AssetPackConstants.lutsId,
     }.contains(packId)) {
       throw ArgumentError.value(packId, 'packId', 'Unsupported asset pack.');
     }

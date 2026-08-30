@@ -283,6 +283,40 @@ class FFmpegService {
     return outputPath;
   }
 
+  static Future<String> extractVideoFrame(
+    String videoPath, {
+    required Duration position,
+    int maximumWidth = 1280,
+  }) async {
+    final tempDir = await getTemporaryDirectory();
+    final outputPath = p.join(
+      tempDir.path,
+      'caption_craft_frame_${DateTime.now().microsecondsSinceEpoch}.png',
+    );
+    final session = await FFmpegKit.executeWithArguments([
+      '-hide_banner',
+      '-y',
+      '-ss',
+      _formatDurationForFfmpeg(position.isNegative ? Duration.zero : position),
+      '-i',
+      videoPath,
+      '-vf',
+      "scale='min(iw,$maximumWidth)':-2:flags=lanczos,format=rgba",
+      '-frames:v',
+      '1',
+      outputPath,
+    ]);
+    final returnCode = await session.getReturnCode();
+    if (!ReturnCode.isSuccess(returnCode) ||
+        !await File(outputPath).exists() ||
+        await File(outputPath).length() == 0) {
+      final logs = await session.getAllLogsAsString();
+      await _deleteFileBestEffort(outputPath);
+      throw Exception('Could not read the selected frame: $logs');
+    }
+    return outputPath;
+  }
+
   /// Burn subtitles into video using ASS file.
   static Future<String> burnSubtitles({
     required String videoPath,
@@ -416,6 +450,13 @@ class FFmpegService {
     int height = 0;
     bool hasAudio = false;
     double frameRate = 0;
+    String? colorPrimaries;
+    String? colorTransfer;
+    String? colorSpace;
+    String? colorRange;
+    String? pixelFormat;
+    int bitDepth = 0;
+    final audioStreams = <Map<String, dynamic>>[];
 
     for (final stream in streams) {
       final type = stream.getType();
@@ -425,9 +466,31 @@ class FFmpegService {
         frameRate = _parseFrameRate(
           stream.getAverageFrameRate() ?? stream.getRealFrameRate(),
         );
+        final properties = stream.getAllProperties() ?? const {};
+        colorPrimaries = properties['color_primaries']?.toString();
+        colorTransfer = properties['color_transfer']?.toString();
+        colorSpace = properties['color_space']?.toString();
+        colorRange = properties['color_range']?.toString();
+        pixelFormat = properties['pix_fmt']?.toString();
+        bitDepth = int.tryParse(
+              properties['bits_per_raw_sample']?.toString() ?? '',
+            ) ??
+            _pixelFormatBitDepth(pixelFormat);
       }
       if (type == 'audio') {
         hasAudio = true;
+        final properties = stream.getAllProperties() ?? const {};
+        final tags = properties['tags'];
+        audioStreams.add({
+          'streamIndex': audioStreams.length,
+          'codec': stream.getCodec(),
+          'channels': int.tryParse(properties['channels']?.toString() ?? '') ??
+              _channelsForLayout(stream.getChannelLayout()),
+          'channelLayout': stream.getChannelLayout(),
+          'sampleRate': int.tryParse(stream.getSampleRate() ?? '') ?? 0,
+          'language': tags is Map ? tags['language']?.toString() : null,
+          'title': tags is Map ? tags['title']?.toString() : null,
+        });
       }
     }
 
@@ -439,7 +502,38 @@ class FFmpegService {
       'height': height,
       'frameRate': frameRate,
       'hasAudio': hasAudio,
+      'audioStreamCount': audioStreams.length,
+      'audioStreams': audioStreams,
+      'audioChannels': audioStreams.isEmpty
+          ? 0
+          : audioStreams.first['channels'] as int? ?? 0,
+      'colorPrimaries': colorPrimaries,
+      'colorTransfer': colorTransfer,
+      'colorSpace': colorSpace,
+      'colorRange': colorRange,
+      'pixelFormat': pixelFormat,
+      'bitDepth': bitDepth,
       'fileSize': int.tryParse(fileSize ?? '0') ?? 0,
+    };
+  }
+
+  static int _pixelFormatBitDepth(String? pixelFormat) {
+    final match = RegExp(r'p(\d{2})(?:le|be)?$').firstMatch(
+      pixelFormat?.toLowerCase() ?? '',
+    );
+    return int.tryParse(match?.group(1) ?? '') ?? 8;
+  }
+
+  static int _channelsForLayout(String? layout) {
+    return switch (layout?.toLowerCase()) {
+      'mono' => 1,
+      'stereo' => 2,
+      '2.1' => 3,
+      'quad' || '4.0' => 4,
+      '5.0' => 5,
+      '5.1' => 6,
+      '7.1' => 8,
+      _ => 0,
     };
   }
 

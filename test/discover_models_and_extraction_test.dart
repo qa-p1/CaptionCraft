@@ -78,6 +78,49 @@ void main() {
       expect(encoded, isNot(contains('Cookie')));
       expect(restored.headers, isEmpty);
     });
+
+    test('round trips Instagram post media and catalog provenance', () {
+      const info = InstagramPostInfo(
+        shortcode: 'Caption123',
+        canonicalUrl: 'https://www.instagram.com/p/Caption123/',
+        title: 'Example post',
+        author: 'Creator',
+        isReel: false,
+        media: <InstagramMediaOption>[
+          InstagramMediaOption(
+            id: 'Caption123-0',
+            url: 'https://cdn.example.test/post.jpg',
+            kind: DiscoverMediaKind.image,
+            mimeType: 'image/jpeg',
+            width: 1080,
+            height: 1350,
+          ),
+        ],
+      );
+      final restoredInfo = InstagramPostInfo.fromJson(info.toJson());
+      final now = DateTime.utc(2026, 8, 30);
+      final item = DiscoverDownloadItem(
+        id: 'instagram-job',
+        source: DiscoverDownloadSource.instagram,
+        status: DiscoverDownloadStatus.queued,
+        sourceUrl: info.canonicalUrl,
+        pageUrl: info.canonicalUrl,
+        displayName: info.title,
+        fileName: 'instagram-job.jpg',
+        mimeType: 'image/jpeg',
+        kind: DiscoverMediaKind.image,
+        receivedBytes: 0,
+        createdAt: now,
+        updatedAt: now,
+        metadata: <String, dynamic>{'instagramInfo': info.toJson()},
+      );
+      final restoredItem = DiscoverDownloadItem.fromJson(item.toJson());
+
+      expect(restoredInfo.shortcode, info.shortcode);
+      expect(restoredInfo.media.single.width, 1080);
+      expect(restoredItem.source, DiscoverDownloadSource.instagram);
+      expect(restoredItem.pageUrl, info.canonicalUrl);
+    });
   });
 
   group('DOM media result normalization', () {

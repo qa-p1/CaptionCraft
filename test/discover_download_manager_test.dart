@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:caption_craft/core/utils/discover_download_manager.dart';
+import 'package:caption_craft/core/utils/instagram_download_service.dart';
 import 'package:caption_craft/core/utils/youtube_download_service.dart';
 import 'package:caption_craft/features/editor/models/discover_models.dart';
 import 'package:dio/dio.dart';
@@ -251,6 +252,80 @@ void main() {
     );
 
     test(
+      'queues Instagram media with permission and refreshes its URL on retry',
+      () async {
+        final storage = await _temporaryDirectory();
+        final dio = _FailThenWritingDio();
+        final instagram = _FakeInstagramService();
+        final manager = DiscoverDownloadManager(
+          dio: dio,
+          storageDirectory: storage,
+          youtubeService: _FakeYoutubeService(),
+          instagramService: instagram,
+          idGenerator: () => 'instagram-id',
+        );
+        addTearDown(manager.dispose);
+        await manager.initialize();
+
+        await expectLater(
+          manager.enqueueInstagram(
+            info: instagram.initialInfo,
+            media: instagram.initialInfo.media.single,
+            permittedContentAcknowledged: false,
+          ),
+          throwsStateError,
+        );
+        expect(dio.requestedUrls, isEmpty);
+
+        final failed = manager.items
+            .expand((items) => items)
+            .firstWhere((item) => item.status == DiscoverDownloadStatus.failed);
+        final queued = await manager.enqueueInstagram(
+          info: instagram.initialInfo,
+          media: instagram.initialInfo.media.single,
+          permittedContentAcknowledged: true,
+        );
+        final failedItem = await failed.timeout(const Duration(seconds: 2));
+
+        expect(queued.source, DiscoverDownloadSource.instagram);
+        expect(failedItem.id, queued.id);
+        expect(dio.requestedUrls, <String>[
+          'https://cdn.example.test/expired.png',
+        ]);
+        expect(
+          dio.headersByRequest.single['Referer'],
+          instagram.initialInfo.canonicalUrl,
+        );
+
+        final completed = manager.items
+            .expand((items) => items)
+            .firstWhere(
+              (item) => item.status == DiscoverDownloadStatus.completed,
+            );
+        await manager.retry(queued.id);
+        final completedItem = await completed.timeout(
+          const Duration(seconds: 2),
+        );
+
+        expect(instagram.inspectCalls, 1);
+        expect(
+          dio.requestedUrls.last,
+          'https://cdn.example.test/refreshed.png',
+        );
+        expect(completedItem.sourceUrl, instagram.initialInfo.canonicalUrl);
+        expect(completedItem.kind, DiscoverMediaKind.image);
+        expect(await File(completedItem.localPath!).exists(), isTrue);
+
+        final catalog = await File(
+          p.join(storage.path, 'downloads.json'),
+        ).readAsString();
+        expect(catalog, isNot(contains('User-Agent')));
+        expect(catalog, isNot(contains('Referer')));
+        await manager.delete(completedItem.id);
+      },
+    );
+
+    test(
       'cancel during catalog persistence prevents YouTube startup',
       () async {
         final storage = await _temporaryDirectory();
@@ -430,6 +505,49 @@ class _BurstProgressDio extends DioForNative {
   }
 }
 
+class _FailThenWritingDio extends DioForNative {
+  final List<String> requestedUrls = <String>[];
+  final List<Map<String, dynamic>> headersByRequest = <Map<String, dynamic>>[];
+
+  @override
+  Future<Response> download(
+    String urlPath,
+    dynamic savePath, {
+    ProgressCallback? onReceiveProgress,
+    Map<String, dynamic>? queryParameters,
+    CancelToken? cancelToken,
+    bool deleteOnError = true,
+    FileAccessMode fileAccessMode = FileAccessMode.write,
+    String lengthHeader = Headers.contentLengthHeader,
+    Object? data,
+    Options? options,
+  }) async {
+    requestedUrls.add(urlPath);
+    headersByRequest.add(
+      Map<String, dynamic>.from(options?.headers ?? const {}),
+    );
+    final requestOptions = RequestOptions(path: urlPath);
+    if (requestedUrls.length == 1) {
+      throw DioException(
+        requestOptions: requestOptions,
+        type: DioExceptionType.connectionError,
+        error: 'expired media URL',
+      );
+    }
+    const bytes = <int>[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1];
+    await File(savePath as String).writeAsBytes(bytes, flush: true);
+    onReceiveProgress?.call(bytes.length, bytes.length);
+    return Response<dynamic>(
+      requestOptions: requestOptions,
+      statusCode: HttpStatus.ok,
+      headers: Headers.fromMap(<String, List<String>>{
+        Headers.contentTypeHeader: <String>['image/png'],
+        Headers.contentLengthHeader: <String>['${bytes.length}'],
+      }),
+    );
+  }
+}
+
 class _RedirectingDio extends DioForNative {
   _RedirectingDio({required this.location});
 
@@ -529,6 +647,49 @@ class _FakeYoutubeService implements YoutubeMediaService {
 
   @override
   Future<void> cancel(String jobId) async {}
+
+  @override
+  void dispose() {}
+}
+
+class _FakeInstagramService implements InstagramMediaService {
+  final InstagramPostInfo initialInfo = const InstagramPostInfo(
+    shortcode: 'Caption123',
+    canonicalUrl: 'https://www.instagram.com/p/Caption123/',
+    title: 'Allowed image',
+    author: 'Creator',
+    isReel: false,
+    media: <InstagramMediaOption>[
+      InstagramMediaOption(
+        id: 'Caption123-0',
+        url: 'https://cdn.example.test/expired.png',
+        kind: DiscoverMediaKind.image,
+        mimeType: 'image/png',
+      ),
+    ],
+  );
+
+  int inspectCalls = 0;
+
+  @override
+  Future<InstagramPostInfo> inspect(String url) async {
+    inspectCalls++;
+    return const InstagramPostInfo(
+      shortcode: 'Caption123',
+      canonicalUrl: 'https://www.instagram.com/p/Caption123/',
+      title: 'Allowed image',
+      author: 'Creator',
+      isReel: false,
+      media: <InstagramMediaOption>[
+        InstagramMediaOption(
+          id: 'Caption123-0',
+          url: 'https://cdn.example.test/refreshed.png',
+          kind: DiscoverMediaKind.image,
+          mimeType: 'image/png',
+        ),
+      ],
+    );
+  }
 
   @override
   void dispose() {}

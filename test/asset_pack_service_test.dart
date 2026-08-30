@@ -16,6 +16,19 @@ const _packVersion = '2026.08.11';
 const _mediaBytes = <int>[1, 2, 3, 4, 5, 6];
 const _previewBytes = <int>[7, 8, 9];
 const _audioBytes = <int>[10, 11, 12, 13, 14];
+final _lutBytes = utf8.encode(_cubeFixture(17));
+
+String _cubeFixture(int size) {
+  final output = StringBuffer()
+    ..writeln('TITLE "Fixture Film Look"')
+    ..writeln('LUT_3D_SIZE $size')
+    ..writeln('DOMAIN_MIN 0.0 0.0 0.0')
+    ..writeln('DOMAIN_MAX 1.0 1.0 1.0');
+  for (var index = 0; index < size * size * size; index++) {
+    output.writeln('0.0 0.0 0.0');
+  }
+  return output.toString();
+}
 
 void main() {
   group('AssetPackService', () {
@@ -137,6 +150,40 @@ void main() {
         expect(server.requests, hasLength(requestCount));
         expect(reloaded, isNotNull);
         expect(reloaded!.items.single.localPath, item.localPath);
+      },
+    );
+
+    test(
+      'LUT lookup stays local and installs a common 17-point CUBE file',
+      () async {
+        final root = await _temporaryDirectory();
+        final payload = _buildLutPackArchive();
+        final server = await _PackServer.start(
+          payload,
+          packId: AssetPackConstants.lutsId,
+        );
+        addTearDown(server.close);
+        final service = AssetPackService(
+          rootDirectoryOverride: root,
+          manifestUrlOverride: server.manifestUri.toString(),
+        );
+
+        expect(
+          await service.getInstalledCatalog(AssetPackConstants.lutsId),
+          isNull,
+        );
+        expect(server.requests, isEmpty);
+
+        final installed = await service.install(AssetPackConstants.lutsId);
+
+        expect(server.requests, ['/manifest.json', '/pack.zip']);
+        expect(installed.id, AssetPackConstants.lutsId);
+        final item = installed.items.single;
+        expect(item.mediaKind, AssetPackMediaKind.lut);
+        expect(item.duration, isNull);
+        expect(item.hasAudio, isFalse);
+        expect(item.previewPath, isNotNull);
+        expect(await File(item.localPath).readAsBytes(), _lutBytes);
       },
     );
 
@@ -615,6 +662,7 @@ void main() {
           AssetPackConstants.backgroundVideosId,
           AssetPackConstants.overlaysId,
           AssetPackConstants.soundEffectsId,
+          AssetPackConstants.lutsId,
         }) {
           final file = File(
             p.join(root.path, packId, 'releases', 'v1', 'item'),
@@ -831,6 +879,116 @@ void main() {
       expect(item.previewPath, isNull);
     });
 
+    test('loads valid LUT files and rejects malformed LUT contents', () async {
+      final installation = await _temporaryDirectory();
+      final lut = File(p.join(installation.path, 'luts', 'film-look.cube'));
+      final preview = File(
+        p.join(installation.path, 'previews', 'film-look.jpg'),
+      );
+      await lut.parent.create(recursive: true);
+      await preview.parent.create(recursive: true);
+      await lut.writeAsBytes(_lutBytes);
+      await preview.writeAsBytes(_previewBytes);
+      await File(
+        p.join(installation.path, 'catalog.json'),
+      ).writeAsString(jsonEncode(_validLutCatalog()));
+
+      final catalog = await AssetPackCatalog.load(
+        expectedPackId: AssetPackConstants.lutsId,
+        installationDirectory: installation,
+        catalogPath: 'catalog.json',
+      );
+      expect(catalog.items.single.mediaKind, AssetPackMediaKind.lut);
+      expect(catalog.items.single.previewPath, preview.path);
+
+      await lut.writeAsString(
+        'TITLE "Incomplete"\nLUT_3D_SIZE 17\n0.0 0.0 0.0\n',
+      );
+      final malformedCatalog = _validLutCatalog();
+      (malformedCatalog['assets'] as List<Map<String, dynamic>>)
+          .single['sizeBytes'] = await lut
+          .length();
+      await File(
+        p.join(installation.path, 'catalog.json'),
+      ).writeAsString(jsonEncode(malformedCatalog));
+      await expectLater(
+        AssetPackCatalog.load(
+          expectedPackId: AssetPackConstants.lutsId,
+          installationDirectory: installation,
+          catalogPath: 'catalog.json',
+        ),
+        throwsA(
+          isA<FormatException>().having(
+            (error) => error.message,
+            'message',
+            contains('malformed'),
+          ),
+        ),
+      );
+    });
+
+    test(
+      'streams complete 33-point CUBE files beyond the header prefix',
+      () async {
+        final installation = await _temporaryDirectory();
+        final lut = File(p.join(installation.path, 'large-look.cube'));
+        await lut.writeAsString(_cubeFixture(33));
+
+        expect(await lut.length(), greaterThan(256 * 1024));
+        await expectLater(validateLutFile(lut.path), completes);
+      },
+    );
+
+    test(
+      'rejects LUT catalogs without previews or supported extensions',
+      () async {
+        final installation = await _temporaryDirectory();
+        final catalogFile = File(p.join(installation.path, 'catalog.json'));
+
+        final withoutPreview = _validLutCatalog();
+        (withoutPreview['assets'] as List<Map<String, dynamic>>).single.remove(
+          'previewPath',
+        );
+        await catalogFile.writeAsString(jsonEncode(withoutPreview));
+        await expectLater(
+          AssetPackCatalog.load(
+            expectedPackId: AssetPackConstants.lutsId,
+            installationDirectory: installation,
+            catalogPath: 'catalog.json',
+            validateFiles: false,
+          ),
+          throwsA(
+            isA<FormatException>().having(
+              (error) => error.message,
+              'message',
+              contains('preview is required'),
+            ),
+          ),
+        );
+
+        final wrongExtension = _validLutCatalog();
+        (wrongExtension['assets'] as List<Map<String, dynamic>>)
+                .single['relativePath'] =
+            'luts/film-look.txt';
+        await catalogFile.writeAsString(jsonEncode(wrongExtension));
+        await expectLater(
+          AssetPackCatalog.load(
+            expectedPackId: AssetPackConstants.lutsId,
+            installationDirectory: installation,
+            catalogPath: 'catalog.json',
+            validateFiles: false,
+          ),
+          throwsA(
+            isA<FormatException>().having(
+              (error) => error.message,
+              'message',
+              contains('unsupported file type'),
+            ),
+          ),
+        );
+      },
+    );
+
     test('rejects invalid audio duration and hasAudio declarations', () async {
       final installation = await _temporaryDirectory();
       final catalogFile = File(p.join(installation.path, 'catalog.json'));
@@ -1029,6 +1187,35 @@ Map<String, dynamic> _validAudioCatalog({String version = _packVersion}) {
   };
 }
 
+Map<String, dynamic> _validLutCatalog({String version = _packVersion}) {
+  return {
+    'schema': 'captioncraft-asset-pack',
+    'schemaVersion': AssetPackConstants.catalogSchemaVersion,
+    'pack': {
+      'id': AssetPackConstants.lutsId,
+      'title': 'LUTs',
+      'version': version,
+    },
+    'categories': [
+      {'id': 'cinematic', 'name': 'Cinematic'},
+    ],
+    'assets': <Map<String, dynamic>>[
+      {
+        'id': 'film-look-1',
+        'title': 'Fixture Film Look',
+        'categoryId': 'cinematic',
+        'mediaType': 'lut',
+        'relativePath': 'luts/film-look.cube',
+        'previewPath': 'previews/film-look.jpg',
+        'sizeBytes': _lutBytes.length,
+        'hasAudio': false,
+        'tags': ['cinematic', 'film'],
+        'metadata': {'format': 'cube', 'gridSize': 17},
+      },
+    ],
+  };
+}
+
 _ZipPayload _buildPackArchive({
   Map<String, dynamic>? catalog,
   List<ArchiveFile> additionalEntries = const [],
@@ -1062,6 +1249,25 @@ _ZipPayload _buildAudioPackArchive() {
   final entries = <ArchiveFile>[
     ArchiveFile.bytes('catalog.json', catalogBytes),
     ArchiveFile.bytes('sounds/click.m4a', _audioBytes),
+  ];
+  var installedBytes = 0;
+  for (final entry in entries) {
+    archive.add(entry);
+    if (entry.isFile) installedBytes += entry.size;
+  }
+  return _ZipPayload(
+    archiveBytes: ZipEncoder().encodeBytes(archive),
+    installedBytes: installedBytes,
+  );
+}
+
+_ZipPayload _buildLutPackArchive() {
+  final archive = Archive();
+  final catalogBytes = utf8.encode(jsonEncode(_validLutCatalog()));
+  final entries = <ArchiveFile>[
+    ArchiveFile.bytes('catalog.json', catalogBytes),
+    ArchiveFile.bytes('luts/film-look.cube', _lutBytes),
+    ArchiveFile.bytes('previews/film-look.jpg', _previewBytes),
   ];
   var installedBytes = 0;
   for (final entry in entries) {

@@ -1,12 +1,13 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 
 import '../../../core/constants/asset_pack_constants.dart';
 
-enum AssetPackMediaKind { image, video, audio }
+enum AssetPackMediaKind { image, video, audio, lut }
 
 enum AssetPackProgressPhase {
   fetchingManifest,
@@ -415,6 +416,7 @@ class AssetPackCatalog {
         'image' => AssetPackMediaKind.image,
         'video' => AssetPackMediaKind.video,
         'audio' => AssetPackMediaKind.audio,
+        'lut' => AssetPackMediaKind.lut,
         _ => throw const FormatException('Unsupported pack media type.'),
       };
       final relativePath = normalizePackRelativePath(
@@ -470,6 +472,24 @@ class AssetPackCatalog {
       if (kind == AssetPackMediaKind.audio) {
         _validateAudioMetadata(metadata, itemId);
       }
+      if (kind == AssetPackMediaKind.lut) {
+        final extension = p.extension(relativePath).toLowerCase();
+        if (extension != '.cube' && extension != '.3dl') {
+          throw FormatException('LUT has an unsupported file type: $itemId');
+        }
+        if (sizeBytes > AssetPackConstants.maxLutBytes) {
+          throw FormatException('LUT file is too large: $itemId');
+        }
+        if (duration != null || hasAudio) {
+          throw FormatException('LUT metadata is invalid: $itemId');
+        }
+        if (previewPath == null) {
+          throw FormatException('LUT preview is required: $itemId');
+        }
+        if (validateFiles) {
+          await validateLutFile(mediaFile.path, itemId: itemId);
+        }
+      }
       if (id == AssetPackConstants.soundEffectsId &&
           kind != AssetPackMediaKind.audio) {
         throw const FormatException(
@@ -487,6 +507,9 @@ class AssetPackCatalog {
         throw const FormatException(
           'The overlays pack may contain images and video only.',
         );
+      }
+      if (id == AssetPackConstants.lutsId && kind != AssetPackMediaKind.lut) {
+        throw const FormatException('The LUT pack may contain LUT files only.');
       }
       items.add(
         AssetPackCatalogItem(
@@ -651,8 +674,77 @@ String _defaultPackTitle(String id) => switch (id) {
   AssetPackConstants.backgroundVideosId => 'Background Videos',
   AssetPackConstants.overlaysId => 'Overlays',
   AssetPackConstants.soundEffectsId => 'Sound Effects',
+  AssetPackConstants.lutsId => 'LUTs',
   _ => id,
 };
+
+Future<void> validateLutFile(String filePath, {String itemId = 'LUT'}) async {
+  final file = File(filePath);
+  final extension = p.extension(file.path).toLowerCase();
+  if (extension != '.cube' && extension != '.3dl') {
+    throw FormatException('LUT has an unsupported file type: $itemId');
+  }
+  final length = await file.length();
+  if (length <= 0 || length > AssetPackConstants.maxLutBytes) {
+    throw FormatException('LUT file size is invalid: $itemId');
+  }
+  final valid = extension == '.cube'
+      ? await _hasValidCubeStructure(file)
+      : await _hasValid3dlHeader(file, length);
+  if (!valid) {
+    throw FormatException('LUT file is malformed: $itemId');
+  }
+}
+
+Future<bool> _hasValidCubeStructure(File file) async {
+  final sizePattern = RegExp(r'^LUT_(1D|3D)_SIZE\s+(\d+)\s*$');
+  final number = r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?';
+  final dataPattern = RegExp(
+    '^$number\\s+$number\\s+$number\\s*'
+    r'$',
+  );
+  String? dimension;
+  int? size;
+  var dataRows = 0;
+  await for (final rawLine
+      in file
+          .openRead()
+          .transform(const Utf8Decoder(allowMalformed: true))
+          .transform(const LineSplitter())) {
+    final comment = rawLine.indexOf('#');
+    final line = (comment < 0 ? rawLine : rawLine.substring(0, comment)).trim();
+    if (line.isEmpty) continue;
+    final sizeMatch = sizePattern.firstMatch(line);
+    if (sizeMatch != null) {
+      if (size != null) return false;
+      dimension = sizeMatch.group(1);
+      size = int.tryParse(sizeMatch.group(2)!);
+      continue;
+    }
+    if (dataPattern.hasMatch(line)) dataRows++;
+  }
+  if (size == null || size < 2) return false;
+  if (dimension == '3D' && size > 256) return false;
+  if (dimension == '1D' && size > 65536) return false;
+  final expectedRows = dimension == '3D' ? size * size * size : size;
+  return dataRows == expectedRows;
+}
+
+Future<bool> _hasValid3dlHeader(File file, int length) async {
+  final handle = await file.open();
+  try {
+    final prefix = utf8.decode(
+      await handle.read(math.min(length, 256 * 1024)),
+      allowMalformed: true,
+    );
+    return const LineSplitter()
+        .convert(prefix)
+        .map((line) => line.trim())
+        .any((line) => RegExp(r'^\d+(?:\s+\d+){3,}$').hasMatch(line));
+  } finally {
+    await handle.close();
+  }
+}
 
 Uri _resolvePublicAssetUri(
   Uri manifestUri,

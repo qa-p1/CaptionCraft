@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/subtitle_entry.dart';
 import '../models/subtitle_style_model.dart';
+import '../models/editor_effect_models.dart';
 import '../models/timeline_models.dart';
 import 'editor_history_clock.dart';
 import 'subtitle_provider.dart';
@@ -143,6 +144,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
   final Ref _ref;
   final List<_EditorHistorySnapshot> _undoStack = [];
   final List<_EditorHistorySnapshot> _redoStack = [];
+  EditorEffectStack? _effectStackClipboard;
   bool _isTimelineGestureEditing = false;
   bool _timelineChangedDuringGesture = false;
   _EditorHistorySnapshot? _timelineGestureBaseline;
@@ -160,6 +162,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
       _redoStack.last.branch == _historyClock.branch;
   int? get latestUndoSequence => canUndo ? _undoStack.last.sequence : null;
   int? get latestRedoSequence => canRedo ? _redoStack.last.sequence : null;
+  bool get hasCopiedEffectStack => _effectStackClipboard?.isNotEmpty == true;
 
   EditorNotifier(this._ref) : super(const EditorState()) {
     _ref.listen<SubtitleState>(subtitleProvider, (_, next) {
@@ -558,6 +561,891 @@ class EditorNotifier extends StateNotifier<EditorState> {
     return true;
   }
 
+  EditorEffectStack effectStackForTarget({
+    required EditorEffectScope scope,
+    String? targetId,
+  }) {
+    switch (scope) {
+      case EditorEffectScope.project:
+        return state.timeline.projectEffectStack;
+      case EditorEffectScope.clip:
+      case EditorEffectScope.adjustmentLayer:
+        return state.timeline.tracks
+                .expand((track) => track.clips)
+                .where((clip) => clip.id == targetId)
+                .firstOrNull
+                ?.effectStack ??
+            const EditorEffectStack();
+      case EditorEffectScope.track:
+        return state.timeline.tracks
+                .where((track) => track.id == targetId)
+                .firstOrNull
+                ?.effectStack ??
+            const EditorEffectStack();
+      case EditorEffectScope.audioBus:
+        return state.timeline.audioBuses
+                .where((bus) => bus.id == targetId)
+                .firstOrNull
+                ?.effectStack ??
+            const EditorEffectStack();
+      case EditorEffectScope.group:
+      case EditorEffectScope.compound:
+        return state.timeline.effectContainers
+                .where(
+                  (container) =>
+                      container.scope == scope &&
+                      container.targetId == targetId,
+                )
+                .firstOrNull
+                ?.stack ??
+            const EditorEffectStack();
+    }
+  }
+
+  bool updateEffectStack({
+    required EditorEffectScope scope,
+    String? targetId,
+    required EditorEffectStack Function(EditorEffectStack current) mapper,
+    bool recordHistory = true,
+  }) {
+    if (scope != EditorEffectScope.project && targetId == null) return false;
+    if (scope == EditorEffectScope.adjustmentLayer &&
+        !state.timeline.tracks
+            .expand((track) => track.clips)
+            .any((clip) => clip.id == targetId && clip.isAdjustmentLayer)) {
+      return false;
+    }
+    final current = effectStackForTarget(scope: scope, targetId: targetId);
+    final updated = mapper(current);
+    if (identical(current, updated)) return false;
+    switch (scope) {
+      case EditorEffectScope.project:
+        setTimeline(
+          state.timeline.copyWith(projectEffectStack: updated),
+          recordHistory: recordHistory,
+        );
+        return true;
+      case EditorEffectScope.clip:
+      case EditorEffectScope.adjustmentLayer:
+        return updateClip(
+          targetId!,
+          (clip) => clip.copyWith(effectStack: updated),
+          recordHistory: recordHistory,
+        );
+      case EditorEffectScope.track:
+        return updateTrack(
+          targetId!,
+          (track) => track.copyWith(effectStack: updated),
+          recordHistory: recordHistory,
+        );
+      case EditorEffectScope.audioBus:
+        return updateAudioBus(
+          targetId!,
+          (bus) => bus.copyWith(effectStack: updated),
+          recordHistory: recordHistory,
+        );
+      case EditorEffectScope.group:
+      case EditorEffectScope.compound:
+        if (!_effectTargetExists(scope, targetId!)) {
+          return false;
+        }
+        if (_effectTargetIsLocked(scope, targetId)) return false;
+        final containers = [...state.timeline.effectContainers];
+        final index = containers.indexWhere(
+          (container) =>
+              container.scope == scope && container.targetId == targetId,
+        );
+        if (index < 0) {
+          containers.add(
+            EditorEffectContainer(
+              scope: scope,
+              targetId: targetId,
+              label: scope == EditorEffectScope.group
+                  ? 'Group effects'
+                  : 'Compound effects',
+              stack: updated,
+            ),
+          );
+        } else {
+          containers[index] = containers[index].copyWith(
+            enabled: true,
+            stack: updated,
+          );
+        }
+        setTimeline(
+          state.timeline.copyWith(effectContainers: containers),
+          recordHistory: recordHistory,
+        );
+        return true;
+    }
+  }
+
+  bool addEffect({
+    required EditorEffectScope scope,
+    String? targetId,
+    required EditorEffectType type,
+  }) {
+    return updateEffectStack(
+      scope: scope,
+      targetId: targetId,
+      mapper: (stack) => stack.add(EditorEffect(type: type)),
+    );
+  }
+
+  bool updateEffect({
+    required EditorEffectScope scope,
+    String? targetId,
+    required String effectId,
+    required EditorEffect Function(EditorEffect effect) mapper,
+    bool recordHistory = true,
+  }) {
+    final currentStack = effectStackForTarget(scope: scope, targetId: targetId);
+    if (currentStack.byId(effectId) == null) return false;
+    var found = false;
+    final changed = updateEffectStack(
+      scope: scope,
+      targetId: targetId,
+      recordHistory: recordHistory,
+      mapper: (stack) => stack.copyWith(
+        effects: stack.effects.map((effect) {
+          if (effect.id != effectId) return effect;
+          found = true;
+          return mapper(effect);
+        }).toList(),
+      ),
+    );
+    return changed && found;
+  }
+
+  bool removeEffect({
+    required EditorEffectScope scope,
+    String? targetId,
+    required String effectId,
+  }) {
+    if (effectStackForTarget(scope: scope, targetId: targetId).byId(effectId) ==
+        null) {
+      return false;
+    }
+    return updateEffectStack(
+      scope: scope,
+      targetId: targetId,
+      mapper: (stack) => stack.remove(effectId),
+    );
+  }
+
+  bool toggleEffect({
+    required EditorEffectScope scope,
+    String? targetId,
+    required String effectId,
+  }) {
+    if (effectStackForTarget(scope: scope, targetId: targetId).byId(effectId) ==
+        null) {
+      return false;
+    }
+    return updateEffectStack(
+      scope: scope,
+      targetId: targetId,
+      mapper: (stack) => stack.toggle(effectId),
+    );
+  }
+
+  bool reorderEffects({
+    required EditorEffectScope scope,
+    String? targetId,
+    required int oldIndex,
+    required int newIndex,
+  }) {
+    final stack = effectStackForTarget(scope: scope, targetId: targetId);
+    if (oldIndex < 0 ||
+        oldIndex >= stack.effects.length ||
+        newIndex < 0 ||
+        newIndex > stack.effects.length ||
+        oldIndex == newIndex ||
+        oldIndex + 1 == newIndex) {
+      return false;
+    }
+    return updateEffectStack(
+      scope: scope,
+      targetId: targetId,
+      mapper: (stack) => stack.reorder(oldIndex, newIndex),
+    );
+  }
+
+  bool copyEffectStack({
+    required EditorEffectScope sourceScope,
+    String? sourceTargetId,
+    required EditorEffectScope destinationScope,
+    String? destinationTargetId,
+    bool append = false,
+  }) {
+    final source = effectStackForTarget(
+      scope: sourceScope,
+      targetId: sourceTargetId,
+    );
+    if (source.isEmpty) return false;
+    final copied = source.cloneWithNewIds();
+    return updateEffectStack(
+      scope: destinationScope,
+      targetId: destinationTargetId,
+      mapper: (current) => append
+          ? current.copyWith(effects: [...current.effects, ...copied.effects])
+          : copied,
+    );
+  }
+
+  bool copyEffectStackToClipboard({
+    required EditorEffectScope scope,
+    String? targetId,
+    EditorEffectDomain? domain,
+  }) {
+    final source = effectStackForTarget(scope: scope, targetId: targetId);
+    final stack = domain == null
+        ? source
+        : source.copyWith(
+            effects: source.effects
+                .where((effect) => effect.domain == domain)
+                .toList(),
+          );
+    if (stack.isEmpty) return false;
+    _effectStackClipboard = stack.cloneWithNewIds();
+    return true;
+  }
+
+  bool pasteEffectStackFromClipboard({
+    required EditorEffectScope scope,
+    String? targetId,
+    bool append = false,
+    EditorEffectDomain? domain,
+  }) {
+    final clipboard = _effectStackClipboard;
+    if (clipboard == null || clipboard.isEmpty) return false;
+    final copied = EditorEffectStack(
+      effects: clipboard.effects
+          .where((effect) => domain == null || effect.domain == domain)
+          .map((effect) => effect.cloneWithNewId())
+          .toList(),
+    );
+    if (copied.isEmpty) return false;
+    return updateEffectStack(
+      scope: scope,
+      targetId: targetId,
+      mapper: (current) {
+        if (append || domain == null) {
+          return append
+              ? current.copyWith(
+                  effects: [...current.effects, ...copied.effects],
+                )
+              : copied;
+        }
+        return current.copyWith(
+          effects: [
+            ...current.effects.where((effect) => effect.domain != domain),
+            ...copied.effects,
+          ],
+        );
+      },
+    );
+  }
+
+  String? saveEffectPreset({
+    required String name,
+    required EditorEffectScope scope,
+    String? targetId,
+    EditorEffectDomain? domain,
+  }) {
+    final cleaned = name.trim();
+    if (cleaned.isEmpty) return null;
+    final source = effectStackForTarget(scope: scope, targetId: targetId);
+    final stack = domain == null
+        ? source
+        : source.copyWith(
+            effects: source.effects
+                .where((effect) => effect.domain == domain)
+                .toList(),
+          );
+    if (stack.isEmpty) return null;
+    final preset = EditorEffectPreset(
+      name: cleaned,
+      stack: stack.cloneWithNewIds(),
+    );
+    setTimeline(
+      state.timeline.copyWith(
+        effectPresets: [...state.timeline.effectPresets, preset],
+      ),
+    );
+    return preset.id;
+  }
+
+  bool applyEffectPreset({
+    required String presetId,
+    required EditorEffectScope scope,
+    String? targetId,
+    bool append = false,
+    EditorEffectDomain? domain,
+  }) {
+    final preset = state.timeline.effectPresets
+        .where((candidate) => candidate.id == presetId)
+        .firstOrNull;
+    if (preset == null) return false;
+    return applyEffectPresetValue(
+      preset: preset,
+      scope: scope,
+      targetId: targetId,
+      append: append,
+      domain: domain,
+    );
+  }
+
+  bool applyEffectPresetValue({
+    required EditorEffectPreset preset,
+    required EditorEffectScope scope,
+    String? targetId,
+    bool append = false,
+    EditorEffectDomain? domain,
+  }) {
+    final copied = EditorEffectStack(
+      effects: preset.stack.effects
+          .where((effect) => domain == null || effect.domain == domain)
+          .map((effect) => effect.cloneWithNewId())
+          .toList(),
+    );
+    if (copied.isEmpty) return false;
+    return updateEffectStack(
+      scope: scope,
+      targetId: targetId,
+      mapper: (current) {
+        if (append || domain == null) {
+          return append
+              ? current.copyWith(
+                  effects: [...current.effects, ...copied.effects],
+                )
+              : copied;
+        }
+        return current.copyWith(
+          effects: [
+            ...current.effects.where((effect) => effect.domain != domain),
+            ...copied.effects,
+          ],
+        );
+      },
+    );
+  }
+
+  bool deleteEffectPreset(String presetId) {
+    if (!state.timeline.effectPresets.any((preset) => preset.id == presetId)) {
+      return false;
+    }
+    setTimeline(
+      state.timeline.copyWith(
+        effectPresets: state.timeline.effectPresets
+            .where((preset) => preset.id != presetId)
+            .toList(),
+      ),
+    );
+    return true;
+  }
+
+  bool upsertEffectParameterKeyframe({
+    required EditorEffectScope scope,
+    String? targetId,
+    required String effectId,
+    required String parameter,
+    required Duration time,
+    required double value,
+    EditorEffectInterpolation interpolation = EditorEffectInterpolation.linear,
+  }) {
+    final safeTime = time.isNegative ? Duration.zero : time;
+    return updateEffect(
+      scope: scope,
+      targetId: targetId,
+      effectId: effectId,
+      mapper: (effect) => effect.upsertKeyframe(
+        parameter: parameter,
+        time: safeTime,
+        value: value,
+        interpolation: interpolation,
+      ),
+    );
+  }
+
+  bool removeEffectParameterKeyframe({
+    required EditorEffectScope scope,
+    String? targetId,
+    required String effectId,
+    required String parameter,
+    required Duration time,
+  }) {
+    return updateEffect(
+      scope: scope,
+      targetId: targetId,
+      effectId: effectId,
+      mapper: (effect) => effect.copyWith(
+        keyframes: effect.keyframes
+            .where(
+              (keyframe) =>
+                  keyframe.parameter != parameter || keyframe.time != time,
+            )
+            .toList(),
+      ),
+    );
+  }
+
+  String? createGroup(Iterable<String> clipIds, {String? name}) {
+    final ids = clipIds.toSet();
+    if (ids.length < 2) return null;
+    final matching = state.timeline.tracks
+        .expand((track) => track.clips.map((clip) => (track, clip)))
+        .where((entry) => ids.contains(entry.$2.id))
+        .toList();
+    if (matching.length != ids.length ||
+        matching.any((entry) => entry.$1.isLocked)) {
+      return null;
+    }
+    final group = TimelineGroup(
+      name: name?.trim().isNotEmpty == true
+          ? name!.trim()
+          : 'Group ${state.timeline.groups.length + 1}',
+      clipIds: ids,
+    );
+    final oldGroupIds = matching
+        .map((entry) => entry.$2.groupId)
+        .whereType<String>()
+        .toSet();
+    final tracks = state.timeline.tracks.map((track) {
+      return track.copyWith(
+        clips: track.clips
+            .map(
+              (clip) => ids.contains(clip.id)
+                  ? clip.copyWith(groupId: group.id)
+                  : clip,
+            )
+            .toList(),
+      );
+    }).toList();
+    final groups =
+        state.timeline.groups
+            .map(
+              (existing) => oldGroupIds.contains(existing.id)
+                  ? existing.copyWith(
+                      clipIds: existing.clipIds.where(
+                        (id) => !ids.contains(id),
+                      ),
+                    )
+                  : existing,
+            )
+            .where((existing) => existing.clipIds.isNotEmpty)
+            .toList()
+          ..add(group);
+    setTimeline(state.timeline.copyWith(tracks: tracks, groups: groups));
+    selectClipIds(ids);
+    return group.id;
+  }
+
+  bool ungroup(String groupId) {
+    if (_effectTargetIsLocked(EditorEffectScope.group, groupId)) return false;
+    final group = state.timeline.groups
+        .where((candidate) => candidate.id == groupId)
+        .firstOrNull;
+    if (group == null) return false;
+    final tracks = state.timeline.tracks.map((track) {
+      return track.copyWith(
+        clips: track.clips
+            .map(
+              (clip) => clip.groupId == groupId
+                  ? clip.copyWith(clearGroupId: true)
+                  : clip,
+            )
+            .toList(),
+      );
+    }).toList();
+    setTimeline(
+      state.timeline.copyWith(
+        tracks: tracks,
+        groups: state.timeline.groups
+            .where((candidate) => candidate.id != groupId)
+            .toList(),
+        effectContainers: state.timeline.effectContainers
+            .where(
+              (container) =>
+                  container.scope != EditorEffectScope.group ||
+                  container.targetId != groupId,
+            )
+            .toList(),
+      ),
+    );
+    return true;
+  }
+
+  String? createCompoundClip(Iterable<String> clipIds, {String? name}) {
+    final ids = clipIds.toSet();
+    if (ids.length < 2) return null;
+    final matching = state.timeline.tracks
+        .expand((track) => track.clips.map((clip) => (track, clip)))
+        .where((entry) => ids.contains(entry.$2.id))
+        .toList();
+    if (matching.length != ids.length ||
+        matching.any(
+          (entry) => entry.$1.isLocked || !entry.$2.type.isVisualMedia,
+        )) {
+      return null;
+    }
+    final compound = TimelineCompoundClip(
+      name: name?.trim().isNotEmpty == true
+          ? name!.trim()
+          : 'Compound ${state.timeline.compoundClips.length + 1}',
+      clipIds: ids,
+    );
+    final oldCompoundIds = matching
+        .map((entry) => entry.$2.compoundId)
+        .whereType<String>()
+        .toSet();
+    final tracks = state.timeline.tracks.map((track) {
+      return track.copyWith(
+        clips: track.clips
+            .map(
+              (clip) => ids.contains(clip.id)
+                  ? clip.copyWith(compoundId: compound.id)
+                  : clip,
+            )
+            .toList(),
+      );
+    }).toList();
+    final compounds =
+        state.timeline.compoundClips
+            .map(
+              (existing) => oldCompoundIds.contains(existing.id)
+                  ? existing.copyWith(
+                      clipIds: existing.clipIds.where(
+                        (id) => !ids.contains(id),
+                      ),
+                    )
+                  : existing,
+            )
+            .where((existing) => existing.clipIds.isNotEmpty)
+            .toList()
+          ..add(compound);
+    setTimeline(
+      state.timeline.copyWith(tracks: tracks, compoundClips: compounds),
+    );
+    selectClipIds(ids);
+    return compound.id;
+  }
+
+  bool dissolveCompoundClip(String compoundId) {
+    if (_effectTargetIsLocked(EditorEffectScope.compound, compoundId)) {
+      return false;
+    }
+    if (!state.timeline.compoundClips.any(
+      (candidate) => candidate.id == compoundId,
+    )) {
+      return false;
+    }
+    final tracks = state.timeline.tracks.map((track) {
+      return track.copyWith(
+        clips: track.clips
+            .map(
+              (clip) => clip.compoundId == compoundId
+                  ? clip.copyWith(clearCompoundId: true)
+                  : clip,
+            )
+            .toList(),
+      );
+    }).toList();
+    setTimeline(
+      state.timeline.copyWith(
+        tracks: tracks,
+        compoundClips: state.timeline.compoundClips
+            .where((candidate) => candidate.id != compoundId)
+            .toList(),
+        effectContainers: state.timeline.effectContainers
+            .where(
+              (container) =>
+                  container.scope != EditorEffectScope.compound ||
+                  container.targetId != compoundId,
+            )
+            .toList(),
+      ),
+    );
+    return true;
+  }
+
+  String? createAdjustmentLayer({
+    required Duration startTime,
+    required Duration endTime,
+    String label = 'Adjustment layer',
+  }) {
+    if (endTime <= startTime) return null;
+    final timeline = state.timeline;
+    var track = timeline.tracks
+        .where(
+          (candidate) =>
+              candidate.section == TimelineTrackSection.overlay &&
+              candidate.acceptsClipType(TimelineTrackType.effect) &&
+              !candidate.isLocked &&
+              candidate.clips.every(
+                (clip) =>
+                    endTime <= clip.startTime || startTime >= clip.endTime,
+              ),
+        )
+        .firstOrNull;
+    var nextTimeline = timeline;
+    if (track == null) {
+      track = TimelineTrack(
+        name: timeline.nextTrackNameForSection(TimelineTrackSection.overlay),
+        type: TimelineTrackType.video,
+        section: TimelineTrackSection.overlay,
+      );
+      nextTimeline = timeline.insertTrackUsingEditorRules(track);
+    }
+    final layer = TimelineClip.effect(
+      trackId: track.id,
+      effectKind: null,
+      label: label.trim().isEmpty ? 'Adjustment layer' : label.trim(),
+      startTime: startTime,
+      endTime: endTime,
+      isAdjustmentLayer: true,
+    );
+    final tracks = nextTimeline.tracks.map((candidate) {
+      return candidate.id == track!.id
+          ? candidate.copyWith(clips: [...candidate.clips, layer])
+          : candidate;
+    }).toList();
+    setTimeline(nextTimeline.copyWith(tracks: tracks));
+    selectTrack(track.id);
+    selectClip(layer.id);
+    return layer.id;
+  }
+
+  String createAudioBus({String? name}) {
+    final bus = TimelineAudioBus(
+      name: name?.trim().isNotEmpty == true
+          ? name!.trim()
+          : 'Bus ${state.timeline.audioBuses.length + 1}',
+    );
+    setTimeline(
+      state.timeline.copyWith(audioBuses: [...state.timeline.audioBuses, bus]),
+    );
+    return bus.id;
+  }
+
+  bool updateAudioBus(
+    String busId,
+    TimelineAudioBus Function(TimelineAudioBus bus) mapper, {
+    bool recordHistory = true,
+  }) {
+    if (!state.timeline.audioBuses.any((bus) => bus.id == busId)) return false;
+    setTimeline(
+      state.timeline.copyWith(
+        audioBuses: state.timeline.audioBuses
+            .map((bus) => bus.id == busId ? mapper(bus) : bus)
+            .toList(),
+      ),
+      recordHistory: recordHistory,
+    );
+    return true;
+  }
+
+  bool assignTrackToAudioBus(String trackId, String? busId) {
+    if (busId != null &&
+        !state.timeline.audioBuses.any((bus) => bus.id == busId)) {
+      return false;
+    }
+    return updateTrack(
+      trackId,
+      (track) => busId == null
+          ? track.copyWith(clearAudioBusId: true)
+          : track.copyWith(audioBusId: busId),
+    );
+  }
+
+  bool deleteAudioBus(String busId) {
+    if (!state.timeline.audioBuses.any((bus) => bus.id == busId)) return false;
+    setTimeline(
+      state.timeline.copyWith(
+        audioBuses: state.timeline.audioBuses
+            .where((bus) => bus.id != busId)
+            .toList(),
+        tracks: state.timeline.tracks
+            .map(
+              (track) => track.audioBusId == busId
+                  ? track.copyWith(clearAudioBusId: true)
+                  : track,
+            )
+            .toList(),
+      ),
+    );
+    return true;
+  }
+
+  String? importAndApplyLutToClip({
+    required String clipId,
+    required String sourcePath,
+    String? name,
+    String folder = 'Custom',
+  }) => importAndApplyLutToClips(
+    clipIds: [clipId],
+    sourcePath: sourcePath,
+    name: name,
+    folder: folder,
+  );
+
+  String? importAndApplyLutToClips({
+    required Iterable<String> clipIds,
+    required String sourcePath,
+    String? name,
+    String folder = 'Custom',
+  }) {
+    final ids = clipIds.toSet();
+    if (ids.isEmpty) return null;
+    final cleanedPath = sourcePath.trim();
+    if (cleanedPath.isEmpty) return null;
+    final matching = state.timeline.tracks
+        .expand((track) => track.clips.map((clip) => (track, clip)))
+        .where((entry) => ids.contains(entry.$2.id))
+        .toList();
+    if (matching.length != ids.length ||
+        matching.any(
+          (entry) => entry.$1.isLocked || !entry.$2.supportsVisualEffects,
+        )) {
+      return null;
+    }
+    final existing = state.timeline.colorManagement.luts
+        .where((lut) => lut.path.toLowerCase() == cleanedPath.toLowerCase())
+        .firstOrNull;
+    final lut =
+        existing ??
+        EditorLutAsset(
+          name: name?.trim().isNotEmpty == true ? name!.trim() : 'Custom LUT',
+          path: cleanedPath,
+          folder: folder.trim().isEmpty ? 'Custom' : folder.trim(),
+        );
+    final tracks = state.timeline.tracks
+        .map(
+          (track) => track.copyWith(
+            clips: track.clips
+                .map(
+                  (clip) => ids.contains(clip.id)
+                      ? clip.copyWith(
+                          colorAdjustments: clip.colorAdjustments.copyWith(
+                            lutPath: lut.path,
+                            lutIntensity: 1,
+                          ),
+                        )
+                      : clip,
+                )
+                .toList(),
+          ),
+        )
+        .toList();
+    setTimeline(
+      state.timeline.copyWith(
+        tracks: tracks,
+        colorManagement: state.timeline.colorManagement.copyWith(
+          luts: existing == null
+              ? [...state.timeline.colorManagement.luts, lut]
+              : state.timeline.colorManagement.luts,
+        ),
+      ),
+    );
+    return lut.id;
+  }
+
+  bool applyLutToClip(String clipId, String? lutId) {
+    return applyLutToClips([clipId], lutId);
+  }
+
+  bool applyLutToClips(Iterable<String> clipIds, String? lutId) {
+    final ids = clipIds.toSet();
+    if (ids.isEmpty) return false;
+    final lut = lutId == null
+        ? null
+        : state.timeline.colorManagement.luts
+              .where((candidate) => candidate.id == lutId)
+              .firstOrNull;
+    if (lutId != null && lut == null) return false;
+    final matching = state.timeline.tracks
+        .expand((track) => track.clips.map((clip) => (track, clip)))
+        .where((entry) => ids.contains(entry.$2.id))
+        .toList();
+    if (matching.length != ids.length ||
+        matching.any(
+          (entry) => entry.$1.isLocked || !entry.$2.supportsVisualEffects,
+        )) {
+      return false;
+    }
+    setTimeline(
+      state.timeline.copyWith(
+        tracks: state.timeline.tracks
+            .map(
+              (track) => track.copyWith(
+                clips: track.clips
+                    .map(
+                      (clip) => ids.contains(clip.id)
+                          ? clip.copyWith(
+                              colorAdjustments: lut == null
+                                  ? clip.colorAdjustments.copyWith(
+                                      clearLutPath: true,
+                                    )
+                                  : clip.colorAdjustments.copyWith(
+                                      lutPath: lut.path,
+                                    ),
+                            )
+                          : clip,
+                    )
+                    .toList(),
+              ),
+            )
+            .toList(),
+      ),
+    );
+    return true;
+  }
+
+  bool updateLutAsset(
+    String lutId,
+    EditorLutAsset Function(EditorLutAsset lut) mapper,
+  ) {
+    if (!state.timeline.colorManagement.luts.any((lut) => lut.id == lutId)) {
+      return false;
+    }
+    setTimeline(
+      state.timeline.copyWith(
+        colorManagement: state.timeline.colorManagement.copyWith(
+          luts: state.timeline.colorManagement.luts
+              .map((lut) => lut.id == lutId ? mapper(lut) : lut)
+              .toList(),
+        ),
+      ),
+    );
+    return true;
+  }
+
+  bool _effectTargetExists(EditorEffectScope scope, String targetId) {
+    return switch (scope) {
+      EditorEffectScope.group => state.timeline.groups.any(
+        (group) => group.id == targetId,
+      ),
+      EditorEffectScope.compound => state.timeline.compoundClips.any(
+        (compound) => compound.id == targetId,
+      ),
+      _ => false,
+    };
+  }
+
+  bool _effectTargetIsLocked(EditorEffectScope scope, String targetId) {
+    return state.timeline.tracks.any(
+      (track) =>
+          track.isLocked &&
+          track.clips.any(
+            (clip) => switch (scope) {
+              EditorEffectScope.group => clip.groupId == targetId,
+              EditorEffectScope.compound => clip.compoundId == targetId,
+              _ => false,
+            },
+          ),
+    );
+  }
+
   bool upsertKeyframe({
     required String clipId,
     required TimelineKeyframeProperty property,
@@ -773,7 +1661,10 @@ class EditorNotifier extends StateNotifier<EditorState> {
       final safeVolume = volume.clamp(0.0, 2.0).toDouble();
       if (!clip.hasVolumeKeyframes) {
         return clip.copyWith(
-          audioMix: clip.audioMix.copyWith(volume: safeVolume),
+          audioMix: clip.audioMix.copyWith(
+            volume: safeVolume,
+            clearLoudnessAnalysis: true,
+          ),
         );
       }
       final time = _snappedKeyframeTime(clip, absolutePosition);
@@ -795,7 +1686,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
                 .blurAt(absolutePosition)
                 .safeStrength,
         },
-      );
+      ).copyWith(audioMix: clip.audioMix.copyWith(clearLoudnessAnalysis: true));
     }, recordHistory: recordHistory);
   }
 
@@ -907,18 +1798,36 @@ class EditorNotifier extends StateNotifier<EditorState> {
         .firstOrNull;
     if (source == null || source.isLocked || !source.isDuplicable) return false;
     final duplicateId = 'track_${DateTime.now().microsecondsSinceEpoch}';
+    final duplicatedClipIds = {
+      for (final clip in source.clips) clip.id: '${clip.id}_copy_$duplicateId',
+    };
     final duplicate = TimelineTrack(
       id: duplicateId,
       name: '${source.name} copy',
       type: source.type,
       section: source.section,
+      role: source.role,
+      isCollapsed: source.isCollapsed,
+      isMuted: source.isMuted,
+      isHidden: source.isHidden,
+      isSolo: source.isSolo,
       audioGain: source.audioGain,
       audioPan: source.audioPan,
+      audioBusId: source.audioBusId,
+      syncLocked: source.syncLocked,
+      effectStack: source.effectStack.cloneWithNewIds(),
       clips: source.clips
           .map(
             (clip) => clip.copyWith(
-              id: '${clip.id}_copy_$duplicateId',
+              id: duplicatedClipIds[clip.id],
               trackId: duplicateId,
+              linkedClipId: duplicatedClipIds[clip.linkedClipId],
+              clearLinkedClipId:
+                  clip.linkedClipId != null &&
+                  !duplicatedClipIds.containsKey(clip.linkedClipId),
+              effectStack: clip.effectStack.cloneWithNewIds(),
+              clearGroupId: true,
+              clearCompoundId: true,
             ),
           )
           .toList(),

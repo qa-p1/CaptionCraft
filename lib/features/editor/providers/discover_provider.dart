@@ -9,8 +9,10 @@ class DiscoverState {
   const DiscoverState({
     this.downloads = const <DiscoverDownloadItem>[],
     this.youtubeInfo,
+    this.instagramInfo,
     this.isInitialized = false,
     this.isInspectingYoutube = false,
+    this.isInspectingInstagram = false,
     this.isEnqueuing = false,
     this.permittedContentAcknowledged = false,
     this.errorMessage,
@@ -18,8 +20,10 @@ class DiscoverState {
 
   final List<DiscoverDownloadItem> downloads;
   final YoutubeVideoInfo? youtubeInfo;
+  final InstagramPostInfo? instagramInfo;
   final bool isInitialized;
   final bool isInspectingYoutube;
+  final bool isInspectingInstagram;
   final bool isEnqueuing;
   final bool permittedContentAcknowledged;
   final String? errorMessage;
@@ -34,19 +38,27 @@ class DiscoverState {
   DiscoverState copyWith({
     List<DiscoverDownloadItem>? downloads,
     YoutubeVideoInfo? youtubeInfo,
+    InstagramPostInfo? instagramInfo,
     bool? isInitialized,
     bool? isInspectingYoutube,
+    bool? isInspectingInstagram,
     bool? isEnqueuing,
     bool? permittedContentAcknowledged,
     String? errorMessage,
     bool clearYoutubeInfo = false,
+    bool clearInstagramInfo = false,
     bool clearErrorMessage = false,
   }) {
     return DiscoverState(
       downloads: downloads ?? this.downloads,
       youtubeInfo: clearYoutubeInfo ? null : youtubeInfo ?? this.youtubeInfo,
+      instagramInfo: clearInstagramInfo
+          ? null
+          : instagramInfo ?? this.instagramInfo,
       isInitialized: isInitialized ?? this.isInitialized,
       isInspectingYoutube: isInspectingYoutube ?? this.isInspectingYoutube,
+      isInspectingInstagram:
+          isInspectingInstagram ?? this.isInspectingInstagram,
       isEnqueuing: isEnqueuing ?? this.isEnqueuing,
       permittedContentAcknowledged:
           permittedContentAcknowledged ?? this.permittedContentAcknowledged,
@@ -77,6 +89,7 @@ class DiscoverNotifier extends StateNotifier<DiscoverState> {
   late final StreamSubscription<List<DiscoverDownloadItem>> _subscription;
   Future<void>? _initialization;
   int _youtubeInspectionGeneration = 0;
+  int _instagramInspectionGeneration = 0;
   int _enqueueOperations = 0;
 
   Future<void> initialize() {
@@ -169,6 +182,59 @@ class DiscoverNotifier extends StateNotifier<DiscoverState> {
     }
   }
 
+  Future<InstagramPostInfo?> inspectInstagram(String url) async {
+    final generation = ++_instagramInspectionGeneration;
+    state = state.copyWith(
+      isInspectingInstagram: true,
+      permittedContentAcknowledged: false,
+      clearInstagramInfo: true,
+      clearErrorMessage: true,
+    );
+    try {
+      final info = await _facade.inspectInstagram(url);
+      if (mounted && generation == _instagramInspectionGeneration) {
+        state = state.copyWith(instagramInfo: info);
+      }
+      return info;
+    } catch (error) {
+      if (mounted && generation == _instagramInspectionGeneration) {
+        state = state.copyWith(errorMessage: _errorText(error));
+      }
+      return null;
+    } finally {
+      if (mounted && generation == _instagramInspectionGeneration) {
+        state = state.copyWith(isInspectingInstagram: false);
+      }
+    }
+  }
+
+  Future<DiscoverDownloadItem?> enqueueInstagram({
+    required InstagramPostInfo info,
+    required InstagramMediaOption media,
+    String? outputFileName,
+  }) async {
+    final acknowledged = state.permittedContentAcknowledged;
+    _beginEnqueue();
+    try {
+      await initialize();
+      final item = await _facade.enqueueInstagram(
+        info: info,
+        media: media,
+        permittedContentAcknowledged: acknowledged,
+        outputFileName: outputFileName,
+      );
+      if (mounted) {
+        state = state.copyWith(permittedContentAcknowledged: false);
+      }
+      return item;
+    } catch (error) {
+      if (mounted) state = state.copyWith(errorMessage: _errorText(error));
+      return null;
+    } finally {
+      _endEnqueue();
+    }
+  }
+
   void setPermittedContentAcknowledged(bool value) {
     state = state.copyWith(
       permittedContentAcknowledged: value,
@@ -181,6 +247,15 @@ class DiscoverNotifier extends StateNotifier<DiscoverState> {
     state = state.copyWith(
       clearYoutubeInfo: true,
       isInspectingYoutube: false,
+      permittedContentAcknowledged: false,
+    );
+  }
+
+  void clearInstagramInspection() {
+    _instagramInspectionGeneration++;
+    state = state.copyWith(
+      clearInstagramInfo: true,
+      isInspectingInstagram: false,
       permittedContentAcknowledged: false,
     );
   }

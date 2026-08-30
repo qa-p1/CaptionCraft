@@ -126,7 +126,7 @@ void main() {
         final restoredTrack = restored.tracks.single;
         final restoredClip = restoredTrack.clips.single;
 
-        expect(restored.schemaVersion, 7);
+        expect(restored.schemaVersion, EditorTimeline.currentSchemaVersion);
         expect(
           restored.canvasSettings.aspectRatioPreset,
           CanvasAspectRatioPreset.ratio9x16,

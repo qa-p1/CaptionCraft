@@ -72,9 +72,12 @@ class TimelinePreviewAudioService {
         if (track.section == TimelineTrackSection.audio)
           for (final clip in track.clips)
             if (clip.type == TimelineTrackType.audio &&
-                clip.linkedClipId != null &&
+                clip.separatedAudioSourceClipId != null &&
                 clip.assetId != null)
-              (visualClipId: clip.linkedClipId!, assetId: clip.assetId!),
+              (
+                visualClipId: clip.separatedAudioSourceClipId!,
+                assetId: clip.assetId!,
+              ),
     };
     final hasSoloMediaTrack = timeline.tracks.any(
       (track) =>
@@ -89,6 +92,11 @@ class TimelinePreviewAudioService {
                 clip.type != TimelineTrackType.effect,
           ),
     );
+    final audioBusesById = {for (final bus in timeline.audioBuses) bus.id: bus};
+    final soloBusIds = timeline.audioBuses
+        .where((bus) => bus.solo)
+        .map((bus) => bus.id)
+        .toSet();
 
     final selected =
         <
@@ -106,12 +114,18 @@ class TimelinePreviewAudioService {
       trackIndex++
     ) {
       final track = timeline.tracks[trackIndex];
+      final bus = track.audioBusId == null
+          ? null
+          : audioBusesById[track.audioBusId];
       if (track.section != TimelineTrackSection.baseVideo &&
           track.section != TimelineTrackSection.overlay &&
           track.section != TimelineTrackSection.audio) {
         continue;
       }
       if (track.isMuted ||
+          bus?.muted == true ||
+          (soloBusIds.isNotEmpty &&
+              (bus == null || !soloBusIds.contains(bus.id))) ||
           (track.isHidden && track.section != TimelineTrackSection.audio) ||
           (hasSoloMediaTrack && !track.isSolo)) {
         continue;
@@ -126,6 +140,10 @@ class TimelinePreviewAudioService {
         }
         // An explicit separated audio clip owns the source even if an older or
         // malformed project forgot to mute the corresponding visual clip.
+        if (clip.type == TimelineTrackType.video &&
+            clip.embeddedAudioSeparated) {
+          continue;
+        }
         if (clip.type == TimelineTrackType.video &&
             clip.assetId != null &&
             explicitVisualAudioOwners.contains((
@@ -175,6 +193,24 @@ class TimelinePreviewAudioService {
           asset: selected[index].asset,
           sourcePath: selected[index].sourcePath,
           hasAudio: true,
+          frameRate: (selected[index].asset?.metadata['frameRate'] as num?)
+              ?.toDouble(),
+          colorPrimaries:
+              selected[index].asset?.metadata['colorPrimaries'] as String?,
+          colorTransfer:
+              selected[index].asset?.metadata['colorTransfer'] as String?,
+          colorSpace: selected[index].asset?.metadata['colorSpace'] as String?,
+          colorRange: selected[index].asset?.metadata['colorRange'] as String?,
+          pixelFormat:
+              selected[index].asset?.metadata['pixelFormat'] as String?,
+          bitDepth: selected[index].asset?.metadata['bitDepth'] as int?,
+          audioStreamCount:
+              selected[index].asset?.metadata['audioStreamCount'] as int?,
+          audioChannels:
+              selected[index].asset?.metadata['audioChannels'] as int?,
+          audioChannelsByStream: audioChannelsByStreamFromMetadata(
+            selected[index].asset?.metadata['audioStreams'],
+          ),
         ),
     ];
     final maximumConcurrentVoices = _maximumConcurrentVoices(inputs);
@@ -195,9 +231,15 @@ class TimelinePreviewAudioService {
             'trackSolo': input.track.isSolo,
             'trackGain': input.track.audioGain,
             'trackPan': input.track.audioPan,
+            'trackEffectStack': input.track.effectStack.toJson(),
+            'audioBusId': input.track.audioBusId,
+            'audioBus': input.track.audioBusId == null
+                ? null
+                : audioBusesById[input.track.audioBusId]?.toJson(),
             'clipId': input.clip.id,
             'assetId': input.clip.assetId,
             'linkedClipId': input.clip.linkedClipId,
+            'separatedFromClipId': input.clip.separatedAudioSourceClipId,
             'startUs': input.clip.startTime.inMicroseconds,
             'endUs': input.clip.endTime.inMicroseconds,
             'sourceStartUs': input.clip.sourceStartTime.inMicroseconds,
@@ -211,6 +253,9 @@ class TimelinePreviewAudioService {
             'duckReleaseMs': input.clip.duckReleaseMs,
             'duckSidechainTrackIds': input.clip.duckSidechainTrackIds,
             'denoise': input.clip.denoise,
+            'resolvedEffectStack': timeline
+                .effectStackForClip(input.clip, track: input.track)
+                .toJson(),
             'volumeKeyframes': [
               for (final keyframe in input.clip.keyframes)
                 if (keyframe.property == TimelineKeyframeProperty.volume)
@@ -218,6 +263,7 @@ class TimelinePreviewAudioService {
             ],
           },
       ],
+      'projectEffectStack': timeline.projectEffectStack.toJson(),
       // Automatic ducking depends on dialogue/text timing even when those
       // clips do not own an audio stream themselves.
       'dialogueWindows': [
@@ -386,6 +432,15 @@ class TimelinePreviewAudioService {
           sourcePath: readable[index].sourcePath,
           hasAudio: true,
           frameRate: readable[index].frameRate,
+          colorPrimaries: readable[index].colorPrimaries,
+          colorTransfer: readable[index].colorTransfer,
+          colorSpace: readable[index].colorSpace,
+          colorRange: readable[index].colorRange,
+          pixelFormat: readable[index].pixelFormat,
+          bitDepth: readable[index].bitDepth,
+          audioStreamCount: readable[index].audioStreamCount,
+          audioChannels: readable[index].audioChannels,
+          audioChannelsByStream: readable[index].audioChannelsByStream,
         ),
     ];
   }

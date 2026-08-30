@@ -1,4 +1,5 @@
 import 'package:caption_craft/features/editor/widgets/preview_playback_clock.dart';
+import 'package:caption_craft/features/editor/widgets/video_preview_panel.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -154,6 +155,44 @@ void main() {
           forceSeek: true,
         ),
         PreviewMediaSyncDecision.seek,
+      );
+    });
+  });
+
+  group('preview transport revision', () {
+    test('a stale async play request cannot restart paused media', () {
+      expect(
+        previewTransportCanPlayForTesting(
+          requestRevision: 7,
+          currentRevision: 8,
+          requestedPlaying: true,
+          playRequested: false,
+          suspendedByLifecycle: false,
+        ),
+        isFalse,
+      );
+    });
+
+    test('only current unsuspended shared play intent may run', () {
+      expect(
+        previewTransportCanPlayForTesting(
+          requestRevision: 8,
+          currentRevision: 8,
+          requestedPlaying: true,
+          playRequested: true,
+          suspendedByLifecycle: false,
+        ),
+        isTrue,
+      );
+      expect(
+        previewTransportCanPlayForTesting(
+          requestRevision: 8,
+          currentRevision: 8,
+          requestedPlaying: true,
+          playRequested: true,
+          suspendedByLifecycle: true,
+        ),
+        isFalse,
       );
     });
   });

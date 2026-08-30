@@ -152,6 +152,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
   EditorTimeline? _cachedMergedTimeline;
   _ClipMoveSession? _clipMoveSession;
   _ClipTrimSession? _clipTrimSession;
+  bool _audioFadeGestureActive = false;
   final Map<String, GlobalKey> _clipStateKeys = <String, GlobalKey>{};
   Timer? _edgeScrollTimer;
   Offset? _latestTimelineGesturePointer;
@@ -182,7 +183,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
   }
 
   static const double _minPixelsPerSecond = 10;
-  static const double _maxPixelsPerSecond = 150;
+  static const double _maxPixelsPerSecond = 1200;
   static const double _toolbarHeight = 48;
   static const double _rulerHeight = 30;
   static const double _labelColumnWidth = 50;
@@ -194,7 +195,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
   @override
   void dispose() {
     _edgeScrollTimer?.cancel();
-    if (_clipMoveSession != null || _clipTrimSession != null) {
+    if (_clipMoveSession != null ||
+        _clipTrimSession != null ||
+        _audioFadeGestureActive) {
       _editorNotifier.endTimelineGestureEdit();
     }
     _horizontalScrollController.removeListener(_scheduleViewportRebuild);
@@ -401,6 +404,47 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         .read(subtitleProvider.notifier)
         .syncFromTimeline(timeline.subtitleEntries);
     return true;
+  }
+
+  void _beginAudioFadeEdit() {
+    if (_audioFadeGestureActive) return;
+    _audioFadeGestureActive = true;
+    _editorNotifier.beginTimelineGestureEdit();
+  }
+
+  void _updateAudioFade(
+    String clipId, {
+    required bool fadeIn,
+    required int durationMs,
+  }) {
+    final timeline = ref.read(editorProvider).timeline;
+    final selection = _cachedClipSelectionById[clipId];
+    if (selection == null || selection.$1.isLocked) return;
+    final safeDuration = durationMs
+        .clamp(0, selection.$2.duration.inMilliseconds ~/ 2)
+        .toInt();
+    final nextTracks = timeline.tracks.map((track) {
+      if (track.id != selection.$1.id) return track;
+      return track.copyWith(
+        clips: track.clips.map((clip) {
+          if (clip.id != clipId) return clip;
+          return clip.copyWith(
+            audioMix: clip.audioMix.copyWith(
+              fadeInMs: fadeIn ? safeDuration : clip.audioMix.fadeInMs,
+              fadeOutMs: fadeIn ? clip.audioMix.fadeOutMs : safeDuration,
+              clearLoudnessAnalysis: true,
+            ),
+          );
+        }).toList(),
+      );
+    }).toList();
+    _applyTimeline(timeline.copyWith(tracks: nextTracks));
+  }
+
+  void _endAudioFadeEdit() {
+    if (!_audioFadeGestureActive) return;
+    _audioFadeGestureActive = false;
+    _editorNotifier.endTimelineGestureEdit();
   }
 
   bool _wouldRemoveLastVisual(
@@ -668,8 +712,20 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       if (replacement != null) await _showLastVisualGuard(replacement);
       return;
     }
+    final removedClipIds = track.clips.map((clip) => clip.id).toSet();
     final nextTracks = timeline.tracks
         .where((candidate) => candidate.id != track.id)
+        .map(
+          (candidate) => candidate.copyWith(
+            clips: candidate.clips
+                .where(
+                  (clip) =>
+                      clip.linkedClipId == null ||
+                      !removedClipIds.contains(clip.linkedClipId),
+                )
+                .toList(),
+          ),
+        )
         .toList();
     final removedAssetIds = track.clips
         .map((clip) => clip.assetId)
@@ -690,7 +746,11 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
 
     ref
         .read(editorProvider.notifier)
-        .setTimeline(timeline.copyWith(tracks: nextTracks, assets: nextAssets));
+        .setTimeline(
+          timeline
+              .copyWith(tracks: nextTracks, assets: nextAssets)
+              .prunedRelationships(),
+        );
 
     if (editorState.selectedTrackId == track.id) {
       ref.read(editorProvider.notifier).selectTrack(null);
@@ -1049,6 +1109,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       trackId: targetTrack.id,
       startTime: resolvedStart,
       endTime: resolvedStart + sourceClip.duration,
+      effectStack: sourceClip.effectStack.cloneWithNewIds(),
+      clearGroupId: true,
+      clearCompoundId: true,
     );
     if (!targetTrack.canPlaceClip(pasted)) {
       SnackBarHelper.showInfo(context, 'There is no free space in this track.');
@@ -1693,6 +1756,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         clip,
         Duration(milliseconds: newStartMs),
       ),
+      effectStack: clip.effectStack.trimmedFromStart(
+        Duration(milliseconds: newStartMs - clip.startTime.inMilliseconds),
+      ),
     );
     if (!track.canPlaceClip(updatedClip, ignoringClipId: clip.id)) return;
 
@@ -1725,6 +1791,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
             keyframes: TimelineKeyframeEditing.forNewStart(
               candidate,
               updatedClip.startTime,
+            ),
+            effectStack: candidate.effectStack.trimmedFromStart(
+              updatedClip.startTime - candidate.startTime,
             ),
           );
         }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
@@ -1824,6 +1893,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         clip,
         Duration(milliseconds: newEndMs),
       ),
+      effectStack: clip.effectStack.trimmedToDuration(
+        Duration(milliseconds: newEndMs) - clip.startTime,
+      ),
     );
     if (!track.canPlaceClip(updatedClip, ignoringClipId: clip.id)) return;
 
@@ -1856,6 +1928,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
             keyframes: TimelineKeyframeEditing.forNewEnd(
               candidate,
               updatedClip.endTime,
+            ),
+            effectStack: candidate.effectStack.trimmedToDuration(
+              updatedClip.endTime - candidate.startTime,
             ),
           );
         }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
@@ -1967,6 +2042,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         clip,
         Duration(milliseconds: newStartMs),
       ),
+      effectStack: clip.effectStack.trimmedFromStart(
+        Duration(milliseconds: newStartMs - clip.startTime.inMilliseconds),
+      ),
     );
     if (!track.canPlaceClip(updatedClip, ignoringClipId: clip.id)) return;
     final nextStart = Duration(milliseconds: newStartMs);
@@ -1998,6 +2076,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
             keyframes: TimelineKeyframeEditing.forNewStart(
               candidate,
               updatedClip.startTime,
+            ),
+            effectStack: candidate.effectStack.trimmedFromStart(
+              updatedClip.startTime - candidate.startTime,
             ),
           );
         }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
@@ -2088,6 +2169,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         clip,
         Duration(milliseconds: newEndMs),
       ),
+      effectStack: clip.effectStack.trimmedToDuration(newDuration),
     );
     if (!track.canPlaceClip(updatedClip, ignoringClipId: clip.id)) return;
     final nextEnd = Duration(milliseconds: newEndMs);
@@ -2119,6 +2201,9 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
             keyframes: TimelineKeyframeEditing.forNewEnd(
               candidate,
               updatedClip.endTime,
+            ),
+            effectStack: candidate.effectStack.trimmedToDuration(
+              updatedClip.endTime - candidate.startTime,
             ),
           );
         }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
@@ -2296,17 +2381,25 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       clip,
       Duration(milliseconds: leftTimelineDurationMs),
     );
+    final effectStackSplit = clip.effectStack.splitAt(
+      Duration(milliseconds: leftTimelineDurationMs),
+    );
     final firstClip = clip.copyWith(
       endTime: splitPoint,
       sourceStartTime: firstSourceStart,
       sourceDuration: Duration(milliseconds: leftSourceDurationMs),
       outroTransition: const ClipTransition(),
       keyframes: keyframeSplit.leading,
+      effectStack: effectStackSplit.leading,
     );
     final secondClip = TimelineClip(
       trackId: clip.trackId,
       type: clip.type,
       effectKind: clip.effectKind,
+      effectStack: effectStackSplit.trailing,
+      isAdjustmentLayer: clip.isAdjustmentLayer,
+      groupId: clip.groupId,
+      compoundId: clip.compoundId,
       label: clip.label,
       assetId: clip.assetId,
       linkedClipId: clip.linkedClipId,
@@ -2422,7 +2515,25 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       return track;
     }).toList();
 
-    final nextTimeline = timeline.copyWith(tracks: nextTracks);
+    final nextTimeline = timeline.copyWith(
+      tracks: nextTracks,
+      groups: timeline.groups
+          .map(
+            (group) => group.id == clip!.groupId
+                ? group.copyWith(clipIds: [...group.clipIds, secondClip.id])
+                : group,
+          )
+          .toList(),
+      compoundClips: timeline.compoundClips
+          .map(
+            (compound) => compound.id == clip!.compoundId
+                ? compound.copyWith(
+                    clipIds: [...compound.clipIds, secondClip.id],
+                  )
+                : compound,
+          )
+          .toList(),
+    );
     _applyTimeline(nextTimeline);
     ref.read(editorProvider.notifier).selectClip(secondClip.id);
   }
@@ -2436,6 +2547,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       audio,
       firstSource.duration,
     );
+    final effectStackSplit = audio.effectStack.splitAt(firstSource.duration);
     final first = audio.copyWith(
       linkedClipId: firstSource.id,
       endTime: firstSource.endTime,
@@ -2444,10 +2556,14 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       audioMix: audio.audioMix.copyWith(fadeOutMs: 0),
       outroTransition: const ClipTransition(),
       keyframes: keyframeSplit.leading,
+      effectStack: effectStackSplit.leading,
     );
     final second = TimelineClip(
       trackId: audio.trackId,
       type: TimelineTrackType.audio,
+      effectStack: effectStackSplit.trailing,
+      groupId: audio.groupId,
+      compoundId: audio.compoundId,
       label: audio.label,
       assetId: audio.assetId,
       linkedClipId: secondSource.id,
@@ -2689,7 +2805,11 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
             );
           }).toList();
 
-    _applyTimeline(timeline.copyWith(tracks: nextTracks, assets: nextAssets));
+    _applyTimeline(
+      timeline
+          .copyWith(tracks: nextTracks, assets: nextAssets)
+          .prunedRelationships(),
+    );
     ref.read(editorProvider.notifier).selectClip(null);
     ref.read(subtitleProvider.notifier).selectEntry(null);
   }
@@ -2714,45 +2834,14 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       latestEnd: Duration(milliseconds: timelineEndMs),
     );
     final nextStartMs = nextStart.inMilliseconds;
-    final duplicate = TimelineClip(
+    final duplicate = clip.copyWith(
+      id: const Uuid().v4(),
       trackId: track.id,
-      type: clip.type,
-      effectKind: clip.effectKind,
-      label: clip.label,
-      assetId: clip.assetId,
-      linkedClipId: clip.linkedClipId,
       startTime: Duration(milliseconds: nextStartMs),
       endTime: Duration(milliseconds: nextStartMs + durationMs),
-      sourceStartTime: clip.sourceStartTime,
-      sourceDuration: clip.sourceDuration,
-      layer: clip.layer,
-      enabled: clip.enabled,
-      transform: clip.transform,
-      audioMix: clip.audioMix,
-      fitMode: clip.fitMode,
-      playbackRate: clip.playbackRate,
-      isReversed: clip.isReversed,
-      crop: clip.crop,
-      blur: clip.blur,
-      colorAdjustments: clip.colorAdjustments,
-      text: clip.text,
-      subtitleStyle: clip.subtitleStyle,
-      introTransition: clip.introTransition,
-      outroTransition: clip.outroTransition,
-      keyframes: clip.keyframes,
-      freezeFrame: clip.freezeFrame,
-      stabilize: clip.stabilize,
-      denoise: clip.denoise,
-      chromaKeyEnabled: clip.chromaKeyEnabled,
-      chromaKeyColor: clip.chromaKeyColor,
-      chromaKeySimilarity: clip.chromaKeySimilarity,
-      timelineColor: clip.timelineColor,
-      notes: clip.notes,
-      autoDuck: clip.autoDuck,
-      duckAmount: clip.duckAmount,
-      duckAttackMs: clip.duckAttackMs,
-      duckReleaseMs: clip.duckReleaseMs,
-      duckSidechainTrackIds: clip.duckSidechainTrackIds,
+      effectStack: clip.effectStack.cloneWithNewIds(),
+      clearGroupId: true,
+      clearCompoundId: true,
     );
     if (!track.canPlaceClip(duplicate)) {
       SnackBarHelper.showInfo(
@@ -2811,17 +2900,25 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       clip,
       Duration(milliseconds: leftTimelineDurationMs),
     );
+    final effectStackSplit = clip.effectStack.splitAt(
+      Duration(milliseconds: leftTimelineDurationMs),
+    );
     final firstClip = clip.copyWith(
       endTime: splitPoint,
       sourceStartTime: firstSourceStart,
       sourceDuration: Duration(milliseconds: leftSourceDurationMs),
       outroTransition: const ClipTransition(),
       keyframes: keyframeSplit.leading,
+      effectStack: effectStackSplit.leading,
     );
     final secondClip = TimelineClip(
       trackId: track.id,
       type: clip.type,
       effectKind: clip.effectKind,
+      effectStack: effectStackSplit.trailing,
+      isAdjustmentLayer: clip.isAdjustmentLayer,
+      groupId: clip.groupId,
+      compoundId: clip.compoundId,
       label: clip.label,
       assetId: clip.assetId,
       linkedClipId: clip.linkedClipId,
@@ -2875,7 +2972,27 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       return candidateTrack.copyWith(clips: nextClips);
     }).toList();
 
-    _applyTimeline(timeline.copyWith(tracks: nextTracks));
+    _applyTimeline(
+      timeline.copyWith(
+        tracks: nextTracks,
+        groups: timeline.groups
+            .map(
+              (group) => group.id == clip.groupId
+                  ? group.copyWith(clipIds: [...group.clipIds, secondClip.id])
+                  : group,
+            )
+            .toList(),
+        compoundClips: timeline.compoundClips
+            .map(
+              (compound) => compound.id == clip.compoundId
+                  ? compound.copyWith(
+                      clipIds: [...compound.clipIds, secondClip.id],
+                    )
+                  : compound,
+            )
+            .toList(),
+      ),
+    );
     ref.read(editorProvider.notifier).selectTrack(track.id);
     ref.read(editorProvider.notifier).selectClip(secondClip.id);
   }
@@ -3758,6 +3875,16 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                                                     clip.id,
                                                     delta,
                                                   ),
+                                              onAudioFadeStart:
+                                                  _beginAudioFadeEdit,
+                                              onAudioFadeChanged:
+                                                  (clip, fadeIn, durationMs) =>
+                                                      _updateAudioFade(
+                                                        clip.id,
+                                                        fadeIn: fadeIn,
+                                                        durationMs: durationMs,
+                                                      ),
+                                              onAudioFadeEnd: _endAudioFadeEdit,
                                             ),
                                           ),
                                       ],
@@ -4439,6 +4566,10 @@ class _TimelineLane extends StatelessWidget {
   final ValueChanged<TimelineClip> onClipTrimGestureEnd;
   final void Function(TimelineClip clip, Offset delta) onClipTrimStart;
   final void Function(TimelineClip clip, Offset delta) onClipTrimEnd;
+  final VoidCallback onAudioFadeStart;
+  final void Function(TimelineClip clip, bool fadeIn, int durationMs)
+  onAudioFadeChanged;
+  final VoidCallback onAudioFadeEnd;
 
   const _TimelineLane({
     required this.track,
@@ -4467,6 +4598,9 @@ class _TimelineLane extends StatelessWidget {
     required this.onClipTrimGestureEnd,
     required this.onClipTrimStart,
     required this.onClipTrimEnd,
+    required this.onAudioFadeStart,
+    required this.onAudioFadeChanged,
+    required this.onAudioFadeEnd,
   });
 
   @override
@@ -4682,6 +4816,10 @@ class _TimelineLane extends StatelessWidget {
               onClipTrimStart(clip, pointerPosition),
           onTrimEndUpdate: (pointerPosition) =>
               onClipTrimEnd(clip, pointerPosition),
+          onAudioFadeStart: onAudioFadeStart,
+          onAudioFadeChanged: (fadeIn, durationMs) =>
+              onAudioFadeChanged(clip, fadeIn, durationMs),
+          onAudioFadeEnd: onAudioFadeEnd,
         ),
       ),
     );
@@ -4841,6 +4979,9 @@ class _TimelineClipBlock extends StatelessWidget {
   final VoidCallback onTrimGestureEnd;
   final ValueChanged<Offset> onTrimStartUpdate;
   final ValueChanged<Offset> onTrimEndUpdate;
+  final VoidCallback onAudioFadeStart;
+  final void Function(bool fadeIn, int durationMs) onAudioFadeChanged;
+  final VoidCallback onAudioFadeEnd;
 
   const _TimelineClipBlock({
     super.key,
@@ -4866,6 +5007,9 @@ class _TimelineClipBlock extends StatelessWidget {
     required this.onTrimGestureEnd,
     required this.onTrimStartUpdate,
     required this.onTrimEndUpdate,
+    required this.onAudioFadeStart,
+    required this.onAudioFadeChanged,
+    required this.onAudioFadeEnd,
   });
 
   @override
@@ -4886,6 +5030,8 @@ class _TimelineClipBlock extends StatelessWidget {
               .toDouble();
           final visibleLeft = (constraints.maxWidth - resolvedVisualWidth) / 2;
           final showUsableTrimHandles = showTrimHandles && !isLocked;
+          final showAudioFadeHandles =
+              isSelected && !isLocked && clip.type == TimelineTrackType.audio;
           final moveHitLeft = showUsableTrimHandles
               ? visibleLeft + handleHitWidth / 2
               : 0.0;
@@ -5111,6 +5257,30 @@ class _TimelineClipBlock extends StatelessWidget {
                       onUpdate: onTrimEndUpdate,
                     ),
                   ),
+                if (showAudioFadeHandles)
+                  _AudioFadeHandle(
+                    key: ValueKey('timeline_fade_in_${clip.id}'),
+                    fadeIn: true,
+                    visibleLeft: visibleLeft,
+                    visualWidth: resolvedVisualWidth,
+                    clipDurationMs: clip.duration.inMilliseconds,
+                    fadeDurationMs: clip.audioMix.fadeInMs,
+                    onStart: onAudioFadeStart,
+                    onChanged: (value) => onAudioFadeChanged(true, value),
+                    onEnd: onAudioFadeEnd,
+                  ),
+                if (showAudioFadeHandles)
+                  _AudioFadeHandle(
+                    key: ValueKey('timeline_fade_out_${clip.id}'),
+                    fadeIn: false,
+                    visibleLeft: visibleLeft,
+                    visualWidth: resolvedVisualWidth,
+                    clipDurationMs: clip.duration.inMilliseconds,
+                    fadeDurationMs: clip.audioMix.fadeOutMs,
+                    onStart: onAudioFadeStart,
+                    onChanged: (value) => onAudioFadeChanged(false, value),
+                    onEnd: onAudioFadeEnd,
+                  ),
               ],
             ),
           );
@@ -5220,6 +5390,110 @@ class _TimelineClipBlock extends StatelessWidget {
   }
 }
 
+class _AudioFadeHandle extends StatefulWidget {
+  final bool fadeIn;
+  final double visibleLeft;
+  final double visualWidth;
+  final int clipDurationMs;
+  final int fadeDurationMs;
+  final VoidCallback onStart;
+  final ValueChanged<int> onChanged;
+  final VoidCallback onEnd;
+
+  const _AudioFadeHandle({
+    super.key,
+    required this.fadeIn,
+    required this.visibleLeft,
+    required this.visualWidth,
+    required this.clipDurationMs,
+    required this.fadeDurationMs,
+    required this.onStart,
+    required this.onChanged,
+    required this.onEnd,
+  });
+
+  @override
+  State<_AudioFadeHandle> createState() => _AudioFadeHandleState();
+}
+
+class _AudioFadeHandleState extends State<_AudioFadeHandle> {
+  double? _dragDurationMs;
+
+  void _start(DragStartDetails details) {
+    _dragDurationMs = widget.fadeDurationMs.toDouble();
+    widget.onStart();
+  }
+
+  void _update(DragUpdateDetails details) {
+    final width = math.max(1.0, widget.visualWidth);
+    final maximumFadeMs = math.max(0, widget.clipDurationMs ~/ 2);
+    final direction = widget.fadeIn ? 1.0 : -1.0;
+    final deltaMs =
+        (details.primaryDelta ?? 0) / width * widget.clipDurationMs * direction;
+    final next = ((_dragDurationMs ?? widget.fadeDurationMs) + deltaMs).clamp(
+      0.0,
+      maximumFadeMs.toDouble(),
+    );
+    _dragDurationMs = next;
+    widget.onChanged(next.round());
+    setState(() {});
+  }
+
+  void _finish() {
+    _dragDurationMs = null;
+    widget.onEnd();
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final maximumFadeMs = math.max(0, widget.clipDurationMs ~/ 2);
+    final durationMs = (_dragDurationMs ?? widget.fadeDurationMs).clamp(
+      0.0,
+      maximumFadeMs.toDouble(),
+    );
+    final offset = widget.clipDurationMs <= 0
+        ? 0.0
+        : durationMs / widget.clipDurationMs * widget.visualWidth;
+    final centerX = widget.fadeIn
+        ? widget.visibleLeft + offset
+        : widget.visibleLeft + widget.visualWidth - offset;
+    return Positioned(
+      left: centerX - 15,
+      top: 0,
+      height: 28,
+      width: 30,
+      child: Semantics(
+        slider: true,
+        label: widget.fadeIn ? 'Audio fade in' : 'Audio fade out',
+        value: '${durationMs.round()} milliseconds',
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onHorizontalDragStart: _start,
+          onHorizontalDragUpdate: _update,
+          onHorizontalDragEnd: (_) => _finish(),
+          onHorizontalDragCancel: _finish,
+          child: Align(
+            alignment: Alignment.topCenter,
+            child: Container(
+              width: 13,
+              height: 13,
+              decoration: BoxDecoration(
+                color: kSuccess,
+                shape: BoxShape.circle,
+                border: Border.all(color: kTextPrimary, width: 1.5),
+                boxShadow: const [
+                  BoxShadow(color: Colors.black45, blurRadius: 3),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _ClipEnvelopePainter extends CustomPainter {
   final TimelineClip clip;
   final Color accentColor;
@@ -5316,7 +5590,7 @@ class _ClipEnvelopePainter extends CustomPainter {
     final durationMs = math.max(1, clip.duration.inMilliseconds);
     final fadeInX = fadeInMs / durationMs * size.width;
     final fadeOutX = size.width - fadeOutMs / durationMs * size.width;
-    final highY = math.max(3.0, size.height * 0.56);
+    const highY = 3.5;
     final lowY = size.height - 3;
     final path = Path()
       ..moveTo(0, fadeInMs > 0 ? lowY : highY)
@@ -5417,7 +5691,7 @@ class _CachedTimelineWaveformState extends State<_CachedTimelineWaveform> {
   }
 
   int _resolutionFor(double logicalWidth) {
-    return (logicalWidth * 2).round().clamp(128, 2048).toInt();
+    return (logicalWidth * 2).round().clamp(128, 16384).toInt();
   }
 
   @override

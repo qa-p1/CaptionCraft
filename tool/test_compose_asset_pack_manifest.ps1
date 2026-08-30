@@ -41,7 +41,9 @@ function New-PackRow {
 try {
     $basePath = Join-Path $fixtureRoot 'base.json'
     $sfxPath = Join-Path $fixtureRoot 'sfx.json'
+    $lutPath = Join-Path $fixtureRoot 'luts.json'
     $outputPath = Join-Path $fixtureRoot 'asset-pack-manifest.json'
+    $lutOnlyOutputPath = Join-Path $fixtureRoot 'asset-pack-manifest.with-luts.json'
 
     $base = [ordered] @{
         schemaVersion = 2
@@ -55,6 +57,11 @@ try {
         schemaVersion = 2
         pack = New-PackRow -Id 'sound-effects' -Title 'Sound Effects' -DigestCharacter 'c'
     }
+    $luts = [ordered] @{
+        schema = 'captioncraft-asset-pack-release'
+        schemaVersion = 2
+        pack = New-PackRow -Id 'luts' -Title 'LUTs' -DigestCharacter 'd'
+    }
 
     [System.IO.File]::WriteAllText(
         $basePath,
@@ -66,23 +73,53 @@ try {
         (($sfx | ConvertTo-Json -Depth 12) + "`n"),
         $utf8NoBom
     )
+    [System.IO.File]::WriteAllText(
+        $lutPath,
+        (($luts | ConvertTo-Json -Depth 12) + "`n"),
+        $utf8NoBom
+    )
 
-    & $composer -BaseManifest $basePath -SfxRelease $sfxPath -OutputPath $outputPath
+    & $composer `
+        -BaseManifest $basePath `
+        -SfxRelease $sfxPath `
+        -LutRelease $lutPath `
+        -OutputPath $outputPath
     $result = [System.IO.File]::ReadAllText($outputPath) | ConvertFrom-Json
     $ids = @($result.packs | ForEach-Object { [string] $_.id })
     if (
         [int] $result.schemaVersion -ne 2 -or
-        $ids.Count -ne 3 -or
+        $ids.Count -ne 4 -or
         $ids -cnotcontains 'background-videos' -or
         $ids -cnotcontains 'overlays' -or
-        $ids -cnotcontains 'sound-effects'
+        $ids -cnotcontains 'sound-effects' -or
+        $ids -cnotcontains 'luts'
     ) {
         throw 'Composer did not produce one validated row for every supported pack.'
     }
 
+    & $composer `
+        -BaseManifest $basePath `
+        -LutRelease $lutPath `
+        -OutputPath $lutOnlyOutputPath
+    $lutOnly = [System.IO.File]::ReadAllText($lutOnlyOutputPath) | ConvertFrom-Json
+    $lutOnlyIds = @($lutOnly.packs | ForEach-Object { [string] $_.id })
+    if (
+        $lutOnlyIds.Count -ne 3 -or
+        $lutOnlyIds -cnotcontains 'background-videos' -or
+        $lutOnlyIds -cnotcontains 'overlays' -or
+        $lutOnlyIds -cnotcontains 'luts' -or
+        $lutOnlyIds -ccontains 'sound-effects'
+    ) {
+        throw 'Composer could not add a LUT release independently of SFX.'
+    }
+
     $refusedOverwrite = $false
     try {
-        & $composer -BaseManifest $basePath -SfxRelease $sfxPath -OutputPath $outputPath
+        & $composer `
+            -BaseManifest $basePath `
+            -SfxRelease $sfxPath `
+            -LutRelease $lutPath `
+            -OutputPath $outputPath
     }
     catch {
         $refusedOverwrite = $_.Exception.Message -like 'Refusing to overwrite*'
@@ -91,7 +128,7 @@ try {
         throw 'Composer did not protect an existing manifest from overwrite.'
     }
 
-    Write-Host 'compose_asset_pack_manifest fixture passed: three packs and atomic overwrite guard verified.'
+    Write-Host 'compose_asset_pack_manifest fixture passed: optional releases and atomic overwrite guard verified.'
 }
 finally {
     if ([System.IO.Directory]::Exists($fixtureRoot)) {

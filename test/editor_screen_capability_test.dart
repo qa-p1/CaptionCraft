@@ -608,6 +608,11 @@ void main() {
       find.byKey(const ValueKey('copy-audio-attribution')),
       findsOneWidget,
     );
+    expect(find.byKey(const ValueKey('relink-separated-audio')), findsNothing);
+    expect(
+      find.byKey(const ValueKey('reattach-separated-audio')),
+      findsNothing,
+    );
     expect(tester.takeException(), isNull);
   });
 
@@ -667,15 +672,53 @@ void main() {
           track.role == TimelineTrackRole.regular,
     );
     expect(video.audioMix.muted, isTrue);
+    expect(video.embeddedAudioSeparated, isTrue);
     expect(audioTrack.clips, hasLength(1));
     expect(audioTrack.clips.single.linkedClipId, video.id);
+    expect(audioTrack.clips.single.separatedAudioSourceClipId, video.id);
     expect(audioTrack.clips.single.audioMix.muted, isFalse);
+    expect(find.byKey(const ValueKey('separate-video-audio')), findsNothing);
     expect(
       find.byKey(const ValueKey('edit-separated-video-audio')),
       findsOneWidget,
     );
     expect(find.text('Unmute'), findsNothing);
     expect(find.textContaining('prevent duplicate playback'), findsOneWidget);
+
+    final editor = container.read(editorProvider.notifier);
+    expect(container.read(editorProvider).canUndo, isTrue);
+    editor.undo();
+    await tester.pump();
+    final undoneTimeline = container.read(editorProvider).timeline;
+    expect(
+      undoneTimeline.tracks.any(
+        (track) => track.section == TimelineTrackSection.audio,
+      ),
+      isFalse,
+    );
+    expect(
+      undoneTimeline.tracks
+          .expand((track) => track.clips)
+          .singleWhere((clip) => clip.id == video.id)
+          .embeddedAudioSeparated,
+      isFalse,
+    );
+    editor.redo();
+    await tester.pump();
+    expect(
+      container
+          .read(editorProvider)
+          .timeline
+          .tracks
+          .expand((track) => track.clips)
+          .singleWhere((clip) => clip.id == video.id)
+          .embeddedAudioSeparated,
+      isTrue,
+    );
+    expect(
+      find.byKey(const ValueKey('edit-separated-video-audio')),
+      findsOneWidget,
+    );
 
     await tester.tap(find.byKey(const ValueKey('edit-separated-video-audio')));
     await tester.pumpAndSettle();

@@ -14,11 +14,13 @@ import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/utils/editor_change_log_service.dart';
+import '../../../core/utils/audio_meter_service.dart';
 import '../../../core/utils/discover_media_import_service.dart';
 import '../../../core/utils/ffmpeg_service.dart';
 import '../../../core/utils/firebase_service.dart';
 import '../../../core/utils/giphy_service.dart';
 import '../../../core/utils/media_import_service.dart';
+import '../../../core/utils/mask_tracking_service.dart';
 import '../../../core/utils/remote_audio_import_service.dart';
 import '../../../core/utils/remote_media_import_service.dart';
 import '../../../core/utils/subtitle_export_service.dart';
@@ -39,6 +41,7 @@ import '../models/export_settings.dart';
 import '../models/asset_pack_models.dart';
 import '../models/element_library_asset.dart';
 import '../models/discover_models.dart';
+import '../models/editor_effect_models.dart';
 import '../models/sound_effect_library_asset.dart';
 import '../providers/editor_provider.dart';
 import '../providers/playback_provider.dart';
@@ -48,6 +51,7 @@ import 'creator_lab_screen.dart';
 import 'export_video_screen.dart';
 import '../widgets/export_dialog.dart';
 import '../widgets/element_library_sheet.dart';
+import '../widgets/effect_stack_editor_sheet.dart';
 import '../widgets/discover_sheet.dart';
 import '../widgets/subtitle_edit_modal.dart';
 import '../widgets/subtitle_style_panel.dart';
@@ -57,6 +61,8 @@ import '../widgets/video_preview_panel.dart';
 import '../widgets/resizable_editor_sheet.dart';
 import '../widgets/sfx_library_sheet.dart';
 import '../widgets/keyframe_graph_editor.dart';
+import '../widgets/advanced_color_controls.dart';
+import '../widgets/video_scopes_panel.dart';
 
 String _audioFadeShapeLabel(AudioFadeShape shape) {
   return switch (shape) {
@@ -64,6 +70,488 @@ String _audioFadeShapeLabel(AudioFadeShape shape) {
     AudioFadeShape.logarithmic => 'Logarithmic',
     AudioFadeShape.exponential => 'Exponential',
     AudioFadeShape.sCurve => 'Smooth S-curve',
+  };
+}
+
+double _linearGainToDb(double gain) {
+  if (gain <= 0.001) return -60;
+  return (20 * math.log(gain) / math.ln10).clamp(-60.0, 6.0).toDouble();
+}
+
+double _dbToLinearGain(double decibels) {
+  if (decibels <= -60) return 0;
+  return math.pow(10, decibels.clamp(-60.0, 6.0) / 20).toDouble();
+}
+
+@visibleForTesting
+EditorTimeline applyAudioCrossfadeForTesting({
+  required EditorTimeline timeline,
+  required String firstClipId,
+  required String secondClipId,
+  required Duration duration,
+}) {
+  if (firstClipId == secondClipId) {
+    throw ArgumentError('Select two different audio clips.');
+  }
+  (TimelineTrack, TimelineClip)? locate(String id) {
+    for (final track in timeline.tracks) {
+      for (final clip in track.clips) {
+        if (clip.id == id) return (track, clip);
+      }
+    }
+    return null;
+  }
+
+  var first = locate(firstClipId);
+  var second = locate(secondClipId);
+  if (first == null || second == null) {
+    throw ArgumentError('Both crossfade clips must still exist.');
+  }
+  if (first.$2.startTime > second.$2.startTime) {
+    final swap = first;
+    first = second;
+    second = swap;
+  }
+  if (first.$1.isLocked || second.$1.isLocked) {
+    throw StateError('Unlock both audio tracks before crossfading.');
+  }
+  if (first.$2.type != TimelineTrackType.audio ||
+      second.$2.type != TimelineTrackType.audio) {
+    throw StateError('Crossfades require two independent audio clips.');
+  }
+  if (first.$2.linkedClipId != null || second.$2.linkedClipId != null) {
+    throw StateError('Unlink separated video audio before crossfading it.');
+  }
+  final maximumMs = math.min(
+    first.$2.duration.inMilliseconds ~/ 2,
+    second.$2.duration.inMilliseconds ~/ 2,
+  );
+  if (maximumMs <= 0) throw StateError('The selected clips are too short.');
+  final fadeMs = duration.inMilliseconds.clamp(1, maximumMs).toInt();
+  final fadeDuration = Duration(milliseconds: fadeMs);
+  final movedSecond = second.$2.copyWith(
+    startTime: first.$2.endTime - fadeDuration,
+    endTime: first.$2.endTime - fadeDuration + second.$2.duration,
+    audioMix: second.$2.audioMix.copyWith(
+      fadeInMs: fadeMs,
+      fadeInShape: AudioFadeShape.sCurve,
+      clearLoudnessAnalysis: true,
+    ),
+  );
+  var tracks = timeline.tracks.map((track) {
+    final clips = <TimelineClip>[];
+    for (final clip in track.clips) {
+      if (clip.id == second!.$2.id) continue;
+      clips.add(
+        clip.id == first!.$2.id
+            ? clip.copyWith(
+                audioMix: clip.audioMix.copyWith(
+                  fadeOutMs: fadeMs,
+                  fadeOutShape: AudioFadeShape.sCurve,
+                  clearLoudnessAnalysis: true,
+                ),
+              )
+            : clip,
+      );
+    }
+    return track.copyWith(clips: clips);
+  }).toList();
+
+  TimelineTrack? destination;
+  for (final track in tracks) {
+    if (track.id == first.$1.id ||
+        track.isLocked ||
+        track.section != TimelineTrackSection.audio ||
+        track.role != TimelineTrackRole.regular ||
+        !track.acceptsClipType(TimelineTrackType.audio)) {
+      continue;
+    }
+    final candidate = movedSecond.copyWith(trackId: track.id);
+    if (track.canPlaceClip(candidate)) {
+      destination = track;
+      break;
+    }
+  }
+  var working = timeline.copyWith(tracks: tracks);
+  if (destination == null) {
+    destination = TimelineTrack(
+      name: timeline.nextTrackNameForSection(TimelineTrackSection.audio),
+      type: TimelineTrackType.audio,
+      section: TimelineTrackSection.audio,
+    );
+    working = working.insertTrackUsingEditorRules(destination);
+    tracks = working.tracks;
+  }
+  final destinationId = destination.id;
+  tracks = tracks.map((track) {
+    if (track.id != destinationId) return track;
+    return track.copyWith(
+      clips: [...track.clips, movedSecond.copyWith(trackId: destinationId)]
+        ..sort((a, b) => a.startTime.compareTo(b.startTime)),
+    );
+  }).toList();
+  return working.copyWith(tracks: tracks);
+}
+
+@visibleForTesting
+EditorTimeline fitAudioClipToDurationForTesting({
+  required EditorTimeline timeline,
+  required String clipId,
+  required Duration targetDuration,
+}) {
+  TimelineTrack? sourceTrack;
+  TimelineClip? sourceClip;
+  for (final track in timeline.tracks) {
+    for (final clip in track.clips) {
+      if (clip.id == clipId) {
+        sourceTrack = track;
+        sourceClip = clip;
+        break;
+      }
+    }
+    if (sourceClip != null) break;
+  }
+  if (sourceTrack == null || sourceClip == null) {
+    throw ArgumentError('The audio clip no longer exists.');
+  }
+  if (sourceTrack.isLocked || sourceClip.type != TimelineTrackType.audio) {
+    throw StateError('Select an unlocked independent audio clip.');
+  }
+  if (targetDuration <= Duration.zero) {
+    throw ArgumentError('Target duration must be greater than zero.');
+  }
+  final sourceSpanUs = sourceClip.sourceDuration > Duration.zero
+      ? sourceClip.sourceDuration.inMicroseconds
+      : (sourceClip.duration.inMicroseconds * sourceClip.playbackRate).round();
+  final stretch =
+      sourceSpanUs /
+      math.max(1, targetDuration.inMicroseconds) /
+      sourceClip.playbackRate;
+  if (stretch < 0.25 || stretch > 4) {
+    throw StateError(
+      'This target requires ${stretch.toStringAsFixed(2)}× stretching; '
+      'choose a duration within the supported 0.25×–4× range.',
+    );
+  }
+  final oldDuration = sourceClip.duration;
+  final updated = sourceClip.copyWith(
+    endTime: sourceClip.startTime + targetDuration,
+    audioMix: sourceClip.audioMix.copyWith(
+      timeStretch: stretch,
+      preservePitch: true,
+      clearLoudnessAnalysis: true,
+    ),
+    keyframes: sourceClip.keyframes
+        .map(
+          (keyframe) => keyframe.copyWith(
+            time: Duration(
+              microseconds:
+                  (keyframe.time.inMicroseconds *
+                          targetDuration.inMicroseconds /
+                          math.max(1, oldDuration.inMicroseconds))
+                      .round(),
+            ),
+          ),
+        )
+        .toList(),
+    effectStack: sourceClip.effectStack.retimed(oldDuration, targetDuration),
+  );
+  if (!sourceTrack.canPlaceClip(updated, ignoringClipId: sourceClip.id)) {
+    throw StateError('The fitted clip would overlap another clip.');
+  }
+  return timeline.copyWith(
+    tracks: timeline.tracks.map((track) {
+      if (track.id != sourceTrack!.id) return track;
+      return track.copyWith(
+        clips: track.clips
+            .map((clip) => clip.id == sourceClip!.id ? updated : clip)
+            .toList(),
+      );
+    }).toList(),
+  );
+}
+
+@visibleForTesting
+EditorTimeline unlinkSeparatedAudioForTesting({
+  required EditorTimeline timeline,
+  required String audioClipId,
+}) {
+  return timeline.copyWith(
+    tracks: timeline.tracks.map((track) {
+      if (track.isLocked) return track;
+      return track.copyWith(
+        clips: track.clips.map((clip) {
+          if (clip.id != audioClipId ||
+              clip.type != TimelineTrackType.audio ||
+              clip.linkedClipId == null) {
+            return clip;
+          }
+          return clip.copyWith(
+            separatedFromClipId: clip.separatedAudioSourceClipId,
+            clearLinkedClipId: true,
+          );
+        }).toList(),
+      );
+    }).toList(),
+  );
+}
+
+@visibleForTesting
+EditorTimeline relinkSeparatedAudioForTesting({
+  required EditorTimeline timeline,
+  required String audioClipId,
+  required String videoClipId,
+}) {
+  TimelineTrack? audioTrack;
+  TimelineClip? audio;
+  TimelineTrack? videoTrack;
+  TimelineClip? video;
+  for (final track in timeline.tracks) {
+    for (final clip in track.clips) {
+      if (clip.id == audioClipId) {
+        audioTrack = track;
+        audio = clip;
+      }
+      if (clip.id == videoClipId) {
+        videoTrack = track;
+        video = clip;
+      }
+    }
+  }
+  if (audioTrack == null ||
+      audio == null ||
+      videoTrack == null ||
+      video == null) {
+    throw ArgumentError('The source audio or video clip no longer exists.');
+  }
+  if (audioTrack.isLocked || videoTrack.isLocked) {
+    throw StateError('Unlock both tracks before relinking audio.');
+  }
+  if (audio.type != TimelineTrackType.audio ||
+      video.type != TimelineTrackType.video ||
+      audio.assetId == null ||
+      audio.assetId != video.assetId) {
+    throw StateError('Audio can only be relinked to its source video asset.');
+  }
+  final sourceVideoId = audio.separatedAudioSourceClipId;
+  if (sourceVideoId != null && sourceVideoId != video.id) {
+    throw StateError(
+      'Audio can only be relinked to its original source video.',
+    );
+  }
+  for (final track in timeline.tracks) {
+    for (final candidate in track.clips) {
+      if (candidate.id != audio.id &&
+          candidate.type == TimelineTrackType.audio &&
+          candidate.separatedAudioSourceClipId == video.id) {
+        throw StateError('That video already has a separated audio clip.');
+      }
+    }
+  }
+  final linkedAudio = syncSeparatedAudioTransport(
+    audio: audio,
+    updatedVideo: video,
+    linkedClipId: video.id,
+  );
+  return timeline.copyWith(
+    tracks: timeline.tracks.map((track) {
+      return track.copyWith(
+        clips: track.clips.map((clip) {
+          if (clip.id == audio!.id) return linkedAudio;
+          if (clip.id == video!.id) {
+            return clip.copyWith(
+              embeddedAudioSeparated: true,
+              audioMix: clip.audioMix.copyWith(muted: true),
+            );
+          }
+          return clip;
+        }).toList(),
+      );
+    }).toList(),
+  );
+}
+
+@visibleForTesting
+EditorTimeline reattachSeparatedAudioForTesting({
+  required EditorTimeline timeline,
+  required String audioClipId,
+}) {
+  TimelineTrack? audioTrack;
+  TimelineClip? audio;
+  for (final track in timeline.tracks) {
+    final candidate = track.clips
+        .where((clip) => clip.id == audioClipId)
+        .firstOrNull;
+    if (candidate != null) {
+      audioTrack = track;
+      audio = candidate;
+      break;
+    }
+  }
+  final videoId = audio?.separatedAudioSourceClipId;
+  if (audioTrack == null || audio == null || videoId == null) {
+    throw StateError('The original source-video relationship is unavailable.');
+  }
+  TimelineTrack? videoTrack;
+  TimelineClip? video;
+  for (final track in timeline.tracks) {
+    final candidate = track.clips
+        .where((clip) => clip.id == videoId)
+        .firstOrNull;
+    if (candidate != null) {
+      videoTrack = track;
+      video = candidate;
+      break;
+    }
+  }
+  if (videoTrack == null ||
+      video == null ||
+      audioTrack.isLocked ||
+      videoTrack.isLocked) {
+    throw StateError('Unlock the linked audio and video tracks first.');
+  }
+  final bus = audioTrack.audioBusId == null
+      ? null
+      : timeline.audioBuses
+            .where((candidate) => candidate.id == audioTrack!.audioBusId)
+            .firstOrNull;
+  final routedEffects = <EditorEffect>[
+    ...audio.effectStack.effects,
+    ...audioTrack.effectStack.effects.where(
+      (effect) => effect.type.domain == EditorEffectDomain.audio,
+    ),
+    ...?bus?.effectStack.effects.where(
+      (effect) => effect.type.domain == EditorEffectDomain.audio,
+    ),
+  ];
+  final usedIds = <String>{
+    for (final effect in video.effectStack.effects)
+      if (effect.type.domain == EditorEffectDomain.visual) effect.id,
+  };
+  final mergedAudioEffects = <EditorEffect>[];
+  for (final effect in routedEffects) {
+    final resolved = usedIds.add(effect.id) ? effect : effect.cloneWithNewId();
+    usedIds.add(resolved.id);
+    mergedAudioEffects.add(resolved);
+  }
+  final routeGain = (audioTrack.audioGain * (bus?.gain ?? 1)).clamp(0.0, 4.0);
+  final routePan = (audio.audioMix.pan + audioTrack.audioPan + (bus?.pan ?? 0))
+      .clamp(-1.0, 1.0)
+      .toDouble();
+  final restoredMix = audio.audioMix.copyWith(
+    volume: (audio.audioMix.volume * routeGain).clamp(0.0, 2.0),
+    pan: routePan,
+    muted: audio.audioMix.muted || audioTrack.isMuted || bus?.muted == true,
+    clearLoudnessAnalysis: true,
+  );
+  final restoredVideo = video.copyWith(
+    embeddedAudioSeparated: false,
+    audioMix: restoredMix,
+    effectStack: EditorEffectStack(
+      effects: [
+        ...video.effectStack.effects.where(
+          (effect) => effect.type.domain == EditorEffectDomain.visual,
+        ),
+        ...mergedAudioEffects,
+      ],
+    ),
+    autoDuck: audio.autoDuck,
+    duckAmount: audio.duckAmount,
+    duckAttackMs: audio.duckAttackMs,
+    duckReleaseMs: audio.duckReleaseMs,
+    duckSidechainTrackIds: audio.duckSidechainTrackIds,
+    denoise: audio.denoise,
+    keyframes: [
+      ...video.keyframes.where(
+        (keyframe) => keyframe.property != TimelineKeyframeProperty.volume,
+      ),
+      ...audio.keyframes
+          .where(
+            (keyframe) => keyframe.property == TimelineKeyframeProperty.volume,
+          )
+          .map(
+            (keyframe) => keyframe.copyWith(
+              value: (keyframe.value * routeGain).clamp(0.0, 2.0),
+            ),
+          ),
+    ],
+  );
+  return timeline.copyWith(
+    tracks: timeline.tracks.map((track) {
+      return track.copyWith(
+        clips: track.clips
+            .where((clip) => clip.id != audioClipId)
+            .map((clip) => clip.id == restoredVideo.id ? restoredVideo : clip)
+            .toList(),
+      );
+    }).toList(),
+  );
+}
+
+String _audioChannelModeLabel(EditorAudioChannelMode mode) {
+  return switch (mode) {
+    EditorAudioChannelMode.stereo => 'Stereo',
+    EditorAudioChannelMode.mono => 'Stereo to mono',
+    EditorAudioChannelMode.dualMono => 'Dual mono',
+    EditorAudioChannelMode.leftOnly => 'Left channel only',
+    EditorAudioChannelMode.rightOnly => 'Right channel only',
+  };
+}
+
+Map<String, dynamic> _editorMediaMetadata(Map<String, dynamic> mediaInfo) {
+  const persistedKeys = <String>{
+    'durationMs',
+    'width',
+    'height',
+    'frameRate',
+    'hasAudio',
+    'audioStreamCount',
+    'audioStreams',
+    'audioChannels',
+    'colorPrimaries',
+    'colorTransfer',
+    'colorSpace',
+    'colorRange',
+    'pixelFormat',
+    'bitDepth',
+  };
+  return <String, dynamic>{
+    for (final entry in mediaInfo.entries)
+      if (persistedKeys.contains(entry.key) && entry.value != null)
+        entry.key: entry.value,
+  };
+}
+
+Duration _sourcePositionForTimelineClip(
+  TimelineClip clip,
+  Duration timelinePosition,
+) {
+  if (clip.freezeFrame) return clip.effectiveFreezeFrameSourceTime;
+  final elapsedMs = (timelinePosition - clip.startTime).inMilliseconds.clamp(
+    0,
+    clip.duration.inMilliseconds,
+  );
+  final forwardOffsetMs = (elapsedMs * clip.playbackRate).round();
+  if (!clip.isReversed) {
+    return clip.sourceStartTime + Duration(milliseconds: forwardOffsetMs);
+  }
+  final spanMs = clip.sourceDuration.inMilliseconds > 0
+      ? clip.sourceDuration.inMilliseconds
+      : (clip.duration.inMilliseconds * clip.playbackRate).round();
+  final reversedOffsetMs = (spanMs - forwardOffsetMs - 1)
+      .clamp(0, math.max(0, spanMs - 1))
+      .toInt();
+  return clip.sourceStartTime + Duration(milliseconds: reversedOffsetMs);
+}
+
+String _editorColorSpaceLabel(EditorColorSpace space) {
+  return switch (space) {
+    EditorColorSpace.automatic => 'Automatic',
+    EditorColorSpace.sdr709 => 'SDR / Rec.709',
+    EditorColorSpace.log => 'Camera Log',
+    EditorColorSpace.hlg => 'HLG / Rec.2020',
+    EditorColorSpace.pq => 'PQ / HDR10',
+    EditorColorSpace.wideGamut => 'Wide gamut / Rec.2020',
   };
 }
 
@@ -100,6 +588,7 @@ bool isExactSeparatedAudioTransportMirror({
   return video.type == TimelineTrackType.video &&
       audio.type == TimelineTrackType.audio &&
       audio.linkedClipId == video.id &&
+      audio.separatedAudioSourceClipId == video.id &&
       audio.assetId == video.assetId &&
       audio.startTime == video.startTime &&
       audio.endTime == video.endTime &&
@@ -117,7 +606,7 @@ bool isExactSeparatedAudioTransportMirror({
     for (final track in timeline.tracks) {
       for (final candidate in track.clips) {
         if (candidate.type == TimelineTrackType.audio &&
-            candidate.linkedClipId == clip.id) {
+            candidate.separatedAudioSourceClipId == clip.id) {
           return (track: track, clip: candidate);
         }
       }
@@ -137,6 +626,7 @@ TimelineClip syncSeparatedAudioTransport({
 }) {
   return audio.copyWith(
     linkedClipId: linkedClipId ?? updatedVideo.id,
+    separatedFromClipId: updatedVideo.id,
     startTime: updatedVideo.startTime,
     endTime: updatedVideo.endTime,
     sourceStartTime: updatedVideo.sourceStartTime,
@@ -151,6 +641,7 @@ TimelineClip restoreAttachedAudioForDuplicate({
   required TimelineClip separatedAudio,
 }) {
   return duplicateVideo.copyWith(
+    embeddedAudioSeparated: false,
     audioMix: separatedAudio.audioMix,
     autoDuck: separatedAudio.autoDuck,
     duckAmount: separatedAudio.duckAmount,
@@ -178,6 +669,7 @@ TimelineClip restoreAttachedAudioForDuplicate({
 
   final splitOffset = splitAt - originalVideo.startTime;
   final keyframeSplit = TimelineKeyframeEditing.split(audio, splitOffset);
+  final effectStackSplit = audio.effectStack.splitAt(splitOffset);
 
   final left =
       syncSeparatedAudioTransport(
@@ -186,12 +678,16 @@ TimelineClip restoreAttachedAudioForDuplicate({
         linkedClipId: leftVideo.id,
       ).copyWith(
         keyframes: keyframeSplit.leading,
+        effectStack: effectStackSplit.leading,
         outroTransition: const ClipTransition(),
         audioMix: audio.audioMix.copyWith(fadeOutMs: 0),
       );
   final right =
       syncSeparatedAudioTransport(
-        audio: audio.copyWith(id: rightAudioId),
+        audio: audio.copyWith(
+          id: rightAudioId,
+          effectStack: effectStackSplit.trailing,
+        ),
         updatedVideo: rightVideo,
         linkedClipId: rightVideo.id,
       ).copyWith(
@@ -388,7 +884,9 @@ enum _BottomActionSubgroup {
   editTiming,
   editTransform,
   editDetails,
+  effectsStack,
   effectsColor,
+  effectsLuts,
   effectsBlur,
   effectsMotion,
   effectsKeyframes,
@@ -397,6 +895,7 @@ enum _BottomActionSubgroup {
   keyframeCurves,
   keyframeProperties,
   audioMix,
+  audioEffects,
   audioCleanup,
   audioAutomation,
   textObjects,
@@ -437,6 +936,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   PersistentBottomSheetController? _textEditorSheetController;
   bool _isPreviewFullscreen = false;
   bool _isGeneratingSubtitles = false;
+  String? _analyzingAudioClipId;
   TimelineClip? _clipAttributeClipboard;
 
   @override
@@ -3035,6 +3535,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       playbackRate: safeRate,
       endTime: nextEnd,
       keyframes: TimelineKeyframeEditing.retime(liveTarget, nextDuration),
+      effectStack: liveTarget.effectStack.retimed(
+        liveTarget.duration,
+        nextDuration,
+      ),
     );
 
     final retimedTracks = timeline.tracks.map((timelineTrack) {
@@ -3053,6 +3557,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   audio: clip.copyWith(
                     keyframes: TimelineKeyframeEditing.retime(
                       clip,
+                      nextDuration,
+                    ),
+                    effectStack: clip.effectStack.retimed(
+                      clip.duration,
                       nextDuration,
                     ),
                   ),
@@ -3129,10 +3637,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       }
       return marker;
     }).toList();
-    final nextTimeline = timeline.copyWith(
-      tracks: nextTracks,
-      markers: markers,
-    );
+    final nextTimeline = timeline
+        .copyWith(tracks: nextTracks, markers: markers)
+        .prunedRelationships();
     if (nextTimeline.hasTrackOverlaps) {
       if (mounted && recordHistory) {
         SnackBarHelper.showInfo(
@@ -3427,6 +3934,167 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     }
   }
 
+  Future<void> _openEffectStackSheet(
+    TimelineClip? selectedClip, {
+    required EditorEffectDomain domain,
+    EditorEffectScope? preferredScope,
+  }) async {
+    final editorState = ref.read(editorProvider);
+    final timeline = editorState.timeline;
+    final liveClip = selectedClip == null
+        ? null
+        : _clipById(selectedClip.id, editorState);
+    final track = liveClip == null
+        ? null
+        : _trackForClip(liveClip, editorState);
+    final targets = <EffectStackTargetOption>[];
+
+    if (liveClip != null && track != null) {
+      final supportsDomain = domain == EditorEffectDomain.visual
+          ? liveClip.supportsVisualEffects || liveClip.isAdjustmentLayer
+          : timeline.clipHasAudio(liveClip);
+      if (supportsDomain) {
+        targets.add(
+          EffectStackTargetOption(
+            scope: liveClip.isAdjustmentLayer
+                ? EditorEffectScope.adjustmentLayer
+                : EditorEffectScope.clip,
+            targetId: liveClip.id,
+            label: liveClip.isAdjustmentLayer
+                ? liveClip.label
+                : 'Clip • ${liveClip.label}',
+            description: liveClip.isAdjustmentLayer
+                ? 'Affects visual layers beneath it'
+                : 'Only this timeline clip',
+          ),
+        );
+      }
+
+      final compound = liveClip.compoundId == null
+          ? null
+          : timeline.compoundClips
+                .where((candidate) => candidate.id == liveClip.compoundId)
+                .firstOrNull;
+      if (compound != null) {
+        targets.add(
+          EffectStackTargetOption(
+            scope: EditorEffectScope.compound,
+            targetId: compound.id,
+            label: 'Compound • ${compound.name}',
+            description: '${compound.clipIds.length} linked visual clips',
+          ),
+        );
+      }
+
+      final group = liveClip.groupId == null
+          ? null
+          : timeline.groups
+                .where((candidate) => candidate.id == liveClip.groupId)
+                .firstOrNull;
+      if (group != null) {
+        targets.add(
+          EffectStackTargetOption(
+            scope: EditorEffectScope.group,
+            targetId: group.id,
+            label: 'Group • ${group.name}',
+            description: '${group.clipIds.length} linked clips',
+          ),
+        );
+      }
+
+      targets.add(
+        EffectStackTargetOption(
+          scope: EditorEffectScope.track,
+          targetId: track.id,
+          label: 'Track • ${track.displayName}',
+          description: 'Every compatible clip on this track',
+        ),
+      );
+      if (domain == EditorEffectDomain.audio && track.audioBusId != null) {
+        final bus = timeline.audioBuses
+            .where((candidate) => candidate.id == track.audioBusId)
+            .firstOrNull;
+        if (bus != null) {
+          targets.add(
+            EffectStackTargetOption(
+              scope: EditorEffectScope.audioBus,
+              targetId: bus.id,
+              label: 'Bus • ${bus.name}',
+              description: 'Post-mix processing for assigned tracks',
+            ),
+          );
+        }
+      }
+    }
+
+    targets.add(
+      EffectStackTargetOption(
+        scope: EditorEffectScope.project,
+        targetId: null,
+        label: domain == EditorEffectDomain.visual
+            ? 'Entire project'
+            : 'Master output',
+        description: domain == EditorEffectDomain.visual
+            ? 'Runs after the complete visual composition'
+            : 'Runs after buses and before the master limiter',
+      ),
+    );
+
+    final initialTarget = preferredScope == null
+        ? targets.first
+        : targets.firstWhere(
+            (target) => target.scope == preferredScope,
+            orElse: () => targets.first,
+          );
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: Colors.black.withValues(alpha: 0.58),
+      builder: (context) => FractionallySizedBox(
+        heightFactor: 0.92,
+        child: EffectStackEditorSheet(
+          domain: domain,
+          targets: targets,
+          initialTargetKey: initialTarget.key,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _createAdjustmentLayerAtPlayhead() async {
+    final timeline = ref.read(editorProvider).timeline;
+    if (timeline.duration <= Duration.zero) {
+      SnackBarHelper.showError(context, 'Add visual media first.');
+      return;
+    }
+    final playhead = ref.read(playbackProvider).position;
+    final endTime = timeline.duration;
+    final preferredStart = playhead < endTime
+        ? playhead
+        : endTime - const Duration(seconds: 3);
+    final startTime = preferredStart.isNegative
+        ? Duration.zero
+        : preferredStart;
+    if (endTime - startTime < const Duration(milliseconds: 100)) {
+      SnackBarHelper.showError(context, 'Move the playhead earlier first.');
+      return;
+    }
+    final id = ref
+        .read(editorProvider.notifier)
+        .createAdjustmentLayer(startTime: startTime, endTime: endTime);
+    if (id == null || !mounted) {
+      SnackBarHelper.showError(context, 'Could not place an adjustment layer.');
+      return;
+    }
+    final state = ref.read(editorProvider);
+    final clip = _clipById(id, state);
+    if (clip != null) {
+      await _openEffectStackSheet(clip, domain: EditorEffectDomain.visual);
+    }
+  }
+
   void _replaceFilterEffect(TimelineClip effectClip, ClipFilterPreset preset) {
     final adjustments = ClipColorAdjustments.forPreset(preset);
     _updateTimelineClip(
@@ -3662,7 +4330,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           .where(
             (candidate) =>
                 candidate.type == TimelineTrackType.audio &&
-                candidate.linkedClipId == liveVideo.id,
+                candidate.separatedAudioSourceClipId == liveVideo.id,
           )
           .firstOrNull;
       if (existing != null) {
@@ -3676,6 +4344,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         return false;
       }
     }
+    if (liveVideo.embeddedAudioSeparated) {
+      SnackBarHelper.showInfo(
+        context,
+        'This video audio was already separated and is no longer attached.',
+      );
+      return false;
+    }
 
     final audioProbe = TimelineClip(
       trackId: '',
@@ -3683,6 +4358,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       label: '${liveVideo.label} audio',
       assetId: liveVideo.assetId,
       linkedClipId: liveVideo.id,
+      separatedFromClipId: liveVideo.id,
       startTime: liveVideo.startTime,
       endTime: liveVideo.endTime,
       sourceStartTime: liveVideo.sourceStartTime,
@@ -3692,6 +4368,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       // Transfer the current mix exactly. A video that the user muted before
       // separating should not unexpectedly become audible again.
       audioMix: liveVideo.audioMix,
+      effectStack: EditorEffectStack(
+        effects: liveVideo.effectStack.effects
+            .where((effect) => effect.type.domain == EditorEffectDomain.audio)
+            .toList(),
+      ),
       autoDuck: liveVideo.autoDuck,
       duckAmount: liveVideo.duckAmount,
       duckAttackMs: liveVideo.duckAttackMs,
@@ -3727,7 +4408,17 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               .map(
                 (candidate) => candidate.id == liveVideo.id
                     ? candidate.copyWith(
+                        embeddedAudioSeparated: true,
                         audioMix: candidate.audioMix.copyWith(muted: true),
+                        effectStack: EditorEffectStack(
+                          effects: candidate.effectStack.effects
+                              .where(
+                                (effect) =>
+                                    effect.type.domain ==
+                                    EditorEffectDomain.visual,
+                              )
+                              .toList(),
+                        ),
                       )
                     : candidate,
               )
@@ -3811,6 +4502,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       startTime: newStart,
       endTime: newStart + clip.duration,
       clearLinkedClipId: true,
+      clearSeparatedFromClipId: true,
+      embeddedAudioSeparated: false,
+      effectStack: clip.effectStack.cloneWithNewIds(),
+      clearGroupId: true,
+      clearCompoundId: true,
     );
     if (separatedAudio != null) {
       // A duplicate starts with attached audio again; it must not become
@@ -3875,7 +4571,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final nextTracks = timeline.tracks.map((candidate) {
       if (candidate.id != track.id && candidate.isLocked) {
         final dependentClips = candidate.clips
-            .where((item) => item.linkedClipId != clip.id)
+            .where(
+              (item) =>
+                  item.linkedClipId != clip.id &&
+                  item.separatedAudioSourceClipId != clip.id,
+            )
             .toList();
         return dependentClips.length == candidate.clips.length
             ? candidate
@@ -3885,12 +4585,52 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           .where(
             (item) =>
                 item.id != clip.id &&
-                (item.linkedClipId == null || item.linkedClipId != clip.id),
+                (item.linkedClipId == null || item.linkedClipId != clip.id) &&
+                item.separatedAudioSourceClipId != clip.id,
           )
           .toList();
       return candidate.copyWith(clips: clips);
     }).toList();
-    final nextTimeline = timeline.copyWith(tracks: nextTracks);
+    final remainingClipIds = nextTracks
+        .expand((candidate) => candidate.clips)
+        .map((candidate) => candidate.id)
+        .toSet();
+    final nextGroups = timeline.groups
+        .map(
+          (group) => group.copyWith(
+            clipIds: group.clipIds.where(remainingClipIds.contains),
+          ),
+        )
+        .where((group) => group.clipIds.isNotEmpty)
+        .toList();
+    final nextCompounds = timeline.compoundClips
+        .map(
+          (compound) => compound.copyWith(
+            clipIds: compound.clipIds.where(remainingClipIds.contains),
+          ),
+        )
+        .where((compound) => compound.clipIds.isNotEmpty)
+        .toList();
+    final validGroupIds = nextGroups.map((group) => group.id).toSet();
+    final validCompoundIds = nextCompounds
+        .map((compound) => compound.id)
+        .toSet();
+    final nextTimeline = timeline.copyWith(
+      tracks: nextTracks,
+      groups: nextGroups,
+      compoundClips: nextCompounds,
+      effectContainers: timeline.effectContainers.where((container) {
+        return switch (container.scope) {
+          EditorEffectScope.clip || EditorEffectScope.adjustmentLayer =>
+            remainingClipIds.contains(container.targetId),
+          EditorEffectScope.group => validGroupIds.contains(container.targetId),
+          EditorEffectScope.compound => validCompoundIds.contains(
+            container.targetId,
+          ),
+          _ => true,
+        };
+      }).toList(),
+    );
     ref.read(editorProvider.notifier)
       ..setTimeline(nextTimeline)
       ..selectClip(null);
@@ -3930,6 +4670,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       clip,
       Duration(milliseconds: timelineOffsetMs),
     );
+    final effectStackSplit = clip.effectStack.splitAt(
+      Duration(milliseconds: timelineOffsetMs),
+    );
     final leftSourceStart = clip.isReversed
         ? clip.sourceStartTime +
               Duration(milliseconds: sourceDurationMs - sourceOffsetMs)
@@ -3942,6 +4685,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       sourceStartTime: leftSourceStart,
       sourceDuration: Duration(milliseconds: sourceOffsetMs),
       keyframes: keyframeSplit.leading,
+      effectStack: effectStackSplit.leading,
       outroTransition: const ClipTransition(),
       audioMix: clip.audioMix.copyWith(fadeOutMs: 0),
     );
@@ -3953,6 +4697,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         milliseconds: math.max(1, sourceDurationMs - sourceOffsetMs),
       ),
       keyframes: keyframeSplit.trailing,
+      effectStack: effectStackSplit.trailing,
       introTransition: const ClipTransition(),
       audioMix: clip.audioMix.copyWith(fadeInMs: 0),
     );
@@ -4020,7 +4765,23 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       captions.sort((a, b) => a.startTime.compareTo(b.startTime));
       nextTracks.add(candidateTrack.copyWith(clips: captions));
     }
-    final nextTimeline = timeline.copyWith(tracks: nextTracks);
+    final nextTimeline = timeline.copyWith(
+      tracks: nextTracks,
+      groups: timeline.groups
+          .map(
+            (group) => group.id == clip.groupId
+                ? group.copyWith(clipIds: [...group.clipIds, rightId])
+                : group,
+          )
+          .toList(),
+      compoundClips: timeline.compoundClips
+          .map(
+            (compound) => compound.id == clip.compoundId
+                ? compound.copyWith(clipIds: [...compound.clipIds, rightId])
+                : compound,
+          )
+          .toList(),
+    );
     ref.read(editorProvider.notifier)
       ..setTimeline(nextTimeline)
       ..selectClip(rightId);
@@ -4073,6 +4834,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       sourceDuration: sourceDuration,
       endTime: nextEnd,
       keyframes: TimelineKeyframeEditing.forNewEnd(target, nextEnd),
+      effectStack: target.effectStack.trimmedToDuration(nextDuration),
     );
 
     final nextTracks = timeline.tracks.map((candidateTrack) {
@@ -4848,6 +5610,26 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           }
 
           final adjustments = clip.colorAdjustments;
+          final currentTimeline = ref.read(editorProvider).timeline;
+          final sourcePath = currentTimeline.assetForClip(clip)?.sourcePath;
+          final lutLibrary = [...currentTimeline.colorManagement.luts]
+            ..sort((first, second) {
+              final byFavorite = (second.favorite ? 1 : 0).compareTo(
+                first.favorite ? 1 : 0,
+              );
+              if (byFavorite != 0) return byFavorite;
+              final byFolder = first.folder.toLowerCase().compareTo(
+                second.folder.toLowerCase(),
+              );
+              return byFolder != 0
+                  ? byFolder
+                  : first.name.toLowerCase().compareTo(
+                      second.name.toLowerCase(),
+                    );
+            });
+          final appliedLut = lutLibrary
+              .where((lut) => lut.path == adjustments.lutPath)
+              .firstOrNull;
           Widget adjustmentSlider({
             required String label,
             required double value,
@@ -4883,11 +5665,40 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           return _buildEditorSheet(
             title: 'Color correction',
             subtitle:
-                'Color and vignette preview live; spatial sharpening is finalized on export',
+                'Basic controls preview live; advanced corrections render an accurate cached proxy',
             resizable: true,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                if (sourcePath?.trim().isNotEmpty == true) ...[
+                  _sheetSectionTitle('LIVE VIDEO SCOPES'),
+                  const SizedBox(height: 8),
+                  VideoScopesPanel(
+                    key: ValueKey('scopes_${clip.id}'),
+                    clip: clip,
+                    sourcePath: sourcePath!.trim(),
+                  ),
+                  const SizedBox(height: 14),
+                ],
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    key: const ValueKey('project_color_management'),
+                    onPressed: _openColorManagementSheet,
+                    icon: const Icon(Icons.hdr_on_rounded),
+                    label: const Text('Project color management & HDR output'),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                _sheetSectionTitle('LIGHT'),
+                adjustmentSlider(
+                  label: 'Exposure',
+                  value: adjustments.exposure,
+                  minimum: -4,
+                  maximum: 4,
+                  formatter: (value) => '${value.toStringAsFixed(2)} EV',
+                  mapper: (value) => adjustments.copyWith(exposure: value),
+                ),
                 adjustmentSlider(
                   label: 'Brightness',
                   value: adjustments.brightness,
@@ -4903,6 +5714,38 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   formatter: (value) => '${value.toStringAsFixed(2)}×',
                   mapper: (value) => adjustments.copyWith(contrast: value),
                 ),
+                const SizedBox(height: 8),
+                _sheetSectionTitle('TONE'),
+                adjustmentSlider(
+                  label: 'Highlights',
+                  value: adjustments.highlights,
+                  minimum: -1,
+                  maximum: 1,
+                  mapper: (value) => adjustments.copyWith(highlights: value),
+                ),
+                adjustmentSlider(
+                  label: 'Shadows',
+                  value: adjustments.shadows,
+                  minimum: -1,
+                  maximum: 1,
+                  mapper: (value) => adjustments.copyWith(shadows: value),
+                ),
+                adjustmentSlider(
+                  label: 'Whites',
+                  value: adjustments.whites,
+                  minimum: -1,
+                  maximum: 1,
+                  mapper: (value) => adjustments.copyWith(whites: value),
+                ),
+                adjustmentSlider(
+                  label: 'Blacks',
+                  value: adjustments.blacks,
+                  minimum: -1,
+                  maximum: 1,
+                  mapper: (value) => adjustments.copyWith(blacks: value),
+                ),
+                const SizedBox(height: 8),
+                _sheetSectionTitle('COLOR'),
                 adjustmentSlider(
                   label: 'Saturation',
                   value: adjustments.saturation,
@@ -4912,12 +5755,333 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   mapper: (value) => adjustments.copyWith(saturation: value),
                 ),
                 adjustmentSlider(
+                  label: 'Vibrance',
+                  value: adjustments.vibrance,
+                  minimum: -1,
+                  maximum: 1,
+                  mapper: (value) => adjustments.copyWith(vibrance: value),
+                ),
+                adjustmentSlider(
                   label: 'Temperature',
                   value: adjustments.temperature,
                   minimum: -1,
                   maximum: 1,
                   mapper: (value) => adjustments.copyWith(temperature: value),
                 ),
+                adjustmentSlider(
+                  label: 'Tint',
+                  value: adjustments.tint,
+                  minimum: -1,
+                  maximum: 1,
+                  mapper: (value) => adjustments.copyWith(tint: value),
+                ),
+                adjustmentSlider(
+                  label: 'Hue',
+                  value: adjustments.hue,
+                  minimum: -180,
+                  maximum: 180,
+                  formatter: (value) => '${value.round()}°',
+                  mapper: (value) => adjustments.copyWith(hue: value),
+                ),
+                adjustmentSlider(
+                  label: 'Gamma',
+                  value: adjustments.gamma,
+                  minimum: 0.1,
+                  maximum: 4,
+                  formatter: (value) => value.toStringAsFixed(2),
+                  mapper: (value) => adjustments.copyWith(gamma: value),
+                ),
+                const SizedBox(height: 8),
+                _sheetSectionTitle('RGB CHANNELS'),
+                adjustmentSlider(
+                  label: 'Red gain',
+                  value: adjustments.redGain,
+                  minimum: 0,
+                  maximum: 3,
+                  formatter: (value) => '${value.toStringAsFixed(2)}×',
+                  mapper: (value) => adjustments.copyWith(redGain: value),
+                ),
+                adjustmentSlider(
+                  label: 'Green gain',
+                  value: adjustments.greenGain,
+                  minimum: 0,
+                  maximum: 3,
+                  formatter: (value) => '${value.toStringAsFixed(2)}×',
+                  mapper: (value) => adjustments.copyWith(greenGain: value),
+                ),
+                adjustmentSlider(
+                  label: 'Blue gain',
+                  value: adjustments.blueGain,
+                  minimum: 0,
+                  maximum: 3,
+                  formatter: (value) => '${value.toStringAsFixed(2)}×',
+                  mapper: (value) => adjustments.copyWith(blueGain: value),
+                ),
+                const SizedBox(height: 12),
+                AdvancedColorControls(
+                  adjustments: adjustments,
+                  onChanged: (value, {required recordHistory}) =>
+                      update((_) => value, recordHistory: recordHistory),
+                  onGestureStart: () => ref
+                      .read(editorProvider.notifier)
+                      .beginTimelineGestureEdit(),
+                  onGestureEnd: () => ref
+                      .read(editorProvider.notifier)
+                      .endTimelineGestureEdit(),
+                  onPickNeutralReference: () async {
+                    if (sourcePath?.trim().isNotEmpty != true) {
+                      SnackBarHelper.showWarning(
+                        context,
+                        'The source media is unavailable.',
+                      );
+                      return;
+                    }
+                    try {
+                      final playback = ref.read(playbackProvider).position;
+                      final sampled = await pickNeutralReferenceColor(
+                        context: context,
+                        sourcePath: sourcePath!.trim(),
+                        sourcePosition: _sourcePositionForTimelineClip(
+                          clip,
+                          playback,
+                        ),
+                      );
+                      if (sampled == null || !context.mounted) return;
+                      final red = sampled.r;
+                      final green = sampled.g;
+                      final blue = sampled.b;
+                      final temperatureCorrection = ((blue - red) * 1.65)
+                          .clamp(-1.0, 1.0)
+                          .toDouble();
+                      final tintCorrection = ((green - (red + blue) / 2) * 1.65)
+                          .clamp(-1.0, 1.0)
+                          .toDouble();
+                      update(
+                        (current) => current.copyWith(
+                          temperature:
+                              (current.temperature + temperatureCorrection)
+                                  .clamp(-1.0, 1.0)
+                                  .toDouble(),
+                          tint: (current.tint + tintCorrection)
+                              .clamp(-1.0, 1.0)
+                              .toDouble(),
+                        ),
+                      );
+                    } catch (error) {
+                      if (context.mounted) {
+                        SnackBarHelper.showError(
+                          context,
+                          error.toString().replaceFirst('Exception: ', ''),
+                        );
+                      }
+                    }
+                  },
+                  onPickQualifierReference:
+                      sourcePath?.trim().isNotEmpty != true
+                      ? null
+                      : () async {
+                          try {
+                            final playback = ref
+                                .read(playbackProvider)
+                                .position;
+                            final sampled = await pickFrameReferenceColor(
+                              context: context,
+                              sourcePath: sourcePath!.trim(),
+                              sourcePosition: _sourcePositionForTimelineClip(
+                                clip,
+                                playback,
+                              ),
+                              title: 'Qualifier eyedropper',
+                              instruction:
+                                  'Tap the color you want to isolate and correct.',
+                              actionLabel: 'Use sampled color',
+                            );
+                            if (sampled == null || !context.mounted) return;
+                            update(
+                              (current) => current.copyWith(
+                                qualifier: current.qualifier.copyWith(
+                                  enabled: true,
+                                  skinTone: false,
+                                  color: sampled.toARGB32(),
+                                ),
+                              ),
+                            );
+                          } catch (error) {
+                            if (context.mounted) {
+                              SnackBarHelper.showError(
+                                context,
+                                error.toString().replaceFirst(
+                                  'Exception: ',
+                                  '',
+                                ),
+                              );
+                            }
+                          }
+                        },
+                  onTrackQualifierMask:
+                      adjustments.qualifier.spatialMask == null ||
+                          sourcePath?.trim().isNotEmpty != true
+                      ? null
+                      : () async {
+                          final tracked = await _trackColorQualifierMask(
+                            clip,
+                            adjustments.qualifier.spatialMask!,
+                          );
+                          if (tracked != null && context.mounted) {
+                            update(
+                              (current) => current.copyWith(
+                                qualifier: current.qualifier.copyWith(
+                                  spatialMask: tracked,
+                                ),
+                              ),
+                            );
+                          }
+                        },
+                ),
+                const SizedBox(height: 8),
+                _sheetSectionTitle('LUT'),
+                const SizedBox(height: 8),
+                DropdownButtonFormField<String>(
+                  key: ValueKey('clip_lut_${appliedLut?.id ?? 'none'}'),
+                  initialValue: appliedLut?.id ?? '__none__',
+                  isExpanded: true,
+                  decoration: const InputDecoration(
+                    labelText: 'Project LUT library',
+                    prefixIcon: Icon(Icons.color_lens_outlined),
+                  ),
+                  items: [
+                    const DropdownMenuItem(
+                      value: '__none__',
+                      child: Text('No LUT'),
+                    ),
+                    for (final lut in lutLibrary)
+                      DropdownMenuItem(
+                        value: lut.id,
+                        child: Text(
+                          '${lut.favorite ? '★ ' : ''}${lut.folder} / ${lut.name}',
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                  ],
+                  onChanged: (value) {
+                    if (value == null) return;
+                    ref
+                        .read(editorProvider.notifier)
+                        .applyLutToClip(
+                          clip.id,
+                          value == '__none__' ? null : value,
+                        );
+                    final latest = _clipById(clip.id, ref.read(editorProvider));
+                    if (latest != null) setSheetState(() => clip = latest);
+                  },
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    OutlinedButton.icon(
+                      onPressed: () async {
+                        final result = await FilePicker.platform.pickFiles(
+                          type: FileType.custom,
+                          allowedExtensions: const ['cube', '3dl'],
+                          allowMultiple: false,
+                        );
+                        final selectedPath = result?.files.single.path;
+                        if (selectedPath == null || !mounted) return;
+                        try {
+                          await validateLutFile(selectedPath);
+                          final durablePath =
+                              await MediaImportService.persistFile(
+                                selectedPath,
+                                originalFileName: path.basename(selectedPath),
+                                forceCopy: true,
+                              );
+                          ref
+                              .read(editorProvider.notifier)
+                              .importAndApplyLutToClip(
+                                clipId: clip.id,
+                                sourcePath: durablePath,
+                                name: path.basenameWithoutExtension(
+                                  selectedPath,
+                                ),
+                              );
+                        } catch (error) {
+                          if (context.mounted) {
+                            SnackBarHelper.showError(
+                              context,
+                              'Could not import LUT: $error',
+                            );
+                          }
+                          return;
+                        }
+                        final latest = _clipById(
+                          clip.id,
+                          ref.read(editorProvider),
+                        );
+                        if (latest != null && context.mounted) {
+                          setSheetState(() => clip = latest);
+                        }
+                      },
+                      icon: const Icon(Icons.file_open_outlined),
+                      label: const Text('Import LUT'),
+                    ),
+                    if (appliedLut != null)
+                      OutlinedButton.icon(
+                        onPressed: () {
+                          ref
+                              .read(editorProvider.notifier)
+                              .updateLutAsset(
+                                appliedLut.id,
+                                (lut) => lut.copyWith(favorite: !lut.favorite),
+                              );
+                          setSheetState(() {});
+                        },
+                        icon: Icon(
+                          appliedLut.favorite
+                              ? Icons.star_rounded
+                              : Icons.star_border_rounded,
+                        ),
+                        label: Text(
+                          appliedLut.favorite ? 'Favorited' : 'Favorite',
+                        ),
+                      ),
+                    if (appliedLut != null)
+                      OutlinedButton.icon(
+                        key: const ValueKey('organize_applied_lut'),
+                        onPressed: () async {
+                          final organization = await _editLutOrganization(
+                            appliedLut,
+                          );
+                          if (organization == null || !context.mounted) return;
+                          ref
+                              .read(editorProvider.notifier)
+                              .updateLutAsset(
+                                appliedLut.id,
+                                (lut) => lut.copyWith(
+                                  name: organization.name,
+                                  folder: organization.folder,
+                                  favorite: organization.favorite,
+                                ),
+                              );
+                          setSheetState(() {});
+                        },
+                        icon: const Icon(Icons.folder_outlined),
+                        label: const Text('Organize'),
+                      ),
+                  ],
+                ),
+                if (adjustments.lutPath?.trim().isNotEmpty == true)
+                  adjustmentSlider(
+                    label: 'LUT intensity',
+                    value: adjustments.lutIntensity,
+                    minimum: 0,
+                    maximum: 1,
+                    mapper: (value) =>
+                        adjustments.copyWith(lutIntensity: value),
+                  ),
+                const SizedBox(height: 8),
+                _sheetSectionTitle('FINISH'),
                 adjustmentSlider(
                   label: 'Fade',
                   value: adjustments.fade,
@@ -4933,7 +6097,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   mapper: (value) => adjustments.copyWith(vignette: value),
                 ),
                 adjustmentSlider(
-                  label: 'Sharpen (export)',
+                  label: 'Sharpen',
                   value: adjustments.sharpen,
                   minimum: 0,
                   maximum: 1,
@@ -4944,6 +6108,319 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   onPressed: () => update((_) => const ClipColorAdjustments()),
                   icon: const Icon(Icons.restart_alt_rounded),
                   label: const Text('Reset color correction'),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Future<EditorEffectMask?> _trackColorQualifierMask(
+    TimelineClip clip,
+    EditorEffectMask mask,
+  ) async {
+    final timeline = ref.read(editorProvider).timeline;
+    final liveClip = _clipById(clip.id, ref.read(editorProvider)) ?? clip;
+    final sourcePath = timeline.assetForClip(liveClip)?.sourcePath?.trim();
+    if (sourcePath == null ||
+        sourcePath.isEmpty ||
+        !await File(sourcePath).exists()) {
+      if (mounted) {
+        SnackBarHelper.showWarning(
+          context,
+          'The source video is unavailable for tracking.',
+        );
+      }
+      return null;
+    }
+    final playhead = ref.read(playbackProvider).position;
+    final relativeUs = (playhead - liveClip.startTime).inMicroseconds
+        .clamp(0, liveClip.duration.inMicroseconds)
+        .toInt();
+    final remainingUs = liveClip.duration.inMicroseconds - relativeUs;
+    if (remainingUs < const Duration(milliseconds: 200).inMicroseconds) {
+      if (mounted) {
+        SnackBarHelper.showInfo(
+          context,
+          'Move the playhead earlier to track forward.',
+        );
+      }
+      return null;
+    }
+    final rate = liveClip.playbackRate.clamp(0.25, 4).toDouble();
+    final declaredSpanUs = liveClip.sourceDuration.inMicroseconds > 0
+        ? liveClip.sourceDuration.inMicroseconds
+        : (liveClip.duration.inMicroseconds * rate).round();
+    final remainingSourceUs = math.min(
+      (remainingUs * rate).round(),
+      declaredSpanUs,
+    );
+    final sourceStartOffsetUs = liveClip.isReversed
+        ? math.max(
+            0,
+            declaredSpanUs - (relativeUs * rate).round() - remainingSourceUs,
+          )
+        : math.min(declaredSpanUs, (relativeUs * rate).round());
+    if (mounted) {
+      SnackBarHelper.showInfo(context, 'Tracking qualifier mask…');
+    }
+    try {
+      final result = await MaskTrackingService.trackForward(
+        sourcePath: sourcePath,
+        sourceStartTime:
+            liveClip.sourceStartTime +
+            Duration(microseconds: sourceStartOffsetUs),
+        sourceDuration: Duration(microseconds: remainingSourceUs),
+        timelineOffset: Duration(microseconds: relativeUs),
+        timelineDuration: Duration(microseconds: remainingUs),
+        playbackRate: rate,
+        reversed: liveClip.isReversed,
+        initialMask: mask,
+      );
+      if (mounted) {
+        SnackBarHelper.showSuccess(
+          context,
+          'Tracked ${result.keyframes.length} samples '
+          '(${(result.averageConfidence * 100).round()}% confidence).',
+        );
+      }
+      return mask.copyWith(
+        trackingEnabled: true,
+        trackingTargetId: liveClip.id,
+        trackingKeyframes: [
+          ...mask.trackingKeyframes.where(
+            (frame) => frame.time.inMicroseconds < relativeUs,
+          ),
+          ...result.keyframes,
+        ],
+      );
+    } catch (error) {
+      if (mounted) {
+        SnackBarHelper.showError(
+          context,
+          error.toString().replaceFirst('Exception: ', ''),
+        );
+      }
+      return null;
+    }
+  }
+
+  Future<void> _openColorManagementSheet() async {
+    var settings = ref.read(editorProvider).timeline.colorManagement;
+    const outputSpaces = <EditorColorSpace>[
+      EditorColorSpace.sdr709,
+      EditorColorSpace.hlg,
+      EditorColorSpace.pq,
+      EditorColorSpace.wideGamut,
+    ];
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          void update(
+            EditorColorManagementSettings next, {
+            bool recordHistory = true,
+          }) {
+            setSheetState(() => settings = next);
+            final notifier = ref.read(editorProvider.notifier);
+            notifier.setTimeline(
+              ref.read(editorProvider).timeline.copyWith(colorManagement: next),
+              recordHistory: recordHistory,
+            );
+          }
+
+          Widget slider({
+            required String label,
+            required double value,
+            required double minimum,
+            required double maximum,
+            required ValueChanged<double> onChanged,
+          }) {
+            return Column(
+              children: [
+                _sheetSliderHeader(label, '${value.round()} nits'),
+                Slider(
+                  value: value.clamp(minimum, maximum).toDouble(),
+                  min: minimum,
+                  max: maximum,
+                  divisions: 100,
+                  onChangeStart: (_) => ref
+                      .read(editorProvider.notifier)
+                      .beginTimelineGestureEdit(),
+                  onChanged: onChanged,
+                  onChangeEnd: (_) => ref
+                      .read(editorProvider.notifier)
+                      .endTimelineGestureEdit(),
+                ),
+              ],
+            );
+          }
+
+          return _buildEditorSheet(
+            title: 'Color management',
+            subtitle:
+                'Camera transforms, working gamut, tone mapping and HDR delivery',
+            resizable: true,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _sheetSectionTitle('PROJECT PIPELINE'),
+                const SizedBox(height: 8),
+                DropdownButtonFormField<EditorColorSpace>(
+                  key: ValueKey('working_${settings.workingSpace.name}'),
+                  initialValue: settings.workingSpace,
+                  decoration: const InputDecoration(
+                    labelText: 'Working color space',
+                    prefixIcon: Icon(Icons.workspaces_outline),
+                  ),
+                  items: [
+                    for (final space in outputSpaces)
+                      DropdownMenuItem(
+                        value: space,
+                        child: Text(_editorColorSpaceLabel(space)),
+                      ),
+                  ],
+                  onChanged: (space) {
+                    if (space != null) {
+                      update(settings.copyWith(workingSpace: space));
+                    }
+                  },
+                ),
+                const SizedBox(height: 10),
+                SwitchListTile.adaptive(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Automatic camera Log transform'),
+                  subtitle: const Text(
+                    'Interpret detected Log footage before grading',
+                  ),
+                  value: settings.automaticLogTransform,
+                  onChanged: (value) =>
+                      update(settings.copyWith(automaticLogTransform: value)),
+                ),
+                const SizedBox(height: 12),
+                _sheetSectionTitle('DELIVERY'),
+                const SizedBox(height: 8),
+                DropdownButtonFormField<EditorColorSpace>(
+                  key: ValueKey('output_${settings.outputSpace.name}'),
+                  initialValue: settings.outputSpace,
+                  decoration: const InputDecoration(
+                    labelText: 'Output color space',
+                    prefixIcon: Icon(Icons.tv_rounded),
+                  ),
+                  items: [
+                    for (final space in outputSpaces)
+                      DropdownMenuItem(
+                        value: space,
+                        child: Text(_editorColorSpaceLabel(space)),
+                      ),
+                  ],
+                  onChanged: (space) {
+                    if (space == null) return;
+                    update(
+                      settings.copyWith(
+                        outputSpace: space,
+                        preserveHdr: space == EditorColorSpace.sdr709
+                            ? false
+                            : settings.preserveHdr,
+                      ),
+                    );
+                  },
+                ),
+                SwitchListTile.adaptive(
+                  key: const ValueKey('preserve_hdr_export'),
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Preserve HDR on export'),
+                  subtitle: Text(
+                    settings.outputSpace == EditorColorSpace.sdr709
+                        ? 'Choose HLG, PQ, or wide gamut output first'
+                        : 'Encode 10-bit HEVC with matching color metadata',
+                  ),
+                  value: settings.preserveHdr,
+                  onChanged: settings.outputSpace == EditorColorSpace.sdr709
+                      ? null
+                      : (value) =>
+                            update(settings.copyWith(preserveHdr: value)),
+                ),
+                slider(
+                  label: 'Reference white',
+                  value: settings.referenceWhiteNits,
+                  minimum: 80,
+                  maximum: 500,
+                  onChanged: (value) => update(
+                    settings.copyWith(referenceWhiteNits: value),
+                    recordHistory: false,
+                  ),
+                ),
+                slider(
+                  label: 'Mastering peak',
+                  value: settings.peakLuminanceNits,
+                  minimum: 100,
+                  maximum: 4000,
+                  onChanged: (value) => update(
+                    settings.copyWith(peakLuminanceNits: value),
+                    recordHistory: false,
+                  ),
+                ),
+                DropdownButtonFormField<EditorToneMapMode>(
+                  key: ValueKey('tone_map_${settings.toneMapMode.name}'),
+                  initialValue: settings.toneMapMode,
+                  decoration: const InputDecoration(
+                    labelText: 'HDR-to-SDR tone map',
+                    prefixIcon: Icon(Icons.tonality_rounded),
+                  ),
+                  items: [
+                    for (final mode in EditorToneMapMode.values)
+                      DropdownMenuItem(
+                        value: mode,
+                        child: Text(switch (mode) {
+                          EditorToneMapMode.hable => 'Hable (filmic)',
+                          EditorToneMapMode.reinhard => 'Reinhard',
+                          EditorToneMapMode.mobius => 'Mobius',
+                        }),
+                      ),
+                  ],
+                  onChanged: (mode) {
+                    if (mode != null) {
+                      update(settings.copyWith(toneMapMode: mode));
+                    }
+                  },
+                ),
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: kSurfaceElevated,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: kBorder),
+                  ),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Icon(
+                        settings.preserveHdr
+                            ? Icons.hdr_on_rounded
+                            : Icons.hdr_off_rounded,
+                        color: settings.preserveHdr ? kAccent : kTextSecondary,
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          settings.preserveHdr
+                              ? 'HDR delivery uses HEVC Main 10, yuv420p10le, and explicit Rec.2020 transfer/primaries metadata.'
+                              : 'Preview and export tone-map into SDR Rec.709 when HDR preservation is off.',
+                          style: const TextStyle(
+                            color: kTextSecondary,
+                            fontSize: 10,
+                            height: 1.35,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ],
             ),
@@ -5596,6 +7073,31 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     );
   }
 
+  Widget _audioMeterValue(String label, String value) {
+    return ConstrainedBox(
+      constraints: const BoxConstraints(minWidth: 92),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            label,
+            style: const TextStyle(color: kTextSecondary, fontSize: 9),
+          ),
+          Text(
+            value,
+            style: const TextStyle(
+              color: kTextPrimary,
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+              fontFamily: 'monospace',
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _sheetActionTile({
     required IconData icon,
     required String label,
@@ -6142,13 +7644,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         if (sourceDuration <= Duration.zero) {
           throw Exception('Could not read the selected video duration.');
         }
-        metadata = {
-          'durationMs': mediaInfo['durationMs'],
-          'width': mediaInfo['width'],
-          'height': mediaInfo['height'],
-          'hasAudio': mediaInfo['hasAudio'],
-          'frameRate': mediaInfo['frameRate'],
-        };
+        metadata = _editorMediaMetadata(mediaInfo);
       }
 
       if (!mounted) return;
@@ -6249,13 +7745,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         sourceDuration: sourceDuration,
         appendToMainTrack: true,
         preferredTrackId: targetTrack.id,
-        metadata: {
-          'durationMs': mediaInfo['durationMs'],
-          'width': mediaInfo['width'],
-          'height': mediaInfo['height'],
-          'hasAudio': mediaInfo['hasAudio'],
-          'frameRate': mediaInfo['frameRate'],
-        },
+        metadata: _editorMediaMetadata(mediaInfo),
         enableEmbeddedAudio:
             assetType == EditorAssetType.video && mediaInfo['hasAudio'] == true,
       );
@@ -6301,10 +7791,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         sourcePath: filePath,
         label: file.name,
         sourceDuration: duration,
-        metadata: {
-          'durationMs': mediaInfo['durationMs'],
-          'hasAudio': mediaInfo['hasAudio'],
-        },
+        metadata: _editorMediaMetadata(mediaInfo),
         forceNewTrack: forceNewTrack,
       );
     } catch (error) {
@@ -6566,6 +8053,203 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     );
   }
 
+  Set<String> _lutTargetClipIds(TimelineClip anchor) {
+    final editorState = ref.read(editorProvider);
+    final selectedIds = editorState.selectedClipIds.contains(anchor.id)
+        ? editorState.selectedClipIds
+        : {anchor.id};
+    return editorState.timeline.tracks
+        .expand((track) => track.clips)
+        .where(
+          (clip) => selectedIds.contains(clip.id) && clip.supportsVisualEffects,
+        )
+        .map((clip) => clip.id)
+        .toSet();
+  }
+
+  Future<void> _openLutLibrarySheet(TimelineClip anchor) async {
+    final targetIds = _lutTargetClipIds(anchor);
+    if (targetIds.isEmpty) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: Colors.black.withValues(alpha: 0.4),
+      builder: (sheetContext) => ElementLibrarySheet(
+        title: 'LUT Library',
+        subtitle: targetIds.length == 1
+            ? 'Preview and apply a verified offline color look'
+            : 'Apply one look to ${targetIds.length} selected visual clips',
+        initialDestination: ElementLibraryDestination.luts,
+        showNavigation: false,
+        onOnlineAssetSelected: _insertOnlineElementAsset,
+        onPackAssetSelected: (item) => _applyPackLut(item, targetIds),
+        onClose: () => Navigator.of(sheetContext).pop(),
+      ),
+    );
+  }
+
+  Future<({String name, String folder, bool favorite})?> _editLutOrganization(
+    EditorLutAsset lut,
+  ) async {
+    final nameController = TextEditingController(text: lut.name);
+    final folderController = TextEditingController(text: lut.folder);
+    var favorite = lut.favorite;
+    final result =
+        await showDialog<({String name, String folder, bool favorite})>(
+          context: context,
+          builder: (dialogContext) => StatefulBuilder(
+            builder: (context, setDialogState) => AlertDialog(
+              title: const Text('Organize LUT'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: nameController,
+                    autofocus: true,
+                    decoration: const InputDecoration(
+                      labelText: 'Display name',
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: folderController,
+                    decoration: const InputDecoration(
+                      labelText: 'Folder / collection',
+                      hintText: 'Film, Portrait, Favorites…',
+                    ),
+                  ),
+                  SwitchListTile.adaptive(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Favorite'),
+                    value: favorite,
+                    onChanged: (value) =>
+                        setDialogState(() => favorite = value),
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    final name = nameController.text.trim();
+                    final folder = folderController.text.trim();
+                    if (name.isEmpty || folder.isEmpty) return;
+                    Navigator.of(
+                      dialogContext,
+                    ).pop((name: name, folder: folder, favorite: favorite));
+                  },
+                  child: const Text('Save'),
+                ),
+              ],
+            ),
+          ),
+        );
+    nameController.dispose();
+    folderController.dispose();
+    return result;
+  }
+
+  Future<void> _applyPackLut(
+    AssetPackCatalogItem item,
+    Set<String> targetIds,
+  ) async {
+    if (item.mediaKind != AssetPackMediaKind.lut) {
+      throw Exception('This library item is not a LUT.');
+    }
+    final source = File(item.localPath);
+    if (!await source.exists() || await source.length() == 0) {
+      throw Exception('This LUT is missing. Download the pack again.');
+    }
+    final durablePath = await MediaImportService.persistFile(
+      item.localPath,
+      originalFileName: path.basename(item.localPath),
+      forceCopy: true,
+      stableCacheKey: 'pack_${item.packId}_${item.packVersion}_${item.id}',
+    );
+    final lutId = ref
+        .read(editorProvider.notifier)
+        .importAndApplyLutToClips(
+          clipIds: targetIds,
+          sourcePath: durablePath,
+          name: item.title,
+          folder: 'Pack / ${item.categoryName}',
+        );
+    if (lutId == null) {
+      throw Exception(
+        'Unlock the selected visual clips before applying a LUT.',
+      );
+    }
+    if (mounted) {
+      SnackBarHelper.showSuccess(
+        context,
+        targetIds.length == 1
+            ? '${item.title} applied'
+            : '${item.title} applied to ${targetIds.length} clips',
+      );
+    }
+  }
+
+  Future<void> _importLutForSelection(TimelineClip anchor) async {
+    final targetIds = _lutTargetClipIds(anchor);
+    if (targetIds.isEmpty) return;
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: const ['cube', '3dl'],
+      allowMultiple: false,
+    );
+    final selectedPath = result?.files.single.path;
+    if (selectedPath == null || !mounted) return;
+    try {
+      await validateLutFile(selectedPath);
+      final durablePath = await MediaImportService.persistFile(
+        selectedPath,
+        originalFileName: path.basename(selectedPath),
+        forceCopy: true,
+      );
+      final lutId = ref
+          .read(editorProvider.notifier)
+          .importAndApplyLutToClips(
+            clipIds: targetIds,
+            sourcePath: durablePath,
+            name: path.basenameWithoutExtension(selectedPath),
+          );
+      if (lutId == null) {
+        throw Exception('Unlock the selected visual clips first.');
+      }
+      if (mounted) {
+        SnackBarHelper.showSuccess(
+          context,
+          targetIds.length == 1
+              ? 'LUT imported and applied'
+              : 'LUT applied to ${targetIds.length} clips',
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        SnackBarHelper.showError(context, 'Could not import LUT: $error');
+      }
+    }
+  }
+
+  void _clearLutFromSelection(TimelineClip anchor) {
+    final targetIds = _lutTargetClipIds(anchor);
+    final cleared = ref
+        .read(editorProvider.notifier)
+        .applyLutToClips(targetIds, null);
+    if (cleared) {
+      SnackBarHelper.showSuccess(
+        context,
+        targetIds.length == 1
+            ? 'LUT removed'
+            : 'LUT removed from ${targetIds.length} clips',
+      );
+    }
+  }
+
   Future<void> _openSfxLibrarySheet() async {
     final downloadCancellation = CancelToken();
     try {
@@ -6640,6 +8324,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       sourceDuration: sourceDuration,
       forceNewTrack: true,
       metadata: {
+        ..._editorMediaMetadata(mediaInfo),
         'durationMs': sourceDuration.inMilliseconds,
         'hasAudio': true,
         'provider': result.provider.name,
@@ -6675,13 +8360,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
 
     var sourceDuration = result.duration;
     var hasAudio = result.hasAudio;
+    final mediaInfo = await FFmpegService.getMediaInfo(result.localPath);
     if (sourceDuration == null || sourceDuration <= Duration.zero) {
-      final mediaInfo = await FFmpegService.getMediaInfo(result.localPath);
       sourceDuration = Duration(
         milliseconds: (mediaInfo['durationMs'] as int?) ?? 0,
       );
-      hasAudio = mediaInfo['hasAudio'] == true;
     }
+    hasAudio = mediaInfo['hasAudio'] == true;
     if (sourceDuration <= Duration.zero) {
       throw Exception('Could not read this sound-effect duration.');
     }
@@ -6703,6 +8388,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       forceNewTrack: true,
       metadata: {
         ...result.metadata,
+        ..._editorMediaMetadata(mediaInfo),
         'provider': 'captionCraft',
         'packId': result.packId,
         'packVersion': result.packVersion,
@@ -6783,8 +8469,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     var width = result.width;
     var height = result.height;
     var hasAudio = false;
+    Map<String, dynamic> mediaInfo = const {};
     if (isVideo) {
-      final mediaInfo = await FFmpegService.getMediaInfo(localPath);
+      mediaInfo = await FFmpegService.getMediaInfo(localPath);
       if (sourceDuration == null || sourceDuration <= Duration.zero) {
         sourceDuration = Duration(
           milliseconds: (mediaInfo['durationMs'] as int?) ?? 0,
@@ -6806,6 +8493,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       sourcePath: localPath,
       sourceDuration: sourceDuration,
       metadata: {
+        ..._editorMediaMetadata(mediaInfo),
         'previewUrl': result.previewUrl,
         'providerAssetId': result.id,
         'width': width,
@@ -6828,6 +8516,18 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   Future<void> _insertPackElementAsset(AssetPackCatalogItem result) async {
+    if (result.mediaKind == AssetPackMediaKind.lut) {
+      final editorState = ref.read(editorProvider);
+      final selected = _clipById(editorState.selectedClipId ?? '', editorState);
+      if (selected == null || !selected.supportsVisualEffects) {
+        throw Exception('Select a visual clip first, or open Effects › LUTs.');
+      }
+      await _applyPackLut(result, _lutTargetClipIds(selected));
+      return;
+    }
+    if (result.mediaKind == AssetPackMediaKind.audio) {
+      throw Exception('Use the Sound Effects library for audio assets.');
+    }
     final mediaFile = File(result.localPath);
     if (!await mediaFile.exists()) {
       throw Exception(
@@ -6839,15 +8539,18 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     var width = result.width;
     var height = result.height;
     var hasAudio = result.hasAudio;
-    if (isVideo &&
-        (sourceDuration == null || sourceDuration <= Duration.zero)) {
-      final mediaInfo = await FFmpegService.getMediaInfo(result.localPath);
-      sourceDuration = Duration(
-        milliseconds: (mediaInfo['durationMs'] as int?) ?? 0,
-      );
+    Map<String, dynamic> mediaInfo = const {};
+    if (isVideo) {
+      mediaInfo = await FFmpegService.getMediaInfo(result.localPath);
       width ??= mediaInfo['width'] as int?;
       height ??= mediaInfo['height'] as int?;
       hasAudio = mediaInfo['hasAudio'] == true;
+    }
+    if (isVideo &&
+        (sourceDuration == null || sourceDuration <= Duration.zero)) {
+      sourceDuration = Duration(
+        milliseconds: (mediaInfo['durationMs'] as int?) ?? 0,
+      );
     }
     if (isVideo &&
         (sourceDuration == null || sourceDuration <= Duration.zero)) {
@@ -6902,6 +8605,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               .toDouble(),
       metadata: {
         ...result.metadata,
+        ..._editorMediaMetadata(mediaInfo),
         'provider': 'captionCraft',
         'packId': result.packId,
         'packVersion': result.packVersion,
@@ -7207,6 +8911,19 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     bool? normalize,
     AudioFadeShape? fadeInShape,
     AudioFadeShape? fadeOutShape,
+    EditorAudioChannelMode? channelMode,
+    int? sourceStreamIndex,
+    int? sourceLeftChannel,
+    int? sourceRightChannel,
+    double? leftGain,
+    double? rightGain,
+    double? targetLufs,
+    double? peakLimitDb,
+    double? pitchSemitones,
+    double? timeStretch,
+    bool? preservePitch,
+    AudioLoudnessAnalysis? loudnessAnalysis,
+    bool clearLoudnessAnalysis = false,
   }) {
     final editorState = ref.read(editorProvider);
     if (!editorState.timeline.clipHasAudio(clip)) {
@@ -7222,7 +8939,37 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         pan != null ||
         normalize != null ||
         fadeInShape != null ||
-        fadeOutShape != null;
+        fadeOutShape != null ||
+        channelMode != null ||
+        sourceStreamIndex != null ||
+        sourceLeftChannel != null ||
+        sourceRightChannel != null ||
+        leftGain != null ||
+        rightGain != null ||
+        targetLufs != null ||
+        peakLimitDb != null ||
+        pitchSemitones != null ||
+        timeStretch != null ||
+        preservePitch != null ||
+        loudnessAnalysis != null ||
+        clearLoudnessAnalysis;
+    final invalidatesAnalysis =
+        fadeInMs != null ||
+        fadeOutMs != null ||
+        pan != null ||
+        fadeInShape != null ||
+        fadeOutShape != null ||
+        channelMode != null ||
+        sourceStreamIndex != null ||
+        sourceLeftChannel != null ||
+        sourceRightChannel != null ||
+        leftGain != null ||
+        rightGain != null ||
+        targetLufs != null ||
+        peakLimitDb != null ||
+        pitchSemitones != null ||
+        timeStretch != null ||
+        preservePitch != null;
     final ownsGesture =
         volume != null && hasMixUpdate && !editorState.isTimelineGestureEditing;
     if (ownsGesture) notifier.beginTimelineGestureEdit();
@@ -7246,6 +8993,25 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               normalize: normalize ?? candidate.audioMix.normalize,
               fadeInShape: fadeInShape ?? candidate.audioMix.fadeInShape,
               fadeOutShape: fadeOutShape ?? candidate.audioMix.fadeOutShape,
+              channelMode: channelMode ?? candidate.audioMix.channelMode,
+              sourceStreamIndex:
+                  sourceStreamIndex ?? candidate.audioMix.sourceStreamIndex,
+              sourceLeftChannel:
+                  sourceLeftChannel ?? candidate.audioMix.sourceLeftChannel,
+              sourceRightChannel:
+                  sourceRightChannel ?? candidate.audioMix.sourceRightChannel,
+              leftGain: leftGain ?? candidate.audioMix.leftGain,
+              rightGain: rightGain ?? candidate.audioMix.rightGain,
+              targetLufs: targetLufs ?? candidate.audioMix.targetLufs,
+              peakLimitDb: peakLimitDb ?? candidate.audioMix.peakLimitDb,
+              pitchSemitones:
+                  pitchSemitones ?? candidate.audioMix.pitchSemitones,
+              timeStretch: timeStretch ?? candidate.audioMix.timeStretch,
+              preservePitch: preservePitch ?? candidate.audioMix.preservePitch,
+              loudnessAnalysis: loudnessAnalysis,
+              clearLoudnessAnalysis:
+                  clearLoudnessAnalysis ||
+                  (loudnessAnalysis == null && invalidatesAnalysis),
             ),
           ),
         );
@@ -7253,6 +9019,350 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     } finally {
       if (ownsGesture) notifier.endTimelineGestureEdit();
     }
+  }
+
+  Future<void> _analyzeAudioClip(TimelineClip clip) async {
+    final editorState = ref.read(editorProvider);
+    final timeline = editorState.timeline;
+    final owner = _audioOwnerForClip(timeline, clip);
+    if (owner == null || owner.track.isLocked) return;
+    final asset = timeline.assetForClip(owner.clip);
+    var sourcePath = asset?.sourcePath?.trim() ?? '';
+    final linkedVideoId = owner.clip.linkedClipId;
+    if (sourcePath.isEmpty && linkedVideoId != null) {
+      final sourceVideo = _clipById(linkedVideoId, editorState);
+      sourcePath = sourceVideo == null
+          ? ''
+          : timeline.assetForClip(sourceVideo)?.sourcePath?.trim() ?? '';
+    }
+    if (sourcePath.isEmpty && owner.clip.type == TimelineTrackType.video) {
+      sourcePath = resolveCaptionMediaPath(
+        timeline: timeline,
+        sourceClip: owner.clip,
+        legacyBaseVideoPath: widget.project.videoPath,
+      );
+    }
+    if (sourcePath.isEmpty || !await File(sourcePath).exists()) {
+      if (mounted) {
+        SnackBarHelper.showError(context, 'The audio source is unavailable.');
+      }
+      return;
+    }
+    setState(() => _analyzingAudioClipId = owner.clip.id);
+    try {
+      final analysis = await AudioMeterService.analyzeClip(
+        timeline: timeline,
+        track: owner.track,
+        clip: owner.clip,
+        asset: asset,
+        sourcePath: sourcePath,
+      );
+      if (!mounted) return;
+      final current = _clipById(owner.clip.id, ref.read(editorProvider));
+      if (current == null) return;
+      _updateSelectedClipAudioMix(
+        current,
+        normalize: true,
+        loudnessAnalysis: analysis,
+      );
+      SnackBarHelper.showSuccess(
+        context,
+        'Measured ${analysis.integratedLufs.toStringAsFixed(1)} LUFS.',
+      );
+    } catch (error) {
+      if (mounted) {
+        SnackBarHelper.showError(context, 'Audio analysis failed: $error');
+      }
+    } finally {
+      if (mounted) setState(() => _analyzingAudioClipId = null);
+    }
+  }
+
+  Future<void> _crossfadeSelectedAudioClips() async {
+    final editorState = ref.read(editorProvider);
+    final selectedIds = <String>{
+      ...editorState.selectedClipIds,
+      if (editorState.selectedClipId != null) editorState.selectedClipId!,
+    };
+    final clips = <TimelineClip>[];
+    for (final track in editorState.timeline.tracks) {
+      for (final clip in track.clips) {
+        if (selectedIds.contains(clip.id) &&
+            clip.type == TimelineTrackType.audio) {
+          clips.add(clip);
+        }
+      }
+    }
+    clips.sort((a, b) => a.startTime.compareTo(b.startTime));
+    if (clips.length != 2) {
+      SnackBarHelper.showInfo(
+        context,
+        'Select exactly two independent audio clips to crossfade.',
+      );
+      return;
+    }
+    final maximumMs = math.min(
+      clips.first.duration.inMilliseconds ~/ 2,
+      clips.last.duration.inMilliseconds ~/ 2,
+    );
+    final defaultMs = math.min(1000, maximumMs);
+    final controller = TextEditingController(
+      text: (defaultMs / 1000).toStringAsFixed(2),
+    );
+    final durationMs = await showDialog<int>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Create music crossfade'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          decoration: InputDecoration(
+            labelText: 'Crossfade duration (seconds)',
+            helperText: 'Maximum ${(maximumMs / 1000).toStringAsFixed(2)} s',
+          ),
+          onSubmitted: (value) {
+            final seconds = double.tryParse(value);
+            if (seconds != null) {
+              Navigator.of(dialogContext).pop((seconds * 1000).round());
+            }
+          },
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final seconds = double.tryParse(controller.text);
+              if (seconds != null) {
+                Navigator.of(dialogContext).pop((seconds * 1000).round());
+              }
+            },
+            child: const Text('Crossfade'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (durationMs == null || !mounted) return;
+    try {
+      final next = applyAudioCrossfadeForTesting(
+        timeline: ref.read(editorProvider).timeline,
+        firstClipId: clips.first.id,
+        secondClipId: clips.last.id,
+        duration: Duration(milliseconds: durationMs),
+      );
+      ref.read(editorProvider.notifier).setTimeline(next);
+      SnackBarHelper.showSuccess(context, 'Music crossfade created.');
+    } catch (error) {
+      SnackBarHelper.showError(context, '$error');
+    }
+  }
+
+  Future<void> _fitAudioClipToTarget(TimelineClip clip) async {
+    final sourceSpan = clip.sourceDuration > Duration.zero
+        ? clip.sourceDuration
+        : Duration(
+            microseconds: (clip.duration.inMicroseconds * clip.playbackRate)
+                .round(),
+          );
+    final controller = TextEditingController(
+      text: (clip.duration.inMilliseconds / 1000).toStringAsFixed(2),
+    );
+    final durationMs = await showDialog<int>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Fit music to duration'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          decoration: InputDecoration(
+            labelText: 'Target duration (seconds)',
+            helperText:
+                'Selected source: ${(sourceSpan.inMilliseconds / 1000).toStringAsFixed(2)} s',
+          ),
+          onSubmitted: (value) {
+            final seconds = double.tryParse(value);
+            if (seconds != null) {
+              Navigator.of(dialogContext).pop((seconds * 1000).round());
+            }
+          },
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final seconds = double.tryParse(controller.text);
+              if (seconds != null) {
+                Navigator.of(dialogContext).pop((seconds * 1000).round());
+              }
+            },
+            child: const Text('Fit'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (durationMs == null || durationMs <= 0 || !mounted) return;
+    try {
+      final next = fitAudioClipToDurationForTesting(
+        timeline: ref.read(editorProvider).timeline,
+        clipId: clip.id,
+        targetDuration: Duration(milliseconds: durationMs),
+      );
+      ref.read(editorProvider.notifier).setTimeline(next);
+      SnackBarHelper.showSuccess(context, 'Music fitted with pitch preserved.');
+    } catch (error) {
+      SnackBarHelper.showError(context, '$error');
+    }
+  }
+
+  void _unlinkSeparatedAudio(TimelineClip audio) {
+    final timeline = ref.read(editorProvider).timeline;
+    final next = unlinkSeparatedAudioForTesting(
+      timeline: timeline,
+      audioClipId: audio.id,
+    );
+    ref.read(editorProvider.notifier).setTimeline(next);
+    SnackBarHelper.showSuccess(
+      context,
+      'Audio unlinked and can now move independently.',
+    );
+  }
+
+  Future<void> _relinkSeparatedAudio(TimelineClip audio) async {
+    final timeline = ref.read(editorProvider).timeline;
+    final sourceVideoId = audio.separatedAudioSourceClipId;
+    final candidates = <TimelineClip>[];
+    for (final track in timeline.tracks) {
+      for (final clip in track.clips) {
+        if (clip.type == TimelineTrackType.video &&
+            clip.assetId != null &&
+            clip.assetId == audio.assetId &&
+            (sourceVideoId == null || clip.id == sourceVideoId) &&
+            !timeline.tracks.any(
+              (candidateTrack) => candidateTrack.clips.any(
+                (candidate) =>
+                    candidate.id != audio.id &&
+                    candidate.type == TimelineTrackType.audio &&
+                    candidate.separatedAudioSourceClipId == clip.id,
+              ),
+            )) {
+          candidates.add(clip);
+        }
+      }
+    }
+    if (candidates.isEmpty) {
+      SnackBarHelper.showInfo(
+        context,
+        'No available source video uses this audio asset.',
+      );
+      return;
+    }
+    TimelineClip? target = candidates.singleOrNull;
+    target ??= await showDialog<TimelineClip>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: const Text('Relink to source video'),
+        children: [
+          for (final candidate in candidates)
+            SimpleDialogOption(
+              onPressed: () => Navigator.of(dialogContext).pop(candidate),
+              child: Text(
+                '${candidate.label} • ${SubtitleEntry.formatDisplayTime(candidate.startTime)}',
+              ),
+            ),
+        ],
+      ),
+    );
+    if (target == null || !mounted) return;
+    try {
+      final next = relinkSeparatedAudioForTesting(
+        timeline: ref.read(editorProvider).timeline,
+        audioClipId: audio.id,
+        videoClipId: target.id,
+      );
+      ref.read(editorProvider.notifier).setTimeline(next);
+      SnackBarHelper.showSuccess(context, 'Audio relinked to source video.');
+    } catch (error) {
+      SnackBarHelper.showError(context, '$error');
+    }
+  }
+
+  void _reattachSeparatedAudio(TimelineClip audio) {
+    final linkedVideoId = audio.separatedAudioSourceClipId;
+    try {
+      final next = reattachSeparatedAudioForTesting(
+        timeline: ref.read(editorProvider).timeline,
+        audioClipId: audio.id,
+      );
+      ref.read(editorProvider.notifier).setTimeline(next);
+      if (linkedVideoId != null) {
+        ref.read(editorProvider.notifier).selectClip(linkedVideoId);
+      }
+      SnackBarHelper.showSuccess(context, 'Audio reattached to the video.');
+    } catch (error) {
+      SnackBarHelper.showError(context, '$error');
+    }
+  }
+
+  Future<void> _editClipVolumeDb(
+    TimelineClip clip,
+    double currentDecibels,
+  ) async {
+    final controller = TextEditingController(
+      text: currentDecibels.toStringAsFixed(1),
+    );
+    final value = await showDialog<double>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Clip volume'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          keyboardType: const TextInputType.numberWithOptions(
+            signed: true,
+            decimal: true,
+          ),
+          inputFormatters: [
+            FilteringTextInputFormatter.allow(RegExp(r'^-?\d{0,2}(\.\d?)?')),
+          ],
+          decoration: const InputDecoration(
+            labelText: 'Gain in dB',
+            helperText: 'Range: −60.0 dB to +6.0 dB',
+            suffixText: 'dB',
+          ),
+          onSubmitted: (text) => Navigator.of(
+            context,
+          ).pop(double.tryParse(text)?.clamp(-60.0, 6.0).toDouble()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(
+              double.tryParse(controller.text)?.clamp(-60.0, 6.0).toDouble(),
+            ),
+            child: const Text('Apply'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (value == null || !mounted) return;
+    _updateSelectedClipAudioMix(
+      clip,
+      volume: _dbToLinearGain(value),
+      muted: value <= -60,
+    );
   }
 
   void _updateTrackAudioMix(String trackId, {double? gain, double? pan}) {
@@ -7614,10 +9724,22 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       ],
       _BottomActionCategory.effects => const [
         (
+          _BottomActionSubgroup.effectsStack,
+          'Stack',
+          'Layer, reorder, mask and animate effects',
+          Icons.auto_awesome_rounded,
+        ),
+        (
           _BottomActionSubgroup.effectsColor,
           'Color',
           'Chroma key, filters and adjustments',
           Icons.tonality_rounded,
+        ),
+        (
+          _BottomActionSubgroup.effectsLuts,
+          'LUTs',
+          'Browse, import and control reusable color looks',
+          Icons.color_lens_rounded,
         ),
         (
           _BottomActionSubgroup.effectsBlur,
@@ -7664,6 +9786,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           'Mixer',
           'Volume, pan, fades and normalization',
           Icons.tune_rounded,
+        ),
+        (
+          _BottomActionSubgroup.audioEffects,
+          'Effects',
+          'EQ, dynamics, restoration and pitch',
+          Icons.multitrack_audio_rounded,
         ),
         (
           _BottomActionSubgroup.audioCleanup,
@@ -7887,6 +10015,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                       (action.label == 'Enable' || action.label == 'Disable')),
             )
             .toList(),
+      _BottomActionSubgroup.effectsStack =>
+        effectActions.where((action) => action.group == 'Stack').toList(),
       _BottomActionSubgroup.effectsColor =>
         effectActions
             .where(
@@ -7895,6 +10025,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   action.label != 'Remove',
             )
             .toList(),
+      _BottomActionSubgroup.effectsLuts =>
+        effectActions.where((action) => action.group == 'LUTs').toList(),
       _BottomActionSubgroup.effectsBlur =>
         effectActions
             .where(
@@ -7926,6 +10058,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         audioActions
             .where((action) => action.group == 'Mix' && action.label == 'Mixer')
             .toList(),
+      _BottomActionSubgroup.audioEffects =>
+        audioActions.where((action) => action.group == 'Effects').toList(),
       _BottomActionSubgroup.audioCleanup =>
         audioActions
             .where(
@@ -8375,9 +10509,30 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final visual = clip != null && capabilities.canVisualEffects;
     final filter = clip != null && capabilities.isFilterEffect;
     final blur = clip != null && capabilities.isBlurEffect;
+    final hasLut = clip?.colorAdjustments.lutPath?.trim().isNotEmpty == true;
     final canKey =
         clip != null && capabilities.canEdit && clip.supportsChromaKey;
     return [
+      _ActionSpec(
+        group: 'Stack',
+        label: 'Effect Stack',
+        tooltip: 'Add, reorder, mask, disable and animate visual effects',
+        icon: Icons.auto_awesome_rounded,
+        active:
+            clip?.effectStack.effects.any(
+              (effect) => effect.domain == EditorEffectDomain.visual,
+            ) ==
+            true,
+        onTap: () =>
+            _openEffectStackSheet(clip, domain: EditorEffectDomain.visual),
+      ),
+      _ActionSpec(
+        group: 'Stack',
+        label: 'Adjustment',
+        tooltip: 'Create a timed adjustment layer above the composition',
+        icon: Icons.layers_rounded,
+        onTap: _createAdjustmentLayerAtPlayhead,
+      ),
       _ActionSpec(
         group: 'Keying',
         label: 'Chroma Key',
@@ -8401,6 +10556,39 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         icon: Icons.tune_rounded,
         active: clip?.colorAdjustments.isNeutral == false,
         onTap: visual || filter ? () => _openColorAdjustmentsSheet(clip) : null,
+      ),
+      _ActionSpec(
+        group: 'LUTs',
+        label: 'Library',
+        tooltip: 'Browse the verified offline LUT pack',
+        icon: Icons.grid_view_rounded,
+        active: hasLut,
+        onTap: visual || filter ? () => _openLutLibrarySheet(clip) : null,
+      ),
+      _ActionSpec(
+        group: 'LUTs',
+        label: 'Import',
+        tooltip: 'Import a custom CUBE or 3DL file',
+        icon: Icons.file_open_outlined,
+        onTap: visual || filter ? () => _importLutForSelection(clip) : null,
+      ),
+      _ActionSpec(
+        group: 'LUTs',
+        label: 'Strength',
+        tooltip: 'Adjust LUT intensity and color controls',
+        icon: Icons.tune_rounded,
+        onTap: (visual || filter) && hasLut
+            ? () => _openColorAdjustmentsSheet(clip)
+            : null,
+      ),
+      _ActionSpec(
+        group: 'LUTs',
+        label: 'Clear',
+        tooltip: 'Remove the LUT from the selected visual clips',
+        icon: Icons.layers_clear_outlined,
+        onTap: (visual || filter) && hasLut
+            ? () => _clearLutFromSelection(clip)
+            : null,
       ),
       _ActionSpec(
         group: 'Color',
@@ -8626,6 +10814,23 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         tooltip: 'Volume, pan, fades and normalization',
         icon: Icons.tune_rounded,
         onTap: audio ? () => _openAudioControlsSheet(audioClip) : null,
+      ),
+      _ActionSpec(
+        group: 'Effects',
+        label: 'Audio FX',
+        tooltip: 'Build a non-destructive audio processing chain',
+        icon: Icons.multitrack_audio_rounded,
+        active:
+            audioClip?.effectStack.effects.any(
+              (effect) => effect.domain == EditorEffectDomain.audio,
+            ) ==
+            true,
+        onTap: audio
+            ? () => _openEffectStackSheet(
+                audioClip,
+                domain: EditorEffectDomain.audio,
+              )
+            : null,
       ),
       _ActionSpec(
         group: 'Mix',
@@ -8859,6 +11064,20 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final canReorderTrack = selectedTrack?.isReorderable == true;
     final canDuplicateTrack =
         selectedTrack?.isDuplicable == true && !selectedTrack!.isLocked;
+    final selectedClips = timeline.tracks
+        .expand((track) => track.clips)
+        .where(
+          (candidate) => editorState.selectedClipIds.contains(candidate.id),
+        )
+        .toList();
+    final selectedGroupId = selectedClips
+        .map((candidate) => candidate.groupId)
+        .whereType<String>()
+        .firstOrNull;
+    final selectedCompoundId = selectedClips
+        .map((candidate) => candidate.compoundId)
+        .whereType<String>()
+        .firstOrNull;
     return [
       _ActionSpec(
         group: 'Selection',
@@ -8882,6 +11101,39 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         tooltip: 'Split every clip crossing the playhead',
         icon: Icons.call_split_rounded,
         onTap: _splitEveryTrackAtPlayhead,
+      ),
+      _ActionSpec(
+        group: 'Selection',
+        label: selectedGroupId == null ? 'Group' : 'Ungroup',
+        tooltip: selectedGroupId == null
+            ? 'Link selected clips for shared effects'
+            : 'Remove the selected clip group',
+        icon: selectedGroupId == null
+            ? Icons.group_work_outlined
+            : Icons.workspaces_outline,
+        onTap: selectedGroupId != null
+            ? () => _ungroupSelection(selectedGroupId)
+            : selectedClips.length >= 2
+            ? _groupSelection
+            : null,
+      ),
+      _ActionSpec(
+        group: 'Selection',
+        label: selectedCompoundId == null ? 'Compound' : 'Dissolve',
+        tooltip: selectedCompoundId == null
+            ? 'Link selected visual clips for shared processing'
+            : 'Dissolve the selected compound',
+        icon: selectedCompoundId == null
+            ? Icons.layers_outlined
+            : Icons.layers_clear_outlined,
+        onTap: selectedCompoundId != null
+            ? () => _dissolveCompoundSelection(selectedCompoundId)
+            : selectedClips.length >= 2 &&
+                  selectedClips.every(
+                    (candidate) => candidate.type.isVisualMedia,
+                  )
+            ? _compoundSelection
+            : null,
       ),
       _ActionSpec(
         group: 'Tracks',
@@ -9078,6 +11330,46 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     if (primaryClipId != null) notifier.selectClip(primaryClipId);
   }
 
+  void _groupSelection() {
+    final ids = ref.read(editorProvider).selectedClipIds;
+    final groupId = ref.read(editorProvider.notifier).createGroup(ids);
+    if (groupId == null) {
+      SnackBarHelper.showError(
+        context,
+        'Select at least two editable clips to create a group.',
+      );
+      return;
+    }
+    SnackBarHelper.showSuccess(context, 'Clip group created');
+  }
+
+  void _ungroupSelection(String groupId) {
+    final removed = ref.read(editorProvider.notifier).ungroup(groupId);
+    if (removed) SnackBarHelper.showSuccess(context, 'Clip group removed');
+  }
+
+  void _compoundSelection() {
+    final ids = ref.read(editorProvider).selectedClipIds;
+    final compoundId = ref
+        .read(editorProvider.notifier)
+        .createCompoundClip(ids);
+    if (compoundId == null) {
+      SnackBarHelper.showError(
+        context,
+        'Select at least two editable visual clips.',
+      );
+      return;
+    }
+    SnackBarHelper.showSuccess(context, 'Compound selection created');
+  }
+
+  void _dissolveCompoundSelection(String compoundId) {
+    final removed = ref
+        .read(editorProvider.notifier)
+        .dissolveCompoundClip(compoundId);
+    if (removed) SnackBarHelper.showSuccess(context, 'Compound dissolved');
+  }
+
   Future<void> _exportCaptionSidecar(String format) async {
     if (ref.read(subtitleProvider).entries.isEmpty) {
       SnackBarHelper.showInfo(context, 'No subtitles to export');
@@ -9239,7 +11531,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final audioTrack = audioOwner?.track;
     final asset = timeline.assetForClip(clip);
     final separatedAudio = _separatedAudioForVideo(timeline, clip.id);
-    final hasSeparatedAudio = separatedAudio != null;
+    final hasSeparatedAudio =
+        separatedAudio != null || clip.embeddedAudioSeparated;
     final provenance = asset?.metadata['provenance'];
     final rawAttribution =
         asset?.metadata['attribution'] ??
@@ -9247,15 +11540,14 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final attribution = rawAttribution is String ? rawAttribution.trim() : null;
     final license = (asset?.metadata['license'] as String?)?.trim();
     final resolvedVolume = clip.volumeAt(ref.read(playbackProvider).position);
+    final resolvedVolumeDb = _linearGainToDb(resolvedVolume);
     final hasCustomMix =
-        clip.audioMix.muted ||
+        clip.audioMix.hasMixAdjustment ||
         (resolvedVolume - 1).abs() > 0.001 ||
-        clip.audioMix.fadeInMs != 0 ||
-        clip.audioMix.fadeOutMs != 0 ||
-        clip.audioMix.pan.abs() > 0.001 ||
-        clip.audioMix.normalize ||
         clip.audioMix.fadeInShape != AudioFadeShape.linear ||
         clip.audioMix.fadeOutShape != AudioFadeShape.linear;
+    final maximumFadeMs = math.max(1, clip.duration.inMilliseconds ~/ 2);
+    final fadeDivisions = math.max(1, math.min(200, maximumFadeMs ~/ 50));
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
@@ -9347,27 +11639,35 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               width: double.infinity,
               child: OutlinedButton.icon(
                 key: ValueKey(
-                  hasSeparatedAudio
+                  separatedAudio != null
                       ? 'edit-separated-video-audio'
+                      : clip.embeddedAudioSeparated
+                      ? 'video-audio-already-separated'
                       : 'separate-video-audio',
                 ),
-                onPressed: hasSeparatedAudio
+                onPressed: separatedAudio != null
                     ? () {
                         ref.read(editorProvider.notifier)
                           ..selectTrack(separatedAudio.track.id)
                           ..selectClip(separatedAudio.clip.id);
                         Navigator.of(context).maybePop();
                       }
+                    : clip.embeddedAudioSeparated
+                    ? null
                     : () => _separateVideoAudio(clip),
                 icon: Icon(
-                  hasSeparatedAudio
+                  separatedAudio != null
                       ? Icons.graphic_eq_rounded
+                      : clip.embeddedAudioSeparated
+                      ? Icons.check_circle_outline_rounded
                       : Icons.call_split_rounded,
                   size: 18,
                 ),
                 label: Text(
-                  hasSeparatedAudio
+                  separatedAudio != null
                       ? 'Edit separated audio'
+                      : clip.embeddedAudioSeparated
+                      ? 'Audio already separated'
                       : 'Separate audio to its own track',
                 ),
               ),
@@ -9375,7 +11675,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             const SizedBox(height: 4),
             Text(
               hasSeparatedAudio
-                  ? 'This video is muted to prevent duplicate playback. Volume, fades, pan, and mute now belong to the linked audio clip.'
+                  ? separatedAudio != null
+                        ? 'This video is muted to prevent duplicate playback. Volume, fades, pan, and effects belong to its separated audio clip.'
+                        : 'The original audio was separated and is no longer attached to this video.'
                   : 'Video audio stays attached by default. Separate it only when you need independent timeline controls.',
               style: TextStyle(
                 color: kTextSecondary,
@@ -9384,6 +11686,53 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               ),
             ),
             const SizedBox(height: 8),
+          ],
+          if (clip.type == TimelineTrackType.audio &&
+              clip.separatedAudioSourceClipId != null) ...[
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    key: ValueKey(
+                      clip.linkedClipId == null
+                          ? 'relink-separated-audio'
+                          : 'unlink-separated-audio',
+                    ),
+                    onPressed: clip.linkedClipId == null
+                        ? () => _relinkSeparatedAudio(clip)
+                        : () => _unlinkSeparatedAudio(clip),
+                    icon: Icon(
+                      clip.linkedClipId == null
+                          ? Icons.link_rounded
+                          : Icons.link_off_rounded,
+                    ),
+                    label: Text(
+                      clip.linkedClipId == null ? 'Relink video' : 'Unlink',
+                    ),
+                  ),
+                ),
+                if (clip.separatedAudioSourceClipId != null) ...[
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      key: const ValueKey('reattach-separated-audio'),
+                      onPressed: () => _reattachSeparatedAudio(clip),
+                      icon: const Icon(Icons.merge_type_rounded),
+                      label: const Text('Reattach'),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Text(
+                clip.linkedClipId == null
+                    ? 'Relink to restore synchronized transport, or reattach the processed audio to its original video.'
+                    : 'Unlink to edit transport independently, or reattach the processed audio to the video clip.',
+                style: const TextStyle(color: kTextSecondary, fontSize: 9),
+              ),
+            ),
           ],
           if (!isVideoClip || !hasSeparatedAudio) ...[
             Row(
@@ -9405,8 +11754,15 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 Text(
                   clip.audioMix.muted
                       ? 'Muted'
-                      : '${(resolvedVolume * 100).round()}%',
+                      : '${resolvedVolumeDb.toStringAsFixed(1)} dB',
                   style: TextStyle(color: kTextSecondary, fontSize: 12),
+                ),
+                const Spacer(),
+                IconButton(
+                  key: const ValueKey('audio_volume_db_entry'),
+                  tooltip: 'Enter an exact dB value',
+                  onPressed: () => _editClipVolumeDb(clip, resolvedVolumeDb),
+                  icon: const Icon(Icons.edit_outlined, size: 18),
                 ),
               ],
             ),
@@ -9418,17 +11774,18 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 overlayColor: kAccent.withValues(alpha: 0.14),
               ),
               child: Slider(
-                value: resolvedVolume.clamp(0.0, 1.0),
-                min: 0,
-                max: 1,
-                divisions: 20,
+                value: resolvedVolumeDb,
+                min: -60,
+                max: 6,
+                divisions: 132,
+                label: '${resolvedVolumeDb.toStringAsFixed(1)} dB',
                 onChangeStart: (_) => ref
                     .read(editorProvider.notifier)
                     .beginTimelineGestureEdit(),
                 onChanged: (value) => _updateSelectedClipAudioMix(
                   clip,
-                  volume: value,
-                  muted: value == 0 ? true : false,
+                  volume: _dbToLinearGain(value),
+                  muted: value <= -60,
                 ),
                 onChangeEnd: (_) =>
                     ref.read(editorProvider.notifier).endTimelineGestureEdit(),
@@ -9507,10 +11864,18 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             SwitchListTile.adaptive(
               contentPadding: EdgeInsets.zero,
               title: const Text('Normalize loudness'),
-              subtitle: const Text('Target a consistent −16 LUFS on export'),
+              subtitle: Text(
+                'Target ${clip.audioMix.targetLufs.toStringAsFixed(0)} LUFS • '
+                '${clip.audioMix.peakLimitDb.toStringAsFixed(1)} dBTP ceiling',
+              ),
               value: clip.audioMix.normalize,
               onChanged: (value) =>
                   _updateSelectedClipAudioMix(clip, normalize: value),
+            ),
+            _buildAdvancedAudioControls(
+              clip: clip,
+              track: audioTrack,
+              timeline: timeline,
             ),
             const SizedBox(height: 6),
             Text(
@@ -9525,10 +11890,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 overlayColor: kAccent.withValues(alpha: 0.14),
               ),
               child: Slider(
-                value: clip.audioMix.fadeInMs.toDouble().clamp(0, 1500),
+                value: clip.audioMix.fadeInMs
+                    .toDouble()
+                    .clamp(0, maximumFadeMs)
+                    .toDouble(),
                 min: 0,
-                max: 1500,
-                divisions: 15,
+                max: maximumFadeMs.toDouble(),
+                divisions: fadeDivisions,
                 label: '${clip.audioMix.fadeInMs}ms',
                 onChangeStart: (_) => ref
                     .read(editorProvider.notifier)
@@ -9569,10 +11937,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 overlayColor: kAccent.withValues(alpha: 0.14),
               ),
               child: Slider(
-                value: clip.audioMix.fadeOutMs.toDouble().clamp(0, 1500),
+                value: clip.audioMix.fadeOutMs
+                    .toDouble()
+                    .clamp(0, maximumFadeMs)
+                    .toDouble(),
                 min: 0,
-                max: 1500,
-                divisions: 15,
+                max: maximumFadeMs.toDouble(),
+                divisions: fadeDivisions,
                 label: '${clip.audioMix.fadeOutMs}ms',
                 onChangeStart: (_) => ref
                     .read(editorProvider.notifier)
@@ -9704,6 +12075,14 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                         fadeOutShape: AudioFadeShape.linear,
                         pan: 0,
                         normalize: false,
+                        channelMode: EditorAudioChannelMode.stereo,
+                        leftGain: 1,
+                        rightGain: 1,
+                        targetLufs: -16,
+                        peakLimitDb: -1.5,
+                        pitchSemitones: 0,
+                        timeStretch: 1,
+                        preservePitch: true,
                       )
                     : null,
                 icon: const Icon(Icons.restart_alt_rounded),
@@ -9716,6 +12095,629 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     );
   }
 
+  Widget _buildAdvancedAudioControls({
+    required TimelineClip clip,
+    required TimelineTrack? track,
+    required EditorTimeline timeline,
+  }) {
+    final mix = clip.audioMix;
+    final asset = timeline.assetForClip(clip);
+    final rawAudioStreams = asset?.metadata['audioStreams'];
+    final audioStreams = rawAudioStreams is List
+        ? rawAudioStreams
+              .whereType<Map>()
+              .map((value) => Map<String, dynamic>.from(value))
+              .toList()
+        : <Map<String, dynamic>>[];
+    final declaredStreamCount =
+        (asset?.metadata['audioStreamCount'] as num?)?.toInt() ??
+        audioStreams.length;
+    final streamCount = math.max(1, declaredStreamCount);
+    final selectedStream = mix.sourceStreamIndex
+        .clamp(0, streamCount - 1)
+        .toInt();
+    final selectedStreamMetadata = selectedStream < audioStreams.length
+        ? audioStreams[selectedStream]
+        : const <String, dynamic>{};
+    final sourceChannelCount = math.max(
+      1,
+      (selectedStreamMetadata['channels'] as num?)?.toInt() ??
+          (asset?.metadata['audioChannels'] as num?)?.toInt() ??
+          2,
+    );
+    final storedMeasurement = mix.loudnessAnalysis;
+    String? currentMeasurementFingerprint;
+    final measurementSourcePath = asset?.sourcePath?.trim();
+    if (storedMeasurement != null &&
+        track != null &&
+        measurementSourcePath?.isNotEmpty == true) {
+      try {
+        currentMeasurementFingerprint = AudioMeterService.fingerprintForClip(
+          timeline: timeline,
+          track: track,
+          clip: clip,
+          asset: asset,
+          sourcePath: measurementSourcePath!,
+        );
+      } catch (_) {
+        currentMeasurementFingerprint = null;
+      }
+    }
+    final measurementIsCurrent =
+        storedMeasurement != null &&
+        (currentMeasurementFingerprint == null ||
+            storedMeasurement.sourceFingerprint ==
+                currentMeasurementFingerprint);
+    final measured = measurementIsCurrent ? storedMeasurement : null;
+    final hasStaleMeasurement =
+        storedMeasurement != null && !measurementIsCurrent;
+    final isAnalyzing = _analyzingAudioClipId == clip.id;
+    final bus = track?.audioBusId == null
+        ? null
+        : timeline.audioBuses
+              .where((candidate) => candidate.id == track!.audioBusId)
+              .firstOrNull;
+
+    Widget slider({
+      required String label,
+      required double value,
+      required double minimum,
+      required double maximum,
+      required int divisions,
+      required String Function(double value) format,
+      required ValueChanged<double> onChanged,
+    }) {
+      return Column(
+        children: [
+          _sheetSliderHeader(label, format(value)),
+          Slider(
+            value: value.clamp(minimum, maximum).toDouble(),
+            min: minimum,
+            max: maximum,
+            divisions: divisions,
+            label: format(value),
+            onChangeStart: (_) =>
+                ref.read(editorProvider.notifier).beginTimelineGestureEdit(),
+            onChanged: onChanged,
+            onChangeEnd: (_) =>
+                ref.read(editorProvider.notifier).endTimelineGestureEdit(),
+          ),
+        ],
+      );
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      decoration: BoxDecoration(
+        color: kSurfaceElevated,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: kBorder),
+      ),
+      child: ExpansionTile(
+        key: const ValueKey('advanced_audio_controls'),
+        tilePadding: const EdgeInsets.symmetric(horizontal: 12),
+        childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 14),
+        leading: const Icon(Icons.tune_rounded, color: kAccent, size: 20),
+        title: const Text(
+          'Advanced routing & processing',
+          style: TextStyle(
+            color: kTextPrimary,
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        subtitle: const Text(
+          'Channels, LUFS, pitch, stretch and buses',
+          style: TextStyle(color: kTextSecondary, fontSize: 9),
+        ),
+        children: [
+          if (streamCount > 1) ...[
+            DropdownButtonFormField<int>(
+              key: ValueKey('audio_source_stream_${clip.id}_$selectedStream'),
+              initialValue: selectedStream,
+              decoration: const InputDecoration(labelText: 'Audio stream'),
+              items: [
+                for (var index = 0; index < streamCount; index++)
+                  DropdownMenuItem(
+                    value: index,
+                    child: Text(() {
+                      final metadata = index < audioStreams.length
+                          ? audioStreams[index]
+                          : const <String, dynamic>{};
+                      final title = metadata['title']?.toString().trim();
+                      final language = metadata['language']?.toString().trim();
+                      final channels = (metadata['channels'] as num?)?.toInt();
+                      return [
+                        'Stream ${index + 1}',
+                        if (title?.isNotEmpty == true) title!,
+                        if (language?.isNotEmpty == true) language!,
+                        if (channels != null) '$channels ch',
+                      ].join(' • ');
+                    }()),
+                  ),
+              ],
+              onChanged: (value) {
+                if (value == null) return;
+                final metadata = value < audioStreams.length
+                    ? audioStreams[value]
+                    : const <String, dynamic>{};
+                final channels = math.max(
+                  1,
+                  (metadata['channels'] as num?)?.toInt() ?? 2,
+                );
+                _updateSelectedClipAudioMix(
+                  clip,
+                  sourceStreamIndex: value,
+                  sourceLeftChannel: 0,
+                  sourceRightChannel: math.min(1, channels - 1),
+                );
+              },
+            ),
+            const SizedBox(height: 8),
+          ],
+          if (sourceChannelCount > 1) ...[
+            Row(
+              children: [
+                Expanded(
+                  child: DropdownButtonFormField<int>(
+                    key: ValueKey(
+                      'audio_left_source_${clip.id}_$selectedStream',
+                    ),
+                    initialValue: mix.sourceLeftChannel
+                        .clamp(0, sourceChannelCount - 1)
+                        .toInt(),
+                    decoration: const InputDecoration(labelText: 'Output L'),
+                    items: [
+                      for (var index = 0; index < sourceChannelCount; index++)
+                        DropdownMenuItem(
+                          value: index,
+                          child: Text('Source ${index + 1}'),
+                        ),
+                    ],
+                    onChanged: (value) {
+                      if (value != null) {
+                        _updateSelectedClipAudioMix(
+                          clip,
+                          sourceLeftChannel: value,
+                        );
+                      }
+                    },
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: DropdownButtonFormField<int>(
+                    key: ValueKey(
+                      'audio_right_source_${clip.id}_$selectedStream',
+                    ),
+                    initialValue: mix.sourceRightChannel
+                        .clamp(0, sourceChannelCount - 1)
+                        .toInt(),
+                    decoration: const InputDecoration(labelText: 'Output R'),
+                    items: [
+                      for (var index = 0; index < sourceChannelCount; index++)
+                        DropdownMenuItem(
+                          value: index,
+                          child: Text('Source ${index + 1}'),
+                        ),
+                    ],
+                    onChanged: (value) {
+                      if (value != null) {
+                        _updateSelectedClipAudioMix(
+                          clip,
+                          sourceRightChannel: value,
+                        );
+                      }
+                    },
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+          ],
+          DropdownButtonFormField<EditorAudioChannelMode>(
+            key: const ValueKey('audio_channel_mode'),
+            initialValue: mix.channelMode,
+            decoration: const InputDecoration(labelText: 'Source channels'),
+            items: [
+              for (final mode in EditorAudioChannelMode.values)
+                DropdownMenuItem(
+                  value: mode,
+                  child: Text(_audioChannelModeLabel(mode)),
+                ),
+            ],
+            onChanged: (mode) {
+              if (mode != null) {
+                _updateSelectedClipAudioMix(clip, channelMode: mode);
+              }
+            },
+          ),
+          const SizedBox(height: 8),
+          slider(
+            label: 'Left channel gain',
+            value: _linearGainToDb(mix.leftGain),
+            minimum: -60,
+            maximum: 6,
+            divisions: 132,
+            format: (value) => '${value.toStringAsFixed(1)} dB',
+            onChanged: (value) => _updateSelectedClipAudioMix(
+              clip,
+              leftGain: _dbToLinearGain(value),
+            ),
+          ),
+          slider(
+            label: 'Right channel gain',
+            value: _linearGainToDb(mix.rightGain),
+            minimum: -60,
+            maximum: 6,
+            divisions: 132,
+            format: (value) => '${value.toStringAsFixed(1)} dB',
+            onChanged: (value) => _updateSelectedClipAudioMix(
+              clip,
+              rightGain: _dbToLinearGain(value),
+            ),
+          ),
+          if (mix.normalize) ...[
+            const Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                'TARGET STANDARD',
+                style: TextStyle(
+                  color: kTextSecondary,
+                  fontSize: 9,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.8,
+                ),
+              ),
+            ),
+            const SizedBox(height: 6),
+            Wrap(
+              spacing: 7,
+              runSpacing: 7,
+              children: [
+                for (final preset in const [
+                  (label: 'Streaming', lufs: -14.0, peak: -1.0),
+                  (label: 'Podcast', lufs: -16.0, peak: -1.0),
+                  (label: 'EBU R128', lufs: -23.0, peak: -1.0),
+                  (label: 'ATSC A/85', lufs: -24.0, peak: -2.0),
+                ])
+                  ChoiceChip(
+                    key: ValueKey(
+                      'loudness_preset_${preset.label.toLowerCase().replaceAll(' ', '_')}',
+                    ),
+                    label: Text(preset.label),
+                    selected:
+                        (mix.targetLufs - preset.lufs).abs() < 0.01 &&
+                        (mix.peakLimitDb - preset.peak).abs() < 0.01,
+                    onSelected: (_) => _updateSelectedClipAudioMix(
+                      clip,
+                      targetLufs: preset.lufs,
+                      peakLimitDb: preset.peak,
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            slider(
+              label: 'Loudness target',
+              value: mix.targetLufs,
+              minimum: -30,
+              maximum: -6,
+              divisions: 48,
+              format: (value) => '${value.toStringAsFixed(1)} LUFS',
+              onChanged: (value) =>
+                  _updateSelectedClipAudioMix(clip, targetLufs: value),
+            ),
+            slider(
+              label: 'True-peak ceiling',
+              value: mix.peakLimitDb,
+              minimum: -12,
+              maximum: -0.1,
+              divisions: 119,
+              format: (value) => '${value.toStringAsFixed(1)} dBTP',
+              onChanged: (value) =>
+                  _updateSelectedClipAudioMix(clip, peakLimitDb: value),
+            ),
+          ],
+          const SizedBox(height: 4),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton.tonalIcon(
+              key: const ValueKey('analyze_audio_loudness'),
+              onPressed: isAnalyzing ? null : () => _analyzeAudioClip(clip),
+              icon: isAnalyzing
+                  ? const SizedBox.square(
+                      dimension: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.speed_rounded),
+              label: Text(
+                isAnalyzing ? 'Analyzing audio…' : 'Analyze Peak / RMS / LUFS',
+              ),
+            ),
+          ),
+          if (measured != null) ...[
+            const SizedBox(height: 8),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: kSurface,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: kBorder),
+              ),
+              child: Wrap(
+                spacing: 14,
+                runSpacing: 8,
+                children: [
+                  _audioMeterValue(
+                    'Peak',
+                    '${measured.samplePeakDb.toStringAsFixed(1)} dBFS',
+                  ),
+                  _audioMeterValue(
+                    'True peak',
+                    '${measured.truePeakDb.toStringAsFixed(1)} dBTP',
+                  ),
+                  _audioMeterValue(
+                    'RMS',
+                    '${measured.rmsDb.toStringAsFixed(1)} dBFS',
+                  ),
+                  _audioMeterValue(
+                    'Integrated',
+                    '${measured.integratedLufs.toStringAsFixed(1)} LUFS',
+                  ),
+                  _audioMeterValue(
+                    'LRA',
+                    '${measured.loudnessRange.toStringAsFixed(1)} LU',
+                  ),
+                ],
+              ),
+            ),
+            const Padding(
+              padding: EdgeInsets.only(top: 6),
+              child: Text(
+                'Export uses these measurements for deterministic two-pass loudness normalization. Re-analyze after changing effects.',
+                style: TextStyle(color: kTextSecondary, fontSize: 9),
+              ),
+            ),
+          ],
+          if (hasStaleMeasurement) ...[
+            const SizedBox(height: 8),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: kWarning.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: kWarning.withValues(alpha: 0.45)),
+              ),
+              child: const Text(
+                'The stored meter pass is stale because routing, gain, effects, or source media changed. Export falls back to safe one-pass normalization until you analyze again.',
+                style: TextStyle(color: kWarning, fontSize: 9),
+              ),
+            ),
+          ],
+          slider(
+            label: 'Pitch',
+            value: mix.pitchSemitones,
+            minimum: -24,
+            maximum: 24,
+            divisions: 48,
+            format: (value) => '${value.round()} semitones',
+            onChanged: (value) =>
+                _updateSelectedClipAudioMix(clip, pitchSemitones: value),
+          ),
+          slider(
+            label: 'Time stretch',
+            value: mix.timeStretch,
+            minimum: 0.25,
+            maximum: 4,
+            divisions: 75,
+            format: (value) => '${value.toStringAsFixed(2)}×',
+            onChanged: (value) =>
+                _updateSelectedClipAudioMix(clip, timeStretch: value),
+          ),
+          SwitchListTile.adaptive(
+            contentPadding: EdgeInsets.zero,
+            dense: true,
+            title: const Text('Preserve pitch while stretching'),
+            subtitle: const Text(
+              'Uses FFmpeg tempo processing in preview and export',
+            ),
+            value: mix.preservePitch,
+            onChanged: (value) =>
+                _updateSelectedClipAudioMix(clip, preservePitch: value),
+          ),
+          if (clip.type == TimelineTrackType.audio) ...[
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    key: const ValueKey('fit_audio_target_duration'),
+                    onPressed: () => _fitAudioClipToTarget(clip),
+                    icon: const Icon(Icons.fit_screen_rounded),
+                    label: const Text('Fit duration'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    key: const ValueKey('crossfade_selected_audio'),
+                    onPressed: _crossfadeSelectedAudioClips,
+                    icon: const Icon(Icons.compare_arrows_rounded),
+                    label: const Text('Crossfade 2'),
+                  ),
+                ),
+              ],
+            ),
+            const Padding(
+              padding: EdgeInsets.only(bottom: 8),
+              child: Text(
+                'Fit uses pitch-preserving tempo processing. Crossfade overlaps clips on independent lanes with smooth curves.',
+                style: TextStyle(color: kTextSecondary, fontSize: 9),
+              ),
+            ),
+          ],
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              key: const ValueKey('open_audio_effect_stack'),
+              onPressed: () =>
+                  _openEffectStackSheet(clip, domain: EditorEffectDomain.audio),
+              icon: const Icon(Icons.multitrack_audio_rounded),
+              label: const Text('Open clip / track effect stack'),
+            ),
+          ),
+          if (track != null) ...[
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: DropdownButtonFormField<String>(
+                    key: ValueKey('audio_bus_${track.id}'),
+                    initialValue: track.audioBusId ?? '',
+                    decoration: const InputDecoration(labelText: 'Output bus'),
+                    items: [
+                      const DropdownMenuItem(
+                        value: '',
+                        child: Text('Master output'),
+                      ),
+                      for (final candidate in timeline.audioBuses)
+                        DropdownMenuItem(
+                          value: candidate.id,
+                          child: Text(candidate.name),
+                        ),
+                    ],
+                    onChanged: (value) => ref
+                        .read(editorProvider.notifier)
+                        .assignTrackToAudioBus(
+                          track.id,
+                          value == null || value.isEmpty ? null : value,
+                        ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton.filledTonal(
+                  key: const ValueKey('create_audio_bus'),
+                  tooltip: 'Create bus',
+                  onPressed: () => _createAudioBusForTrack(track.id),
+                  icon: const Icon(Icons.add_rounded),
+                ),
+              ],
+            ),
+          ],
+          if (bus != null) ...[
+            const SizedBox(height: 8),
+            slider(
+              label: '${bus.name} gain',
+              value: _linearGainToDb(bus.gain),
+              minimum: -60,
+              maximum: 6,
+              divisions: 132,
+              format: (value) => '${value.toStringAsFixed(1)} dB',
+              onChanged: (value) => ref
+                  .read(editorProvider.notifier)
+                  .updateAudioBus(
+                    bus.id,
+                    (current) => current.copyWith(gain: _dbToLinearGain(value)),
+                    recordHistory: false,
+                  ),
+            ),
+            slider(
+              label: '${bus.name} pan',
+              value: bus.pan,
+              minimum: -1,
+              maximum: 1,
+              divisions: 40,
+              format: (value) => value.abs() < 0.025
+                  ? 'Center'
+                  : value < 0
+                  ? 'L ${(value.abs() * 100).round()}'
+                  : 'R ${(value * 100).round()}',
+              onChanged: (value) => ref
+                  .read(editorProvider.notifier)
+                  .updateAudioBus(
+                    bus.id,
+                    (current) => current.copyWith(pan: value),
+                    recordHistory: false,
+                  ),
+            ),
+            Row(
+              children: [
+                FilterChip(
+                  label: const Text('Mute'),
+                  selected: bus.muted,
+                  onSelected: (value) => ref
+                      .read(editorProvider.notifier)
+                      .updateAudioBus(
+                        bus.id,
+                        (current) => current.copyWith(muted: value),
+                      ),
+                ),
+                const SizedBox(width: 8),
+                FilterChip(
+                  label: const Text('Solo'),
+                  selected: bus.solo,
+                  onSelected: (value) => ref
+                      .read(editorProvider.notifier)
+                      .updateAudioBus(
+                        bus.id,
+                        (current) => current.copyWith(solo: value),
+                      ),
+                ),
+                const Spacer(),
+                TextButton.icon(
+                  onPressed: () => _openEffectStackSheet(
+                    clip,
+                    domain: EditorEffectDomain.audio,
+                    preferredScope: EditorEffectScope.audioBus,
+                  ),
+                  icon: const Icon(Icons.graphic_eq_rounded, size: 17),
+                  label: const Text('Bus FX'),
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Future<void> _createAudioBusForTrack(String trackId) async {
+    final controller = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Create audio bus'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          textCapitalization: TextCapitalization.words,
+          decoration: const InputDecoration(
+            labelText: 'Bus name',
+            hintText: 'Dialogue, Music, SFX…',
+          ),
+          onSubmitted: (value) => Navigator.of(context).pop(value),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(controller.text),
+            child: const Text('Create'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (name == null || !mounted) return;
+    final notifier = ref.read(editorProvider.notifier);
+    final busId = notifier.createAudioBus(name: name);
+    notifier.assignTrackToAudioBus(trackId, busId);
+  }
+
   ({TimelineTrack track, TimelineClip clip})? _separatedAudioForVideo(
     EditorTimeline timeline,
     String videoClipId,
@@ -9723,7 +12725,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     for (final track in timeline.tracks) {
       for (final clip in track.clips) {
         if (clip.type == TimelineTrackType.audio &&
-            clip.linkedClipId == videoClipId) {
+            clip.separatedAudioSourceClipId == videoClipId) {
           return (track: track, clip: clip);
         }
       }
@@ -9934,6 +12936,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         : track.section == TimelineTrackSection.baseVideo
         ? 'Clip Animation'
         : 'Overlay Animation';
+    final maximumFadeMs = math.max(1, clip.duration.inMilliseconds ~/ 2);
+    final fadeDivisions = math.max(1, math.min(200, maximumFadeMs ~/ 50));
 
     return Container(
       width: double.infinity,
@@ -10093,10 +13097,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 overlayColor: kAccent.withValues(alpha: 0.14),
               ),
               child: Slider(
-                value: clip.audioMix.fadeInMs.toDouble().clamp(0, 1500),
+                value: clip.audioMix.fadeInMs
+                    .toDouble()
+                    .clamp(0, maximumFadeMs)
+                    .toDouble(),
                 min: 0,
-                max: 1500,
-                divisions: 15,
+                max: maximumFadeMs.toDouble(),
+                divisions: fadeDivisions,
                 label: '${clip.audioMix.fadeInMs}ms',
                 onChangeStart: (_) => ref
                     .read(editorProvider.notifier)
@@ -10119,10 +13126,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 overlayColor: kAccent.withValues(alpha: 0.14),
               ),
               child: Slider(
-                value: clip.audioMix.fadeOutMs.toDouble().clamp(0, 1500),
+                value: clip.audioMix.fadeOutMs
+                    .toDouble()
+                    .clamp(0, maximumFadeMs)
+                    .toDouble(),
                 min: 0,
-                max: 1500,
-                divisions: 15,
+                max: maximumFadeMs.toDouble(),
+                divisions: fadeDivisions,
                 label: '${clip.audioMix.fadeOutMs}ms',
                 onChangeStart: (_) => ref
                     .read(editorProvider.notifier)

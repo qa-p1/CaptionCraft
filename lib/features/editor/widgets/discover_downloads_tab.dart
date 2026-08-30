@@ -136,7 +136,7 @@ class _DiscoverDownloadsTabState extends State<DiscoverDownloadsTab>
               ),
               SizedBox(height: 5),
               Text(
-                'Save media from Browser or YouTube, then add completed items directly to the timeline here.',
+                'Save media from Browser, YouTube, or Instagram, then add completed items directly to the timeline here.',
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   color: kTextSecondary,
@@ -494,6 +494,7 @@ class _DiscoverDownloadsTabState extends State<DiscoverDownloadsTab>
   String _sourceLabel(DiscoverDownloadSource source) => switch (source) {
     DiscoverDownloadSource.direct => 'Browser',
     DiscoverDownloadSource.youtube => 'YouTube',
+    DiscoverDownloadSource.instagram => 'Instagram',
   };
 
   String _formatBytes(int bytes) {

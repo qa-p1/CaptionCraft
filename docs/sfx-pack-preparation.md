@@ -93,7 +93,7 @@ gitignored `tool/asset_pack_dist/packs/sound-effects/<version>` directory. The
 release JSON's `pack` object is ready to merge into the public
 `asset-pack-manifest.json`. Every part stays below the configured Cloudflare
 cache ceiling and has its own exact byte count and SHA-256. Existing version
-output is never overwritten. After preparing it, compose the three-pack index:
+output is never overwritten. After preparing it, add the SFX row independently:
 
 ```powershell
 pwsh -NoProfile -File .\tool\compose_asset_pack_manifest.ps1 `
@@ -101,6 +101,9 @@ pwsh -NoProfile -File .\tool\compose_asset_pack_manifest.ps1 `
   -SfxRelease .\tool\asset_pack_dist\packs\sound-effects\1.0.0\sound-effects-1.0.0-REPLACE.release.json `
   -OutputPath .\tool\asset_pack_dist\asset-pack-manifest.with-sfx.json
 ```
+
+`-SfxRelease` and `-LutRelease` are independent. Supply both when both optional
+packs are ready; an unpublished pack never blocks the other.
 
 Run the isolated synthetic fixture with:
 

@@ -60,7 +60,7 @@ class TimelineWaveformCache {
   }) async {
     final normalizedPath = sourcePath.trim();
     if (normalizedPath.isEmpty || sourceDuration <= Duration.zero) return '';
-    final safeWidth = width.clamp(64, 4096).toInt();
+    final safeWidth = width.clamp(64, 16384).toInt();
     final safeHeight = height.clamp(24, 256).toInt();
     final sourceFingerprint = await _fingerprintResolver(normalizedPath);
     if (sourceFingerprint == 'missing') return '';

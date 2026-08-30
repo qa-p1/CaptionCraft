@@ -4,9 +4,11 @@ param(
     [ValidateNotNullOrEmpty()]
     [string] $BaseManifest,
 
-    [Parameter(Mandatory)]
-    [ValidateNotNullOrEmpty()]
+    [Parameter()]
     [string] $SfxRelease,
+
+    [Parameter()]
+    [string] $LutRelease,
 
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
@@ -17,7 +19,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 $maximumPartBytes = 503316480L
-$supportedIds = @('background-videos', 'overlays', 'sound-effects')
+$supportedIds = @('background-videos', 'overlays', 'sound-effects', 'luts')
 
 function Read-JsonObject {
     param([Parameter(Mandatory)] [string] $Path)
@@ -85,25 +87,48 @@ function Assert-PackRow {
 }
 
 $base = Read-JsonObject -Path $BaseManifest
-$sfx = Read-JsonObject -Path $SfxRelease
 if ([int] $base.schemaVersion -ne 2) {
     throw 'Base asset-pack manifest must use schema version 2.'
 }
-if (
-    [string] $sfx.schema -cne 'captioncraft-asset-pack-release' -or
-    [int] $sfx.schemaVersion -ne 2 -or
-    [string] $sfx.pack.id -cne 'sound-effects'
-) {
-    throw 'SFX release JSON is not a schema-v2 sound-effects release.'
+
+$replacements = [System.Collections.Generic.Dictionary[string, object]]::new(
+    [System.StringComparer]::Ordinal
+)
+if (-not [string]::IsNullOrWhiteSpace($SfxRelease)) {
+    $sfx = Read-JsonObject -Path $SfxRelease
+    if (
+        [string] $sfx.schema -cne 'captioncraft-asset-pack-release' -or
+        [int] $sfx.schemaVersion -ne 2 -or
+        [string] $sfx.pack.id -cne 'sound-effects'
+    ) {
+        throw 'SFX release JSON is not a schema-v2 sound-effects release.'
+    }
+    $replacements.Add('sound-effects', $sfx.pack)
+}
+if (-not [string]::IsNullOrWhiteSpace($LutRelease)) {
+    $luts = Read-JsonObject -Path $LutRelease
+    if (
+        [string] $luts.schema -cne 'captioncraft-asset-pack-release' -or
+        [int] $luts.schemaVersion -ne 2 -or
+        [string] $luts.pack.id -cne 'luts'
+    ) {
+        throw 'LUT release JSON is not a schema-v2 luts release.'
+    }
+    $replacements.Add('luts', $luts.pack)
+}
+if ($replacements.Count -eq 0) {
+    throw 'Provide at least one SfxRelease or LutRelease to compose.'
 }
 
 $rows = [System.Collections.Generic.List[object]]::new()
 foreach ($pack in @($base.packs)) {
-    if ([string] $pack.id -cne 'sound-effects') {
+    if (-not $replacements.ContainsKey([string] $pack.id)) {
         $rows.Add($pack)
     }
 }
-$rows.Add($sfx.pack)
+foreach ($replacementId in @($replacements.Keys | Sort-Object)) {
+    $rows.Add($replacements[$replacementId])
+}
 
 $ids = [System.Collections.Generic.HashSet[string]]::new(
     [System.StringComparer]::Ordinal
@@ -111,9 +136,14 @@ $ids = [System.Collections.Generic.HashSet[string]]::new(
 foreach ($row in $rows) {
     Assert-PackRow -Pack $row -Ids $ids
 }
-foreach ($requiredId in $supportedIds) {
+foreach ($requiredId in @('background-videos', 'overlays')) {
     if (-not $ids.Contains($requiredId)) {
         throw "Composed manifest is missing '$requiredId'."
+    }
+}
+foreach ($replacementId in $replacements.Keys) {
+    if (-not $ids.Contains($replacementId)) {
+        throw "Composed manifest is missing replacement '$replacementId'."
     }
 }
 
@@ -140,4 +170,4 @@ finally {
     }
 }
 
-Write-Host "Composed three-pack manifest: $outputFull"
+Write-Host "Composed $($rows.Count)-pack manifest: $outputFull"

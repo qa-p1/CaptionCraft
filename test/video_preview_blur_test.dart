@@ -1152,7 +1152,7 @@ void main() {
   });
 
   testWidgets(
-    'preview only mounts controllers for independently audible clips',
+    'preview suppresses fallback controllers while exact mix prepares',
     (tester) async {
       final container = ProviderContainer();
       addTearDown(container.dispose);
@@ -1264,7 +1264,11 @@ void main() {
       );
       await tester.pump();
 
-      expect(find.byKey(const ValueKey('audio_audible')), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('preview-audio-processing-state')),
+        findsOneWidget,
+      );
+      expect(find.byKey(const ValueKey('audio_audible')), findsNothing);
       expect(
         find.byKey(const ValueKey('audio_linked-source-audio')),
         findsNothing,

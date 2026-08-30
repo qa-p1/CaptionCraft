@@ -10,6 +10,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import '../../features/editor/models/export_settings.dart';
+import '../../features/editor/models/editor_effect_models.dart';
 import '../../features/editor/models/subtitle_entry.dart';
 import '../../features/editor/models/subtitle_style_model.dart';
 import '../../features/editor/models/timeline_models.dart';
@@ -67,7 +68,7 @@ class PreviewCompositeRenderCancelled implements Exception {
   String toString() => 'Optimized preview rendering was paused for playback.';
 }
 
-/// Renders decoder-dense timelines into a cached, silent 480p proxy.
+/// Renders decoder-dense or effect-heavy timelines into a cached 480p proxy.
 ///
 /// The original timeline remains authoritative and final export is unchanged.
 /// This cache only replaces a collection of simultaneous preview decoders with
@@ -147,7 +148,9 @@ class TimelinePreviewCompositeService {
     String Function(String path)? sourceVersion,
   }) {
     final maximumConcurrentDecoders = maximumConcurrentVisualDecoders(timeline);
-    if (maximumConcurrentDecoders <= kMaximumLivePreviewVideoDecoders ||
+    final needsRenderedEffects = requiresRenderedEffectPreview(timeline);
+    if ((!needsRenderedEffects &&
+            maximumConcurrentDecoders <= kMaximumLivePreviewVideoDecoders) ||
         timeline.duration <= Duration.zero) {
       return null;
     }
@@ -222,6 +225,22 @@ class TimelinePreviewCompositeService {
           frameRate: _metadataNumber(
             selected[index].asset?.metadata['frameRate'],
           ),
+          colorPrimaries:
+              selected[index].asset?.metadata['colorPrimaries'] as String?,
+          colorTransfer:
+              selected[index].asset?.metadata['colorTransfer'] as String?,
+          colorSpace: selected[index].asset?.metadata['colorSpace'] as String?,
+          colorRange: selected[index].asset?.metadata['colorRange'] as String?,
+          pixelFormat:
+              selected[index].asset?.metadata['pixelFormat'] as String?,
+          bitDepth: selected[index].asset?.metadata['bitDepth'] as int?,
+          audioStreamCount:
+              selected[index].asset?.metadata['audioStreamCount'] as int?,
+          audioChannels:
+              selected[index].asset?.metadata['audioChannels'] as int?,
+          audioChannelsByStream: audioChannelsByStreamFromMetadata(
+            selected[index].asset?.metadata['audioStreams'],
+          ),
         ),
     ];
     final canvasReference = inputs.firstWhere(
@@ -249,6 +268,7 @@ class TimelinePreviewCompositeService {
               'id': track.id,
               'type': track.type.name,
               'section': track.section.name,
+              'effectStack': track.effectStack.toJson(),
               'clips': [
                 for (final clip in track.clips)
                   if (clip.enabled && clip.endTime > clip.startTime)
@@ -273,6 +293,15 @@ class TimelinePreviewCompositeService {
       ],
       'subtitles': [for (final entry in subtitleEntries) entry.toJson()],
       'subtitleStyle': globalSubtitleStyle.toJson(),
+      'projectEffectStack': timeline.projectEffectStack.toJson(),
+      'effectContainers': [
+        for (final container in timeline.effectContainers) container.toJson(),
+      ],
+      'groups': [for (final group in timeline.groups) group.toJson()],
+      'compoundClips': [
+        for (final compound in timeline.compoundClips) compound.toJson(),
+      ],
+      'colorManagement': timeline.colorManagement.toJson(),
     };
     final fingerprint = sha256
         .convert(utf8.encode(jsonEncode(fingerprintPayload)))
@@ -287,6 +316,38 @@ class TimelinePreviewCompositeService {
       canvasSize: canvasSize,
       maximumConcurrentDecoders: maximumConcurrentDecoders,
     );
+  }
+
+  static bool requiresRenderedEffectPreview(EditorTimeline timeline) {
+    bool hasVisualEffects(EditorEffectStack stack) {
+      return stack.effects.any(
+        (effect) =>
+            effect.enabled &&
+            effect.intensity > 0.0001 &&
+            effect.domain == EditorEffectDomain.visual,
+      );
+    }
+
+    bool needsExactColorPreview(ClipColorAdjustments adjustments) {
+      return !adjustments.isNeutral;
+    }
+
+    if (hasVisualEffects(timeline.projectEffectStack)) return true;
+    if (timeline.effectContainers.any(
+      (container) => container.enabled && hasVisualEffects(container.stack),
+    )) {
+      return true;
+    }
+    for (final track in timeline.tracks) {
+      if (hasVisualEffects(track.effectStack)) return true;
+      for (final clip in track.clips) {
+        if (hasVisualEffects(clip.effectStack) ||
+            needsExactColorPreview(clip.colorAdjustments)) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   static Future<PreviewCompositeResult> ensureRendered(
@@ -356,6 +417,7 @@ class TimelinePreviewCompositeService {
         captionFontDirectory: fontDirectory,
         videoPreset: 'ultrafast',
         videoCrf: 30,
+        previewMode: true,
         outputPath: partialPath,
       );
       final completion =

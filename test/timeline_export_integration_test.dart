@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:caption_craft/core/utils/subtitle_export_service.dart';
 import 'package:caption_craft/core/utils/timeline_export_service.dart';
+import 'package:caption_craft/features/editor/models/editor_effect_models.dart';
 import 'package:caption_craft/features/editor/models/export_settings.dart';
 import 'package:caption_craft/features/editor/models/subtitle_entry.dart';
 import 'package:caption_craft/features/editor/models/subtitle_style_model.dart';
@@ -231,6 +232,18 @@ void main() {
           pan: -0.12,
           normalize: true,
         ),
+        effectStack: EditorEffectStack(
+          effects: [
+            EditorEffect(
+              type: EditorEffectType.equalizer,
+              parameters: const <String, dynamic>{
+                'frequency': 1000,
+                'gain': 6,
+                'width': 1.5,
+              },
+            ),
+          ],
+        ),
         outroTransition: const ClipTransition(
           type: TransitionType.dissolve,
           durationMs: 200,
@@ -246,13 +259,35 @@ void main() {
         endTime: const Duration(milliseconds: 3000),
         sourceDuration: const Duration(milliseconds: 1400),
         audioMix: const AudioMixSettings(
+          muted: true,
           volume: 0.68,
           fadeInMs: 180,
           pan: 0.12,
         ),
+        embeddedAudioSeparated: true,
         introTransition: const ClipTransition(
           type: TransitionType.fade,
           durationMs: 200,
+        ),
+      );
+      final separatedSecondAudio = TimelineClip(
+        id: 'second_audio',
+        trackId: 'audio_track',
+        type: TimelineTrackType.audio,
+        label: 'Second source audio',
+        assetId: secondAsset.id,
+        linkedClipId: secondClip.id,
+        separatedFromClipId: secondClip.id,
+        startTime: secondClip.startTime,
+        endTime: secondClip.endTime,
+        sourceDuration: secondClip.sourceDuration,
+        audioMix: const AudioMixSettings(
+          volume: 0.68,
+          fadeInMs: 180,
+          pan: 0.12,
+        ),
+        effectStack: EditorEffectStack(
+          effects: [EditorEffect(type: EditorEffectType.compressor)],
         ),
       );
 
@@ -269,6 +304,13 @@ void main() {
         type: TimelineTrackType.video,
         section: TimelineTrackSection.baseVideo,
         clips: [firstClip, secondClip],
+      );
+      final audioTrack = TimelineTrack(
+        id: 'audio_track',
+        name: 'Extracted audio',
+        type: TimelineTrackType.audio,
+        section: TimelineTrackSection.audio,
+        clips: [separatedSecondAudio],
       );
       final effectTrack = TimelineTrack(
         id: 'effect_track',
@@ -311,7 +353,7 @@ void main() {
           backgroundColor: Color(0xFF101210),
         ),
         assets: [overlayAsset, firstAsset, secondAsset],
-        tracks: [overlayTrack, effectTrack, baseTrack],
+        tracks: [overlayTrack, effectTrack, baseTrack, audioTrack],
       );
       final inputs = [
         TimelineRenderInput(
@@ -337,6 +379,15 @@ void main() {
           trackIndex: 2,
           track: baseTrack,
           clip: secondClip,
+          asset: secondAsset,
+          sourcePath: secondVideo,
+          hasAudio: true,
+        ),
+        TimelineRenderInput(
+          index: 3,
+          trackIndex: 3,
+          track: audioTrack,
+          clip: separatedSecondAudio,
           asset: secondAsset,
           sourcePath: secondVideo,
           hasAudio: true,
@@ -372,6 +423,11 @@ void main() {
       expect(filterGraph, contains('gte(t,0.100000)*lt(t,0.400000)'));
       expect(filterGraph, contains('gte(t,2.600000)*lt(t,2.900000)'));
       expect(filterGraph, contains('loudnorm=I=-16:LRA=11:TP=-1.5'));
+      expect(filterGraph, contains('equalizer=f=1000'));
+      expect(filterGraph, contains('acompressor=threshold='));
+      expect(filterGraph, contains('[1:a:0]'));
+      expect(filterGraph, isNot(contains('[2:a:0]')));
+      expect(filterGraph, contains('[3:a:0]'));
       expect(filterGraph, contains('afade=t=in:st=0:d=0.1'));
       expect(filterGraph, contains('afade=t=out:st=1.42:d=0.18'));
       expect(filterGraph, contains('pan=stereo'));
@@ -573,6 +629,136 @@ void main() {
           .singleWhere((stream) => stream['codec_type'] == 'video');
       expect(video['width'], 320);
       expect(video['height'], 240);
+    },
+    timeout: const Timeout(Duration(minutes: 1)),
+  );
+
+  test(
+    'color conversion stabilizes RGB tags and even geometry before zscale',
+    () async {
+      if (!await _commandExists('ffmpeg') || !await _commandExists('ffprobe')) {
+        markTestSkipped('Desktop FFmpeg tools are not installed.');
+        return;
+      }
+      final directory = await Directory.systemTemp.createTemp(
+        'captioncraft_zscale_regression_',
+      );
+      addTearDown(() async {
+        if (await directory.exists()) await directory.delete(recursive: true);
+      });
+      final sourcePath = p.join(directory.path, 'odd_rgb.mkv');
+      final outputPath = p.join(directory.path, 'converted.mp4');
+      await _runFfmpeg([
+        '-f',
+        'lavfi',
+        '-i',
+        'testsrc=size=321x569:rate=12:duration=0.5',
+        '-vf',
+        'format=gbrp,setparams=range=full:color_primaries=bt709:'
+            'color_trc=bt709:colorspace=gbr',
+        '-c:v',
+        'ffv1',
+        sourcePath,
+      ]);
+      final asset = EditorAssetReference(
+        id: 'rgb-asset',
+        type: EditorAssetType.video,
+        label: 'Odd RGB source',
+        sourcePath: sourcePath,
+        metadata: const <String, dynamic>{
+          'width': 321,
+          'height': 569,
+          'hasAudio': false,
+          'pixelFormat': 'gbrp',
+          'colorPrimaries': 'bt709',
+          'colorTransfer': 'bt709',
+          'colorSpace': 'gbr',
+          'colorRange': 'pc',
+        },
+      );
+      final clip = TimelineClip(
+        id: 'rgb-clip',
+        trackId: 'base',
+        type: TimelineTrackType.video,
+        label: 'Odd RGB source',
+        assetId: asset.id,
+        startTime: Duration.zero,
+        endTime: const Duration(milliseconds: 500),
+        sourceDuration: const Duration(milliseconds: 500),
+        fitMode: ClipFitMode.cover,
+      );
+      final track = TimelineTrack(
+        id: 'base',
+        name: 'Base',
+        type: TimelineTrackType.video,
+        section: TimelineTrackSection.baseVideo,
+        clips: [clip],
+      );
+      final timeline = EditorTimeline(assets: [asset], tracks: [track]);
+      final input = TimelineRenderInput(
+        index: 0,
+        trackIndex: 0,
+        track: track,
+        clip: clip,
+        asset: asset,
+        sourcePath: sourcePath,
+        hasAudio: false,
+        colorPrimaries: 'bt709',
+        colorTransfer: 'bt709',
+        colorSpace: 'gbr',
+        colorRange: 'pc',
+        pixelFormat: 'gbrp',
+      );
+      final arguments = TimelineExportService.buildFfmpegArguments(
+        timeline: timeline,
+        inputs: [input],
+        settings: const ExportSettings(
+          resolution: ExportResolution.p480,
+          frameRate: ExportFrameRate.fps30,
+          quality: ExportQuality.compact,
+          includeAudio: false,
+          saveToGallery: false,
+        ),
+        canvasSize: const ExportCanvasSize(
+          width: 320,
+          height: 568,
+          framesPerSecond: 30,
+        ),
+        timelineDuration: const Duration(milliseconds: 500),
+        assPath: null,
+        outputPath: outputPath,
+      );
+      final graph = arguments[arguments.indexOf('-filter_complex') + 1];
+      expect(graph, contains("scale=w='max(2,ceil(iw/2)*2)'"));
+      expect(
+        graph,
+        contains(
+          'setparams=range=full:color_primaries=bt709:'
+          'color_trc=bt709:colorspace=gbr',
+        ),
+      );
+      expect(graph, contains('zscale='));
+
+      final render = await Process.run('ffmpeg', arguments);
+      expect(render.exitCode, 0, reason: '${render.stdout}\n${render.stderr}');
+      final probe = await Process.run('ffprobe', [
+        '-v',
+        'error',
+        '-show_entries',
+        'stream=codec_type,width,height,pix_fmt',
+        '-of',
+        'json',
+        outputPath,
+      ]);
+      expect(probe.exitCode, 0, reason: '${probe.stderr}');
+      final metadata =
+          jsonDecode(probe.stdout as String) as Map<String, dynamic>;
+      final video = (metadata['streams'] as List<dynamic>)
+          .cast<Map<String, dynamic>>()
+          .singleWhere((stream) => stream['codec_type'] == 'video');
+      expect(video['width'], 320);
+      expect(video['height'], 568);
+      expect(video['pix_fmt'], 'yuv420p');
     },
     timeout: const Timeout(Duration(minutes: 1)),
   );

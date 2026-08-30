@@ -1,3 +1,4 @@
+import 'package:caption_craft/features/editor/models/editor_effect_models.dart';
 import 'package:caption_craft/features/editor/models/timeline_models.dart';
 import 'package:caption_craft/features/editor/models/subtitle_entry.dart';
 import 'package:caption_craft/features/editor/models/subtitle_style_model.dart';
@@ -49,6 +50,63 @@ void main() {
       'clip_7779',
       'clip_7780',
     ]);
+  });
+
+  testWidgets('selected audio clips expose direct draggable fade handles', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(500, 320));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final clip = TimelineClip(
+      id: 'audio_fade',
+      trackId: 'audio',
+      type: TimelineTrackType.audio,
+      label: 'Music',
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 4),
+      sourceDuration: const Duration(seconds: 4),
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    final notifier = container.read(editorProvider.notifier);
+    notifier.loadProject(
+      videoPath: 'missing.mp4',
+      projectId: 'audio-fade-handles',
+      projectName: 'Audio fade handles',
+      timeline: EditorTimeline(
+        tracks: [
+          TimelineTrack(
+            id: 'audio',
+            name: 'Audio',
+            type: TimelineTrackType.audio,
+            section: TimelineTrackSection.audio,
+            clips: [clip],
+          ),
+        ],
+      ),
+    );
+    notifier
+      ..selectTrack('audio')
+      ..selectClip(clip.id);
+
+    await tester.pumpWidget(_timelineHarness(container));
+    await tester.pumpAndSettle();
+    final fadeIn = find.byKey(const ValueKey('timeline_fade_in_audio_fade'));
+    final fadeOut = find.byKey(const ValueKey('timeline_fade_out_audio_fade'));
+    expect(fadeIn, findsOneWidget);
+    expect(fadeOut, findsOneWidget);
+
+    await tester.drag(fadeIn, const Offset(50, 0));
+    await tester.pumpAndSettle();
+    final updated = container
+        .read(editorProvider)
+        .timeline
+        .tracks
+        .single
+        .clips
+        .single;
+    expect(updated.audioMix.fadeInMs, inInclusiveRange(500, 700));
+    expect(container.read(editorProvider).canUndo, isTrue);
   });
 
   testWidgets('timeline mounts only the horizontal clip window', (
@@ -833,6 +891,100 @@ void main() {
       expect(audios.single.toJson(), originalAudio);
       container.dispose();
     }
+  });
+
+  testWidgets('splitting an adjustment layer preserves animated stack state', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(844, 420));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final adjustment = TimelineClip.effect(
+      id: 'adjustment',
+      trackId: 'adjustments',
+      label: 'Adjustment',
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 4),
+      isAdjustmentLayer: true,
+      groupId: 'adjustment-group',
+      effectStack: EditorEffectStack(
+        effects: [
+          EditorEffect(
+            id: 'blur-effect',
+            type: EditorEffectType.gaussianBlur,
+            keyframes: [
+              EditorEffectParameterKeyframe(
+                parameter: 'radius',
+                time: Duration.zero,
+                value: 0,
+              ),
+              EditorEffectParameterKeyframe(
+                parameter: 'radius',
+                time: const Duration(seconds: 4),
+                value: 40,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+    final initial = _testTimeline();
+    final timeline = initial.copyWith(
+      tracks: [
+        TimelineTrack(
+          id: 'adjustments',
+          name: 'Adjustments',
+          type: TimelineTrackType.video,
+          section: TimelineTrackSection.overlay,
+          clips: [adjustment],
+        ),
+        ...initial.tracks,
+      ],
+      groups: [
+        TimelineGroup(
+          id: 'adjustment-group',
+          name: 'Adjustment group',
+          clipIds: const ['adjustment'],
+        ),
+      ],
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    container
+        .read(editorProvider.notifier)
+        .loadProject(
+          videoPath: 'missing.mp4',
+          projectId: 'adjustment-split-test',
+          projectName: 'Adjustment split test',
+          timeline: timeline,
+        );
+    container.read(editorProvider.notifier)
+      ..selectTrack('adjustments')
+      ..selectClip('adjustment');
+    container
+        .read(playbackProvider.notifier)
+        .updatePosition(const Duration(seconds: 2));
+
+    await tester.pumpWidget(_timelineHarness(container));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Split'));
+    await tester.pumpAndSettle();
+
+    final restored = container.read(editorProvider).timeline;
+    final clips = restored.tracks
+        .singleWhere((track) => track.id == 'adjustments')
+        .clips;
+    expect(clips, hasLength(2));
+    expect(clips.every((clip) => clip.isAdjustmentLayer), isTrue);
+    final leading = clips.first.effectStack.effects.single;
+    final trailing = clips.last.effectStack.effects.single;
+    expect(leading.id, 'blur-effect');
+    expect(trailing.id, isNot(leading.id));
+    expect(trailing.parameterAt('radius', Duration.zero), closeTo(20, 0.001));
+    expect(
+      restored.groups.single.clipIds.toSet(),
+      clips.map((clip) => clip.id).toSet(),
+    );
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('overlay-video audio follows moves and both trim edges', (

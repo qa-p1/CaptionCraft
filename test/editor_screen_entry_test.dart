@@ -174,7 +174,9 @@ void main() {
 
     await tapDock('dock_category_effects');
     for (final subgroup in const [
+      'effectsStack',
       'effectsColor',
+      'effectsLuts',
       'effectsBlur',
       'effectsMotion',
       'effectsEnhance',
@@ -185,6 +187,14 @@ void main() {
     for (final tool in const ['chroma_key', 'filters', 'adjust']) {
       expect(
         find.byKey(ValueKey('dock_tool_effects_effectsColor_$tool')),
+        findsOneWidget,
+      );
+    }
+    await tapDock('dock_back_button');
+    await tapDock('dock_subgroup_effectsLuts');
+    for (final tool in const ['library', 'import', 'strength', 'clear']) {
+      expect(
+        find.byKey(ValueKey('dock_tool_effects_effectsLuts_$tool')),
         findsOneWidget,
       );
     }
@@ -319,7 +329,8 @@ void main() {
     expect(find.byKey(const ValueKey('resizable_sheet_handle')), findsNothing);
     await tester.tap(find.text('Add Text'));
     // The add menu closes before the persistent text editor animates in.
-    await tester.pumpAndSettle();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
     expect(find.byKey(const ValueKey('text_editor_field')), findsOneWidget);
     await tester.enterText(
       find.byKey(const ValueKey('text_editor_field')),
@@ -328,7 +339,7 @@ void main() {
     await tester.pump();
     expect(find.text('Direct canvas title'), findsWidgets);
     tester.testTextInput.hide();
-    await tester.pumpAndSettle();
+    await tester.pump(const Duration(milliseconds: 100));
     await tester.tap(find.byKey(const ValueKey('text_editor_done')));
     await tester.pumpAndSettle();
 
