@@ -73,18 +73,31 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('progressive dock drills from categories to grouped tools', (
+  testWidgets('editor dock exposes direct tools with one flat overflow sheet', (
     tester,
   ) async {
     _setTestView(tester, const Size(390, 844));
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
+    addTearDown(container.dispose);
     await tester.pumpWidget(
-      _testApp(home: EditorScreen(project: _freshProject())),
+      UncontrolledProviderScope(
+        container: container,
+        child: MaterialApp(
+          debugShowCheckedModeBanner: false,
+          theme: AppTheme.darkTheme,
+          home: EditorScreen(project: _freshProject()),
+        ),
+      ),
     );
     await tester.pump(const Duration(milliseconds: 600));
+    container.read(editorProvider.notifier)
+      ..selectTrack('track_video_primary')
+      ..selectClip('fresh-clip');
+    await tester.pump();
 
     final dock = find.byKey(const ValueKey('editor_tool_dock'));
-    Finder inDock(Finder matching) =>
-        find.descendant(of: dock, matching: matching);
 
     Future<void> tapDock(String key) async {
       final target = find.byKey(ValueKey(key));
@@ -95,171 +108,83 @@ void main() {
     }
 
     expect(dock, findsOneWidget);
-    expect(find.byKey(const ValueKey('categories')), findsOneWidget);
-    for (final category in const {
-      'edit': 'Edit',
+    expect(find.byKey(const ValueKey('editor_primary_tools')), findsOneWidget);
+    for (final tool in const {
+      'split': 'Split',
+      'timing': 'Timing',
+      'transform': 'Transform',
+      'crop': 'Crop',
       'effects': 'Effects',
-      'keyframes': 'Keyframes',
+      'chroma': 'Chroma',
+      'color': 'Color',
+      'animation': 'Animate',
       'audio': 'Audio',
-      'text': 'Text',
-      'timeline': 'Timeline',
-      'canvas': 'Canvas',
-      'studio': 'Studio',
-      'discover': 'Discover',
+      'keyframe': 'Keyframe',
+      'duplicate': 'Duplicate',
+      'delete': 'Delete',
+      'more': 'More',
     }.entries) {
+      final target = find.byKey(ValueKey('dock_primary_${tool.key}'));
+      expect(target, findsOneWidget);
       expect(
-        find.byKey(ValueKey('dock_category_${category.key}')),
+        find.descendant(of: target, matching: find.text(tool.value)),
         findsOneWidget,
       );
-      expect(inDock(find.text(category.value)), findsOneWidget);
     }
-    final editCategory = find.byKey(const ValueKey('dock_category_edit'));
-    expect(tester.getSize(editCategory).width, 72);
-    expect(
-      tester
-          .widget<Icon>(
-            find.descendant(
-              of: editCategory,
-              matching: find.byIcon(Icons.content_cut_rounded),
-            ),
-          )
-          .size,
-      22,
+    final primaryTools = find.descendant(
+      of: dock,
+      matching: find.byWidgetPredicate((widget) {
+        final key = widget.key;
+        return key is ValueKey<String> && key.value.startsWith('dock_primary_');
+      }),
     );
-    final categoryScroll = tester.state<ScrollableState>(
-      find.descendant(
-        of: find.byKey(const ValueKey('categories')),
+    expect(primaryTools, findsNWidgets(13));
+    expect(find.byKey(const ValueKey('dock_category_edit')), findsNothing);
+    expect(find.byKey(const ValueKey('editor_export_button')), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('editor_aspect_ratio_button')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: find.byType(AppBar), matching: find.text('Export')),
+      findsNothing,
+    );
+
+    await tapDock('dock_primary_more');
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('editor_all_tools_sheet')),
+      findsOneWidget,
+    );
+    expect(find.text('All tools'), findsOneWidget);
+    expect(find.text('Clip'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('all_tools_clip_attributes_copy_attrs')),
+      findsOneWidget,
+    );
+    await tester.scrollUntilVisible(
+      find.text('Visual'),
+      300,
+      scrollable: find.descendant(
+        of: find.byKey(const ValueKey('editor_all_tools_sheet')),
         matching: find.byType(Scrollable),
       ),
     );
-    expect(categoryScroll.position.maxScrollExtent, greaterThan(0));
-    expect(find.byKey(const ValueKey('editor_export_button')), findsOneWidget);
-    expect(find.byTooltip('Editor tools'), findsNothing);
-    expect(find.byIcon(Icons.more_horiz_rounded), findsNothing);
-    expect(find.text('Creator Lab'), findsNothing);
-
-    // Timeline track controls already own creation and the toolbar owns the
-    // selected-clip split action, so the dock root must not repeat them.
-    for (final duplicate in const ['Overlay', 'Add Text', 'Split', 'Add']) {
-      expect(inDock(find.text(duplicate)), findsNothing);
-    }
-
-    await tapDock('dock_category_edit');
-    expect(find.byKey(const ValueKey('subgroups_edit')), findsOneWidget);
+    expect(find.text('Visual'), findsOneWidget);
+    expect(find.byKey(const ValueKey('dock_back_button')), findsNothing);
     expect(find.byKey(const ValueKey('categories')), findsNothing);
-    expect(find.byKey(const ValueKey('dock_back_button')), findsOneWidget);
-    for (final subgroup in const [
-      'editTiming',
-      'editTransform',
-      'editDetails',
-    ]) {
-      expect(find.byKey(ValueKey('dock_subgroup_$subgroup')), findsOneWidget);
-    }
+    await tester.tap(find.byTooltip('Close'));
+    await tester.pumpAndSettle();
 
-    await tapDock('dock_subgroup_editTransform');
-    expect(find.byKey(const ValueKey('tools_editTransform')), findsOneWidget);
-    expect(find.byKey(const ValueKey('subgroups_edit')), findsNothing);
-    expect(find.byKey(const ValueKey('dock_back_button')), findsOneWidget);
-    for (final tool in const ['inspector', 'crop']) {
-      expect(
-        find.byKey(ValueKey('dock_tool_edit_editTransform_$tool')),
-        findsOneWidget,
-      );
-    }
-
-    await tapDock('dock_back_button');
-    expect(find.byKey(const ValueKey('subgroups_edit')), findsOneWidget);
-    await tapDock('dock_back_button');
-    expect(find.byKey(const ValueKey('categories')), findsOneWidget);
-
-    await tapDock('dock_category_effects');
-    for (final subgroup in const [
-      'effectsStack',
-      'effectsColor',
-      'effectsLuts',
-      'effectsBlur',
-      'effectsMotion',
-      'effectsEnhance',
-    ]) {
-      expect(find.byKey(ValueKey('dock_subgroup_$subgroup')), findsOneWidget);
-    }
-    await tapDock('dock_subgroup_effectsColor');
-    for (final tool in const ['chroma_key', 'filters', 'adjust']) {
-      expect(
-        find.byKey(ValueKey('dock_tool_effects_effectsColor_$tool')),
-        findsOneWidget,
-      );
-    }
-    await tapDock('dock_back_button');
-    await tapDock('dock_subgroup_effectsLuts');
-    for (final tool in const ['library', 'import', 'strength', 'clear']) {
-      expect(
-        find.byKey(ValueKey('dock_tool_effects_effectsLuts_$tool')),
-        findsOneWidget,
-      );
-    }
-    await tapDock('dock_back_button');
-    await tapDock('dock_back_button');
-
-    await tapDock('dock_category_keyframes');
-    for (final subgroup in const [
-      'keyframeControls',
-      'keyframeCurves',
-      'keyframeProperties',
-    ]) {
-      expect(find.byKey(ValueKey('dock_subgroup_$subgroup')), findsOneWidget);
-    }
-    await tapDock('dock_subgroup_keyframeControls');
-    for (final tool in const ['add_state', 'delete', 'previous', 'next']) {
-      expect(
-        find.byKey(ValueKey('dock_tool_keyframes_keyframeControls_$tool')),
-        findsOneWidget,
-      );
-    }
-    await tapDock('dock_back_button');
-    await tapDock('dock_subgroup_keyframeCurves');
-    for (final tool in const ['graph', 'presets', 'clear_all']) {
-      expect(
-        find.byKey(ValueKey('dock_tool_keyframes_keyframeCurves_$tool')),
-        findsOneWidget,
-      );
-    }
-    await tapDock('dock_back_button');
-    await tapDock('dock_back_button');
-
-    await tapDock('dock_category_text');
-    for (final subgroup in const ['textObjects', 'textCaptions', 'textFiles']) {
-      expect(find.byKey(ValueKey('dock_subgroup_$subgroup')), findsOneWidget);
-    }
-    await tapDock('dock_subgroup_textCaptions');
-    expect(
-      find.byKey(const ValueKey('dock_tool_text_textCaptions_style')),
-      findsOneWidget,
-    );
-    expect(
-      find.byKey(const ValueKey('dock_tool_text_textCaptions_workshop')),
-      findsOneWidget,
-    );
-    await tapDock('dock_back_button');
-    await tapDock('dock_back_button');
-
-    // Canvas, Studio, and Discover are intentionally large, direct
-    // destinations. Discover has its own injected sheet coverage so this
-    // editor smoke test does not instantiate a native platform WebView.
-    await tapDock('dock_category_canvas');
+    await tester.tap(find.byKey(const ValueKey('editor_aspect_ratio_button')));
     await tester.pumpAndSettle();
     expect(
       find.byKey(const ValueKey('resizable_editor_sheet')),
       findsOneWidget,
     );
+    expect(find.text('Canvas'), findsOneWidget);
     expect(find.text('Format, background and guides'), findsOneWidget);
     await tester.tap(find.byTooltip('Close'));
-    await tester.pumpAndSettle();
-
-    await tapDock('dock_category_studio');
-    await tester.pumpAndSettle();
-    expect(find.text('Creator Lab'), findsOneWidget);
-    await tester.pageBack();
     await tester.pumpAndSettle();
     expect(find.byType(EditorScreen), findsOneWidget);
     expect(tester.takeException(), isNull);
@@ -324,10 +249,18 @@ void main() {
       find.byKey(const ValueKey('timeline_track_add_text-primary')),
     );
     await tester.pumpAndSettle();
-    expect(find.text('Add Text'), findsOneWidget);
-    expect(find.text('Subtitles'), findsOneWidget);
+    final addMenu = find.byKey(const ValueKey('fixed_editor_sheet'));
+    final addText = find.descendant(
+      of: addMenu,
+      matching: find.text('Add Text'),
+    );
+    expect(addText, findsOneWidget);
+    expect(
+      find.descendant(of: addMenu, matching: find.text('Subtitles')),
+      findsOneWidget,
+    );
     expect(find.byKey(const ValueKey('resizable_sheet_handle')), findsNothing);
-    await tester.tap(find.text('Add Text'));
+    await tester.tap(addText);
     // The add menu closes before the persistent text editor animates in.
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 400));
@@ -435,7 +368,7 @@ void main() {
       ),
     );
     await tester.enterText(find.byType(TextFormField), 'After edit');
-    await tester.tap(find.text('Save'));
+    await tester.tap(find.text('Save subtitle'));
     await tester.pumpAndSettle();
 
     expect(container.read(subtitleProvider).entries.single.text, 'After edit');

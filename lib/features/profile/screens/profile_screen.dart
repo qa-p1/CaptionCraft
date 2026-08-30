@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/utils/firebase_service.dart';
+import '../../../shared/widgets/captioncraft_brand.dart';
 import '../../../shared/widgets/snack_bar_helper.dart';
 import '../../auth/providers/auth_provider.dart';
 import '../../quota/providers/quota_provider.dart';
@@ -56,21 +57,27 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
       backgroundColor: kBackground,
       appBar: AppBar(
         titleSpacing: 4,
-        title: const Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+        title: const Row(
           children: [
-            Text(
-              'Workspace',
-              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
-            ),
-            Text(
-              'ACCOUNT & USAGE',
-              style: TextStyle(
-                color: kTextSecondary,
-                fontSize: 8,
-                fontWeight: FontWeight.w800,
-                letterSpacing: 1.25,
-              ),
+            CaptionCraftMark(size: 32, radius: 8),
+            SizedBox(width: 10),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Workspace',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+                ),
+                Text(
+                  'ACCOUNT & USAGE',
+                  style: TextStyle(
+                    color: kTextSecondary,
+                    fontSize: 8,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 1.25,
+                  ),
+                ),
+              ],
             ),
           ],
         ),

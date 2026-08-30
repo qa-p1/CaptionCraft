@@ -9,6 +9,7 @@ import 'package:uuid/uuid.dart';
 
 import '../../../core/theme/app_theme.dart';
 import '../../../core/utils/timeline_waveform_cache.dart';
+import '../../../shared/widgets/app_surface.dart';
 import '../../../shared/widgets/snack_bar_helper.dart';
 import '../models/subtitle_entry.dart';
 import '../models/subtitle_style_model.dart';
@@ -184,7 +185,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
 
   static const double _minPixelsPerSecond = 10;
   static const double _maxPixelsPerSecond = 1200;
-  static const double _toolbarHeight = 48;
+  static const double _toolbarHeight = 50;
   static const double _rulerHeight = 30;
   static const double _labelColumnWidth = 50;
   static const double _sectionHeaderHeight = 8;
@@ -312,6 +313,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       context: context,
       title: 'Add track',
       subtitle: 'Create another reusable timeline lane',
+      icon: Icons.playlist_add_rounded,
       heightFactor: 0.44,
       builder: (sheetContext) => Column(
         children: [
@@ -637,44 +639,41 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
 
   Future<void> _showSnappingSettings() async {
     var settings = ref.read(editorProvider).timeline.workspaceSettings.snapping;
-    await showModalBottomSheet<void>(
+    await showFixedEditorSheet<void>(
       context: context,
-      showDragHandle: true,
-      builder: (sheetContext) => StatefulBuilder(
-        builder: (context, setSheetState) => SafeArea(
-          child: ListView(
-            shrinkWrap: true,
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
-            children: [
-              const Text(
-                'Snapping targets',
-                style: TextStyle(
-                  color: kTextPrimary,
-                  fontSize: 18,
-                  fontWeight: FontWeight.w800,
+      title: 'Snapping targets',
+      subtitle:
+          'Choose which timeline relationships become magnetic while editing',
+      icon: Icons.auto_awesome_motion_rounded,
+      heightFactor: 0.58,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setSheetState) => Column(
+          children: [
+            for (final target in TimelineSnapTarget.values)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 7),
+                child: AppPanel(
+                  padding: EdgeInsets.zero,
+                  color: kSurfaceElevated,
+                  selected: settings.targets.contains(target),
+                  child: SwitchListTile.adaptive(
+                    key: ValueKey('timeline_snap_target_${target.name}'),
+                    value: settings.targets.contains(target),
+                    title: Text(_snapTargetLabel(target)),
+                    onChanged: (enabled) {
+                      final next = settings.withTarget(
+                        target,
+                        enabled: enabled,
+                      );
+                      setSheetState(() => settings = next);
+                      _updateWorkspace(
+                        (workspace) => workspace.copyWith(snapping: next),
+                      );
+                    },
+                  ),
                 ),
               ),
-              const SizedBox(height: 6),
-              const Text(
-                'Choose which timeline relationships become magnetic while moving or trimming clips.',
-                style: TextStyle(color: kTextSecondary, fontSize: 12),
-              ),
-              const SizedBox(height: 8),
-              for (final target in TimelineSnapTarget.values)
-                SwitchListTile.adaptive(
-                  key: ValueKey('timeline_snap_target_${target.name}'),
-                  value: settings.targets.contains(target),
-                  title: Text(_snapTargetLabel(target)),
-                  onChanged: (enabled) {
-                    final next = settings.withTarget(target, enabled: enabled);
-                    setSheetState(() => settings = next);
-                    _updateWorkspace(
-                      (workspace) => workspace.copyWith(snapping: next),
-                    );
-                  },
-                ),
-            ],
-          ),
+          ],
         ),
       ),
     );
@@ -2652,6 +2651,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       context: context,
       title: 'Base layer options',
       subtitle: 'Move this item without changing its timing or media',
+      icon: Icons.layers_outlined,
       heightFactor: 0.3,
       builder: (sheetContext) => ListTile(
         key: const ValueKey('timeline_convert_to_overlay_action'),
@@ -3008,26 +3008,39 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         ? color.withValues(alpha: 0.28)
         : (isActive ? kAccent : color);
     return Padding(
-      padding: const EdgeInsets.only(right: 6),
+      padding: const EdgeInsets.only(right: 4),
       child: Tooltip(
         message: tooltip,
         child: InkWell(
-          borderRadius: BorderRadius.circular(10),
+          borderRadius: BorderRadius.circular(9),
           onTap: onPressed,
           child: Container(
-            width: 34,
-            height: 34,
+            width: 35,
+            height: 35,
             decoration: BoxDecoration(
               color: isActive
                   ? kAccent.withValues(alpha: 0.14)
-                  : kSurfaceElevated,
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: isActive ? kAccent : kBorder),
+                  : Colors.transparent,
+              borderRadius: BorderRadius.circular(9),
+              border: Border.all(
+                color: isActive
+                    ? kAccent.withValues(alpha: 0.72)
+                    : kBorder.withValues(alpha: 0.68),
+              ),
             ),
             child: Icon(icon, color: resolvedColor, size: 18),
           ),
         ),
       ),
+    );
+  }
+
+  Widget _toolbarDivider() {
+    return Container(
+      width: 1,
+      height: 24,
+      margin: const EdgeInsets.only(left: 2, right: 7),
+      color: kBorder,
     );
   }
 
@@ -3171,13 +3184,14 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
         ? _rulerHeight + 80
         : rowLayouts.last.bottom + 12;
     return Container(
-      color: kSurfaceElevated,
+      color: kSurface,
       child: Column(
         children: [
           Container(
             height: _toolbarHeight,
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
             decoration: const BoxDecoration(
+              color: kSurface,
               border: Border(bottom: BorderSide(color: kBorder)),
             ),
             child: SingleChildScrollView(
@@ -3214,6 +3228,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                           }
                         : null,
                   ),
+                  _toolbarDivider(),
                   _buildToolbarButton(
                     icon: Icons.copy_rounded,
                     tooltip: 'Copy',
@@ -3268,7 +3283,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                           },
                   ),
                   _buildToolbarButton(
-                    icon: Icons.call_split_rounded,
+                    icon: Icons.content_cut_rounded,
                     tooltip: 'Split',
                     onPressed: !canSplitSelection
                         ? null
@@ -3310,6 +3325,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                             );
                           },
                   ),
+                  _toolbarDivider(),
                   _buildToolbarButton(
                     icon: Icons.my_location_rounded,
                     tooltip: 'Center playhead',
@@ -3331,6 +3347,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                     tooltip: 'Configure snapping targets',
                     onPressed: _showSnappingSettings,
                   ),
+                  _toolbarDivider(),
                   _buildToolbarButton(
                     icon: Icons.keyboard_arrow_left_rounded,
                     tooltip: 'Previous frame',
@@ -3376,6 +3393,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                         ? null
                         : _clearWorkArea,
                   ),
+                  _toolbarDivider(),
                   _buildToolbarButton(
                     icon: Icons.graphic_eq_rounded,
                     tooltip: workspace.showWaveforms
@@ -3401,7 +3419,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                     isActive: workspace.showThumbnails,
                   ),
                   _buildToolbarButton(
-                    icon: Icons.key_rounded,
+                    icon: Icons.diamond_outlined,
                     tooltip: workspace.showKeyframes
                         ? 'Hide keyframes'
                         : 'Show keyframes',
@@ -3424,6 +3442,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                     ),
                     isActive: workspace.autoFollowPlayhead,
                   ),
+                  _toolbarDivider(),
                   _buildToolbarButton(
                     icon: Icons.keyboard_double_arrow_left_rounded,
                     tooltip: 'Previous marker',
@@ -3462,6 +3481,7 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
                     },
                     isActive: _rippleEditingEnabled,
                   ),
+                  _toolbarDivider(),
                   _buildToolbarButton(
                     icon: Icons.zoom_out_rounded,
                     tooltip: 'Zoom out',
@@ -5064,11 +5084,20 @@ class _TimelineClipBlock extends StatelessWidget {
                     clipBehavior: Clip.antiAlias,
                     decoration: BoxDecoration(
                       color: colors.$1,
-                      borderRadius: BorderRadius.circular(5),
+                      borderRadius: BorderRadius.circular(7),
                       border: Border.all(
                         color: isSelected ? kAccent : colors.$2,
-                        width: isSelected ? 1.5 : 1,
+                        width: isSelected ? 2 : 1,
                       ),
+                      boxShadow: isSelected
+                          ? [
+                              BoxShadow(
+                                color: kAccent.withValues(alpha: 0.26),
+                                blurRadius: 7,
+                                spreadRadius: 0.5,
+                              ),
+                            ]
+                          : null,
                     ),
                     child: Stack(
                       fit: StackFit.expand,
@@ -5131,7 +5160,7 @@ class _TimelineClipBlock extends StatelessWidget {
                                     style: TextStyle(
                                       color: kTextPrimary,
                                       fontSize: showMeta ? 10.5 : 9.5,
-                                      fontWeight: FontWeight.w600,
+                                      fontWeight: FontWeight.w700,
                                       height: 1,
                                       shadows: const [
                                         Shadow(
@@ -5191,7 +5220,7 @@ class _TimelineClipBlock extends StatelessWidget {
                                 ),
                                 decoration: BoxDecoration(
                                   color: Colors.black.withValues(alpha: 0.42),
-                                  borderRadius: BorderRadius.circular(4),
+                                  borderRadius: BorderRadius.circular(5),
                                 ),
                                 child: Row(
                                   mainAxisSize: MainAxisSize.min,
@@ -5370,22 +5399,19 @@ class _TimelineClipBlock extends StatelessWidget {
     }
     switch (clip.type) {
       case TimelineTrackType.video:
-        return (
-          kAccent.withValues(alpha: 0.18),
-          kAccent.withValues(alpha: 0.45),
-        );
+        return (const Color(0xFF3A211B), const Color(0xFFFF8055));
       case TimelineTrackType.audio:
-        return (const Color(0xFF15352B), const Color(0xFF2E8B57));
+        return (const Color(0xFF15372F), const Color(0xFF55CFA0));
       case TimelineTrackType.subtitle:
-        return (const Color(0xFF332710), const Color(0xFFD4A017));
+        return (const Color(0xFF3A3018), const Color(0xFFF3C35A));
       case TimelineTrackType.text:
-        return (const Color(0xFF24203C), const Color(0xFF8A7DFF));
+        return (const Color(0xFF29243F), const Color(0xFFA99BFF));
       case TimelineTrackType.image:
       case TimelineTrackType.sticker:
       case TimelineTrackType.gif:
-        return (const Color(0xFF233349), const Color(0xFF5CA8FF));
+        return (const Color(0xFF1C3042), const Color(0xFF69B8FF));
       case TimelineTrackType.effect:
-        return (const Color(0xFF30253F), const Color(0xFFB784F7));
+        return (const Color(0xFF342542), const Color(0xFFC78CFF));
     }
   }
 }
@@ -5536,12 +5562,12 @@ class _ClipEnvelopePainter extends CustomPainter {
     if (!introEnabled && !outroEnabled) return;
 
     final fillPaint = Paint()
-      ..color = accentColor.withValues(alpha: 0.20)
+      ..color = accentColor.withValues(alpha: 0.16)
       ..style = PaintingStyle.fill;
     final linePaint = Paint()
       ..color = accentColor.withValues(alpha: 0.9)
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.35;
+      ..strokeWidth = 1.5;
     const highY = 2.5;
     final lowY = size.height - 2.5;
 
@@ -5560,6 +5586,8 @@ class _ClipEnvelopePainter extends CustomPainter {
       canvas
         ..drawPath(fill, fillPaint)
         ..drawPath(line, linePaint);
+      canvas.drawLine(Offset(x, 2), Offset(x, size.height - 2), linePaint);
+      _paintTransitionTag(canvas, size, label: 'IN', alignRight: false);
     }
 
     if (outroEnabled) {
@@ -5578,7 +5606,47 @@ class _ClipEnvelopePainter extends CustomPainter {
       canvas
         ..drawPath(fill, fillPaint)
         ..drawPath(line, linePaint);
+      canvas.drawLine(Offset(x, 2), Offset(x, size.height - 2), linePaint);
+      _paintTransitionTag(canvas, size, label: 'OUT', alignRight: true);
     }
+  }
+
+  void _paintTransitionTag(
+    Canvas canvas,
+    Size size, {
+    required String label,
+    required bool alignRight,
+  }) {
+    if (size.width < 48 || size.height < 24) return;
+    final textPainter = TextPainter(
+      text: TextSpan(
+        text: label,
+        style: TextStyle(
+          color: accentColor,
+          fontFamily: 'Inter',
+          fontSize: 6.5,
+          fontWeight: FontWeight.w800,
+          letterSpacing: 0.5,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    final padding = const EdgeInsets.symmetric(horizontal: 3, vertical: 1.5);
+    final width = textPainter.width + padding.horizontal;
+    final height = textPainter.height + padding.vertical;
+    final left = alignRight ? size.width - width - 3 : 3.0;
+    final rect = RRect.fromRectAndRadius(
+      Rect.fromLTWH(left, size.height - height - 3, width, height),
+      const Radius.circular(3),
+    );
+    canvas.drawRRect(
+      rect,
+      Paint()..color = kBackground.withValues(alpha: 0.78),
+    );
+    textPainter.paint(
+      canvas,
+      Offset(left + padding.left, size.height - height - 3 + padding.top),
+    );
   }
 
   void _paintAudioEnvelope(Canvas canvas, Size size) {
@@ -5770,8 +5838,14 @@ class _KeyframePainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     if (size.width <= 4 || duration.inMilliseconds <= 0) return;
-    final paint = Paint()..color = color;
+    final fillPaint = Paint()..color = color;
+    final outlinePaint = Paint()
+      ..color = kBackground.withValues(alpha: 0.92)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.1;
     final seen = <int>{};
+    final centerY = math.max(6.0, size.height - 8);
+    const radius = 3.7;
     for (final keyframe in keyframes) {
       final x =
           (keyframe.time.inMilliseconds / duration.inMilliseconds * size.width)
@@ -5780,12 +5854,14 @@ class _KeyframePainter extends CustomPainter {
       final bucket = x.round();
       if (!seen.add(bucket)) continue;
       final path = Path()
-        ..moveTo(x, 3)
-        ..lineTo(x + 3.5, size.height / 2)
-        ..lineTo(x, size.height - 3)
-        ..lineTo(x - 3.5, size.height / 2)
+        ..moveTo(x, centerY - radius)
+        ..lineTo(x + radius, centerY)
+        ..lineTo(x, centerY + radius)
+        ..lineTo(x - radius, centerY)
         ..close();
-      canvas.drawPath(path, paint);
+      canvas
+        ..drawPath(path, fillPaint)
+        ..drawPath(path, outlinePaint);
     }
   }
 
@@ -5882,7 +5958,7 @@ class _TrimHandleState extends State<_TrimHandle> {
         child: Center(
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 90),
-            width: 12,
+            width: 9,
             height: double.infinity,
             decoration: BoxDecoration(
               color: kAccent.withValues(
@@ -5898,19 +5974,22 @@ class _TrimHandleState extends State<_TrimHandle> {
                   : null,
               borderRadius: BorderRadius.horizontal(
                 left: widget.edge == _TrimEdge.start
-                    ? const Radius.circular(5)
+                    ? const Radius.circular(6)
                     : Radius.zero,
                 right: widget.edge == _TrimEdge.end
-                    ? const Radius.circular(5)
+                    ? const Radius.circular(6)
                     : Radius.zero,
               ),
             ),
-            child: Icon(
-              widget.edge == _TrimEdge.start
-                  ? Icons.chevron_left_rounded
-                  : Icons.chevron_right_rounded,
-              size: 14,
-              color: Colors.white,
+            child: Center(
+              child: Container(
+                width: 2,
+                height: 14,
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(99),
+                ),
+              ),
             ),
           ),
         ),

@@ -19,6 +19,8 @@ import '../../../core/utils/media_import_service.dart';
 import '../../../core/utils/project_creation_service.dart';
 import '../../../shared/models/project_model.dart';
 import '../../../shared/widgets/app_button.dart';
+import '../../../shared/widgets/app_surface.dart';
+import '../../../shared/widgets/captioncraft_brand.dart';
 import '../../../shared/widgets/snack_bar_helper.dart';
 import '../../auth/providers/auth_provider.dart';
 import '../../editor/models/timeline_models.dart';
@@ -378,67 +380,27 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       builder: (sheetContext) {
         return FractionallySizedBox(
           heightFactor: 0.72,
-          child: Container(
-            decoration: const BoxDecoration(
-              color: kSurface,
-              borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
-              border: Border(top: BorderSide(color: kBorder)),
-            ),
+          child: AppSheetSurface(
             child: Column(
               children: [
-                const _SheetHandle(),
+                AppSheetHeader(
+                  title: 'Start a new cut',
+                  subtitle:
+                      '${sources.length} source ${sources.length == 1 ? 'clip' : 'clips'} ready to arrange',
+                  icon: Icons.movie_creation_outlined,
+                  onClose: () => Navigator.pop(sheetContext),
+                ),
                 Expanded(
                   child: SingleChildScrollView(
                     padding: EdgeInsets.fromLTRB(
                       24,
-                      8,
+                      18,
                       24,
                       MediaQuery.viewInsetsOf(sheetContext).bottom + 24,
                     ),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Row(
-                          children: [
-                            Container(
-                              width: 44,
-                              height: 44,
-                              decoration: BoxDecoration(
-                                color: kAccent.withValues(alpha: 0.12),
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(
-                                  color: kAccent.withValues(alpha: 0.35),
-                                ),
-                              ),
-                              child: const Icon(
-                                Icons.perm_media_outlined,
-                                color: kAccent,
-                              ),
-                            ),
-                            const SizedBox(width: 14),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    'Start a new cut',
-                                    style: TextStyle(
-                                      color: kTextPrimary,
-                                      fontSize: 21,
-                                      fontWeight: FontWeight.w800,
-                                      letterSpacing: -0.5,
-                                    ),
-                                  ),
-                                  Text(
-                                    '${sources.length} source ${sources.length == 1 ? 'clip' : 'clips'} ready',
-                                    style: AppTextStyles.bodySmall,
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 24),
                         Text('PROJECT NAME', style: AppTextStyles.label),
                         const SizedBox(height: 8),
                         TextField(
@@ -1102,7 +1064,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         bottom: false,
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final horizontalPadding = constraints.maxWidth >= 900 ? 34.0 : 18.0;
+            final horizontalPadding = constraints.maxWidth >= 900 ? 32.0 : 16.0;
             final projects = _visibleProjects;
             return RefreshIndicator(
               onRefresh: _loadData,
@@ -1121,7 +1083,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                         child: Padding(
                           padding: EdgeInsets.fromLTRB(
                             horizontalPadding,
-                            16,
+                            12,
                             horizontalPadding,
                             0,
                           ),
@@ -1145,7 +1107,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                                   ),
                                 ),
                               ],
-                              const SizedBox(height: 20),
+                              const SizedBox(height: 18),
                               _buildStudioHero(constraints.maxWidth),
                               if (_showDeviceQuotaNotice) ...[
                                 const SizedBox(height: 12),
@@ -1155,7 +1117,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                                 const SizedBox(height: 12),
                                 _buildLoadWarning(),
                               ],
-                              const SizedBox(height: 24),
+                              const SizedBox(height: 22),
                               _buildLibraryHeader(),
                               const SizedBox(height: 13),
                             ],
@@ -1195,8 +1157,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               onPressed: _isCreatingProject ? null : _importMedia,
               backgroundColor: kAccent,
               foregroundColor: kOnAccent,
-              elevation: 4,
-              icon: const Icon(Icons.add_rounded),
+              elevation: 2,
+              icon: const Icon(Icons.movie_creation_outlined),
               label: const Text(
                 'New edit',
                 style: TextStyle(fontWeight: FontWeight.w800),
@@ -1209,7 +1171,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     final displayName = (user?.displayName as String?)?.trim();
     return Row(
       children: [
-        const _BrandLockup(),
+        const CaptionCraftLockup(),
         const Spacer(),
         if (MediaQuery.sizeOf(context).width >= 650)
           Padding(
@@ -1238,11 +1200,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             ),
             customBorder: const CircleBorder(),
             child: Container(
-              width: 42,
-              height: 42,
+              width: 40,
+              height: 40,
               alignment: Alignment.center,
               decoration: BoxDecoration(
-                color: kSurfaceHigh,
+                color: kSurfaceElevated,
                 shape: BoxShape.circle,
                 border: Border.all(color: kBorder),
               ),
@@ -1283,13 +1245,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       clipBehavior: Clip.antiAlias,
       decoration: BoxDecoration(
         color: kSurface,
-        borderRadius: BorderRadius.circular(24),
+        borderRadius: BorderRadius.circular(20),
         border: Border.all(color: kBorder),
         boxShadow: [
           BoxShadow(
             color: Colors.black.withValues(alpha: 0.24),
-            blurRadius: 34,
-            offset: const Offset(0, 16),
+            blurRadius: 24,
+            offset: const Offset(0, 12),
           ),
         ],
       ),
@@ -1302,10 +1264,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             top: 0,
             bottom: 0,
             left: 0,
-            child: Container(width: 5, color: kAccent),
+            child: Container(width: 3, color: kAccent),
           ),
           Padding(
-            padding: EdgeInsets.all(compact ? 22 : 32),
+            padding: EdgeInsets.all(compact ? 20 : 28),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -1322,7 +1284,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                     ),
                   ),
                   child: Text(
-                    'READY TO CUT',
+                    'START A PROJECT',
                     style: TextStyle(
                       fontFamily: 'monospace',
                       color: kAccentSecondary,
@@ -1332,7 +1294,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                     ),
                   ),
                 ),
-                const SizedBox(height: 14),
+                const SizedBox(height: 13),
                 ConstrainedBox(
                   constraints: BoxConstraints(maxWidth: compact ? 330 : 520),
                   child: Text(
@@ -1341,10 +1303,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                         : 'Make the cut. Own the frame.',
                     style: TextStyle(
                       color: kTextPrimary,
-                      fontSize: compact ? 31 : 42,
-                      height: 1.02,
-                      fontWeight: FontWeight.w900,
-                      letterSpacing: -1.8,
+                      fontSize: compact ? 29 : 38,
+                      height: 1.05,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: -1.35,
                     ),
                   ),
                 ),
@@ -1360,26 +1322,26 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                     ),
                   ),
                 ),
-                const SizedBox(height: 22),
+                const SizedBox(height: 20),
                 Wrap(
                   spacing: 10,
                   runSpacing: 10,
                   children: [
                     FilledButton.icon(
                       onPressed: _isCreatingProject ? null : _importMedia,
-                      icon: const Icon(Icons.add_rounded, size: 19),
+                      icon: const Icon(Icons.movie_creation_outlined, size: 18),
                       label: const Text('Start new edit'),
                     ),
                     OutlinedButton.icon(
                       onPressed: latestVisibleProject == null
                           ? null
                           : () => _openEditor(latestVisibleProject),
-                      icon: const Icon(Icons.play_arrow_rounded, size: 19),
+                      icon: const Icon(Icons.history_rounded, size: 18),
                       label: const Text('Resume latest'),
                     ),
                   ],
                 ),
-                const SizedBox(height: 27),
+                const SizedBox(height: 24),
                 Wrap(
                   spacing: 8,
                   runSpacing: 8,
@@ -1420,10 +1382,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'Your cuts',
+                    'Projects',
                     style: TextStyle(
                       color: kTextPrimary,
-                      fontSize: 21,
+                      fontSize: 20,
                       fontWeight: FontWeight.w800,
                       letterSpacing: -0.5,
                     ),
@@ -1567,7 +1529,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         : contentWidth >= 520
         ? 2
         : 1;
-    final extent = _view == _ProjectView.list ? 134.0 : 268.0;
+    final extent = _view == _ProjectView.list ? 126.0 : 252.0;
 
     return SliverPadding(
       padding: EdgeInsets.fromLTRB(horizontalPadding, 0, horizontalPadding, 0),
@@ -1615,7 +1577,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           crossAxisCount: columns,
           mainAxisSpacing: 14,
           crossAxisSpacing: 14,
-          mainAxisExtent: 268,
+          mainAxisExtent: 252,
         ),
         delegate: SliverChildBuilderDelegate(
           (_, _) => Shimmer.fromColors(
@@ -1624,7 +1586,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             child: Container(
               decoration: BoxDecoration(
                 color: kSurface,
-                borderRadius: BorderRadius.circular(18),
+                borderRadius: BorderRadius.circular(14),
                 border: Border.all(color: kBorder),
               ),
             ),
@@ -1671,7 +1633,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           left: 10,
           bottom: 9,
           child: _TinyBadge(
-            icon: Icons.movie_outlined,
+            icon: Icons.schedule_rounded,
             label: _formatDuration(project.durationMs),
           ),
         ),
@@ -1708,7 +1670,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
 
     final information = Padding(
-      padding: EdgeInsets.all(isList ? 15 : 14),
+      padding: EdgeInsets.all(isList ? 14 : 13),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisAlignment: MainAxisAlignment.center,
@@ -1722,8 +1684,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
                     color: kTextPrimary,
-                    fontWeight: FontWeight.w800,
-                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 13.5,
                     letterSpacing: -0.2,
                   ),
                 ),
@@ -1739,14 +1701,14 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 ),
             ],
           ),
-          const SizedBox(height: 7),
+          const SizedBox(height: 6),
           Text(
             '${project.timeline.visualMediaClips.length} visual clips  ·  ${project.subtitles.length} captions',
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: AppTextStyles.bodySmall,
           ),
-          const SizedBox(height: 9),
+          const SizedBox(height: 8),
           Row(
             children: [
               Container(
@@ -1788,7 +1750,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       color: kSurface,
       clipBehavior: Clip.antiAlias,
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(18),
+        borderRadius: BorderRadius.circular(14),
         side: const BorderSide(color: kBorder),
       ),
       child: InkWell(
@@ -1806,7 +1768,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               Column(
                 children: [
                   Expanded(child: thumbnail),
-                  SizedBox(height: 100, child: information),
+                  SizedBox(height: 92, child: information),
                 ],
               ),
             Positioned(
@@ -1874,13 +1836,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                   height: 34,
                   decoration: BoxDecoration(
                     color: kBackground.withValues(alpha: 0.78),
-                    borderRadius: BorderRadius.circular(10),
+                    borderRadius: BorderRadius.circular(9),
                     border: Border.all(
                       color: Colors.white.withValues(alpha: 0.09),
                     ),
                   ),
                   child: const Icon(
-                    Icons.more_horiz_rounded,
+                    Icons.more_vert_rounded,
                     color: kTextPrimary,
                     size: 20,
                   ),
@@ -2025,63 +1987,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     if (difference.inDays < 7) return '${difference.inDays}d ago';
     return '${date.day.toString().padLeft(2, '0')}/'
         '${date.month.toString().padLeft(2, '0')}/${date.year}';
-  }
-}
-
-class _BrandLockup extends StatelessWidget {
-  const _BrandLockup();
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      children: [
-        Container(
-          width: 42,
-          height: 42,
-          decoration: BoxDecoration(
-            color: kAccent,
-            borderRadius: BorderRadius.circular(11),
-          ),
-          child: Stack(
-            alignment: Alignment.center,
-            children: [
-              const Icon(Icons.play_arrow_rounded, color: kOnAccent, size: 25),
-              Positioned(
-                left: 7,
-                top: 7,
-                bottom: 7,
-                child: Container(width: 2, color: kAccentSecondary),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(width: 11),
-        Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'CAPTIONCRAFT',
-              style: TextStyle(
-                color: kTextPrimary,
-                fontWeight: FontWeight.w900,
-                fontSize: 14,
-                letterSpacing: 0.35,
-              ),
-            ),
-            Text(
-              'EDITING STUDIO',
-              style: TextStyle(
-                fontFamily: 'monospace',
-                color: kAccent,
-                fontWeight: FontWeight.w700,
-                fontSize: 8.5,
-                letterSpacing: 1.7,
-              ),
-            ),
-          ],
-        ),
-      ],
-    );
   }
 }
 
@@ -2292,10 +2197,9 @@ class _ThumbnailPlaceholder extends StatelessWidget {
     return CustomPaint(
       painter: const _PlaceholderPainter(),
       child: const Center(
-        child: Icon(
-          Icons.play_circle_outline_rounded,
-          color: kTextSecondary,
-          size: 37,
+        child: Opacity(
+          opacity: 0.68,
+          child: CaptionCraftMark(size: 42, radius: 11),
         ),
       ),
     );
@@ -2380,25 +2284,6 @@ class _FilmPerforations extends StatelessWidget {
             color: kBackground,
             borderRadius: BorderRadius.circular(2),
           ),
-        ),
-      ),
-    );
-  }
-}
-
-class _SheetHandle extends StatelessWidget {
-  const _SheetHandle();
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 12),
-      child: Container(
-        width: 38,
-        height: 4,
-        decoration: BoxDecoration(
-          color: kBorder,
-          borderRadius: BorderRadius.circular(99),
         ),
       ),
     );

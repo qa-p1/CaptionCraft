@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/theme/app_theme.dart';
+import '../../../shared/widgets/app_surface.dart';
+import '../../../shared/widgets/captioncraft_brand.dart';
 import '../models/discover_models.dart';
 import '../providers/discover_provider.dart';
 import 'discover_browser_tab.dart';
@@ -71,35 +73,70 @@ class _DiscoverSheetState extends ConsumerState<DiscoverSheet> {
         child: Column(
           key: const ValueKey('discover-sheet-content'),
           children: [
-            SizedBox(
-              height: 48,
+            Container(
+              height: 60,
+              decoration: const BoxDecoration(
+                color: Color(0xB3101316),
+                border: Border(bottom: BorderSide(color: kBorder)),
+              ),
               child: Padding(
-                padding: const EdgeInsets.only(left: 16, right: 6),
+                padding: const EdgeInsets.only(left: 14, right: 8),
                 child: Row(
                   children: [
+                    const CaptionCraftMark(size: 32, radius: 8),
+                    const SizedBox(width: 10),
                     const Expanded(
-                      child: Text(
-                        'Discover',
-                        style: TextStyle(
-                          color: kTextPrimary,
-                          fontSize: 17,
-                          fontWeight: FontWeight.w800,
-                        ),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Discover',
+                            style: TextStyle(
+                              color: kTextPrimary,
+                              fontSize: 16,
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: -0.25,
+                            ),
+                          ),
+                          Text(
+                            'MEDIA & DOWNLOADS',
+                            style: TextStyle(
+                              color: kTextSecondary,
+                              fontSize: 8,
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: 1.05,
+                            ),
+                          ),
+                        ],
                       ),
                     ),
+                    if (activeDownloads > 0) ...[
+                      AppStatusPill(
+                        label: '$activeDownloads active',
+                        color: kInfo,
+                        icon: Icons.downloading_rounded,
+                      ),
+                      const SizedBox(width: 8),
+                    ],
                     IconButton(
                       key: const ValueKey('discover-close'),
                       tooltip: 'Close Discover',
+                      style: IconButton.styleFrom(
+                        backgroundColor: kSurfaceElevated,
+                        side: const BorderSide(color: kBorder),
+                        minimumSize: const Size.square(38),
+                        maximumSize: const Size.square(38),
+                      ),
                       onPressed:
                           widget.onClose ??
                           () => Navigator.of(context).maybePop(),
-                      icon: const Icon(Icons.close_rounded),
+                      icon: const Icon(Icons.close_rounded, size: 19),
                     ),
                   ],
                 ),
               ),
             ),
-            const Divider(height: 1, color: kBorder),
             Expanded(
               child: IndexedStack(
                 key: const ValueKey('discover-tabs'),
@@ -211,14 +248,11 @@ class _DiscoverSheetState extends ConsumerState<DiscoverSheet> {
             const Divider(height: 1, color: kBorder),
             NavigationBar(
               key: const ValueKey('discover-navigation'),
-              height: 68,
               selectedIndex: _selectedIndex,
               onDestinationSelected: (index) {
                 FocusManager.instance.primaryFocus?.unfocus();
                 setState(() => _selectedIndex = index);
               },
-              backgroundColor: kSurface,
-              indicatorColor: kAccent.withValues(alpha: 0.18),
               destinations: [
                 const NavigationDestination(
                   key: ValueKey('discover-nav-browser'),

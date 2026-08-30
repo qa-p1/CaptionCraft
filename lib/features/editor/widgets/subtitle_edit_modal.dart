@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/theme/app_theme.dart';
+import '../../../shared/widgets/app_surface.dart';
 import '../models/subtitle_entry.dart';
 import '../providers/subtitle_provider.dart';
 
@@ -48,56 +49,31 @@ class _SubtitleEditModalState extends ConsumerState<SubtitleEditModal> {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: EdgeInsets.only(
-        left: 24,
-        right: 24,
-        top: 16,
-        bottom: MediaQuery.of(context).viewInsets.bottom + 24,
-      ),
-      decoration: const BoxDecoration(
-        color: kSurface,
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      child: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Drag handle
-            Center(
-              child: Container(
-                width: 40,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: kBorder,
-                  borderRadius: BorderRadius.circular(2),
-                ),
-              ),
-            ),
-            const SizedBox(height: 20),
-
-            // Header
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    'Edit Subtitle Text',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      color: kTextPrimary,
-                      fontSize: 18,
-                      fontWeight: FontWeight.w600,
-                    ),
+    return AnimatedPadding(
+      duration: const Duration(milliseconds: 140),
+      curve: Curves.easeOut,
+      padding: EdgeInsets.only(bottom: MediaQuery.viewInsetsOf(context).bottom),
+      child: AppSheetSurface(
+        child: SafeArea(
+          top: false,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              AppSheetHeader(
+                title: 'Edit subtitle',
+                subtitle: 'Refine copy and line breaks',
+                icon: Icons.closed_caption_rounded,
+                onClose: () => Navigator.pop(context),
+                trailing: IconButton(
+                  tooltip: 'Delete subtitle',
+                  style: IconButton.styleFrom(
+                    foregroundColor: kError,
+                    backgroundColor: kError.withValues(alpha: 0.08),
+                    side: BorderSide(color: kError.withValues(alpha: 0.22)),
+                    minimumSize: const Size.square(36),
+                    maximumSize: const Size.square(36),
                   ),
-                ),
-                IconButton(
-                  icon: const Icon(
-                    Icons.delete_rounded,
-                    color: kError,
-                    size: 20,
-                  ),
+                  icon: const Icon(Icons.delete_outline_rounded, size: 19),
                   onPressed: () {
                     ref
                         .read(subtitleProvider.notifier)
@@ -105,59 +81,56 @@ class _SubtitleEditModalState extends ConsumerState<SubtitleEditModal> {
                     Navigator.pop(context);
                   },
                 ),
-              ],
-            ),
-            const SizedBox(height: 16),
-
-            // Text field
-            TextFormField(
-              controller: _textController,
-              minLines: 3,
-              maxLines: 6,
-              autofocus: true,
-              style: const TextStyle(color: kTextPrimary, fontSize: 15),
-              decoration: InputDecoration(
-                hintText: 'Subtitle text...',
-                filled: true,
-                fillColor: kSurfaceElevated,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: const BorderSide(color: kBorder),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(18, 18, 18, 14),
+                child: TextFormField(
+                  controller: _textController,
+                  minLines: 3,
+                  maxLines: 6,
+                  autofocus: true,
+                  textCapitalization: TextCapitalization.sentences,
+                  style: const TextStyle(
+                    color: kTextPrimary,
+                    fontSize: 15,
+                    height: 1.45,
+                  ),
+                  decoration: const InputDecoration(
+                    hintText: 'Type the subtitle…',
+                    alignLabelWithHint: true,
+                  ),
                 ),
               ),
-            ),
-            const SizedBox(height: 20),
-
-            // Actions row
-            Row(
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: [
-                TextButton(
-                  onPressed: () {
-                    Navigator.pop(context);
-                  },
-                  child: Text(
-                    'Cancel',
-                    style: TextStyle(color: kTextSecondary),
-                  ),
+              Container(
+                padding: const EdgeInsets.fromLTRB(18, 12, 18, 16),
+                decoration: const BoxDecoration(
+                  color: Color(0x7A101316),
+                  border: Border(top: BorderSide(color: kBorder)),
                 ),
-                const SizedBox(width: 16),
-                ElevatedButton(
-                  onPressed: () {
-                    if (_save()) Navigator.pop(context);
-                  },
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: kAccent,
-                    foregroundColor: Colors.white,
-                  ),
-                  child: Text(
-                    'Save',
-                    style: TextStyle(fontWeight: FontWeight.w600),
-                  ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: () => Navigator.pop(context),
+                        child: const Text('Cancel'),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      flex: 2,
+                      child: FilledButton.icon(
+                        onPressed: () {
+                          if (_save()) Navigator.pop(context);
+                        },
+                        icon: const Icon(Icons.check_rounded, size: 18),
+                        label: const Text('Save subtitle'),
+                      ),
+                    ),
+                  ],
                 ),
-              ],
-            ),
-          ],
+              ),
+            ],
+          ),
         ),
       ),
     );

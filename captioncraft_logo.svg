@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1254" height="1254" viewBox="0 0 1254 1254" role="img" aria-label="CaptionCraft logo" shape-rendering="geometricPrecision">
+  <rect width="1254" height="1254" rx="232" fill="#090B0D"/>
+
+  <!-- Left caption/CC frame: same proportions, rebuilt as clean vector geometry. -->
+  <path
+    d="M 526 346 H 248 C 199.4 346 160 385.4 160 434 V 818 C 160 866.6 199.4 906 248 906 H 526"
+    fill="none"
+    stroke="#FCFAF9"
+    stroke-width="80"
+    stroke-linecap="butt"
+    stroke-linejoin="round"/>
+
+  <!-- Right caption/CC frame, preserving the original open gap on the right. -->
+  <path
+    d="M 726 346 H 1006 C 1054.0 346 1093 385.0 1093 433 V 494
+       M 1093 759 V 819 C 1093 867.0 1054.0 906 1006 906 H 726"
+    fill="none"
+    stroke="#FCFAF9"
+    stroke-width="78"
+    stroke-linecap="butt"
+    stroke-linejoin="round"/>
+
+  <!-- Precision cursor / playhead -->
+  <g fill="#FF7548">
+    <rect x="578" y="278" width="98" height="25" rx="0"/>
+    <rect x="615" y="302" width="24" height="647" rx="0"/>
+    <rect x="578" y="948" width="98" height="24" rx="0"/>
+  </g>
+
+  <!-- Caption lines -->
+  <g fill="#FCFAF9">
+    <rect x="291" y="547" width="235" height="56"/>
+    <rect x="291" y="641" width="235" height="56"/>
+    <rect x="726" y="547" width="320" height="56"/>
+    <rect x="726" y="641" width="196" height="56"/>
+  </g>
+</svg>

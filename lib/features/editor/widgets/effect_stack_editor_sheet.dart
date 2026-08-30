@@ -11,6 +11,7 @@ import '../../../core/theme/app_theme.dart';
 import '../../../core/utils/effect_preset_library_service.dart';
 import '../../../core/utils/mask_tracking_service.dart';
 import '../../../core/utils/media_import_service.dart';
+import '../../../shared/widgets/app_surface.dart';
 import '../models/editor_effect_models.dart';
 import '../models/asset_pack_models.dart';
 import '../models/timeline_models.dart';
@@ -121,227 +122,170 @@ class _EffectStackEditorSheetState
     );
     _clipboardAvailable = _clipboardAvailable || notifier.hasCopiedEffectStack;
 
-    return Material(
-      color: Colors.transparent,
-      child: Container(
-        decoration: const BoxDecoration(
-          color: kSurface,
-          borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
-        ),
-        child: Column(
-          children: [
-            const SizedBox(height: 10),
-            Container(
-              width: 44,
-              height: 4,
-              decoration: BoxDecoration(
-                color: kBorder,
-                borderRadius: BorderRadius.circular(999),
+    return AppSheetSurface(
+      child: Column(
+        children: [
+          AppSheetHeader(
+            title: widget.domain == EditorEffectDomain.visual
+                ? 'Effect stack'
+                : 'Audio processing',
+            subtitle:
+                '${domainStack.effects.length} effect${domainStack.effects.length == 1 ? '' : 's'} · top runs first',
+            icon: widget.domain == EditorEffectDomain.visual
+                ? Icons.auto_awesome_motion_rounded
+                : Icons.graphic_eq_rounded,
+            onClose: () => Navigator.of(context).maybePop(),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: DropdownButtonFormField<String>(
+              key: ValueKey('effect_target_$_targetKey'),
+              initialValue: _targetKey,
+              isExpanded: true,
+              decoration: InputDecoration(
+                labelText: 'Apply to',
+                prefixIcon: const Icon(Icons.layers_outlined, size: 19),
+                filled: true,
+                fillColor: kSurfaceElevated,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(13),
+                  borderSide: const BorderSide(color: kBorder),
+                ),
               ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 12, 10, 8),
-              child: Row(
-                children: [
-                  Container(
-                    width: 38,
-                    height: 38,
-                    decoration: BoxDecoration(
-                      color: kAccent.withValues(alpha: 0.12),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: Icon(
-                      widget.domain == EditorEffectDomain.visual
-                          ? Icons.auto_awesome_motion_rounded
-                          : Icons.graphic_eq_rounded,
-                      color: kAccent,
-                      size: 20,
-                    ),
-                  ),
-                  const SizedBox(width: 11),
-                  Expanded(
+              items: [
+                for (final target in widget.targets)
+                  DropdownMenuItem(
+                    value: target.key,
                     child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          widget.domain == EditorEffectDomain.visual
-                              ? 'Effect Stack'
-                              : 'Audio Processing',
+                          target.label,
+                          overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
                             color: kTextPrimary,
-                            fontSize: 16,
-                            fontWeight: FontWeight.w700,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
                           ),
                         ),
                         Text(
-                          '${domainStack.effects.length} effect${domainStack.effects.length == 1 ? '' : 's'} • top runs first',
+                          target.description,
+                          overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
                             color: kTextSecondary,
-                            fontSize: 10,
+                            fontSize: 9,
                           ),
                         ),
                       ],
                     ),
                   ),
-                  IconButton(
-                    tooltip: 'Close',
-                    onPressed: () => Navigator.of(context).maybePop(),
-                    icon: const Icon(Icons.close_rounded),
+              ],
+              selectedItemBuilder: (context) => [
+                for (final target in widget.targets)
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      target.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: kTextPrimary,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
                   ),
-                ],
-              ),
+              ],
+              onChanged: (value) {
+                if (value == null) return;
+                setState(() {
+                  _targetKey = value;
+                  _expandedEffectId = null;
+                });
+              },
             ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: DropdownButtonFormField<String>(
-                key: ValueKey('effect_target_$_targetKey'),
-                initialValue: _targetKey,
-                isExpanded: true,
-                decoration: InputDecoration(
-                  labelText: 'Apply to',
-                  prefixIcon: const Icon(Icons.layers_outlined, size: 19),
-                  filled: true,
-                  fillColor: kSurfaceElevated,
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(13),
-                    borderSide: const BorderSide(color: kBorder),
-                  ),
+          ),
+          const SizedBox(height: 9),
+          SizedBox(
+            height: 42,
+            child: ListView(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              scrollDirection: Axis.horizontal,
+              children: [
+                _ToolbarButton(
+                  key: const ValueKey('effect_stack_add'),
+                  icon: Icons.add_rounded,
+                  label: 'Add effect',
+                  emphasized: true,
+                  onTap: _pickAndAddEffect,
                 ),
-                items: [
-                  for (final target in widget.targets)
-                    DropdownMenuItem(
-                      value: target.key,
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            target.label,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              color: kTextPrimary,
-                              fontSize: 12,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                          Text(
-                            target.description,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              color: kTextSecondary,
-                              fontSize: 9,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                ],
-                selectedItemBuilder: (context) => [
-                  for (final target in widget.targets)
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(
-                        target.label,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: kTextPrimary,
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                ],
-                onChanged: (value) {
-                  if (value == null) return;
-                  setState(() {
-                    _targetKey = value;
-                    _expandedEffectId = null;
-                  });
-                },
-              ),
+                _ToolbarButton(
+                  key: const ValueKey('effect_stack_copy'),
+                  icon: Icons.copy_all_rounded,
+                  label: 'Copy stack',
+                  onTap: domainStack.isEmpty
+                      ? null
+                      : () {
+                          final copied = notifier.copyEffectStackToClipboard(
+                            scope: _target.scope,
+                            targetId: _target.targetId,
+                            domain: widget.domain,
+                          );
+                          if (copied) {
+                            setState(() => _clipboardAvailable = true);
+                            _showMessage('Effect stack copied');
+                          }
+                        },
+                ),
+                _ToolbarButton(
+                  key: const ValueKey('effect_stack_paste'),
+                  icon: Icons.content_paste_rounded,
+                  label: 'Paste',
+                  onTap: _clipboardAvailable
+                      ? () => _pasteStack(append: false)
+                      : null,
+                ),
+                _ToolbarButton(
+                  key: const ValueKey('effect_stack_paste_append'),
+                  icon: Icons.playlist_add_rounded,
+                  label: 'Append',
+                  onTap: _clipboardAvailable
+                      ? () => _pasteStack(append: true)
+                      : null,
+                ),
+                _ToolbarButton(
+                  key: const ValueKey('effect_stack_presets'),
+                  icon: Icons.bookmarks_outlined,
+                  label: 'Presets',
+                  onTap: () => _openPresets(timeline, domainStack),
+                ),
+              ],
             ),
-            const SizedBox(height: 9),
-            SizedBox(
-              height: 42,
-              child: ListView(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                scrollDirection: Axis.horizontal,
-                children: [
-                  _ToolbarButton(
-                    key: const ValueKey('effect_stack_add'),
-                    icon: Icons.add_rounded,
-                    label: 'Add effect',
-                    emphasized: true,
-                    onTap: _pickAndAddEffect,
+          ),
+          const Divider(height: 1, color: kBorder),
+          Expanded(
+            child: domainStack.isEmpty
+                ? _EmptyStack(domain: widget.domain, onAdd: _pickAndAddEffect)
+                : ReorderableListView.builder(
+                    key: ValueKey('effect_stack_${_target.key}'),
+                    padding: const EdgeInsets.fromLTRB(12, 10, 12, 24),
+                    buildDefaultDragHandles: false,
+                    itemCount: domainStack.effects.length,
+                    onReorder: (oldIndex, newIndex) =>
+                        _reorderDomainEffects(oldIndex, newIndex),
+                    itemBuilder: (context, index) {
+                      final effect = domainStack.effects[index];
+                      return _buildEffectCard(
+                        timeline: timeline,
+                        effect: effect,
+                        index: index,
+                        playhead: playhead,
+                      );
+                    },
                   ),
-                  _ToolbarButton(
-                    key: const ValueKey('effect_stack_copy'),
-                    icon: Icons.copy_all_rounded,
-                    label: 'Copy stack',
-                    onTap: domainStack.isEmpty
-                        ? null
-                        : () {
-                            final copied = notifier.copyEffectStackToClipboard(
-                              scope: _target.scope,
-                              targetId: _target.targetId,
-                              domain: widget.domain,
-                            );
-                            if (copied) {
-                              setState(() => _clipboardAvailable = true);
-                              _showMessage('Effect stack copied');
-                            }
-                          },
-                  ),
-                  _ToolbarButton(
-                    key: const ValueKey('effect_stack_paste'),
-                    icon: Icons.content_paste_rounded,
-                    label: 'Paste',
-                    onTap: _clipboardAvailable
-                        ? () => _pasteStack(append: false)
-                        : null,
-                  ),
-                  _ToolbarButton(
-                    key: const ValueKey('effect_stack_paste_append'),
-                    icon: Icons.playlist_add_rounded,
-                    label: 'Append',
-                    onTap: _clipboardAvailable
-                        ? () => _pasteStack(append: true)
-                        : null,
-                  ),
-                  _ToolbarButton(
-                    key: const ValueKey('effect_stack_presets'),
-                    icon: Icons.bookmarks_outlined,
-                    label: 'Presets',
-                    onTap: () => _openPresets(timeline, domainStack),
-                  ),
-                ],
-              ),
-            ),
-            const Divider(height: 1, color: kBorder),
-            Expanded(
-              child: domainStack.isEmpty
-                  ? _EmptyStack(domain: widget.domain, onAdd: _pickAndAddEffect)
-                  : ReorderableListView.builder(
-                      key: ValueKey('effect_stack_${_target.key}'),
-                      padding: const EdgeInsets.fromLTRB(12, 10, 12, 24),
-                      buildDefaultDragHandles: false,
-                      itemCount: domainStack.effects.length,
-                      onReorder: (oldIndex, newIndex) =>
-                          _reorderDomainEffects(oldIndex, newIndex),
-                      itemBuilder: (context, index) {
-                        final effect = domainStack.effects[index];
-                        return _buildEffectCard(
-                          timeline: timeline,
-                          effect: effect,
-                          index: index,
-                          playhead: playhead,
-                        );
-                      },
-                    ),
-            ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
@@ -1056,127 +1000,126 @@ class _EffectStackEditorSheetState
                 .toList()
               ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
         final globalIds = _globalPresets.map((preset) => preset.id).toSet();
-        return Container(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 22),
-          decoration: const BoxDecoration(
-            color: kSurface,
-            borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-          ),
+        return AppSheetSurface(
           child: SafeArea(
             top: false,
             child: Column(
               mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
-                  children: [
-                    const Expanded(
-                      child: Text(
-                        'Effect Presets',
-                        style: TextStyle(
-                          color: kTextPrimary,
-                          fontSize: 15,
-                          fontWeight: FontWeight.w700,
-                        ),
+                AppSheetHeader(
+                  title: 'Effect presets',
+                  subtitle: 'Reusable stacks for faster grading and styling',
+                  icon: Icons.bookmarks_outlined,
+                  onClose: () => Navigator.of(context).pop(),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        key: const ValueKey('effect_preset_import'),
+                        tooltip: 'Import .ccfx preset',
+                        onPressed: () async {
+                          Navigator.of(context).pop();
+                          await _importPreset();
+                        },
+                        icon: const Icon(Icons.file_open_outlined, size: 18),
                       ),
-                    ),
-                    IconButton(
-                      key: const ValueKey('effect_preset_import'),
-                      tooltip: 'Import .ccfx preset',
-                      onPressed: () async {
-                        Navigator.of(context).pop();
-                        await _importPreset();
-                      },
-                      icon: const Icon(Icons.file_open_outlined),
-                    ),
-                    FilledButton.icon(
-                      onPressed: stack.isEmpty
-                          ? null
-                          : () async {
-                              Navigator.of(context).pop();
-                              await _savePreset();
-                            },
-                      icon: const Icon(Icons.add_rounded, size: 17),
-                      label: const Text('Save current'),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                if (_loadingGlobalPresets)
-                  const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 24),
-                    child: Center(child: CircularProgressIndicator()),
-                  )
-                else if (matching.isEmpty)
-                  const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 24),
-                    child: Center(
-                      child: Text(
-                        'No saved presets yet.',
-                        style: TextStyle(color: kTextSecondary),
+                      FilledButton.icon(
+                        onPressed: stack.isEmpty
+                            ? null
+                            : () async {
+                                Navigator.of(context).pop();
+                                await _savePreset();
+                              },
+                        icon: const Icon(Icons.add_rounded, size: 16),
+                        label: const Text('Save'),
                       ),
-                    ),
-                  )
-                else
-                  ConstrainedBox(
-                    constraints: const BoxConstraints(maxHeight: 360),
-                    child: ListView.separated(
-                      shrinkWrap: true,
-                      itemCount: matching.length,
-                      separatorBuilder: (_, _) => const Divider(color: kBorder),
-                      itemBuilder: (context, index) {
-                        final preset = matching[index];
-                        return ListTile(
-                          contentPadding: EdgeInsets.zero,
-                          leading: const CircleAvatar(
-                            backgroundColor: kSurfaceElevated,
-                            child: Icon(Icons.auto_awesome_rounded, size: 18),
-                          ),
-                          title: Text(
-                            preset.name,
-                            style: const TextStyle(color: kTextPrimary),
-                          ),
-                          subtitle: Text(
-                            '${preset.stack.effects.length} effect${preset.stack.effects.length == 1 ? '' : 's'} • '
-                            '${globalIds.contains(preset.id) ? 'Reusable library' : 'This project'}',
-                            style: const TextStyle(color: kTextSecondary),
-                          ),
-                          onTap: () {
-                            ref
-                                .read(editorProvider.notifier)
-                                .applyEffectPresetValue(
-                                  preset: preset,
-                                  scope: _target.scope,
-                                  targetId: _target.targetId,
-                                  domain: widget.domain,
-                                );
-                            Navigator.of(context).pop();
-                          },
-                          trailing: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              IconButton(
-                                tooltip: 'Export .ccfx preset',
-                                onPressed: () async {
-                                  Navigator.of(context).pop();
-                                  await _exportPreset(preset);
-                                },
-                                icon: const Icon(Icons.ios_share_rounded),
-                              ),
-                              IconButton(
-                                tooltip: 'Delete preset',
-                                onPressed: () async {
-                                  Navigator.of(context).pop();
-                                  await _deletePreset(preset.id);
-                                },
-                                icon: const Icon(Icons.delete_outline_rounded),
-                              ),
-                            ],
-                          ),
-                        );
-                      },
-                    ),
+                    ],
                   ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 22),
+                  child: _loadingGlobalPresets
+                      ? const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 24),
+                          child: Center(child: CircularProgressIndicator()),
+                        )
+                      : matching.isEmpty
+                      ? const AppEmptyState(
+                          icon: Icons.bookmark_add_outlined,
+                          title: 'No presets yet',
+                          message:
+                              'Save the current stack to reuse it in another clip or project.',
+                        )
+                      : ConstrainedBox(
+                          constraints: const BoxConstraints(maxHeight: 360),
+                          child: ListView.separated(
+                            shrinkWrap: true,
+                            itemCount: matching.length,
+                            separatorBuilder: (_, _) =>
+                                const SizedBox(height: 6),
+                            itemBuilder: (context, index) {
+                              final preset = matching[index];
+                              return AppPanel(
+                                padding: EdgeInsets.zero,
+                                color: kSurfaceElevated,
+                                child: ListTile(
+                                  leading: const CircleAvatar(
+                                    backgroundColor: kSurfaceHigh,
+                                    child: Icon(
+                                      Icons.auto_awesome_rounded,
+                                      size: 18,
+                                      color: kAccent,
+                                    ),
+                                  ),
+                                  title: Text(preset.name),
+                                  subtitle: Text(
+                                    '${preset.stack.effects.length} effect${preset.stack.effects.length == 1 ? '' : 's'} · '
+                                    '${globalIds.contains(preset.id) ? 'Reusable library' : 'This project'}',
+                                  ),
+                                  onTap: () {
+                                    ref
+                                        .read(editorProvider.notifier)
+                                        .applyEffectPresetValue(
+                                          preset: preset,
+                                          scope: _target.scope,
+                                          targetId: _target.targetId,
+                                          domain: widget.domain,
+                                        );
+                                    Navigator.of(context).pop();
+                                  },
+                                  trailing: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      IconButton(
+                                        tooltip: 'Export .ccfx preset',
+                                        onPressed: () async {
+                                          Navigator.of(context).pop();
+                                          await _exportPreset(preset);
+                                        },
+                                        icon: const Icon(
+                                          Icons.ios_share_rounded,
+                                          size: 18,
+                                        ),
+                                      ),
+                                      IconButton(
+                                        tooltip: 'Delete preset',
+                                        onPressed: () async {
+                                          Navigator.of(context).pop();
+                                          await _deletePreset(preset.id);
+                                        },
+                                        icon: const Icon(
+                                          Icons.delete_outline_rounded,
+                                          size: 18,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                ),
               ],
             ),
           ),
@@ -1334,37 +1277,28 @@ class _EffectBrowserState extends State<_EffectBrowser> {
     }).toList();
     return FractionallySizedBox(
       heightFactor: 0.82,
-      child: Container(
-        decoration: const BoxDecoration(
-          color: kSurface,
-          borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
-        ),
+      child: AppSheetSurface(
         child: SafeArea(
           top: false,
           child: Column(
             children: [
-              const SizedBox(height: 10),
-              Container(
-                width: 44,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: kBorder,
-                  borderRadius: BorderRadius.circular(999),
-                ),
+              AppSheetHeader(
+                title: widget.domain == EditorEffectDomain.visual
+                    ? 'Add visual effect'
+                    : 'Add audio effect',
+                subtitle: '${visible.length} results · non-destructive',
+                icon: widget.domain == EditorEffectDomain.visual
+                    ? Icons.auto_fix_high_rounded
+                    : Icons.graphic_eq_rounded,
+                onClose: () => Navigator.of(context).maybePop(),
               ),
               Padding(
-                padding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
+                padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
                 child: TextField(
                   autofocus: true,
-                  decoration: InputDecoration(
+                  decoration: const InputDecoration(
                     hintText: 'Search effects',
-                    prefixIcon: const Icon(Icons.search_rounded),
-                    filled: true,
-                    fillColor: kSurfaceElevated,
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(14),
-                      borderSide: BorderSide.none,
-                    ),
+                    prefixIcon: Icon(Icons.search_rounded),
                   ),
                   onChanged: (value) => setState(() => _query = value),
                 ),

@@ -229,6 +229,7 @@ class _TextClipEditorSheetState extends State<TextClipEditorSheet>
       key: const ValueKey('text_clip_editor_sheet'),
       title: widget.title,
       subtitle: 'Edit live while the canvas stays visible',
+      icon: Icons.title_rounded,
       initialHeightFactor: 0.66,
       minHeightFactor: 0.48,
       maxHeightFactor: 0.92,

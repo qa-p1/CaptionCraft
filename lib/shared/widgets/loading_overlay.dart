@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../core/theme/app_theme.dart';
+import 'app_surface.dart';
 
 class LoadingOverlay extends StatelessWidget {
   final bool isLoading;
@@ -18,40 +19,50 @@ class LoadingOverlay extends StatelessWidget {
     return Stack(
       children: [
         child,
-        if (isLoading)
-          AnimatedOpacity(
-            opacity: isLoading ? 1.0 : 0.0,
-            duration: const Duration(milliseconds: 200),
-            child: Container(
-              color: kBackground.withValues(alpha: 0.85),
-              child: Center(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const SizedBox(
-                      width: 40,
-                      height: 40,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 3,
-                        valueColor:
-                            AlwaysStoppedAnimation<Color>(kAccent),
-                      ),
-                    ),
-                    if (message != null) ...[
-                      const SizedBox(height: 16),
-                      Text(
-                        message!,
-                        style: const TextStyle(
-                          color: kTextSecondary,
-                          fontSize: 14,
+        Positioned.fill(
+          child: AnimatedSwitcher(
+            duration: const Duration(milliseconds: 180),
+            child: isLoading
+                ? ColoredBox(
+                    key: const ValueKey('loading_overlay_visible'),
+                    color: Colors.black.withValues(alpha: 0.72),
+                    child: Center(
+                      child: AppPanel(
+                        elevated: true,
+                        padding: const EdgeInsets.fromLTRB(18, 16, 20, 16),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const SizedBox(
+                              width: 24,
+                              height: 24,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2.4,
+                              ),
+                            ),
+                            const SizedBox(width: 14),
+                            Flexible(
+                              child: Text(
+                                message ?? 'Working…',
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: kTextPrimary,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
                       ),
-                    ],
-                  ],
-                ),
-              ),
-            ),
+                    ),
+                  )
+                : const SizedBox.shrink(
+                    key: ValueKey('loading_overlay_hidden'),
+                  ),
           ),
+        ),
       ],
     );
   }

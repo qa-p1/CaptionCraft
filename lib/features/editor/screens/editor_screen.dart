@@ -27,6 +27,8 @@ import '../../../core/utils/subtitle_export_service.dart';
 import '../../../core/utils/subtitle_quality_service.dart';
 import '../../../core/utils/timeline_proxy_media_service.dart';
 import '../../../shared/models/project_model.dart';
+import '../../../shared/widgets/app_surface.dart';
+import '../../../shared/widgets/captioncraft_brand.dart';
 import '../../../shared/widgets/snack_bar_helper.dart';
 import '../../auth/providers/auth_provider.dart';
 import '../../home/providers/transcription_pipeline.dart';
@@ -868,48 +870,9 @@ enum _AudioAddOption { localTrack, sfx, music }
 
 enum _LastVisualAction { cancel, replace }
 
-enum _BottomActionCategory {
-  edit,
-  effects,
-  keyframes,
-  audio,
-  text,
-  timeline,
-  canvas,
-  studio,
-  discover,
-}
-
-enum _BottomActionSubgroup {
-  editTiming,
-  editTransform,
-  editDetails,
-  effectsStack,
-  effectsColor,
-  effectsLuts,
-  effectsBlur,
-  effectsMotion,
-  effectsKeyframes,
-  effectsEnhance,
-  keyframeControls,
-  keyframeCurves,
-  keyframeProperties,
-  audioMix,
-  audioEffects,
-  audioCleanup,
-  audioAutomation,
-  textObjects,
-  textCaptions,
-  textFiles,
-  timelineSelection,
-  timelineTracks,
-  timelineMarkers,
-  timelineProject,
-}
-
 class _EditorScreenState extends ConsumerState<EditorScreen>
     with WidgetsBindingObserver {
-  static const double _editorDockContentHeight = 72;
+  static const double _editorDockContentHeight = 76;
 
   Timer? _saveDebounce;
   Timer? _remoteSaveDebounce;
@@ -929,8 +892,6 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   String? _currentUserUid;
   late Project _projectSnapshot;
   _CanvasAspectRatio _canvasAspectRatio = _CanvasAspectRatio.original;
-  _BottomActionCategory? _activeBottomCategory;
-  _BottomActionSubgroup? _activeBottomSubgroup;
   final GlobalKey _previewKey = GlobalKey(debugLabel: 'editor-video-preview');
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   PersistentBottomSheetController? _textEditorSheetController;
@@ -1204,21 +1165,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       ),
       title: Row(
         children: [
-          if (!phoneToolbar)
-            Container(
-              width: 31,
-              height: 31,
-              margin: const EdgeInsets.only(right: 10),
-              decoration: BoxDecoration(
-                color: kAccent,
-                borderRadius: BorderRadius.circular(9),
-              ),
-              child: const Icon(
-                Icons.content_cut_rounded,
-                color: kOnAccent,
-                size: 17,
-              ),
-            ),
+          if (!phoneToolbar) ...[
+            const CaptionCraftMark(size: 32, radius: 8),
+            const SizedBox(width: 10),
+          ],
           Expanded(
             child: SingleChildScrollView(
               child: Column(
@@ -1287,18 +1237,65 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       ),
       actions: [
         Padding(
-          padding: EdgeInsets.fromLTRB(8, 10, compact ? 8 : 12, 10),
-          child: FilledButton.icon(
-            key: const ValueKey('editor_export_button'),
-            onPressed: _showExportDialog,
-            style: FilledButton.styleFrom(
-              padding: EdgeInsets.symmetric(horizontal: compact ? 11 : 15),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(10),
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          child: Tooltip(
+            message: 'Project aspect ratio',
+            child: InkWell(
+              key: const ValueKey('editor_aspect_ratio_button'),
+              borderRadius: BorderRadius.circular(10),
+              onTap: _openCanvasSettingsSheet,
+              child: Container(
+                height: 40,
+                padding: EdgeInsets.symmetric(horizontal: compact ? 8 : 10),
+                decoration: BoxDecoration(
+                  color: kSurfaceElevated,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: kBorder),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(
+                      Icons.aspect_ratio_rounded,
+                      size: 17,
+                      color: kTextSecondary,
+                    ),
+                    if (!phoneToolbar) ...[
+                      const SizedBox(width: 6),
+                      Text(
+                        _selectedAspectRatioLabel,
+                        style: const TextStyle(
+                          color: kTextPrimary,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
               ),
             ),
-            icon: const Icon(Icons.file_upload_outlined, size: 17),
-            label: const Text('Export'),
+          ),
+        ),
+        const SizedBox(width: 7),
+        Padding(
+          padding: EdgeInsets.fromLTRB(0, 10, compact ? 8 : 12, 10),
+          child: Tooltip(
+            message: 'Export project',
+            child: IconButton.filled(
+              key: const ValueKey('editor_export_button'),
+              onPressed: _showExportDialog,
+              style: IconButton.styleFrom(
+                minimumSize: const Size(40, 40),
+                maximumSize: const Size(40, 40),
+                backgroundColor: kAccent,
+                foregroundColor: kOnAccent,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10),
+                ),
+              ),
+              icon: const Icon(Icons.ios_share_rounded, size: 19),
+            ),
           ),
         ),
       ],
@@ -1853,91 +1850,78 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final preset = await showModalBottomSheet<TimelineCurvePreset>(
       context: context,
       isScrollControlled: true,
-      backgroundColor: kSurface,
-      builder: (sheetContext) => SafeArea(
-        child: SizedBox(
-          height: math.min(
-            MediaQuery.sizeOf(sheetContext).height * 0.72,
-            620.0,
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(18, 18, 18, 6),
-                child: Row(
-                  children: [
-                    const Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'Curve to next state',
-                            style: TextStyle(
-                              color: kTextPrimary,
-                              fontSize: 18,
-                              fontWeight: FontWeight.w800,
-                            ),
-                          ),
-                          SizedBox(height: 3),
-                          Text(
-                            'Applied to every property captured at this keyframe.',
-                            style: TextStyle(
-                              color: kTextSecondary,
-                              fontSize: 11,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    IconButton(
-                      onPressed: () => Navigator.pop(sheetContext),
-                      icon: const Icon(Icons.close_rounded),
-                    ),
-                  ],
+      backgroundColor: Colors.transparent,
+      builder: (sheetContext) => AppSheetSurface(
+        child: SafeArea(
+          top: false,
+          child: SizedBox(
+            height: math.min(
+              MediaQuery.sizeOf(sheetContext).height * 0.72,
+              620.0,
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                AppSheetHeader(
+                  title: 'Curve to next state',
+                  subtitle:
+                      'Applied to every property captured at this keyframe',
+                  icon: Icons.show_chart_rounded,
+                  onClose: () => Navigator.pop(sheetContext),
                 ),
-              ),
-              Expanded(
-                child: GridView.builder(
-                  padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
-                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount: 2,
-                    childAspectRatio: 3.2,
-                    crossAxisSpacing: 8,
-                    mainAxisSpacing: 8,
-                  ),
-                  itemCount: timelineCurvePresets.length,
-                  itemBuilder: (context, index) {
-                    final candidate = timelineCurvePresets[index];
-                    return OutlinedButton.icon(
-                      key: ValueKey('state_curve_${candidate.id}'),
-                      onPressed: () => Navigator.pop(sheetContext, candidate),
-                      icon: Icon(
-                        selectedPreset?.id == candidate.id
-                            ? Icons.check_circle_rounded
-                            : Icons.show_chart_rounded,
-                        size: 17,
-                      ),
-                      label: Text(candidate.label),
-                    );
-                  },
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
-                child: SizedBox(
-                  width: double.infinity,
-                  child: FilledButton.icon(
-                    onPressed: () {
-                      openCustomGraph = true;
-                      Navigator.pop(sheetContext);
+                Expanded(
+                  child: GridView.builder(
+                    padding: const EdgeInsets.fromLTRB(14, 14, 14, 14),
+                    gridDelegate:
+                        const SliverGridDelegateWithFixedCrossAxisCount(
+                          crossAxisCount: 2,
+                          childAspectRatio: 3.2,
+                          crossAxisSpacing: 8,
+                          mainAxisSpacing: 8,
+                        ),
+                    itemCount: timelineCurvePresets.length,
+                    itemBuilder: (context, index) {
+                      final candidate = timelineCurvePresets[index];
+                      return OutlinedButton.icon(
+                        key: ValueKey('state_curve_${candidate.id}'),
+                        style: OutlinedButton.styleFrom(
+                          backgroundColor: selectedPreset?.id == candidate.id
+                              ? kAccent.withValues(alpha: 0.1)
+                              : kSurfaceElevated,
+                          side: BorderSide(
+                            color: selectedPreset?.id == candidate.id
+                                ? kAccent
+                                : kBorder,
+                          ),
+                        ),
+                        onPressed: () => Navigator.pop(sheetContext, candidate),
+                        icon: Icon(
+                          selectedPreset?.id == candidate.id
+                              ? Icons.check_circle_rounded
+                              : Icons.show_chart_rounded,
+                          size: 17,
+                        ),
+                        label: Text(candidate.label),
+                      );
                     },
-                    icon: const Icon(Icons.multiline_chart_rounded),
-                    label: const Text('Custom curve in graph editor'),
                   ),
                 ),
-              ),
-            ],
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+                  child: SizedBox(
+                    width: double.infinity,
+                    child: FilledButton.icon(
+                      onPressed: () {
+                        openCustomGraph = true;
+                        Navigator.pop(sheetContext);
+                      },
+                      icon: const Icon(Icons.multiline_chart_rounded),
+                      label: const Text('Open custom curve editor'),
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -2065,6 +2049,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             return ResizableEditorSheet(
               title: 'Keyframe graph',
               subtitle: 'The clip was removed from the timeline.',
+              icon: Icons.multiline_chart_rounded,
               initialHeightFactor: 0.78,
               minHeightFactor: 0.52,
               maxHeightFactor: 0.94,
@@ -2087,6 +2072,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             title: 'Keyframe graph',
             subtitle:
                 '${currentClip.label} • Curves are shared by preview and export',
+            icon: Icons.multiline_chart_rounded,
             initialHeightFactor: 0.78,
             minHeightFactor: 0.52,
             maxHeightFactor: 0.94,
@@ -3001,77 +2987,54 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       return null;
     }
 
-    return showModalBottomSheet<TimelineClip>(
+    return showFixedEditorSheet<TimelineClip>(
       context: context,
-      backgroundColor: kSurface,
-      isScrollControlled: true,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (_) => SafeArea(
-        child: ConstrainedBox(
-          constraints: BoxConstraints(
-            maxHeight: MediaQuery.of(context).size.height * 0.56,
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const SizedBox(height: 10),
-              Container(
-                width: 42,
-                height: 4,
+      title: 'Choose caption source',
+      subtitle: 'Select the video or audio clip to transcribe',
+      icon: Icons.closed_caption_rounded,
+      heightFactor: 0.56,
+      scrollable: false,
+      contentPadding: const EdgeInsets.fromLTRB(12, 12, 12, 20),
+      builder: (sheetContext) => ListView.separated(
+        itemCount: captionSources.length,
+        separatorBuilder: (_, _) => const SizedBox(height: 7),
+        itemBuilder: (_, index) {
+          final clip = captionSources[index];
+          final isAudio = clip.type == TimelineTrackType.audio;
+          return AppPanel(
+            padding: EdgeInsets.zero,
+            color: kSurfaceElevated,
+            child: ListTile(
+              leading: Container(
+                width: 36,
+                height: 36,
                 decoration: BoxDecoration(
-                  color: kBorder,
-                  borderRadius: BorderRadius.circular(999),
+                  color: kSurfaceHigh,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Icon(
+                  isAudio
+                      ? Icons.graphic_eq_rounded
+                      : Icons.movie_creation_outlined,
+                  color: isAudio ? kInfo : kAccent,
+                  size: 19,
                 ),
               ),
-              const SizedBox(height: 14),
-              Text(
-                'Choose caption source',
-                style: TextStyle(
-                  color: kTextPrimary,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                ),
+              title: Text(
+                clip.label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
               ),
-              const SizedBox(height: 8),
-              Flexible(
-                child: ListView.separated(
-                  shrinkWrap: true,
-                  itemCount: captionSources.length,
-                  separatorBuilder: (_, _) =>
-                      const Divider(color: kBorder, height: 1),
-                  itemBuilder: (_, index) {
-                    final clip = captionSources[index];
-                    final isAudio = clip.type == TimelineTrackType.audio;
-                    return ListTile(
-                      leading: Icon(
-                        isAudio
-                            ? Icons.graphic_eq_rounded
-                            : Icons.movie_creation_outlined,
-                        color: kTextPrimary,
-                      ),
-                      title: Text(
-                        clip.label,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(color: kTextPrimary),
-                      ),
-                      subtitle: Text(
-                        '${isAudio ? 'Audio' : 'Video'} • '
-                        '${SubtitleEntry.formatDisplayTime(clip.startTime)} - '
-                        '${SubtitleEntry.formatDisplayTime(clip.endTime)}',
-                        style: TextStyle(color: kTextSecondary, fontSize: 12),
-                      ),
-                      onTap: () => Navigator.pop(context, clip),
-                    );
-                  },
-                ),
+              subtitle: Text(
+                '${isAudio ? 'Audio' : 'Video'} · '
+                '${SubtitleEntry.formatDisplayTime(clip.startTime)} – '
+                '${SubtitleEntry.formatDisplayTime(clip.endTime)}',
               ),
-              const SizedBox(height: 8),
-            ],
-          ),
-        ),
+              trailing: const Icon(Icons.chevron_right_rounded, size: 19),
+              onTap: () => Navigator.pop(sheetContext, clip),
+            ),
+          );
+        },
       ),
     );
   }
@@ -7027,10 +6990,32 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     required Widget child,
     bool resizable = false,
   }) {
+    final normalizedTitle = title.toLowerCase();
+    final icon = normalizedTitle.contains('color')
+        ? Icons.palette_outlined
+        : normalizedTitle.contains('blur')
+        ? Icons.blur_on_rounded
+        : normalizedTitle.contains('crop')
+        ? Icons.crop_rounded
+        : normalizedTitle.contains('tim') || normalizedTitle.contains('speed')
+        ? Icons.av_timer_rounded
+        : normalizedTitle.contains('canvas') ||
+              normalizedTitle.contains('format')
+        ? Icons.aspect_ratio_rounded
+        : normalizedTitle.contains('caption') ||
+              normalizedTitle.contains('subtitle')
+        ? Icons.closed_caption_rounded
+        : normalizedTitle.contains('filter')
+        ? Icons.filter_vintage_outlined
+        : normalizedTitle.contains('transform') ||
+              normalizedTitle.contains('inspector')
+        ? Icons.open_with_rounded
+        : Icons.tune_rounded;
     if (resizable) {
       return ResizableEditorSheet(
         title: title,
         subtitle: subtitle,
+        icon: icon,
         onClose: () => Navigator.pop(context),
         child: child,
       );
@@ -7038,6 +7023,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     return FixedEditorSheet(
       title: title,
       subtitle: subtitle,
+      icon: icon,
       heightFactor: 0.52,
       onClose: () => Navigator.pop(context),
       child: child,
@@ -7342,6 +7328,14 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     }
   }
 
+  String get _selectedAspectRatioLabel => switch (_canvasAspectRatio) {
+    _CanvasAspectRatio.original => 'Original',
+    _CanvasAspectRatio.ratio16x9 => '16:9',
+    _CanvasAspectRatio.ratio9x16 => '9:16',
+    _CanvasAspectRatio.ratio1x1 => '1:1',
+    _CanvasAspectRatio.ratio4x5 => '4:5',
+  };
+
   Future<void> _openSubtitleTextEditor(SubtitleEntry entry) async {
     final editorState = ref.read(editorProvider);
     final clip = _clipById(entry.id, editorState);
@@ -7360,6 +7354,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       context: context,
       title: 'Add overlay',
       subtitle: 'Add a visual layer at the current playhead',
+      icon: Icons.layers_outlined,
       heightFactor: 0.48,
       builder: (sheetContext) => Column(
         children: [
@@ -7405,6 +7400,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       context: context,
       title: 'Add text',
       subtitle: 'Create a title or work with timed subtitles',
+      icon: Icons.title_rounded,
       heightFactor: 0.36,
       builder: (sheetContext) => Column(
         children: [
@@ -7440,6 +7436,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       context: context,
       title: 'Add audio',
       subtitle: 'Add a local sound or open an editor library',
+      icon: Icons.graphic_eq_rounded,
       heightFactor: 0.48,
       builder: (sheetContext) => Column(
         children: [
@@ -9559,419 +9556,41 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final bottomInset = MediaQuery.viewPaddingOf(context).bottom;
     final editorState = ref.read(editorProvider);
     final capabilities = _selectionCapabilitiesFor(editorState, selectedClip);
-    final activeCategory = _activeBottomCategory;
-    final requestedSubgroup = _activeBottomSubgroup;
-    final activeSubgroup =
-        activeCategory != null &&
-            requestedSubgroup != null &&
-            _subgroupsFor(
-              activeCategory,
-            ).any((subgroup) => subgroup.$1 == requestedSubgroup)
-        ? requestedSubgroup
-        : null;
-
-    return Container(
-      key: const ValueKey('editor_tool_dock'),
-      height: _editorDockContentHeight + bottomInset,
-      padding: EdgeInsets.fromLTRB(8, 8, 8, 8 + bottomInset),
-      decoration: const BoxDecoration(
-        color: kSurface,
-        border: Border(top: BorderSide(color: kBorder)),
-      ),
-      child: AnimatedSwitcher(
-        duration: const Duration(milliseconds: 220),
-        switchInCurve: Curves.easeOutCubic,
-        switchOutCurve: Curves.easeInCubic,
-        transitionBuilder: (child, animation) {
-          final returningHome = child.key == const ValueKey('categories');
-          final offset = Tween<Offset>(
-            begin: returningHome
-                ? const Offset(-0.16, 0)
-                : const Offset(0.16, 0),
-            end: Offset.zero,
-          ).animate(animation);
-          return FadeTransition(
-            opacity: animation,
-            child: SlideTransition(position: offset, child: child),
-          );
-        },
-        child: activeCategory == null
-            ? _buildDockCategoryRow()
-            : activeSubgroup == null
-            ? _buildDockSubgroupRow(activeCategory, selectedClip, capabilities)
-            : _buildDockToolRow(
-                activeSubgroup,
-                editorState,
-                selectedClip,
-                capabilities,
-              ),
-      ),
-    );
-  }
-
-  double _editorDockHeightFor(BuildContext context) {
-    return _editorDockContentHeight + MediaQuery.viewPaddingOf(context).bottom;
-  }
-
-  Widget _buildDockCategoryRow() {
-    const categories = [
-      (
-        _BottomActionCategory.edit,
-        'Edit',
-        'Timing, transform and clip details',
-        Icons.content_cut_rounded,
-      ),
-      (
-        _BottomActionCategory.effects,
-        'Effects',
-        'Color, blur, motion and enhancement',
-        Icons.auto_fix_high_rounded,
-      ),
-      (
-        _BottomActionCategory.keyframes,
-        'Keyframes',
-        'State animation, navigation and graph curves',
-        Icons.diamond_outlined,
-      ),
-      (
-        _BottomActionCategory.audio,
-        'Audio',
-        'Mix, cleanup and automation',
-        Icons.graphic_eq_rounded,
-      ),
-      (
-        _BottomActionCategory.text,
-        'Text',
-        'Text objects and captions',
-        Icons.title_rounded,
-      ),
-      (
-        _BottomActionCategory.timeline,
-        'Timeline',
-        'Selection, tracks, markers and project setup',
-        Icons.view_timeline_rounded,
-      ),
-      (
-        _BottomActionCategory.canvas,
-        'Canvas',
-        'Open canvas format, background and guides',
-        Icons.aspect_ratio_rounded,
-      ),
-      (
-        _BottomActionCategory.studio,
-        'Studio',
-        'Open Creator Lab publishing workflows',
-        Icons.auto_awesome_rounded,
-      ),
-      (
-        _BottomActionCategory.discover,
-        'Discover',
-        'Find and download media without leaving the editor',
-        Icons.travel_explore_rounded,
-      ),
-    ];
-    return _buildActionScroller(
-      key: const ValueKey('categories'),
-      // Keep comfortable touch targets and let the existing horizontal
-      // scroller reveal the remaining categories on narrow screens.
-      actions: [
-        for (final category in categories)
-          _ActionSpec(
-            key: ValueKey('dock_category_${category.$1.name}'),
-            width: 72,
-            group: 'Categories',
-            label: category.$2,
-            tooltip: category.$3,
-            icon: category.$4,
-            onTap: category.$1 == _BottomActionCategory.canvas
-                ? _openCanvasSettingsSheet
-                : category.$1 == _BottomActionCategory.studio
-                ? _openCreatorLab
-                : category.$1 == _BottomActionCategory.discover
-                ? _openDiscoverSheet
-                : () => setState(() {
-                    _activeBottomCategory = category.$1;
-                    _activeBottomSubgroup = null;
-                  }),
-          ),
-      ],
-    );
-  }
-
-  List<(_BottomActionSubgroup, String, String, IconData)> _subgroupsFor(
-    _BottomActionCategory category,
-  ) {
-    return switch (category) {
-      _BottomActionCategory.edit => const [
-        (
-          _BottomActionSubgroup.editTiming,
-          'Timing',
-          'Trim, speed, reverse and freeze',
-          Icons.av_timer_rounded,
-        ),
-        (
-          _BottomActionSubgroup.editTransform,
-          'Transform',
-          'Layout, crop, rotation and opacity',
-          Icons.crop_rotate_rounded,
-        ),
-        (
-          _BottomActionSubgroup.editDetails,
-          'Details',
-          'Attributes, notes and frame nudging',
-          Icons.tune_rounded,
-        ),
-      ],
-      _BottomActionCategory.effects => const [
-        (
-          _BottomActionSubgroup.effectsStack,
-          'Stack',
-          'Layer, reorder, mask and animate effects',
-          Icons.auto_awesome_rounded,
-        ),
-        (
-          _BottomActionSubgroup.effectsColor,
-          'Color',
-          'Chroma key, filters and adjustments',
-          Icons.tonality_rounded,
-        ),
-        (
-          _BottomActionSubgroup.effectsLuts,
-          'LUTs',
-          'Browse, import and control reusable color looks',
-          Icons.color_lens_rounded,
-        ),
-        (
-          _BottomActionSubgroup.effectsBlur,
-          'Blur',
-          'Whole-frame and privacy-region blur',
-          Icons.blur_on_rounded,
-        ),
-        (
-          _BottomActionSubgroup.effectsMotion,
-          'Motion',
-          'Animations and transitions',
-          Icons.auto_awesome_motion_rounded,
-        ),
-        (
-          _BottomActionSubgroup.effectsEnhance,
-          'Enhance',
-          'Stabilization and noise reduction',
-          Icons.high_quality_rounded,
-        ),
-      ],
-      _BottomActionCategory.keyframes => const [
-        (
-          _BottomActionSubgroup.keyframeControls,
-          'States',
-          'Add, delete, previous and next state',
-          Icons.diamond_rounded,
-        ),
-        (
-          _BottomActionSubgroup.keyframeCurves,
-          'Curves',
-          'Graph editor, easing presets and custom Bézier curves',
-          Icons.multiline_chart_rounded,
-        ),
-        (
-          _BottomActionSubgroup.keyframeProperties,
-          'Advanced',
-          'Edit an individual animation channel',
-          Icons.tune_rounded,
-        ),
-      ],
-      _BottomActionCategory.audio => const [
-        (
-          _BottomActionSubgroup.audioMix,
-          'Mixer',
-          'Volume, pan, fades and normalization',
-          Icons.tune_rounded,
-        ),
-        (
-          _BottomActionSubgroup.audioEffects,
-          'Effects',
-          'EQ, dynamics, restoration and pitch',
-          Icons.multitrack_audio_rounded,
-        ),
-        (
-          _BottomActionSubgroup.audioCleanup,
-          'Cleanup',
-          'Denoise and automatic ducking',
-          Icons.noise_control_off_rounded,
-        ),
-      ],
-      _BottomActionCategory.text => const [
-        (
-          _BottomActionSubgroup.textObjects,
-          'Text',
-          'Edit the selected text object',
-          Icons.edit_rounded,
-        ),
-        (
-          _BottomActionSubgroup.textCaptions,
-          'Captions',
-          'Subtitle styling and cleanup',
-          Icons.closed_caption_rounded,
-        ),
-        (
-          _BottomActionSubgroup.textFiles,
-          'Files',
-          'Import and export subtitle files',
-          Icons.file_open_outlined,
-        ),
-      ],
-      _BottomActionCategory.timeline => const [
-        (
-          _BottomActionSubgroup.timelineSelection,
-          'Selection',
-          'Batch selection and splitting',
-          Icons.select_all_rounded,
-        ),
-        (
-          _BottomActionSubgroup.timelineTracks,
-          'Tracks',
-          'Rename, duplicate and manage all tracks',
-          Icons.layers_rounded,
-        ),
-        (
-          _BottomActionSubgroup.timelineMarkers,
-          'Markers',
-          'Beat grids and chapter markers',
-          Icons.bookmarks_outlined,
-        ),
-        (
-          _BottomActionSubgroup.timelineProject,
-          'Project',
-          'Frame rate, timecode and clip labels',
-          Icons.settings_suggest_outlined,
-        ),
-      ],
-      _BottomActionCategory.canvas ||
-      _BottomActionCategory.studio ||
-      _BottomActionCategory.discover => const [],
-    };
-  }
-
-  Widget _buildDockSubgroupRow(
-    _BottomActionCategory category,
-    TimelineClip? selectedClip,
-    _SelectionCapabilities capabilities,
-  ) {
-    final subgroups = _subgroupsFor(category);
-    return _buildActionScroller(
-      key: ValueKey('subgroups_${category.name}'),
-      spread: true,
-      actions: [
-        _dockBackAction(
-          tooltip: 'Back to tool categories',
-          onTap: () => setState(() {
-            _activeBottomCategory = null;
-            _activeBottomSubgroup = null;
-          }),
-        ),
-        for (final subgroup in subgroups)
-          _ActionSpec(
-            key: ValueKey('dock_subgroup_${subgroup.$1.name}'),
-            group: category.name,
-            label: subgroup.$2,
-            tooltip: subgroup.$3,
-            icon: subgroup.$4,
-            onTap: _isDirectBottomSubgroup(subgroup.$1)
-                ? _directBottomSubgroupAction(
-                    subgroup.$1,
-                    selectedClip,
-                    capabilities,
-                  )
-                : () => setState(() => _activeBottomSubgroup = subgroup.$1),
-          ),
-      ],
-    );
-  }
-
-  bool _isDirectBottomSubgroup(_BottomActionSubgroup subgroup) {
-    return subgroup == _BottomActionSubgroup.audioMix ||
-        subgroup == _BottomActionSubgroup.textObjects;
-  }
-
-  VoidCallback? _directBottomSubgroupAction(
-    _BottomActionSubgroup subgroup,
-    TimelineClip? selectedClip,
-    _SelectionCapabilities capabilities,
-  ) {
-    return switch (subgroup) {
-      _BottomActionSubgroup.audioMix =>
-        selectedClip != null && capabilities.canAdjustAudio
-            ? () => _openAudioControlsSheet(selectedClip)
-            : null,
-      _BottomActionSubgroup.textObjects =>
-        selectedClip?.type == TimelineTrackType.text && capabilities.canEdit
-            ? () => _editTextClip(selectedClip!)
-            : null,
-      _ => null,
-    };
-  }
-
-  Widget _buildDockToolRow(
-    _BottomActionSubgroup subgroup,
-    EditorState editorState,
-    TimelineClip? selectedClip,
-    _SelectionCapabilities capabilities,
-  ) {
-    final actions = _bottomActionsForSubgroup(
-      subgroup,
+    final actions = _primaryDockActions(
       editorState,
       selectedClip,
       capabilities,
     );
-    return _buildActionScroller(
-      key: ValueKey('tools_${subgroup.name}'),
-      actions: [
-        _dockBackAction(
-          tooltip:
-              'Back to ${_bottomCategoryLabel(_activeBottomCategory!)} tools',
-          onTap: () => setState(() => _activeBottomSubgroup = null),
-        ),
-        ...actions,
-      ],
+
+    return Container(
+      key: const ValueKey('editor_tool_dock'),
+      height: _editorDockContentHeight + bottomInset,
+      padding: EdgeInsets.fromLTRB(8, 7, 8, 7 + bottomInset),
+      decoration: BoxDecoration(
+        color: kSurface,
+        border: const Border(top: BorderSide(color: kBorder)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.28),
+            blurRadius: 14,
+            offset: const Offset(0, -5),
+          ),
+        ],
+      ),
+      child: _buildActionScroller(
+        key: const ValueKey('editor_primary_tools'),
+        actions: actions,
+      ),
     );
   }
 
-  _ActionSpec _dockBackAction({
-    required String tooltip,
-    required VoidCallback onTap,
-  }) {
-    return _ActionSpec(
-      key: const ValueKey('dock_back_button'),
-      group: 'Navigation',
-      label: 'Back',
-      tooltip: tooltip,
-      icon: Icons.arrow_back_rounded,
-      onTap: onTap,
-    );
-  }
-
-  String _bottomCategoryLabel(_BottomActionCategory category) {
-    return switch (category) {
-      _BottomActionCategory.edit => 'Edit',
-      _BottomActionCategory.effects => 'Effects',
-      _BottomActionCategory.keyframes => 'Keyframes',
-      _BottomActionCategory.audio => 'Audio',
-      _BottomActionCategory.text => 'Text',
-      _BottomActionCategory.timeline => 'Timeline',
-      _BottomActionCategory.canvas => 'Canvas',
-      _BottomActionCategory.studio => 'Studio',
-      _BottomActionCategory.discover => 'Discover',
-    };
-  }
-
-  List<_ActionSpec> _bottomActionsForSubgroup(
-    _BottomActionSubgroup subgroup,
+  List<_ActionSpec> _primaryDockActions(
     EditorState editorState,
     TimelineClip? selectedClip,
     _SelectionCapabilities capabilities,
   ) {
     final clipActions = _clipDockActions(selectedClip, capabilities);
-    final effectActions = _visualDockActions(selectedClip, capabilities);
+    final visualActions = _visualDockActions(selectedClip, capabilities);
     final audioActions = _audioDockActions(selectedClip, capabilities);
     final keyframeActions = _keyframeDockActions(
       editorState,
@@ -9985,125 +9604,365 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       capabilities,
     );
 
-    return switch (subgroup) {
-      _BottomActionSubgroup.editTiming =>
-        clipActions
-            .where(
-              (action) =>
-                  action.group == 'Timing' &&
-                  (action.label == 'Timing' ||
-                      action.label == 'Freeze' ||
-                      action.label == 'Unfreeze'),
-            )
-            .toList(),
-      _BottomActionSubgroup.editTransform =>
-        clipActions
-            .where(
-              (action) =>
-                  action.group == 'Transform' &&
-                  (action.label == 'Inspector' || action.label == 'Crop'),
-            )
-            .toList(),
-      _BottomActionSubgroup.editDetails =>
-        clipActions
-            .where(
-              (action) =>
-                  action.group == 'Attributes' ||
-                  action.group == 'Precision' ||
-                  (!capabilities.canVisualEffects &&
-                      action.group == 'Arrange' &&
-                      (action.label == 'Enable' || action.label == 'Disable')),
-            )
-            .toList(),
-      _BottomActionSubgroup.effectsStack =>
-        effectActions.where((action) => action.group == 'Stack').toList(),
-      _BottomActionSubgroup.effectsColor =>
-        effectActions
-            .where(
-              (action) =>
-                  (action.group == 'Keying' || action.group == 'Color') &&
-                  action.label != 'Remove',
-            )
-            .toList(),
-      _BottomActionSubgroup.effectsLuts =>
-        effectActions.where((action) => action.group == 'LUTs').toList(),
-      _BottomActionSubgroup.effectsBlur =>
-        effectActions
-            .where(
-              (action) => action.group == 'Blur' && action.label != 'Remove',
-            )
-            .toList(),
-      _BottomActionSubgroup.effectsMotion =>
-        effectActions.where((action) => action.group == 'Motion').toList(),
-      _BottomActionSubgroup.effectsKeyframes =>
-        effectActions.where((action) => action.group == 'Keyframes').toList(),
-      _BottomActionSubgroup.effectsEnhance =>
-        effectActions
-            .where(
-              (action) =>
-                  action.group == 'Enhance' &&
-                  (action.label == 'Stabilize' ||
-                      action.label == 'Stabilized' ||
-                      action.label == 'Denoise' ||
-                      action.label == 'Denoised'),
-            )
-            .toList(),
-      _BottomActionSubgroup.keyframeControls =>
-        keyframeActions.where((action) => action.group == 'States').toList(),
-      _BottomActionSubgroup.keyframeCurves =>
-        keyframeActions.where((action) => action.group == 'Curves').toList(),
-      _BottomActionSubgroup.keyframeProperties =>
-        keyframeActions.where((action) => action.group == 'Advanced').toList(),
-      _BottomActionSubgroup.audioMix =>
-        audioActions
-            .where((action) => action.group == 'Mix' && action.label == 'Mixer')
-            .toList(),
-      _BottomActionSubgroup.audioEffects =>
-        audioActions.where((action) => action.group == 'Effects').toList(),
-      _BottomActionSubgroup.audioCleanup =>
-        audioActions
-            .where(
-              (action) =>
-                  action.group == 'Enhance' &&
-                  ((action.label == 'Denoise' || action.label == 'Denoised') ||
-                      action.label == 'Auto Duck' ||
-                      action.label == 'Ducking On'),
-            )
-            .toList(),
-      _BottomActionSubgroup.audioAutomation =>
-        audioActions.where((action) => action.group == 'Automation').toList(),
-      _BottomActionSubgroup.textObjects =>
-        textActions.where((action) => action.label == 'Edit Text').toList(),
-      _BottomActionSubgroup.textCaptions =>
-        textActions.where((action) => action.group == 'Captions').toList(),
-      _BottomActionSubgroup.textFiles =>
-        textActions.where((action) => action.group == 'Caption Files').toList(),
-      _BottomActionSubgroup.timelineSelection =>
-        timelineActions.where((action) => action.group == 'Selection').toList(),
-      _BottomActionSubgroup.timelineTracks =>
-        timelineActions
-            .where(
-              (action) =>
-                  action.group == 'Tracks' &&
-                  action.label != 'Move Up' &&
-                  action.label != 'Move Down',
-            )
-            .toList(),
-      _BottomActionSubgroup.timelineMarkers =>
-        timelineActions.where((action) => action.group == 'Markers').toList(),
-      _BottomActionSubgroup.timelineProject =>
-        timelineActions
-            .where(
-              (action) =>
-                  action.group == 'Workspace' &&
-                  (action.label == 'Frame Rate' ||
-                      action.label == 'Timecode' ||
-                      action.label == 'Labels' ||
-                      action.label == 'Preview' ||
-                      action.label == 'Proxies'),
-            )
-            .toList(),
-    };
+    _ActionSpec pick(
+      List<_ActionSpec> source,
+      String label, {
+      String? group,
+      required String key,
+      String? displayLabel,
+      String? tooltip,
+      IconData? icon,
+      bool destructive = false,
+    }) {
+      final action = source.firstWhere(
+        (candidate) =>
+            candidate.label == label &&
+            (group == null || candidate.group == group),
+      );
+      return action.copyWith(
+        key: ValueKey('dock_primary_$key'),
+        label: displayLabel,
+        tooltip: tooltip,
+        icon: icon,
+        destructive: destructive,
+      );
+    }
+
+    final more = _ActionSpec(
+      key: const ValueKey('dock_primary_more'),
+      group: 'More',
+      label: 'More',
+      tooltip: 'Open every editor tool in one sheet',
+      icon: Icons.grid_view_rounded,
+      onTap: _openAllToolsSheet,
+    );
+
+    if (selectedClip == null) {
+      return [
+        pick(textActions, 'Add Text', key: 'add_text'),
+        pick(textActions, 'Subtitles', key: 'subtitles'),
+        pick(textActions, 'Style', key: 'caption_style'),
+        pick(visualActions, 'Adjustment', key: 'adjustment'),
+        pick(visualActions, 'Effect Stack', key: 'effects'),
+        _ActionSpec(
+          key: const ValueKey('dock_primary_canvas'),
+          group: 'Project',
+          label: 'Canvas',
+          tooltip: 'Aspect ratio, background and canvas guides',
+          icon: Icons.aspect_ratio_rounded,
+          onTap: _openCanvasSettingsSheet,
+        ),
+        _ActionSpec(
+          key: const ValueKey('dock_primary_discover'),
+          group: 'Media',
+          label: 'Discover',
+          tooltip: 'Find and download media',
+          icon: Icons.travel_explore_rounded,
+          onTap: _openDiscoverSheet,
+        ),
+        _ActionSpec(
+          key: const ValueKey('dock_primary_studio'),
+          group: 'Studio',
+          label: 'Studio',
+          tooltip: 'Open Creator Lab',
+          icon: Icons.auto_awesome_rounded,
+          onTap: _openCreatorLab,
+        ),
+        pick(timelineActions, 'Select All', key: 'select_all'),
+        pick(timelineActions, 'Split All', key: 'split_all'),
+        more,
+      ];
+    }
+
+    if (selectedClip.type == TimelineTrackType.audio) {
+      return [
+        pick(clipActions, 'Split', key: 'split'),
+        pick(clipActions, 'Timing', key: 'timing'),
+        pick(audioActions, 'Mixer', key: 'audio', displayLabel: 'Mixer'),
+        pick(audioActions, 'Audio FX', key: 'audio_fx'),
+        pick(audioActions, 'Fade In', key: 'fade_in'),
+        pick(audioActions, 'Fade Out', key: 'fade_out'),
+        pick(
+          audioActions,
+          audioActions
+              .firstWhere(
+                (action) =>
+                    action.label == 'Denoise' || action.label == 'Denoised',
+              )
+              .label,
+          key: 'denoise',
+          displayLabel: 'Denoise',
+        ),
+        pick(
+          audioActions,
+          audioActions
+              .firstWhere(
+                (action) =>
+                    action.label == 'Auto Duck' || action.label == 'Ducking On',
+              )
+              .label,
+          key: 'auto_duck',
+          displayLabel: 'Auto Duck',
+        ),
+        pick(
+          keyframeActions,
+          keyframeActions.first.label,
+          group: 'States',
+          key: 'keyframe',
+          displayLabel: 'Keyframe',
+          icon: Icons.diamond_outlined,
+        ),
+        pick(clipActions, 'Duplicate', key: 'duplicate'),
+        pick(clipActions, 'Delete', key: 'delete', destructive: true),
+        more,
+      ];
+    }
+
+    if (selectedClip.type == TimelineTrackType.text) {
+      return [
+        pick(textActions, 'Edit Text', key: 'edit_text'),
+        pick(clipActions, 'Split', key: 'split'),
+        pick(
+          clipActions,
+          'Inspector',
+          key: 'transform',
+          displayLabel: 'Transform',
+        ),
+        pick(visualActions, 'Effect Stack', key: 'effects'),
+        pick(visualActions, 'Adjust', key: 'color', displayLabel: 'Color'),
+        pick(visualActions, 'Animate', key: 'animation'),
+        pick(
+          keyframeActions,
+          keyframeActions.first.label,
+          group: 'States',
+          key: 'keyframe',
+          displayLabel: 'Keyframe',
+          icon: Icons.diamond_outlined,
+        ),
+        pick(clipActions, 'Duplicate', key: 'duplicate'),
+        pick(clipActions, 'Delete', key: 'delete', destructive: true),
+        more,
+      ];
+    }
+
+    return [
+      pick(clipActions, 'Split', key: 'split'),
+      pick(clipActions, 'Timing', key: 'timing'),
+      pick(
+        clipActions,
+        'Inspector',
+        key: 'transform',
+        displayLabel: 'Transform',
+        icon: Icons.open_with_rounded,
+      ),
+      pick(clipActions, 'Crop', key: 'crop'),
+      pick(
+        visualActions,
+        'Effect Stack',
+        key: 'effects',
+        displayLabel: 'Effects',
+      ),
+      pick(visualActions, 'Chroma Key', key: 'chroma', displayLabel: 'Chroma'),
+      pick(visualActions, 'Adjust', key: 'color', displayLabel: 'Color'),
+      pick(visualActions, 'Animate', key: 'animation', displayLabel: 'Animate'),
+      pick(audioActions, 'Mixer', key: 'audio', displayLabel: 'Audio'),
+      pick(
+        keyframeActions,
+        keyframeActions.first.label,
+        group: 'States',
+        key: 'keyframe',
+        displayLabel: 'Keyframe',
+        icon: Icons.diamond_outlined,
+      ),
+      pick(clipActions, 'Duplicate', key: 'duplicate'),
+      pick(clipActions, 'Delete', key: 'delete', destructive: true),
+      more,
+    ];
+  }
+
+  void _openAllToolsSheet() {
+    final editorState = ref.read(editorProvider);
+    final selectedClip = _selectedClipFromState(editorState);
+    final capabilities = _selectionCapabilitiesFor(editorState, selectedClip);
+    final sections = <(String, IconData, List<_ActionSpec>)>[
+      (
+        'Clip',
+        Icons.content_cut_rounded,
+        _clipDockActions(selectedClip, capabilities),
+      ),
+      (
+        'Visual',
+        Icons.auto_fix_high_rounded,
+        _visualDockActions(selectedClip, capabilities),
+      ),
+      (
+        'Audio',
+        Icons.graphic_eq_rounded,
+        _audioDockActions(selectedClip, capabilities),
+      ),
+      (
+        'Animation',
+        Icons.diamond_outlined,
+        _keyframeDockActions(editorState, selectedClip, capabilities),
+      ),
+      (
+        'Text & captions',
+        Icons.closed_caption_rounded,
+        _textDockActions(selectedClip, capabilities),
+      ),
+      (
+        'Timeline & project',
+        Icons.view_timeline_rounded,
+        _timelineDockActions(editorState, selectedClip, capabilities),
+      ),
+    ];
+
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: Colors.black.withValues(alpha: 0.54),
+      builder: (sheetContext) => AppSheetSurface(
+        key: const ValueKey('editor_all_tools_sheet'),
+        child: SizedBox(
+          height: MediaQuery.sizeOf(sheetContext).height * 0.78,
+          child: Column(
+            children: [
+              AppSheetHeader(
+                title: 'All tools',
+                subtitle: selectedClip == null
+                    ? 'Project tools and workspace actions'
+                    : 'Editing ${selectedClip.label}',
+                icon: Icons.grid_view_rounded,
+                onClose: () => Navigator.of(sheetContext).pop(),
+              ),
+              Expanded(
+                child: ListView.separated(
+                  padding: const EdgeInsets.fromLTRB(16, 18, 16, 28),
+                  itemCount: sections.length,
+                  separatorBuilder: (_, _) => const SizedBox(height: 22),
+                  itemBuilder: (context, index) {
+                    final section = sections[index];
+                    return _buildAllToolsSection(
+                      sheetContext,
+                      title: section.$1,
+                      icon: section.$2,
+                      actions: section.$3,
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAllToolsSection(
+    BuildContext sheetContext, {
+    required String title,
+    required IconData icon,
+    required List<_ActionSpec> actions,
+  }) {
+    final sectionKey = title.toLowerCase().replaceAll(RegExp(r'[^a-z]+'), '_');
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        AppSectionHeader(title: title, icon: icon),
+        const SizedBox(height: 10),
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final columns = (constraints.maxWidth / 88).floor().clamp(3, 7);
+            final itemWidth =
+                (constraints.maxWidth - (columns - 1) * 8) / columns;
+            return Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final action in actions)
+                  _buildAllToolsTile(
+                    sheetContext,
+                    key: ValueKey(
+                      'all_tools_${sectionKey}_${action.group.toLowerCase().replaceAll(' ', '_')}_${action.label.toLowerCase().replaceAll(' ', '_')}',
+                    ),
+                    width: itemWidth,
+                    action: action,
+                  ),
+              ],
+            );
+          },
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAllToolsTile(
+    BuildContext sheetContext, {
+    required Key key,
+    required double width,
+    required _ActionSpec action,
+  }) {
+    final enabled = action.onTap != null;
+    final color = action.destructive
+        ? kError
+        : action.active
+        ? kAccent
+        : enabled
+        ? kTextPrimary
+        : kTextSecondary.withValues(alpha: 0.38);
+    return Tooltip(
+      message: action.tooltip,
+      child: InkWell(
+        key: key,
+        onTap: !enabled
+            ? null
+            : () {
+                Navigator.of(sheetContext).pop();
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (mounted) action.onTap?.call();
+                });
+              },
+        borderRadius: BorderRadius.circular(11),
+        child: Ink(
+          width: width,
+          height: 70,
+          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 8),
+          decoration: BoxDecoration(
+            color: action.active
+                ? kAccent.withValues(alpha: 0.11)
+                : kSurfaceElevated,
+            borderRadius: BorderRadius.circular(11),
+            border: Border.all(
+              color: action.active ? kAccent.withValues(alpha: 0.6) : kBorder,
+            ),
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(action.icon, size: 20, color: color),
+              const SizedBox(height: 5),
+              Text(
+                action.label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: color,
+                  fontSize: 9.5,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  double _editorDockHeightFor(BuildContext context) {
+    return _editorDockContentHeight + MediaQuery.viewPaddingOf(context).bottom;
   }
 
   List<_ActionSpec> _keyframeDockActions(
@@ -11398,15 +11257,16 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 for (var index = 0; index < actions.length; index++) ...[
                   _buildQuickActionButton(
                     key: actions[index].key ?? _dockToolKey(actions, index),
-                    width: actions[index].width ?? 70,
+                    width: actions[index].width ?? 64,
                     tooltip: actions[index].tooltip,
                     icon: actions[index].icon,
                     label: actions[index].label,
                     active: actions[index].active,
+                    destructive: actions[index].destructive,
                     onTap: actions[index].onTap,
                   ),
                   if (!spread && index != actions.length - 1)
-                    const SizedBox(width: 8),
+                    const SizedBox(width: 4),
                 ],
               ],
             ),
@@ -11425,10 +11285,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final qualifier = duplicateLabel
         ? '${action.group.toLowerCase().replaceAll(' ', '_')}_'
         : '';
-    final category = _activeBottomCategory?.name ?? 'root';
-    final subgroup = _activeBottomSubgroup?.name;
-    final path = subgroup == null ? category : '${category}_$subgroup';
-    return ValueKey('dock_tool_${path}_$qualifier$normalizedLabel');
+    return ValueKey('dock_tool_$qualifier$normalizedLabel');
   }
 
   Future<void> _openAudioControlsSheet(TimelineClip clip) async {
@@ -11467,56 +11324,77 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     required String label,
     required VoidCallback? onTap,
     bool active = false,
+    bool destructive = false,
   }) {
     final isEnabled = onTap != null;
+    final enabledColor = destructive
+        ? kError
+        : active
+        ? kAccent
+        : kTextPrimary;
     return Tooltip(
       key: key,
       message: tooltip,
       child: InkWell(
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(12),
         onTap: onTap,
         child: Ink(
           width: width,
-          height: 48,
+          height: 56,
           decoration: BoxDecoration(
-            color: active ? kAccent.withValues(alpha: 0.13) : kSurfaceElevated,
-            borderRadius: BorderRadius.circular(16),
+            color: active
+                ? kAccent.withValues(alpha: 0.12)
+                : Colors.transparent,
+            borderRadius: BorderRadius.circular(12),
             border: Border.all(
               color: active
-                  ? kAccent.withValues(alpha: 0.65)
+                  ? kAccent.withValues(alpha: 0.58)
                   : isEnabled
-                  ? kBorder
+                  ? kBorder.withValues(alpha: 0.58)
                   : kBorder.withValues(alpha: 0.45),
             ),
           ),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            mainAxisSize: MainAxisSize.min,
+          child: Stack(
+            alignment: Alignment.center,
             children: [
-              Icon(
-                icon,
-                color: active
-                    ? kAccent
-                    : isEnabled
-                    ? kTextPrimary
-                    : kTextPrimary.withValues(alpha: 0.32),
-                size: 22,
+              Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    icon,
+                    color: isEnabled
+                        ? enabledColor
+                        : kTextPrimary.withValues(alpha: 0.28),
+                    size: 21,
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: isEnabled
+                          ? enabledColor
+                          : kTextPrimary.withValues(alpha: 0.28),
+                      fontSize: 9.5,
+                      fontWeight: active ? FontWeight.w700 : FontWeight.w600,
+                    ),
+                  ),
+                ],
               ),
-              const SizedBox(height: 2),
-              Text(
-                label,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  color: active
-                      ? kAccent
-                      : isEnabled
-                      ? kTextPrimary
-                      : kTextPrimary.withValues(alpha: 0.32),
-                  fontSize: 10,
-                  fontWeight: FontWeight.w600,
+              if (active)
+                Positioned(
+                  bottom: 3,
+                  child: Container(
+                    width: 14,
+                    height: 2,
+                    decoration: BoxDecoration(
+                      color: kAccent,
+                      borderRadius: BorderRadius.circular(99),
+                    ),
+                  ),
                 ),
-              ),
             ],
           ),
         ),
@@ -11552,8 +11430,21 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
       decoration: const BoxDecoration(
-        color: kSurface,
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Color(0xFF15191D), kSurface],
+          stops: [0, 0.2],
+        ),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(kRadiusSheet)),
+        border: Border(top: BorderSide(color: kBorderStrong)),
+        boxShadow: [
+          BoxShadow(
+            color: Color(0x73000000),
+            blurRadius: 28,
+            offset: Offset(0, -8),
+          ),
+        ],
       ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -11564,19 +11455,55 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               width: 44,
               height: 4,
               decoration: BoxDecoration(
-                color: kBorder,
+                color: kBorderStrong,
                 borderRadius: BorderRadius.circular(999),
               ),
             ),
           ),
           const SizedBox(height: 14),
-          Text(
-            isVideoClip ? 'Video Clip Audio' : 'Audio Clip Controls',
-            style: TextStyle(
-              color: kTextPrimary,
-              fontSize: 13,
-              fontWeight: FontWeight.w600,
-            ),
+          Row(
+            children: [
+              Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: kAccent.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: kAccent.withValues(alpha: 0.22)),
+                ),
+                child: const Icon(
+                  Icons.graphic_eq_rounded,
+                  color: kAccent,
+                  size: 19,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      isVideoClip ? 'Video clip audio' : 'Audio clip controls',
+                      style: const TextStyle(
+                        color: kTextPrimary,
+                        fontSize: 17,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: -0.3,
+                      ),
+                    ),
+                    Text(
+                      isVideoClip
+                          ? 'Attached source audio and processing'
+                          : 'Mix, fades, routing and effects',
+                      style: const TextStyle(
+                        color: kTextSecondary,
+                        fontSize: 10.5,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ),
           if (attribution != null && attribution.isNotEmpty) ...[
             const SizedBox(height: 10),
@@ -12747,19 +12674,20 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         clip.type != TimelineTrackType.video) {
       return;
     }
-    await showModalBottomSheet(
+    await showResizableEditorSheet<void>(
       context: context,
-      isScrollControlled: true,
-      constraints: BoxConstraints(
-        maxHeight: MediaQuery.sizeOf(context).height * 0.68,
-      ),
-      backgroundColor: Colors.transparent,
+      title: 'Transition',
+      subtitle: 'Control how this clip moves into the next edit',
+      icon: Icons.compare_arrows_rounded,
+      initialHeightFactor: 0.56,
+      minHeightFactor: 0.38,
+      maxHeightFactor: 0.84,
       barrierColor: Colors.black.withValues(alpha: 0.35),
       builder: (_) => Consumer(
         builder: (context, ref, _) {
           final editorState = ref.watch(editorProvider);
           final liveClip = _clipById(clip.id, editorState) ?? clip;
-          return SingleChildScrollView(child: _buildTransitionEditor(liveClip));
+          return _buildTransitionEditor(liveClip);
         },
       ),
     );
@@ -12770,22 +12698,27 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     TimelineTrack track,
   ) async {
     if (track.isLocked || !clip.supportsClipAnimation) return;
-    await showModalBottomSheet(
+    await showResizableEditorSheet<void>(
       context: context,
-      isScrollControlled: true,
-      constraints: BoxConstraints(
-        maxHeight: MediaQuery.sizeOf(context).height * 0.68,
-      ),
-      backgroundColor: Colors.transparent,
+      title: track.section == TimelineTrackSection.audio
+          ? 'Audio fades'
+          : 'Clip animation',
+      subtitle: track.section == TimelineTrackSection.audio
+          ? 'Shape the entrance and exit of this audio clip'
+          : 'Set polished in and out motion for this layer',
+      icon: track.section == TimelineTrackSection.audio
+          ? Icons.multiline_chart_rounded
+          : Icons.animation_rounded,
+      initialHeightFactor: 0.62,
+      minHeightFactor: 0.42,
+      maxHeightFactor: 0.9,
       barrierColor: Colors.black.withValues(alpha: 0.35),
       builder: (_) => Consumer(
         builder: (context, ref, _) {
           final editorState = ref.watch(editorProvider);
           final liveClip = _clipById(clip.id, editorState) ?? clip;
           final liveTrack = _trackForClip(liveClip, editorState) ?? track;
-          return SingleChildScrollView(
-            child: _buildClipAnimationSheet(liveClip, liveTrack),
-          );
+          return _buildClipAnimationSheet(liveClip, liveTrack);
         },
       ),
     );
@@ -12811,107 +12744,82 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       (TransitionType.slideUpRight, 'Up-right'),
     ];
 
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
-      decoration: const BoxDecoration(
-        color: kSurface,
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Center(
-            child: Container(
-              width: 44,
-              height: 4,
-              decoration: BoxDecoration(
-                color: kBorder,
-                borderRadius: BorderRadius.circular(999),
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        AppSectionHeader(
+          title: 'From ${clip.label}',
+          description: 'Choose the outgoing transition style',
+          icon: Icons.movie_filter_outlined,
+        ),
+        const SizedBox(height: 10),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: transitionOptions.map((option) {
+            final isSelected =
+                clip.outroTransition.type == option.$1 ||
+                (clip.outroTransition.type == TransitionType.none &&
+                    option.$1 == TransitionType.cut);
+            return ChoiceChip(
+              label: Text(option.$2),
+              selected: isSelected,
+              selectedColor: kAccent.withValues(alpha: 0.18),
+              backgroundColor: kSurfaceElevated,
+              side: BorderSide(color: isSelected ? kAccent : kBorder),
+              labelStyle: TextStyle(
+                color: isSelected ? kAccent : kTextSecondary,
+                fontSize: 12,
               ),
-            ),
+              onSelected: (_) => _updateSelectedClipTransition(
+                clip: clip,
+                type: option.$1,
+                durationMs: option.$1 == TransitionType.cut
+                    ? 0
+                    : (clip.outroTransition.durationMs == 0
+                          ? 450
+                          : clip.outroTransition.durationMs),
+              ),
+            );
+          }).toList(),
+        ),
+        const SizedBox(height: 10),
+        Text('Duration', style: TextStyle(color: kTextSecondary, fontSize: 12)),
+        SliderTheme(
+          data: SliderThemeData(
+            activeTrackColor: kAccent,
+            inactiveTrackColor: kBorder,
+            thumbColor: kAccent,
+            overlayColor: kAccent.withValues(alpha: 0.14),
           ),
-          const SizedBox(height: 14),
-          Text(
-            'Transition from ${clip.label}',
-            style: TextStyle(
-              color: kTextPrimary,
-              fontSize: 13,
-              fontWeight: FontWeight.w600,
-            ),
+          child: Slider(
+            value: isCut
+                ? 0
+                : clip.outroTransition.durationMs.toDouble().clamp(100, 2000),
+            min: 0,
+            max: 2000,
+            divisions: 20,
+            label: '${isCut ? 0 : clip.outroTransition.durationMs}ms',
+            onChangeStart: isCut
+                ? null
+                : (_) => ref
+                      .read(editorProvider.notifier)
+                      .beginTimelineGestureEdit(),
+            onChanged: isCut
+                ? null
+                : (value) => _updateSelectedClipTransition(
+                    clip: clip,
+                    durationMs: value.round(),
+                  ),
+            onChangeEnd: isCut
+                ? null
+                : (_) => ref
+                      .read(editorProvider.notifier)
+                      .endTimelineGestureEdit(),
           ),
-          const SizedBox(height: 10),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: transitionOptions.map((option) {
-              final isSelected =
-                  clip.outroTransition.type == option.$1 ||
-                  (clip.outroTransition.type == TransitionType.none &&
-                      option.$1 == TransitionType.cut);
-              return ChoiceChip(
-                label: Text(option.$2),
-                selected: isSelected,
-                selectedColor: kAccent.withValues(alpha: 0.18),
-                backgroundColor: kSurfaceElevated,
-                side: BorderSide(color: isSelected ? kAccent : kBorder),
-                labelStyle: TextStyle(
-                  color: isSelected ? kAccent : kTextSecondary,
-                  fontSize: 12,
-                ),
-                onSelected: (_) => _updateSelectedClipTransition(
-                  clip: clip,
-                  type: option.$1,
-                  durationMs: option.$1 == TransitionType.cut
-                      ? 0
-                      : (clip.outroTransition.durationMs == 0
-                            ? 450
-                            : clip.outroTransition.durationMs),
-                ),
-              );
-            }).toList(),
-          ),
-          const SizedBox(height: 10),
-          Text(
-            'Duration',
-            style: TextStyle(color: kTextSecondary, fontSize: 12),
-          ),
-          SliderTheme(
-            data: SliderThemeData(
-              activeTrackColor: kAccent,
-              inactiveTrackColor: kBorder,
-              thumbColor: kAccent,
-              overlayColor: kAccent.withValues(alpha: 0.14),
-            ),
-            child: Slider(
-              value: isCut
-                  ? 0
-                  : clip.outroTransition.durationMs.toDouble().clamp(100, 2000),
-              min: 0,
-              max: 2000,
-              divisions: 20,
-              label: '${isCut ? 0 : clip.outroTransition.durationMs}ms',
-              onChangeStart: isCut
-                  ? null
-                  : (_) => ref
-                        .read(editorProvider.notifier)
-                        .beginTimelineGestureEdit(),
-              onChanged: isCut
-                  ? null
-                  : (value) => _updateSelectedClipTransition(
-                      clip: clip,
-                      durationMs: value.round(),
-                    ),
-              onChangeEnd: isCut
-                  ? null
-                  : (_) => ref
-                        .read(editorProvider.notifier)
-                        .endTimelineGestureEdit(),
-            ),
-          ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 
@@ -12939,213 +12847,190 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final maximumFadeMs = math.max(1, clip.duration.inMilliseconds ~/ 2);
     final fadeDivisions = math.max(1, math.min(200, maximumFadeMs ~/ 50));
 
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
-      decoration: const BoxDecoration(
-        color: kSurface,
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Center(
-            child: Container(
-              width: 44,
-              height: 4,
-              decoration: BoxDecoration(
-                color: kBorder,
-                borderRadius: BorderRadius.circular(999),
-              ),
-            ),
-          ),
-          const SizedBox(height: 14),
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        AppSectionHeader(
+          title: sheetTitle,
+          description: isAudioTrack
+              ? 'Use fades to blend cleanly with adjacent audio'
+              : 'Animation markers appear directly on the clip',
+          icon: isAudioTrack
+              ? Icons.graphic_eq_rounded
+              : Icons.animation_rounded,
+        ),
+        const SizedBox(height: 12),
+        if (!isAudioTrack) ...[
           Text(
-            sheetTitle,
-            style: TextStyle(
-              color: kTextPrimary,
-              fontSize: 16,
-              fontWeight: FontWeight.w600,
-            ),
+            'Animate In',
+            style: TextStyle(color: kTextSecondary, fontSize: 12),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: animationOptions.map((option) {
+              final isSelected = clip.introTransition.type == option.$1;
+              return ChoiceChip(
+                label: Text(option.$2),
+                selected: isSelected,
+                selectedColor: kAccent.withValues(alpha: 0.18),
+                backgroundColor: kSurfaceElevated,
+                side: BorderSide(color: isSelected ? kAccent : kBorder),
+                labelStyle: TextStyle(
+                  color: isSelected ? kAccent : kTextSecondary,
+                  fontSize: 12,
+                ),
+                onSelected: (_) => _updateSelectedClipTransition(
+                  clip: clip,
+                  updateIntro: true,
+                  updateOutro: false,
+                  type: option.$1,
+                  durationMs: option.$1 == TransitionType.none
+                      ? 0
+                      : math.max(350, clip.introTransition.durationMs),
+                ),
+              );
+            }).toList(),
           ),
           const SizedBox(height: 12),
-          if (!isAudioTrack) ...[
-            Text(
-              'Animate In',
-              style: TextStyle(color: kTextSecondary, fontSize: 12),
+          Text(
+            'Animate Out',
+            style: TextStyle(color: kTextSecondary, fontSize: 12),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: animationOptions.map((option) {
+              final isSelected = clip.outroTransition.type == option.$1;
+              return ChoiceChip(
+                label: Text(option.$2),
+                selected: isSelected,
+                selectedColor: kAccent.withValues(alpha: 0.18),
+                backgroundColor: kSurfaceElevated,
+                side: BorderSide(color: isSelected ? kAccent : kBorder),
+                labelStyle: TextStyle(
+                  color: isSelected ? kAccent : kTextSecondary,
+                  fontSize: 12,
+                ),
+                onSelected: (_) => _updateSelectedClipTransition(
+                  clip: clip,
+                  updateIntro: false,
+                  updateOutro: true,
+                  type: option.$1,
+                  durationMs: option.$1 == TransitionType.none
+                      ? 0
+                      : math.max(350, clip.outroTransition.durationMs),
+                ),
+              );
+            }).toList(),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            'Animation Length',
+            style: TextStyle(color: kTextSecondary, fontSize: 12),
+          ),
+          SliderTheme(
+            data: SliderThemeData(
+              activeTrackColor: kAccent,
+              inactiveTrackColor: kBorder,
+              thumbColor: kAccent,
+              overlayColor: kAccent.withValues(alpha: 0.14),
             ),
-            const SizedBox(height: 8),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: animationOptions.map((option) {
-                final isSelected = clip.introTransition.type == option.$1;
-                return ChoiceChip(
-                  label: Text(option.$2),
-                  selected: isSelected,
-                  selectedColor: kAccent.withValues(alpha: 0.18),
-                  backgroundColor: kSurfaceElevated,
-                  side: BorderSide(color: isSelected ? kAccent : kBorder),
-                  labelStyle: TextStyle(
-                    color: isSelected ? kAccent : kTextSecondary,
-                    fontSize: 12,
-                  ),
-                  onSelected: (_) => _updateSelectedClipTransition(
-                    clip: clip,
-                    updateIntro: true,
-                    updateOutro: false,
-                    type: option.$1,
-                    durationMs: option.$1 == TransitionType.none
-                        ? 0
-                        : math.max(350, clip.introTransition.durationMs),
-                  ),
+            child: Slider(
+              value:
+                  (clip.introTransition.durationMs == 0
+                          ? clip.outroTransition.durationMs
+                          : clip.introTransition.durationMs)
+                      .toDouble()
+                      .clamp(150, 2000),
+              min: 150,
+              max: 2000,
+              divisions: 37,
+              label:
+                  '${(clip.introTransition.durationMs == 0 ? clip.outroTransition.durationMs : clip.introTransition.durationMs)}ms',
+              onChangeStart: (_) =>
+                  ref.read(editorProvider.notifier).beginTimelineGestureEdit(),
+              onChanged: (value) {
+                final rounded = value.round();
+                _updateSelectedClipTransition(
+                  clip: clip,
+                  updateIntro: clip.introTransition.type != TransitionType.none,
+                  updateOutro: false,
+                  durationMs: rounded,
                 );
-              }).toList(),
-            ),
-            const SizedBox(height: 12),
-            Text(
-              'Animate Out',
-              style: TextStyle(color: kTextSecondary, fontSize: 12),
-            ),
-            const SizedBox(height: 8),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: animationOptions.map((option) {
-                final isSelected = clip.outroTransition.type == option.$1;
-                return ChoiceChip(
-                  label: Text(option.$2),
-                  selected: isSelected,
-                  selectedColor: kAccent.withValues(alpha: 0.18),
-                  backgroundColor: kSurfaceElevated,
-                  side: BorderSide(color: isSelected ? kAccent : kBorder),
-                  labelStyle: TextStyle(
-                    color: isSelected ? kAccent : kTextSecondary,
-                    fontSize: 12,
-                  ),
-                  onSelected: (_) => _updateSelectedClipTransition(
-                    clip: clip,
-                    updateIntro: false,
-                    updateOutro: true,
-                    type: option.$1,
-                    durationMs: option.$1 == TransitionType.none
-                        ? 0
-                        : math.max(350, clip.outroTransition.durationMs),
-                  ),
+                _updateSelectedClipTransition(
+                  clip: clip,
+                  updateIntro: false,
+                  updateOutro: clip.outroTransition.type != TransitionType.none,
+                  durationMs: rounded,
                 );
-              }).toList(),
+              },
+              onChangeEnd: (_) =>
+                  ref.read(editorProvider.notifier).endTimelineGestureEdit(),
             ),
-            const SizedBox(height: 12),
-            Text(
-              'Animation Length',
-              style: TextStyle(color: kTextSecondary, fontSize: 12),
+          ),
+        ] else ...[
+          Text(
+            'Fade In',
+            style: TextStyle(color: kTextSecondary, fontSize: 12),
+          ),
+          SliderTheme(
+            data: SliderThemeData(
+              activeTrackColor: kAccent,
+              inactiveTrackColor: kBorder,
+              thumbColor: kAccent,
+              overlayColor: kAccent.withValues(alpha: 0.14),
             ),
-            SliderTheme(
-              data: SliderThemeData(
-                activeTrackColor: kAccent,
-                inactiveTrackColor: kBorder,
-                thumbColor: kAccent,
-                overlayColor: kAccent.withValues(alpha: 0.14),
-              ),
-              child: Slider(
-                value:
-                    (clip.introTransition.durationMs == 0
-                            ? clip.outroTransition.durationMs
-                            : clip.introTransition.durationMs)
-                        .toDouble()
-                        .clamp(150, 2000),
-                min: 150,
-                max: 2000,
-                divisions: 37,
-                label:
-                    '${(clip.introTransition.durationMs == 0 ? clip.outroTransition.durationMs : clip.introTransition.durationMs)}ms',
-                onChangeStart: (_) => ref
-                    .read(editorProvider.notifier)
-                    .beginTimelineGestureEdit(),
-                onChanged: (value) {
-                  final rounded = value.round();
-                  _updateSelectedClipTransition(
-                    clip: clip,
-                    updateIntro:
-                        clip.introTransition.type != TransitionType.none,
-                    updateOutro: false,
-                    durationMs: rounded,
-                  );
-                  _updateSelectedClipTransition(
-                    clip: clip,
-                    updateIntro: false,
-                    updateOutro:
-                        clip.outroTransition.type != TransitionType.none,
-                    durationMs: rounded,
-                  );
-                },
-                onChangeEnd: (_) =>
-                    ref.read(editorProvider.notifier).endTimelineGestureEdit(),
-              ),
+            child: Slider(
+              value: clip.audioMix.fadeInMs
+                  .toDouble()
+                  .clamp(0, maximumFadeMs)
+                  .toDouble(),
+              min: 0,
+              max: maximumFadeMs.toDouble(),
+              divisions: fadeDivisions,
+              label: '${clip.audioMix.fadeInMs}ms',
+              onChangeStart: (_) =>
+                  ref.read(editorProvider.notifier).beginTimelineGestureEdit(),
+              onChanged: (value) =>
+                  _updateSelectedClipAudioMix(clip, fadeInMs: value.round()),
+              onChangeEnd: (_) =>
+                  ref.read(editorProvider.notifier).endTimelineGestureEdit(),
             ),
-          ] else ...[
-            Text(
-              'Fade In',
-              style: TextStyle(color: kTextSecondary, fontSize: 12),
+          ),
+          Text(
+            'Fade Out',
+            style: TextStyle(color: kTextSecondary, fontSize: 12),
+          ),
+          SliderTheme(
+            data: SliderThemeData(
+              activeTrackColor: kAccent,
+              inactiveTrackColor: kBorder,
+              thumbColor: kAccent,
+              overlayColor: kAccent.withValues(alpha: 0.14),
             ),
-            SliderTheme(
-              data: SliderThemeData(
-                activeTrackColor: kAccent,
-                inactiveTrackColor: kBorder,
-                thumbColor: kAccent,
-                overlayColor: kAccent.withValues(alpha: 0.14),
-              ),
-              child: Slider(
-                value: clip.audioMix.fadeInMs
-                    .toDouble()
-                    .clamp(0, maximumFadeMs)
-                    .toDouble(),
-                min: 0,
-                max: maximumFadeMs.toDouble(),
-                divisions: fadeDivisions,
-                label: '${clip.audioMix.fadeInMs}ms',
-                onChangeStart: (_) => ref
-                    .read(editorProvider.notifier)
-                    .beginTimelineGestureEdit(),
-                onChanged: (value) =>
-                    _updateSelectedClipAudioMix(clip, fadeInMs: value.round()),
-                onChangeEnd: (_) =>
-                    ref.read(editorProvider.notifier).endTimelineGestureEdit(),
-              ),
+            child: Slider(
+              value: clip.audioMix.fadeOutMs
+                  .toDouble()
+                  .clamp(0, maximumFadeMs)
+                  .toDouble(),
+              min: 0,
+              max: maximumFadeMs.toDouble(),
+              divisions: fadeDivisions,
+              label: '${clip.audioMix.fadeOutMs}ms',
+              onChangeStart: (_) =>
+                  ref.read(editorProvider.notifier).beginTimelineGestureEdit(),
+              onChanged: (value) =>
+                  _updateSelectedClipAudioMix(clip, fadeOutMs: value.round()),
+              onChangeEnd: (_) =>
+                  ref.read(editorProvider.notifier).endTimelineGestureEdit(),
             ),
-            Text(
-              'Fade Out',
-              style: TextStyle(color: kTextSecondary, fontSize: 12),
-            ),
-            SliderTheme(
-              data: SliderThemeData(
-                activeTrackColor: kAccent,
-                inactiveTrackColor: kBorder,
-                thumbColor: kAccent,
-                overlayColor: kAccent.withValues(alpha: 0.14),
-              ),
-              child: Slider(
-                value: clip.audioMix.fadeOutMs
-                    .toDouble()
-                    .clamp(0, maximumFadeMs)
-                    .toDouble(),
-                min: 0,
-                max: maximumFadeMs.toDouble(),
-                divisions: fadeDivisions,
-                label: '${clip.audioMix.fadeOutMs}ms',
-                onChangeStart: (_) => ref
-                    .read(editorProvider.notifier)
-                    .beginTimelineGestureEdit(),
-                onChanged: (value) =>
-                    _updateSelectedClipAudioMix(clip, fadeOutMs: value.round()),
-                onChangeEnd: (_) =>
-                    ref.read(editorProvider.notifier).endTimelineGestureEdit(),
-              ),
-            ),
-          ],
+          ),
         ],
-      ),
+      ],
     );
   }
 
@@ -13158,6 +13043,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       builder: (sheetContext) => ResizableEditorSheet(
         title: 'Subtitle style',
         subtitle: 'Resize the sheet to balance the preview and controls',
+        icon: Icons.palette_outlined,
         initialHeightFactor: 0.38,
         minHeightFactor: 0.24,
         maxHeightFactor: 0.88,
@@ -13203,6 +13089,7 @@ class _ActionSpec {
   final IconData icon;
   final VoidCallback? onTap;
   final bool active;
+  final bool destructive;
 
   const _ActionSpec({
     this.key,
@@ -13213,7 +13100,28 @@ class _ActionSpec {
     required this.icon,
     required this.onTap,
     this.active = false,
+    this.destructive = false,
   });
+
+  _ActionSpec copyWith({
+    Key? key,
+    String? label,
+    String? tooltip,
+    IconData? icon,
+    bool? destructive,
+  }) {
+    return _ActionSpec(
+      key: key ?? this.key,
+      width: width,
+      group: group,
+      label: label ?? this.label,
+      tooltip: tooltip ?? this.tooltip,
+      icon: icon ?? this.icon,
+      onTap: onTap,
+      active: active,
+      destructive: destructive ?? this.destructive,
+    );
+  }
 }
 
 class _GiphyPickerSheet extends StatefulWidget {
@@ -13309,6 +13217,7 @@ class _GiphyPickerSheetState extends State<_GiphyPickerSheet> {
     return ResizableEditorSheet(
       title: 'GIFs & stickers',
       subtitle: 'Search animated overlays from GIPHY',
+      icon: Icons.gif_box_outlined,
       initialHeightFactor: 0.72,
       minHeightFactor: 0.48,
       maxHeightFactor: 0.90,

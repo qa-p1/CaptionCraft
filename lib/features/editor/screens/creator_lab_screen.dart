@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 
 import '../../../core/theme/app_theme.dart';
 import '../../../core/utils/caption_studio_service.dart';
+import '../../../shared/widgets/app_surface.dart';
 import '../../../shared/widgets/snack_bar_helper.dart';
 import '../models/subtitle_entry.dart';
 import '../models/timeline_models.dart';
@@ -45,22 +46,19 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
                 height: 38,
                 margin: const EdgeInsets.only(right: 11),
                 decoration: BoxDecoration(
-                  gradient: const LinearGradient(
-                    colors: [kAccent, Color(0xFFC84DFF)],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                  ),
-                  borderRadius: BorderRadius.circular(12),
+                  color: kAccent.withValues(alpha: 0.11),
+                  borderRadius: BorderRadius.circular(11),
+                  border: Border.all(color: kAccent.withValues(alpha: 0.24)),
                   boxShadow: [
                     BoxShadow(
-                      color: kAccent.withValues(alpha: 0.2),
-                      blurRadius: 18,
+                      color: kAccent.withValues(alpha: 0.1),
+                      blurRadius: 12,
                     ),
                   ],
                 ),
                 child: const Icon(
                   Icons.auto_awesome_rounded,
-                  color: Colors.white,
+                  color: kAccent,
                   size: 20,
                 ),
               ),
@@ -86,28 +84,12 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
             ],
           ),
           actions: [
-            Container(
-              margin: const EdgeInsets.only(right: 12),
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-              decoration: BoxDecoration(
-                color: kSuccess.withValues(alpha: 0.1),
-                borderRadius: BorderRadius.circular(99),
-                border: Border.all(color: kSuccess.withValues(alpha: 0.3)),
-              ),
-              child: const Row(
-                children: [
-                  Icon(Icons.offline_bolt_rounded, size: 14, color: kSuccess),
-                  SizedBox(width: 4),
-                  Text(
-                    'ON DEVICE',
-                    style: TextStyle(
-                      color: kSuccess,
-                      fontSize: 9,
-                      fontWeight: FontWeight.w900,
-                      letterSpacing: 0.7,
-                    ),
-                  ),
-                ],
+            const Padding(
+              padding: EdgeInsets.only(right: 12),
+              child: AppStatusPill(
+                label: 'On device',
+                color: kSuccess,
+                icon: Icons.offline_bolt_rounded,
               ),
             ),
           ],
@@ -1244,81 +1226,36 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
       builder: (sheetContext) {
-        return SafeArea(
-          child: Container(
+        return SizedBox(
+          height: sheetHeight,
+          child: AppSheetSurface(
             key: const Key('creator_lab_result_sheet'),
-            height: sheetHeight,
-            decoration: const BoxDecoration(
-              color: kBackground,
-              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-              border: Border(top: BorderSide(color: kBorder)),
-            ),
-            child: Column(
-              children: [
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(18, 12, 10, 12),
-                  child: Row(
-                    children: [
-                      Container(
-                        width: 40,
-                        height: 40,
-                        decoration: BoxDecoration(
-                          color: const Color(
-                            0xFFC84DFF,
-                          ).withValues(alpha: 0.12),
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: const Icon(
-                          Icons.auto_awesome_rounded,
-                          color: Color(0xFFE0A7FF),
-                        ),
-                      ),
-                      const SizedBox(width: 11),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              title,
-                              style: const TextStyle(
-                                color: kTextPrimary,
-                                fontSize: 17,
-                                fontWeight: FontWeight.w900,
-                              ),
-                            ),
-                            Text(
-                              subtitle,
-                              style: const TextStyle(
-                                color: kTextSecondary,
-                                fontSize: 11,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      IconButton(
-                        onPressed: () => Navigator.pop(sheetContext),
-                        icon: const Icon(Icons.close_rounded),
-                      ),
-                    ],
+            child: SafeArea(
+              top: false,
+              child: Column(
+                children: [
+                  AppSheetHeader(
+                    title: title,
+                    subtitle: subtitle,
+                    icon: Icons.auto_awesome_rounded,
+                    onClose: () => Navigator.pop(sheetContext),
                   ),
-                ),
-                const Divider(height: 1),
-                Expanded(child: child),
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(14),
-                  decoration: const BoxDecoration(
-                    color: kSurface,
-                    border: Border(top: BorderSide(color: kBorder)),
+                  Expanded(child: child),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+                    decoration: const BoxDecoration(
+                      color: Color(0xA6101316),
+                      border: Border(top: BorderSide(color: kBorder)),
+                    ),
+                    child: FilledButton.icon(
+                      onPressed: onAction,
+                      icon: const Icon(Icons.auto_awesome_rounded, size: 18),
+                      label: Text(actionLabel),
+                    ),
                   ),
-                  child: FilledButton.icon(
-                    onPressed: onAction,
-                    icon: const Icon(Icons.auto_awesome_rounded),
-                    label: Text(actionLabel),
-                  ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         );

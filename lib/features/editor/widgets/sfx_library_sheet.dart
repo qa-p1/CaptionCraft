@@ -145,6 +145,7 @@ class _SfxLibrarySheetState extends ConsumerState<SfxLibrarySheet> {
     return ResizableEditorSheet(
       title: 'Sound effects',
       subtitle: 'Openverse and verified on-demand SFX packs',
+      icon: Icons.graphic_eq_rounded,
       initialHeightFactor: 0.78,
       minHeightFactor: 0.52,
       maxHeightFactor: 0.92,

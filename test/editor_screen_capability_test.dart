@@ -436,62 +436,55 @@ void main() {
       return tester.widget<InkWell>(inkWellFinder.first);
     }
 
-    Future<void> finishDockTransition() async {
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 260));
-    }
-
-    for (final category in const [
-      'edit',
-      'effects',
-      'audio',
-      'text',
-      'timeline',
-      'canvas',
-      'studio',
-      'discover',
-    ]) {
-      expect(keyedInkWell('dock_category_$category').onTap, isNotNull);
-    }
-
     final dock = find.byKey(const ValueKey('editor_tool_dock'));
-    for (final duplicate in const ['Overlay', 'Add Text', 'Split']) {
-      expect(
-        find.descendant(of: dock, matching: find.text(duplicate)),
-        findsNothing,
-      );
-    }
-
-    await tester.tap(find.byKey(const ValueKey('dock_category_effects')));
-    await finishDockTransition();
-    expect(keyedInkWell('dock_subgroup_effectsColor').onTap, isNotNull);
-    await tester.tap(find.byKey(const ValueKey('dock_subgroup_effectsColor')));
-    await finishDockTransition();
-    expect(
-      keyedInkWell('dock_tool_effects_effectsColor_chroma_key').onTap,
-      isNull,
-    );
-    expect(keyedInkWell('dock_tool_effects_effectsColor_adjust').onTap, isNull);
+    expect(dock, findsOneWidget);
+    expect(keyedInkWell('dock_primary_more').onTap, isNotNull);
+    expect(keyedInkWell('dock_primary_effects').onTap, isNotNull);
+    expect(keyedInkWell('dock_primary_chroma').onTap, isNull);
+    expect(keyedInkWell('dock_primary_color').onTap, isNull);
+    expect(keyedInkWell('dock_primary_timing').onTap, isNull);
     // Blur/filter additions are timeline-wide and stay available even when
     // the selected source track is locked.
+    await tester.ensureVisible(find.byKey(const ValueKey('dock_primary_more')));
+    await tester.tap(find.byKey(const ValueKey('dock_primary_more')));
+    await tester.pumpAndSettle();
     expect(
-      keyedInkWell('dock_tool_effects_effectsColor_filters').onTap,
+      find.byKey(const ValueKey('editor_all_tools_sheet')),
+      findsOneWidget,
+    );
+    expect(
+      tester
+          .widget<InkWell>(
+            find.byKey(const ValueKey('all_tools_clip_timing_timing')),
+          )
+          .onTap,
+      isNull,
+    );
+    final toolsScroll = find.descendant(
+      of: find.byKey(const ValueKey('editor_all_tools_sheet')),
+      matching: find.byType(Scrollable),
+    );
+    await tester.scrollUntilVisible(
+      find.text('Visual'),
+      300,
+      scrollable: toolsScroll,
+    );
+    expect(
+      tester
+          .widget<InkWell>(
+            find.byKey(const ValueKey('all_tools_visual_color_filters')),
+          )
+          .onTap,
       isNotNull,
     );
-    expect(keyedInkWell('dock_back_button').onTap, isNotNull);
-
-    await tester.tap(find.byKey(const ValueKey('dock_back_button')));
-    await finishDockTransition();
-    await tester.tap(find.byKey(const ValueKey('dock_back_button')));
-    await finishDockTransition();
-    await tester.tap(find.byKey(const ValueKey('dock_category_edit')));
-    await finishDockTransition();
-    expect(keyedInkWell('dock_subgroup_editTiming').onTap, isNotNull);
-    await tester.tap(find.byKey(const ValueKey('dock_subgroup_editTiming')));
-    await finishDockTransition();
-    expect(keyedInkWell('dock_tool_edit_editTiming_timing').onTap, isNull);
-    expect(keyedInkWell('dock_tool_edit_editTiming_freeze').onTap, isNull);
-    expect(find.text('Add'), findsNothing);
+    expect(
+      tester
+          .widget<InkWell>(
+            find.byKey(const ValueKey('all_tools_clip_timing_freeze')),
+          )
+          .onTap,
+      isNull,
+    );
     expect(tester.takeException(), isNull);
   });
 
@@ -525,17 +518,8 @@ void main() {
       ..selectTrack('overlay_track')
       ..selectClip('overlay_image');
     await tester.pump();
-    await tester.tap(find.byKey(const ValueKey('dock_category_effects')));
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 260));
-    await tester.tap(find.byKey(const ValueKey('dock_subgroup_effectsColor')));
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 260));
-
     final chromaTool = find.descendant(
-      of: find.byKey(
-        const ValueKey('dock_tool_effects_effectsColor_chroma_key'),
-      ),
+      of: find.byKey(const ValueKey('dock_primary_chroma')),
       matching: find.byType(InkWell),
     );
     expect(tester.widget<InkWell>(chromaTool.first).onTap, isNotNull);
@@ -589,13 +573,13 @@ void main() {
       ..selectTrack('sfx-track')
       ..selectClip('sfx-clip');
     await tester.pump();
-    await tester.tap(find.byKey(const ValueKey('dock_category_audio')));
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 260));
-    await tester.tap(find.byKey(const ValueKey('dock_subgroup_audioMix')));
+    await tester.ensureVisible(
+      find.byKey(const ValueKey('dock_primary_audio')),
+    );
+    await tester.tap(find.byKey(const ValueKey('dock_primary_audio')));
     await tester.pumpAndSettle();
 
-    expect(find.text('Audio Clip Controls'), findsOneWidget);
+    expect(find.text('Audio clip controls'), findsOneWidget);
     expect(
       find.byKey(const ValueKey('audio-clip-attribution')),
       findsOneWidget,
@@ -653,9 +637,10 @@ void main() {
       ..selectTrack('base-track')
       ..selectClip('base-video');
     await tester.pump();
-    await tester.tap(find.byKey(const ValueKey('dock_category_audio')));
-    await tester.pump(const Duration(milliseconds: 260));
-    await tester.tap(find.byKey(const ValueKey('dock_subgroup_audioMix')));
+    await tester.ensureVisible(
+      find.byKey(const ValueKey('dock_primary_audio')),
+    );
+    await tester.tap(find.byKey(const ValueKey('dock_primary_audio')));
     await tester.pumpAndSettle();
 
     expect(find.byKey(const ValueKey('separate-video-audio')), findsOneWidget);

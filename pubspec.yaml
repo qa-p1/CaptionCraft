@@ -41,6 +41,7 @@
     # Progress & UI
     percent_indicator: ^4.2.3
     shimmer: ^3.0.0
+    flutter_svg: ^2.3.0
 
     # Media saving / export to gallery
     gal: ^2.3.0
@@ -89,6 +90,7 @@
     uses-material-design: true
     assets:
       - .env.example
+      - captioncraft_logo.svg
       - assets/fonts/licenses/
     fonts:
       - family: Roboto

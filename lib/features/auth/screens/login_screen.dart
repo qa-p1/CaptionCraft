@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/theme/app_theme.dart';
+import '../../../shared/widgets/captioncraft_brand.dart';
 import '../../../shared/widgets/snack_bar_helper.dart';
 import '../providers/auth_provider.dart';
 
@@ -165,7 +166,10 @@ class _LoginScreenState extends ConsumerState<LoginScreen>
     return Column(
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
-        const Align(alignment: Alignment.centerLeft, child: _BrandLockup()),
+        const Align(
+          alignment: Alignment.centerLeft,
+          child: CaptionCraftLockup(),
+        ),
         const SizedBox(height: 26),
         _buildAuthCard(isLoading),
         const SizedBox(height: 18),
@@ -519,7 +523,7 @@ class _StudioIntroduction extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          const _BrandLockup(),
+          const CaptionCraftLockup(),
           const SizedBox(height: 58),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
@@ -579,64 +583,6 @@ class _StudioIntroduction extends StatelessWidget {
           ),
         ],
       ),
-    );
-  }
-}
-
-class _BrandLockup extends StatelessWidget {
-  const _BrandLockup();
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Container(
-          width: 43,
-          height: 43,
-          decoration: BoxDecoration(
-            color: kAccent,
-            borderRadius: BorderRadius.circular(11),
-          ),
-          child: Stack(
-            alignment: Alignment.center,
-            children: [
-              const Icon(Icons.play_arrow_rounded, color: kOnAccent, size: 26),
-              Positioned(
-                left: 7,
-                top: 7,
-                bottom: 7,
-                child: Container(width: 2, color: kAccentSecondary),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(width: 11),
-        Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'CAPTIONCRAFT',
-              style: TextStyle(
-                color: kTextPrimary,
-                fontWeight: FontWeight.w900,
-                fontSize: 14,
-                letterSpacing: 0.35,
-              ),
-            ),
-            Text(
-              'EDITING STUDIO',
-              style: TextStyle(
-                fontFamily: 'monospace',
-                color: kAccent,
-                fontSize: 8.5,
-                fontWeight: FontWeight.w700,
-                letterSpacing: 1.7,
-              ),
-            ),
-          ],
-        ),
-      ],
     );
   }
 }

@@ -68,19 +68,12 @@ void main() {
 }
 
 Future<void> _runAttributeTool(WidgetTester tester, String toolName) async {
-  final toolKey = ValueKey('dock_tool_edit_editDetails_$toolName');
-  if (find.byKey(toolKey).evaluate().isEmpty) {
-    final category = find.byKey(const ValueKey('dock_category_edit'));
-    await tester.ensureVisible(category);
-    await tester.tap(category);
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 260));
-    final subgroup = find.byKey(const ValueKey('dock_subgroup_editDetails'));
-    await tester.ensureVisible(subgroup);
-    await tester.tap(subgroup);
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 260));
-  }
+  final more = find.byKey(const ValueKey('dock_primary_more'));
+  await tester.ensureVisible(more);
+  await tester.tap(more);
+  await tester.pumpAndSettle();
+
+  final toolKey = ValueKey('all_tools_clip_attributes_$toolName');
   final tool = find.byKey(toolKey);
   expect(tool, findsOneWidget);
   await tester.ensureVisible(tool);

@@ -5,6 +5,8 @@ import 'features/auth/screens/login_screen.dart';
 import 'features/home/screens/home_screen.dart';
 import 'features/auth/providers/auth_provider.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'shared/widgets/app_surface.dart';
+import 'shared/widgets/captioncraft_brand.dart';
 
 class CaptionCraftApp extends ConsumerWidget {
   const CaptionCraftApp({super.key});
@@ -57,39 +59,28 @@ class _AppAuthErrorScreen extends StatelessWidget {
             constraints: const BoxConstraints(maxWidth: 430),
             child: Padding(
               padding: const EdgeInsets.all(24),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(
-                    Icons.cloud_off_rounded,
-                    color: kWarning,
-                    size: 42,
-                  ),
-                  const SizedBox(height: 18),
-                  const Text(
-                    'Could not restore your session',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      color: kTextPrimary,
-                      fontSize: 22,
-                      fontWeight: FontWeight.w800,
+              child: AppPanel(
+                elevated: true,
+                padding: EdgeInsets.zero,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Padding(
+                      padding: EdgeInsets.only(top: 24),
+                      child: CaptionCraftMark(size: 42, radius: 11),
                     ),
-                  ),
-                  const SizedBox(height: 10),
-                  Text(
-                    message.replaceFirst('Exception: ', ''),
-                    maxLines: 3,
-                    overflow: TextOverflow.ellipsis,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(color: kTextSecondary, height: 1.4),
-                  ),
-                  const SizedBox(height: 22),
-                  FilledButton.icon(
-                    onPressed: onRetry,
-                    icon: const Icon(Icons.refresh_rounded),
-                    label: const Text('Try again'),
-                  ),
-                ],
+                    AppEmptyState(
+                      icon: Icons.cloud_off_rounded,
+                      title: 'Could not restore your session',
+                      message: message.replaceFirst('Exception: ', ''),
+                      action: FilledButton.icon(
+                        onPressed: onRetry,
+                        icon: const Icon(Icons.refresh_rounded, size: 18),
+                        label: const Text('Try again'),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
@@ -115,25 +106,13 @@ class _AppBootScreen extends StatelessWidget {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Container(
-                  width: 58,
-                  height: 58,
+                const DecoratedBox(
                   decoration: BoxDecoration(
-                    color: kAccent,
-                    borderRadius: BorderRadius.circular(17),
                     boxShadow: [
-                      BoxShadow(
-                        color: kAccent.withValues(alpha: 0.2),
-                        blurRadius: 28,
-                        spreadRadius: 2,
-                      ),
+                      BoxShadow(color: Color(0x33FF7548), blurRadius: 28),
                     ],
                   ),
-                  child: const Icon(
-                    Icons.content_cut_rounded,
-                    color: kOnAccent,
-                    size: 28,
-                  ),
+                  child: CaptionCraftMark(size: 62, radius: 17),
                 ),
                 const SizedBox(height: 20),
                 const Text(

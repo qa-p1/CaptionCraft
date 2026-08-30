@@ -6187,7 +6187,10 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                       horizontal: compactControls ? 6 : 12,
                       vertical: compactControls ? 2 : 8,
                     ),
-                    color: kSurface,
+                    decoration: const BoxDecoration(
+                      color: kSurface,
+                      border: Border(top: BorderSide(color: kBorder)),
+                    ),
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
@@ -6281,16 +6284,25 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                         ),
                                         onPressed: () => _stepFrame(-1),
                                       ),
-                                      IconButton(
+                                      IconButton.filled(
                                         tooltip: playbackState.isPlaying
                                             ? 'Pause'
                                             : 'Play',
+                                        style: IconButton.styleFrom(
+                                          backgroundColor: kAccent,
+                                          foregroundColor: kOnAccent,
+                                          minimumSize: Size.square(
+                                            compactControls ? 36 : 42,
+                                          ),
+                                          maximumSize: Size.square(
+                                            compactControls ? 36 : 42,
+                                          ),
+                                        ),
                                         icon: Icon(
                                           playbackState.isPlaying
                                               ? Icons.pause_rounded
                                               : Icons.play_arrow_rounded,
-                                          color: kTextPrimary,
-                                          size: 32,
+                                          size: compactControls ? 24 : 27,
                                         ),
                                         onPressed: _togglePlayPause,
                                       ),

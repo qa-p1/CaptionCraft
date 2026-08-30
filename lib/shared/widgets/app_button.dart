@@ -25,7 +25,7 @@ class AppButton extends StatelessWidget {
   Widget build(BuildContext context) {
     return SizedBox(
       width: width ?? double.infinity,
-      height: 50,
+      height: 48,
       child: AnimatedSwitcher(
         duration: const Duration(milliseconds: 200),
         layoutBuilder: (currentChild, previousChildren) => Stack(
@@ -80,14 +80,16 @@ class _FilledButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ElevatedButton(
+    return FilledButton(
       onPressed: onPressed,
       style: ElevatedButton.styleFrom(
         backgroundColor: kAccent,
         foregroundColor: Colors.white,
         disabledBackgroundColor: kAccent.withValues(alpha: 0.4),
         disabledForegroundColor: Colors.white54,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(kRadiusMedium),
+        ),
       ),
       child: _buildContent(Colors.white),
     );
@@ -108,13 +110,13 @@ class _FilledButton extends StatelessWidget {
       return Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, size: 20),
+          Icon(icon, size: 18),
           const SizedBox(width: 8),
-          Text(label, style: TextStyle(fontWeight: FontWeight.w600)),
+          Text(label, style: TextStyle(fontWeight: FontWeight.w700)),
         ],
       );
     }
-    return Text(label, style: TextStyle(fontWeight: FontWeight.w600));
+    return Text(label, style: TextStyle(fontWeight: FontWeight.w700));
   }
 }
 
@@ -138,7 +140,9 @@ class _GhostButton extends StatelessWidget {
       style: OutlinedButton.styleFrom(
         foregroundColor: kTextPrimary,
         side: const BorderSide(color: kBorder),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(kRadiusMedium),
+        ),
       ),
       child: _buildContent(),
     );
@@ -159,7 +163,7 @@ class _GhostButton extends StatelessWidget {
       return Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, size: 20),
+          Icon(icon, size: 18),
           const SizedBox(width: 8),
           Text(label, style: TextStyle(fontWeight: FontWeight.w500)),
         ],
@@ -184,12 +188,14 @@ class _DangerButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ElevatedButton(
+    return FilledButton(
       onPressed: onPressed,
       style: ElevatedButton.styleFrom(
         backgroundColor: kError,
         foregroundColor: Colors.white,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(kRadiusMedium),
+        ),
       ),
       child: _buildContent(),
     );
@@ -210,7 +216,7 @@ class _DangerButton extends StatelessWidget {
       return Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, size: 20),
+          Icon(icon, size: 18),
           const SizedBox(width: 8),
           Text(label, style: const TextStyle(fontWeight: FontWeight.w600)),
         ],

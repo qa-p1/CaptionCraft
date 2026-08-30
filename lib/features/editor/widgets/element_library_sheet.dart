@@ -162,6 +162,7 @@ class _ElementLibrarySheetState extends ConsumerState<ElementLibrarySheet> {
     return ResizableEditorSheet(
       title: widget.title,
       subtitle: widget.subtitle,
+      icon: Icons.widgets_outlined,
       initialHeightFactor: 0.78,
       minHeightFactor: 0.52,
       maxHeightFactor: 0.92,

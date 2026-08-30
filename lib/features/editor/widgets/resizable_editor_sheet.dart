@@ -2,7 +2,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
-import '../../../core/theme/app_theme.dart';
+import '../../../shared/widgets/app_surface.dart';
 
 /// A bottom sheet whose top edge follows the user's drag and stays where it is
 /// released. This intentionally does not snap to a small set of presets: the
@@ -13,6 +13,7 @@ class ResizableEditorSheet extends StatefulWidget {
   final Widget child;
   final VoidCallback? onClose;
   final Widget? trailing;
+  final IconData? icon;
   final double initialHeightFactor;
   final double minHeightFactor;
   final double maxHeightFactor;
@@ -26,6 +27,7 @@ class ResizableEditorSheet extends StatefulWidget {
     this.subtitle,
     this.onClose,
     this.trailing,
+    this.icon,
     this.initialHeightFactor = 0.44,
     this.minHeightFactor = 0.24,
     this.maxHeightFactor = 0.90,
@@ -82,90 +84,29 @@ class _ResizableEditorSheetState extends State<ResizableEditorSheet> {
           key: const ValueKey('resizable_editor_sheet'),
           height: resolvedHeight,
           width: double.infinity,
-          child: DecoratedBox(
-            decoration: const BoxDecoration(
-              color: kSurface,
-              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-              boxShadow: [
-                BoxShadow(
-                  color: Color(0x66000000),
-                  blurRadius: 22,
-                  offset: Offset(0, -6),
-                ),
-              ],
-            ),
+          child: AppSheetSurface(
             child: SafeArea(
               top: false,
               child: Column(
                 children: [
-                  Semantics(
-                    label: 'Resize bottom sheet',
-                    hint: 'Drag up or down to resize',
-                    child: GestureDetector(
-                      key: const ValueKey('resizable_sheet_handle'),
-                      behavior: HitTestBehavior.opaque,
-                      onVerticalDragUpdate: (details) =>
-                          _resizeBy(details.delta.dy, availableHeight),
-                      child: SizedBox(
-                        height: 28,
-                        width: double.infinity,
-                        child: Center(
-                          child: Container(
-                            width: 44,
-                            height: 5,
-                            decoration: BoxDecoration(
-                              color: kTextSecondary.withValues(alpha: 0.65),
-                              borderRadius: BorderRadius.circular(999),
-                            ),
-                          ),
-                        ),
+                  AppSheetHeader(
+                    title: widget.title,
+                    subtitle: widget.subtitle,
+                    icon: widget.icon,
+                    trailing: widget.trailing,
+                    onClose: widget.onClose,
+                    handle: Semantics(
+                      label: 'Resize bottom sheet',
+                      hint: 'Drag up or down to resize',
+                      child: GestureDetector(
+                        key: const ValueKey('resizable_sheet_handle'),
+                        behavior: HitTestBehavior.opaque,
+                        onVerticalDragUpdate: (details) =>
+                            _resizeBy(details.delta.dy, availableHeight),
+                        child: const AppSheetHandle(height: 28),
                       ),
                     ),
                   ),
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(18, 2, 10, 12),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                widget.title,
-                                style: const TextStyle(
-                                  color: kTextPrimary,
-                                  fontSize: 18,
-                                  fontWeight: FontWeight.w800,
-                                ),
-                              ),
-                              if (widget.subtitle?.trim().isNotEmpty ==
-                                  true) ...[
-                                const SizedBox(height: 2),
-                                Text(
-                                  widget.subtitle!,
-                                  maxLines: 2,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    color: kTextSecondary,
-                                    fontSize: 12,
-                                    height: 1.25,
-                                  ),
-                                ),
-                              ],
-                            ],
-                          ),
-                        ),
-                        if (widget.trailing != null) widget.trailing!,
-                        if (widget.onClose != null)
-                          IconButton(
-                            tooltip: 'Close',
-                            onPressed: widget.onClose,
-                            icon: const Icon(Icons.close_rounded),
-                          ),
-                      ],
-                    ),
-                  ),
-                  const Divider(height: 1, color: kBorder),
                   Expanded(child: body),
                 ],
               ),
@@ -186,6 +127,7 @@ class FixedEditorSheet extends StatelessWidget {
   final Widget child;
   final VoidCallback? onClose;
   final Widget? trailing;
+  final IconData? icon;
   final double heightFactor;
   final EdgeInsetsGeometry contentPadding;
   final bool scrollable;
@@ -197,6 +139,7 @@ class FixedEditorSheet extends StatelessWidget {
     this.subtitle,
     this.onClose,
     this.trailing,
+    this.icon,
     this.heightFactor = 0.48,
     this.contentPadding = const EdgeInsets.fromLTRB(18, 16, 18, 28),
     this.scrollable = true,
@@ -231,65 +174,20 @@ class FixedEditorSheet extends StatelessWidget {
           key: const ValueKey('fixed_editor_sheet'),
           height: resolvedHeight,
           width: double.infinity,
-          child: DecoratedBox(
-            decoration: const BoxDecoration(
-              color: kSurface,
-              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-              boxShadow: [
-                BoxShadow(
-                  color: Color(0x66000000),
-                  blurRadius: 22,
-                  offset: Offset(0, -6),
-                ),
-              ],
-            ),
+          child: AppSheetSurface(
             child: SafeArea(
               top: false,
               child: Column(
                 children: [
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(18, 16, 10, 12),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                title,
-                                style: const TextStyle(
-                                  color: kTextPrimary,
-                                  fontSize: 18,
-                                  fontWeight: FontWeight.w800,
-                                ),
-                              ),
-                              if (subtitle?.trim().isNotEmpty == true) ...[
-                                const SizedBox(height: 2),
-                                Text(
-                                  subtitle!,
-                                  maxLines: 2,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    color: kTextSecondary,
-                                    fontSize: 12,
-                                    height: 1.25,
-                                  ),
-                                ),
-                              ],
-                            ],
-                          ),
-                        ),
-                        ?trailing,
-                        if (onClose != null)
-                          IconButton(
-                            tooltip: 'Close',
-                            onPressed: onClose,
-                            icon: const Icon(Icons.close_rounded),
-                          ),
-                      ],
-                    ),
+                  AppSheetHeader(
+                    title: title,
+                    subtitle: subtitle,
+                    icon: icon,
+                    trailing: trailing,
+                    onClose: onClose,
+                    showHandle: false,
+                    padding: const EdgeInsets.fromLTRB(18, 15, 10, 13),
                   ),
-                  const Divider(height: 1, color: kBorder),
                   Expanded(child: body),
                 ],
               ),
@@ -310,6 +208,9 @@ Future<T?> showResizableEditorSheet<T>({
   double minHeightFactor = 0.24,
   double maxHeightFactor = 0.90,
   Color barrierColor = const Color(0x66000000),
+  IconData? icon,
+  EdgeInsetsGeometry contentPadding = const EdgeInsets.fromLTRB(18, 16, 18, 28),
+  bool scrollable = true,
 }) {
   return showModalBottomSheet<T>(
     context: context,
@@ -324,6 +225,9 @@ Future<T?> showResizableEditorSheet<T>({
       initialHeightFactor: initialHeightFactor,
       minHeightFactor: minHeightFactor,
       maxHeightFactor: maxHeightFactor,
+      icon: icon,
+      contentPadding: contentPadding,
+      scrollable: scrollable,
       onClose: () => Navigator.of(sheetContext).pop(),
       child: builder(sheetContext),
     ),
@@ -337,6 +241,9 @@ Future<T?> showFixedEditorSheet<T>({
   required WidgetBuilder builder,
   double heightFactor = 0.48,
   Color barrierColor = const Color(0x66000000),
+  IconData? icon,
+  EdgeInsetsGeometry contentPadding = const EdgeInsets.fromLTRB(18, 16, 18, 28),
+  bool scrollable = true,
 }) {
   return showModalBottomSheet<T>(
     context: context,
@@ -349,6 +256,9 @@ Future<T?> showFixedEditorSheet<T>({
       title: title,
       subtitle: subtitle,
       heightFactor: heightFactor,
+      icon: icon,
+      contentPadding: contentPadding,
+      scrollable: scrollable,
       onClose: () => Navigator.of(sheetContext).pop(),
       child: builder(sheetContext),
     ),

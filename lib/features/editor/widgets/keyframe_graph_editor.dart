@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import '../../../core/theme/app_theme.dart';
+import '../../../shared/widgets/app_surface.dart';
 import '../models/keyframe_curve_presets.dart';
 import '../models/timeline_models.dart';
 
@@ -760,102 +761,136 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
   Future<void> _showChannelControls() async {
     await showModalBottomSheet<void>(
       context: context,
-      showDragHandle: true,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
       builder: (sheetContext) => StatefulBuilder(
-        builder: (context, setSheetState) => SafeArea(
-          child: ListView(
-            shrinkWrap: true,
-            padding: const EdgeInsets.fromLTRB(14, 0, 14, 20),
-            children: [
-              const Text(
-                'Animation channels',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+        builder: (context, setSheetState) => AppSheetSurface(
+          child: SafeArea(
+            top: false,
+            child: SizedBox(
+              height: math.min(
+                MediaQuery.sizeOf(sheetContext).height * 0.68,
+                560,
               ),
-              const SizedBox(height: 6),
-              const Text(
-                'Visibility, solo and locking affect this graph session only; animation data is never removed.',
-                style: TextStyle(color: kTextSecondary, fontSize: 12),
-              ),
-              const SizedBox(height: 8),
-              for (final property in widget.properties)
-                ListTile(
-                  key: ValueKey('keyframe_channel_${property.name}'),
-                  title: Text(_propertyLabel(property)),
-                  selected: property == _property,
-                  onTap: () {
-                    _selectProperty(property);
-                    Navigator.pop(sheetContext);
-                  },
-                  trailing: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      IconButton(
-                        key: ValueKey(
-                          'keyframe_channel_visibility_${property.name}',
-                        ),
-                        tooltip: _hiddenProperties.contains(property)
-                            ? 'Show channel'
-                            : 'Hide channel',
-                        onPressed: () {
-                          setState(() {
-                            if (!_hiddenProperties.add(property)) {
-                              _hiddenProperties.remove(property);
-                            }
-                          });
-                          setSheetState(() {});
-                        },
-                        icon: Icon(
-                          _hiddenProperties.contains(property)
-                              ? Icons.visibility_off_rounded
-                              : Icons.visibility_rounded,
-                        ),
-                      ),
-                      IconButton(
-                        key: ValueKey('keyframe_channel_solo_${property.name}'),
-                        tooltip: _soloProperty == property
-                            ? 'Clear solo'
-                            : 'Solo channel',
-                        onPressed: () {
-                          setState(() {
-                            _soloProperty = _soloProperty == property
-                                ? null
-                                : property;
-                            if (_soloProperty != null) {
-                              _property = property;
-                              _selectOnly(null);
-                              _selectNearestToPlayhead();
-                            }
-                          });
-                          setSheetState(() {});
-                        },
-                        icon: Icon(
-                          Icons.headphones_rounded,
-                          color: _soloProperty == property ? kAccent : null,
-                        ),
-                      ),
-                      IconButton(
-                        key: ValueKey('keyframe_channel_lock_${property.name}'),
-                        tooltip: _lockedProperties.contains(property)
-                            ? 'Unlock channel'
-                            : 'Lock channel',
-                        onPressed: () {
-                          setState(() {
-                            if (!_lockedProperties.add(property)) {
-                              _lockedProperties.remove(property);
-                            }
-                          });
-                          setSheetState(() {});
-                        },
-                        icon: Icon(
-                          _lockedProperties.contains(property)
-                              ? Icons.lock_rounded
-                              : Icons.lock_open_rounded,
-                        ),
-                      ),
-                    ],
+              child: Column(
+                children: [
+                  AppSheetHeader(
+                    title: 'Animation channels',
+                    subtitle:
+                        'Visibility, solo and locking affect this graph session only',
+                    icon: Icons.tune_rounded,
+                    onClose: () => Navigator.pop(sheetContext),
                   ),
-                ),
-            ],
+                  Expanded(
+                    child: ListView.builder(
+                      padding: const EdgeInsets.fromLTRB(12, 14, 12, 20),
+                      itemCount: widget.properties.length,
+                      itemBuilder: (context, index) {
+                        final property = widget.properties[index];
+                        return Padding(
+                          padding: const EdgeInsets.only(bottom: 7),
+                          child: AppPanel(
+                            padding: EdgeInsets.zero,
+                            color: property == _property
+                                ? kAccent.withValues(alpha: 0.07)
+                                : kSurfaceElevated,
+                            selected: property == _property,
+                            child: ListTile(
+                              key: ValueKey(
+                                'keyframe_channel_${property.name}',
+                              ),
+                              title: Text(_propertyLabel(property)),
+                              selected: property == _property,
+                              onTap: () {
+                                _selectProperty(property);
+                                Navigator.pop(sheetContext);
+                              },
+                              trailing: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  IconButton(
+                                    key: ValueKey(
+                                      'keyframe_channel_visibility_${property.name}',
+                                    ),
+                                    tooltip:
+                                        _hiddenProperties.contains(property)
+                                        ? 'Show channel'
+                                        : 'Hide channel',
+                                    onPressed: () {
+                                      setState(() {
+                                        if (!_hiddenProperties.add(property)) {
+                                          _hiddenProperties.remove(property);
+                                        }
+                                      });
+                                      setSheetState(() {});
+                                    },
+                                    icon: Icon(
+                                      _hiddenProperties.contains(property)
+                                          ? Icons.visibility_off_rounded
+                                          : Icons.visibility_rounded,
+                                    ),
+                                  ),
+                                  IconButton(
+                                    key: ValueKey(
+                                      'keyframe_channel_solo_${property.name}',
+                                    ),
+                                    tooltip: _soloProperty == property
+                                        ? 'Clear solo'
+                                        : 'Solo channel',
+                                    onPressed: () {
+                                      setState(() {
+                                        _soloProperty =
+                                            _soloProperty == property
+                                            ? null
+                                            : property;
+                                        if (_soloProperty != null) {
+                                          _property = property;
+                                          _selectOnly(null);
+                                          _selectNearestToPlayhead();
+                                        }
+                                      });
+                                      setSheetState(() {});
+                                    },
+                                    icon: Icon(
+                                      Icons.headphones_rounded,
+                                      color: _soloProperty == property
+                                          ? kAccent
+                                          : null,
+                                    ),
+                                  ),
+                                  IconButton(
+                                    key: ValueKey(
+                                      'keyframe_channel_lock_${property.name}',
+                                    ),
+                                    tooltip:
+                                        _lockedProperties.contains(property)
+                                        ? 'Unlock channel'
+                                        : 'Lock channel',
+                                    onPressed: () {
+                                      setState(() {
+                                        if (!_lockedProperties.add(property)) {
+                                          _lockedProperties.remove(property);
+                                        }
+                                      });
+                                      setSheetState(() {});
+                                    },
+                                    icon: Icon(
+                                      _lockedProperties.contains(property)
+                                          ? Icons.lock_rounded
+                                          : Icons.lock_open_rounded,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ),
         ),
       ),
@@ -872,12 +907,15 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
         Row(
           children: [
             Expanded(
-              child: DropdownButton<TimelineKeyframeProperty>(
-                value: _property,
+              child: DropdownButtonFormField<TimelineKeyframeProperty>(
+                initialValue: _property,
                 isExpanded: true,
-                dropdownColor: kSurfaceElevated,
-                underline: const SizedBox.shrink(),
-                borderRadius: BorderRadius.circular(12),
+                decoration: const InputDecoration(
+                  isDense: true,
+                  contentPadding: EdgeInsets.fromLTRB(12, 9, 10, 9),
+                  prefixIcon: Icon(Icons.diamond_outlined, size: 17),
+                  prefixIconConstraints: BoxConstraints(minWidth: 36),
+                ),
                 items: [
                   for (final property in widget.properties)
                     DropdownMenuItem(
@@ -1023,9 +1061,20 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
         Expanded(
           child: DecoratedBox(
             decoration: BoxDecoration(
-              color: kBackground,
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: kBorder),
+              gradient: const LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [Color(0xFF0C0F12), kBackground],
+              ),
+              borderRadius: BorderRadius.circular(15),
+              border: Border.all(color: kBorderStrong),
+              boxShadow: const [
+                BoxShadow(
+                  color: Color(0x2E000000),
+                  blurRadius: 12,
+                  offset: Offset(0, 5),
+                ),
+              ],
             ),
             child: LayoutBuilder(
               builder: (context, constraints) {
@@ -1281,6 +1330,9 @@ class _GraphButton extends StatelessWidget {
               : Colors.transparent,
           foregroundColor: selected ? kAccent : null,
           side: BorderSide(color: selected ? kAccent : kBorder),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(10),
+          ),
           visualDensity: VisualDensity.compact,
         ),
         onPressed: onPressed,
@@ -1313,6 +1365,9 @@ class _GraphIconButton extends StatelessWidget {
             minimumSize: const Size.square(38),
             padding: EdgeInsets.zero,
             side: const BorderSide(color: kBorder),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(10),
+            ),
             visualDensity: VisualDensity.compact,
           ),
           onPressed: onPressed,

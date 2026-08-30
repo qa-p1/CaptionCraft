@@ -31,12 +31,25 @@ class SnackBarHelper {
       SnackBar(
         content: Row(
           children: [
-            Icon(icon, color: color, size: 20),
-            const SizedBox(width: 12),
+            Container(
+              width: 30,
+              height: 30,
+              decoration: BoxDecoration(
+                color: color.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(9),
+              ),
+              child: Icon(icon, color: color, size: 17),
+            ),
+            const SizedBox(width: 10),
             Expanded(
               child: Text(
                 message,
-                style: const TextStyle(color: kTextPrimary, fontSize: 14),
+                style: const TextStyle(
+                  color: kTextPrimary,
+                  fontSize: 12.5,
+                  height: 1.35,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
             ),
           ],
@@ -47,7 +60,9 @@ class SnackBarHelper {
           borderRadius: BorderRadius.circular(12),
           side: BorderSide(color: color.withValues(alpha: 0.3)),
         ),
-        margin: const EdgeInsets.all(16),
+        margin: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+        showCloseIcon: true,
+        closeIconColor: kTextSecondary,
         duration: const Duration(seconds: 3),
       ),
     );

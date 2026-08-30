@@ -5,6 +5,8 @@ import 'package:caption_craft/features/auth/screens/login_screen.dart';
 import 'package:caption_craft/features/auth/providers/auth_provider.dart';
 import 'package:caption_craft/features/editor/models/subtitle_entry.dart';
 import 'package:caption_craft/features/editor/models/timeline_models.dart';
+import 'package:caption_craft/features/editor/providers/editor_provider.dart';
+import 'package:caption_craft/features/editor/screens/editor_screen.dart';
 import 'package:caption_craft/features/home/screens/home_screen.dart';
 import 'package:caption_craft/features/home/screens/processing_screen.dart';
 import 'package:caption_craft/features/quota/providers/quota_provider.dart';
@@ -78,7 +80,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 500));
 
     expect(find.text('Make the cut. Own the frame.'), findsOneWidget);
-    expect(find.text('Your cuts'), findsOneWidget);
+    expect(find.text('Projects'), findsOneWidget);
     expect(find.text('Summer launch'), findsOneWidget);
     expect(find.text('City stories'), findsOneWidget);
     expect(tester.takeException(), isNull);
@@ -86,6 +88,61 @@ void main() {
     await expectLater(
       find.byType(MaterialApp),
       matchesGoldenFile('goldens/home_studio_desktop.png'),
+    );
+  });
+
+  testWidgets('editor workspace stays polished and reachable on a phone', (
+    tester,
+  ) async {
+    final project = _sampleProjects().first;
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
+    addTearDown(container.dispose);
+    await tester.binding.setSurfaceSize(const Size(390, 844));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: MaterialApp(
+          debugShowCheckedModeBanner: false,
+          theme: AppTheme.darkTheme,
+          home: EditorScreen(project: project),
+        ),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 650));
+    container.read(editorProvider.notifier)
+      ..selectTrack('video_0')
+      ..selectClip('clip_0');
+    await tester.pump(const Duration(milliseconds: 250));
+
+    expect(
+      find.byKey(const ValueKey('editor_aspect_ratio_button')),
+      findsOneWidget,
+    );
+    expect(find.byKey(const ValueKey('editor_export_button')), findsOneWidget);
+    expect(find.byKey(const ValueKey('editor_tool_dock')), findsOneWidget);
+    expect(find.byKey(const ValueKey('dock_primary_chroma')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+
+    await expectLater(
+      find.byType(MaterialApp),
+      matchesGoldenFile('goldens/editor_workspace_phone.png'),
+    );
+
+    final more = find.byKey(const ValueKey('dock_primary_more'));
+    await tester.ensureVisible(more);
+    await tester.tap(more);
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('editor_all_tools_sheet')),
+      findsOneWidget,
+    );
+    expect(find.text('All tools'), findsOneWidget);
+    await expectLater(
+      find.byType(MaterialApp),
+      matchesGoldenFile('goldens/editor_all_tools_phone.png'),
     );
   });
 
