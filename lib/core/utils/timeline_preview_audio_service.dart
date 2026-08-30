@@ -186,6 +186,22 @@ class TimelinePreviewAudioService {
           asset: selected[index].asset,
           sourcePath: selected[index].sourcePath,
           hasAudio: true,
+          frameRate: (selected[index].asset?.metadata['frameRate'] as num?)
+              ?.toDouble(),
+          colorPrimaries:
+              selected[index].asset?.metadata['colorPrimaries'] as String?,
+          colorTransfer:
+              selected[index].asset?.metadata['colorTransfer'] as String?,
+          colorSpace: selected[index].asset?.metadata['colorSpace'] as String?,
+          colorRange: selected[index].asset?.metadata['colorRange'] as String?,
+          bitDepth: selected[index].asset?.metadata['bitDepth'] as int?,
+          audioStreamCount:
+              selected[index].asset?.metadata['audioStreamCount'] as int?,
+          audioChannels:
+              selected[index].asset?.metadata['audioChannels'] as int?,
+          audioChannelsByStream: audioChannelsByStreamFromMetadata(
+            selected[index].asset?.metadata['audioStreams'],
+          ),
         ),
     ];
     final maximumConcurrentVoices = _maximumConcurrentVoices(inputs);
@@ -406,6 +422,14 @@ class TimelinePreviewAudioService {
           sourcePath: readable[index].sourcePath,
           hasAudio: true,
           frameRate: readable[index].frameRate,
+          colorPrimaries: readable[index].colorPrimaries,
+          colorTransfer: readable[index].colorTransfer,
+          colorSpace: readable[index].colorSpace,
+          colorRange: readable[index].colorRange,
+          bitDepth: readable[index].bitDepth,
+          audioStreamCount: readable[index].audioStreamCount,
+          audioChannels: readable[index].audioChannels,
+          audioChannelsByStream: readable[index].audioChannelsByStream,
         ),
     ];
   }

@@ -253,7 +253,7 @@ void main() {
       final restoredSecond = restored.tracks.first.clips.last;
       final restoredAudio = restored.tracks.last.clips.single;
 
-      expect(restored.schemaVersion, 8);
+      expect(restored.schemaVersion, EditorTimeline.currentSchemaVersion);
       expect(restored.groups, hasLength(1));
       expect(restored.groups.single.clipIds, ['first', 'second']);
       expect(restoredFirst.groupId, 'group');
@@ -540,6 +540,139 @@ void main() {
       );
       expect(applied.effects, hasLength(2));
       expect(applied.effects.last.id, isNot(firstId));
+    });
+
+    test('effect stacks copy, undo, and reload across every visual scope', () {
+      final source = TimelineClip(
+        id: 'source',
+        trackId: 'visual',
+        type: TimelineTrackType.video,
+        label: 'Source',
+        startTime: Duration.zero,
+        endTime: const Duration(seconds: 2),
+        groupId: 'group',
+        compoundId: 'compound',
+        effectStack: EditorEffectStack(
+          effects: [EditorEffect(type: EditorEffectType.gaussianBlur)],
+        ),
+      );
+      final destination = TimelineClip(
+        id: 'destination',
+        trackId: 'visual',
+        type: TimelineTrackType.video,
+        label: 'Destination',
+        startTime: const Duration(seconds: 2),
+        endTime: const Duration(seconds: 4),
+        groupId: 'group',
+        compoundId: 'compound',
+      );
+      final adjustment = TimelineClip.effect(
+        id: 'adjustment',
+        trackId: 'adjustments',
+        label: 'Adjustment',
+        startTime: Duration.zero,
+        endTime: const Duration(seconds: 4),
+        isAdjustmentLayer: true,
+      );
+      notifier.setTimeline(
+        EditorTimeline(
+          tracks: [
+            TimelineTrack(
+              id: 'visual',
+              name: 'Visual',
+              type: TimelineTrackType.video,
+              section: TimelineTrackSection.overlay,
+              clips: [source, destination],
+            ),
+            TimelineTrack(
+              id: 'adjustments',
+              name: 'Adjustments',
+              type: TimelineTrackType.video,
+              section: TimelineTrackSection.overlay,
+              clips: [adjustment],
+            ),
+          ],
+          groups: [
+            TimelineGroup(
+              id: 'group',
+              name: 'Group',
+              clipIds: const ['source', 'destination'],
+            ),
+          ],
+          compoundClips: [
+            TimelineCompoundClip(
+              id: 'compound',
+              name: 'Compound',
+              clipIds: const ['source', 'destination'],
+            ),
+          ],
+        ),
+        recordHistory: false,
+      );
+
+      expect(
+        notifier.copyEffectStackToClipboard(
+          scope: EditorEffectScope.clip,
+          targetId: 'source',
+          domain: EditorEffectDomain.visual,
+        ),
+        isTrue,
+      );
+      final targets = <({EditorEffectScope scope, String? id})>[
+        (scope: EditorEffectScope.clip, id: 'destination'),
+        (scope: EditorEffectScope.track, id: 'visual'),
+        (scope: EditorEffectScope.group, id: 'group'),
+        (scope: EditorEffectScope.compound, id: 'compound'),
+        (scope: EditorEffectScope.adjustmentLayer, id: 'adjustment'),
+        (scope: EditorEffectScope.project, id: null),
+      ];
+      for (final target in targets) {
+        expect(
+          notifier.pasteEffectStackFromClipboard(
+            scope: target.scope,
+            targetId: target.id,
+            domain: EditorEffectDomain.visual,
+          ),
+          isTrue,
+          reason: '${target.scope.name}:${target.id}',
+        );
+      }
+
+      expect(
+        notifier.effectStackForTarget(scope: EditorEffectScope.project).isEmpty,
+        isFalse,
+      );
+      notifier.undo();
+      expect(
+        notifier.effectStackForTarget(scope: EditorEffectScope.project).isEmpty,
+        isTrue,
+      );
+      notifier.redo();
+
+      final restored = EditorTimeline.fromJson(
+        container.read(editorProvider).timeline.toJson(),
+      );
+      final restoredContainer = ProviderContainer();
+      addTearDown(restoredContainer.dispose);
+      final restoredNotifier = restoredContainer.read(editorProvider.notifier);
+      restoredNotifier.loadProject(
+        videoPath: 'source.mp4',
+        projectId: 'restored',
+        projectName: 'Restored',
+        timeline: restored,
+      );
+      final copiedIds = <String>{};
+      for (final target in targets) {
+        final stack = restoredNotifier.effectStackForTarget(
+          scope: target.scope,
+          targetId: target.id,
+        );
+        expect(stack.effects, hasLength(1), reason: target.scope.name);
+        expect(stack.effects.single.type, EditorEffectType.gaussianBlur);
+        copiedIds.add(stack.effects.single.id);
+      }
+      expect(copiedIds, hasLength(targets.length));
+      expect(copiedIds, isNot(contains(source.effectStack.effects.single.id)));
     });
 
     test('adjustment layers and buses persist through undo and redo', () {

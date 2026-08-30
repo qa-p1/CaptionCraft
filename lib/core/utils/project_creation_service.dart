@@ -102,13 +102,13 @@ class ProjectCreationService {
         label: source.displayName,
         sourcePath: source.filePath,
         metadata: {
+          ...mediaInfo,
           'durationMs': durationMs,
           'width': mediaInfo['width'],
           'height': mediaInfo['height'],
           'hasAudio':
               source.assetType == EditorAssetType.video &&
               mediaInfo['hasAudio'] == true,
-          'frameRate': mediaInfo['frameRate'],
         },
       );
       assets.add(asset);

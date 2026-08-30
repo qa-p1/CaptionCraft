@@ -63,7 +63,13 @@ enum EditorEffectType {
   noiseGate,
   deEsser,
   noiseReduction,
+  hissReduction,
   humReduction,
+  windReduction,
+  clickRemoval,
+  declip,
+  dialogueEnhance,
+  deReverb,
   reverb,
   delay,
   distortion,
@@ -77,7 +83,9 @@ enum EditorEffectInterpolation { hold, linear, easeIn, easeOut, easeInOut }
 
 enum EditorAudioChannelMode { stereo, mono, dualMono, leftOnly, rightOnly }
 
-enum EditorColorSpace { sdr709, log, hlg, pq, wideGamut }
+enum EditorColorSpace { automatic, sdr709, log, hlg, pq, wideGamut }
+
+enum EditorToneMapMode { hable, reinhard, mobius }
 
 const Map<EditorEffectType, String> _effectLabels = {
   EditorEffectType.gaussianBlur: 'Gaussian Blur',
@@ -128,7 +136,13 @@ const Map<EditorEffectType, String> _effectLabels = {
   EditorEffectType.noiseGate: 'Noise Gate',
   EditorEffectType.deEsser: 'De-esser',
   EditorEffectType.noiseReduction: 'Noise Reduction',
+  EditorEffectType.hissReduction: 'Hiss Reduction',
   EditorEffectType.humReduction: 'Hum Reduction',
+  EditorEffectType.windReduction: 'Wind Reduction',
+  EditorEffectType.clickRemoval: 'Click & Pop Removal',
+  EditorEffectType.declip: 'De-clip',
+  EditorEffectType.dialogueEnhance: 'Dialogue Enhance',
+  EditorEffectType.deReverb: 'De-reverb',
   EditorEffectType.reverb: 'Reverb',
   EditorEffectType.delay: 'Delay',
   EditorEffectType.distortion: 'Distortion',
@@ -143,7 +157,13 @@ const Set<EditorEffectType> _audioEffectTypes = {
   EditorEffectType.noiseGate,
   EditorEffectType.deEsser,
   EditorEffectType.noiseReduction,
+  EditorEffectType.hissReduction,
   EditorEffectType.humReduction,
+  EditorEffectType.windReduction,
+  EditorEffectType.clickRemoval,
+  EditorEffectType.declip,
+  EditorEffectType.dialogueEnhance,
+  EditorEffectType.deReverb,
   EditorEffectType.reverb,
   EditorEffectType.delay,
   EditorEffectType.distortion,
@@ -276,7 +296,22 @@ extension EditorEffectTypeMetadata on EditorEffectType {
       EditorEffectType.noiseGate => {'threshold': -45, 'range': -18},
       EditorEffectType.deEsser => {'frequency': 5500, 'amount': 0.35},
       EditorEffectType.noiseReduction => {'amount': 0.35},
-      EditorEffectType.humReduction => {'frequency': 60, 'amount': 0.5},
+      EditorEffectType.hissReduction => {'amount': 0.35, 'floor': -50},
+      EditorEffectType.humReduction => {
+        'frequency': 60,
+        'amount': 0.5,
+        'harmonics': 3,
+      },
+      EditorEffectType.windReduction => {'cutoff': 120, 'amount': 0.5},
+      EditorEffectType.clickRemoval => {'amount': 0.45},
+      EditorEffectType.declip => {'amount': 0.45},
+      EditorEffectType.dialogueEnhance => {
+        'presence': 0.35,
+        'clarity': 0.3,
+        'warmth': 0.15,
+        'compression': 0.3,
+      },
+      EditorEffectType.deReverb => {'amount': 0.35, 'room': 0.5},
       EditorEffectType.reverb => {'room': 0.35, 'damping': 0.5},
       EditorEffectType.delay => {'delayMs': 180, 'decay': 0.35},
       EditorEffectType.distortion => {'amount': 0.2},
@@ -317,6 +352,107 @@ EditorEffectInterpolation _effectInterpolation(Object? value) {
   );
 }
 
+class EditorMaskPoint {
+  final double x;
+  final double y;
+
+  const EditorMaskPoint(this.x, this.y);
+
+  EditorMaskPoint get normalized => EditorMaskPoint(
+    x.clamp(0.0, 1.0).toDouble(),
+    y.clamp(0.0, 1.0).toDouble(),
+  );
+
+  EditorMaskPoint lerp(EditorMaskPoint other, double amount) {
+    final progress = amount.clamp(0.0, 1.0).toDouble();
+    return EditorMaskPoint(
+      x + (other.x - x) * progress,
+      y + (other.y - y) * progress,
+    ).normalized;
+  }
+
+  Map<String, dynamic> toJson() => {'x': normalized.x, 'y': normalized.y};
+
+  factory EditorMaskPoint.fromJson(Object? value) {
+    final json = _effectMap(value);
+    return EditorMaskPoint(
+      _effectDouble(json['x'], 0.5),
+      _effectDouble(json['y'], 0.5),
+    ).normalized;
+  }
+}
+
+class EditorMaskTrackingKeyframe {
+  final String id;
+  final Duration time;
+  final double x;
+  final double y;
+  final double width;
+  final double height;
+  final List<EditorMaskPoint> points;
+  final double confidence;
+
+  EditorMaskTrackingKeyframe({
+    String? id,
+    required this.time,
+    required this.x,
+    required this.y,
+    required this.width,
+    required this.height,
+    this.points = const [],
+    this.confidence = 1,
+  }) : id = id?.trim().isNotEmpty == true ? id! : const Uuid().v4();
+
+  EditorMaskTrackingKeyframe copyWith({
+    Duration? time,
+    double? x,
+    double? y,
+    double? width,
+    double? height,
+    List<EditorMaskPoint>? points,
+    double? confidence,
+  }) {
+    return EditorMaskTrackingKeyframe(
+      id: id,
+      time: time ?? this.time,
+      x: x ?? this.x,
+      y: y ?? this.y,
+      width: width ?? this.width,
+      height: height ?? this.height,
+      points: List.unmodifiable(points ?? this.points),
+      confidence: confidence ?? this.confidence,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'timeMs': math.max(0, time.inMilliseconds),
+    'x': x.clamp(0.0, 1.0),
+    'y': y.clamp(0.0, 1.0),
+    'width': width.clamp(0.02, 1.0),
+    'height': height.clamp(0.02, 1.0),
+    'points': points.map((point) => point.toJson()).toList(),
+    'confidence': confidence.clamp(0.0, 1.0),
+  };
+
+  factory EditorMaskTrackingKeyframe.fromJson(Object? value) {
+    final json = _effectMap(value);
+    final rawPoints = json['points'];
+    return EditorMaskTrackingKeyframe(
+      id: json['id'] as String?,
+      time: Duration(milliseconds: math.max(0, _effectInt(json['timeMs'], 0))),
+      x: _effectDouble(json['x'], 0.25),
+      y: _effectDouble(json['y'], 0.25),
+      width: _effectDouble(json['width'], 0.5),
+      height: _effectDouble(json['height'], 0.5),
+      points: rawPoints is List
+          ? rawPoints.map(EditorMaskPoint.fromJson).toList()
+          : const [],
+      confidence: _effectDouble(json['confidence'], 1),
+    );
+  }
+}
+
 class EditorEffectMask {
   final EditorEffectMaskShape shape;
   final double x;
@@ -327,6 +463,8 @@ class EditorEffectMask {
   final bool inverted;
   final bool trackingEnabled;
   final String? trackingTargetId;
+  final List<EditorMaskPoint> points;
+  final List<EditorMaskTrackingKeyframe> trackingKeyframes;
 
   const EditorEffectMask({
     this.shape = EditorEffectMaskShape.rectangle,
@@ -338,6 +476,8 @@ class EditorEffectMask {
     this.inverted = false,
     this.trackingEnabled = false,
     this.trackingTargetId,
+    this.points = const [],
+    this.trackingKeyframes = const [],
   });
 
   double get safeWidth => width.clamp(0.02, 1).toDouble();
@@ -345,6 +485,66 @@ class EditorEffectMask {
   double get safeX => x.clamp(0.0, 1 - safeWidth).toDouble();
   double get safeY => y.clamp(0.0, 1 - safeHeight).toDouble();
   double get safeFeather => feather.clamp(0.0, 1).toDouble();
+  List<EditorMaskPoint> get safePoints =>
+      List.unmodifiable(points.map((point) => point.normalized));
+
+  bool get hasTrackedMotion => trackingKeyframes.length >= 2;
+
+  EditorEffectMask resolvedAt(Duration time) {
+    if (trackingKeyframes.isEmpty) return this;
+    final frames = [...trackingKeyframes]
+      ..sort((first, second) => first.time.compareTo(second.time));
+    if (time <= frames.first.time) return _withTrackingFrame(frames.first);
+    if (time >= frames.last.time) return _withTrackingFrame(frames.last);
+    for (var index = 1; index < frames.length; index++) {
+      final previous = frames[index - 1];
+      final next = frames[index];
+      if (time > next.time) continue;
+      final span = math.max(
+        1,
+        next.time.inMicroseconds - previous.time.inMicroseconds,
+      );
+      final progress =
+          ((time.inMicroseconds - previous.time.inMicroseconds) / span)
+              .clamp(0.0, 1.0)
+              .toDouble();
+      final canInterpolatePoints =
+          previous.points.length == next.points.length &&
+          previous.points.isNotEmpty;
+      return copyWith(
+        x: previous.x + (next.x - previous.x) * progress,
+        y: previous.y + (next.y - previous.y) * progress,
+        width: previous.width + (next.width - previous.width) * progress,
+        height: previous.height + (next.height - previous.height) * progress,
+        points: canInterpolatePoints
+            ? [
+                for (
+                  var pointIndex = 0;
+                  pointIndex < previous.points.length;
+                  pointIndex++
+                )
+                  previous.points[pointIndex].lerp(
+                    next.points[pointIndex],
+                    progress,
+                  ),
+              ]
+            : previous.points.isNotEmpty
+            ? previous.points
+            : points,
+      );
+    }
+    return this;
+  }
+
+  EditorEffectMask _withTrackingFrame(EditorMaskTrackingKeyframe frame) {
+    return copyWith(
+      x: frame.x,
+      y: frame.y,
+      width: frame.width,
+      height: frame.height,
+      points: frame.points.isEmpty ? points : frame.points,
+    );
+  }
 
   EditorEffectMask copyWith({
     EditorEffectMaskShape? shape,
@@ -356,6 +556,10 @@ class EditorEffectMask {
     bool? inverted,
     bool? trackingEnabled,
     String? trackingTargetId,
+    bool clearTrackingTargetId = false,
+    List<EditorMaskPoint>? points,
+    List<EditorMaskTrackingKeyframe>? trackingKeyframes,
+    bool clearTrackingKeyframes = false,
   }) {
     return EditorEffectMask(
       shape: shape ?? this.shape,
@@ -366,7 +570,78 @@ class EditorEffectMask {
       feather: feather ?? this.feather,
       inverted: inverted ?? this.inverted,
       trackingEnabled: trackingEnabled ?? this.trackingEnabled,
-      trackingTargetId: trackingTargetId ?? this.trackingTargetId,
+      trackingTargetId: clearTrackingTargetId
+          ? null
+          : (trackingTargetId ?? this.trackingTargetId),
+      points: List.unmodifiable(points ?? this.points),
+      trackingKeyframes: List.unmodifiable(
+        clearTrackingKeyframes
+            ? const <EditorMaskTrackingKeyframe>[]
+            : (trackingKeyframes ?? this.trackingKeyframes),
+      ),
+    );
+  }
+
+  EditorEffectMask trimmedFromStart(Duration removedDuration) {
+    final removed = removedDuration.isNegative
+        ? Duration.zero
+        : removedDuration;
+    if (trackingKeyframes.isEmpty || removed == Duration.zero) return this;
+    final resolved = resolvedAt(removed);
+    final next = <EditorMaskTrackingKeyframe>[
+      EditorMaskTrackingKeyframe(
+        time: Duration.zero,
+        x: resolved.x,
+        y: resolved.y,
+        width: resolved.width,
+        height: resolved.height,
+        points: resolved.points,
+      ),
+      ...trackingKeyframes
+          .where((frame) => frame.time > removed)
+          .map((frame) => frame.copyWith(time: frame.time - removed)),
+    ];
+    return resolved.copyWith(trackingKeyframes: next);
+  }
+
+  EditorEffectMask trimmedToDuration(Duration duration) {
+    final end = duration.isNegative ? Duration.zero : duration;
+    if (trackingKeyframes.isEmpty) return this;
+    final next = trackingKeyframes.where((frame) => frame.time <= end).toList();
+    if (trackingKeyframes.any((frame) => frame.time > end) &&
+        !next.any((frame) => frame.time == end)) {
+      final resolved = resolvedAt(end);
+      next.add(
+        EditorMaskTrackingKeyframe(
+          time: end,
+          x: resolved.x,
+          y: resolved.y,
+          width: resolved.width,
+          height: resolved.height,
+          points: resolved.points,
+        ),
+      );
+    }
+    return copyWith(trackingKeyframes: next);
+  }
+
+  EditorEffectMask retimed(Duration oldDuration, Duration newDuration) {
+    final oldUs = oldDuration.inMicroseconds;
+    final newUs = math.max(0, newDuration.inMicroseconds);
+    if (trackingKeyframes.isEmpty || oldUs <= 0 || oldUs == newUs) {
+      return this;
+    }
+    return copyWith(
+      trackingKeyframes: trackingKeyframes
+          .map(
+            (frame) => frame.copyWith(
+              time: Duration(
+                microseconds: (frame.time.inMicroseconds * newUs / oldUs)
+                    .round(),
+              ),
+            ),
+          )
+          .toList(),
     );
   }
 
@@ -380,6 +655,10 @@ class EditorEffectMask {
     'inverted': inverted,
     'trackingEnabled': trackingEnabled,
     'trackingTargetId': trackingTargetId,
+    'points': safePoints.map((point) => point.toJson()).toList(),
+    'trackingKeyframes': trackingKeyframes
+        .map((frame) => frame.toJson())
+        .toList(),
   };
 
   factory EditorEffectMask.fromJson(Map<String, dynamic> json) {
@@ -396,6 +675,14 @@ class EditorEffectMask {
       inverted: json['inverted'] as bool? ?? false,
       trackingEnabled: json['trackingEnabled'] as bool? ?? false,
       trackingTargetId: json['trackingTargetId'] as String?,
+      points: json['points'] is List
+          ? (json['points'] as List).map(EditorMaskPoint.fromJson).toList()
+          : const [],
+      trackingKeyframes: json['trackingKeyframes'] is List
+          ? (json['trackingKeyframes'] as List)
+                .map(EditorMaskTrackingKeyframe.fromJson)
+                .toList()
+          : const [],
     );
   }
 }
@@ -569,7 +856,7 @@ class EditorEffect {
       enabled: enabled,
       intensity: intensity,
       parameters: parameters,
-      mask: mask,
+      mask: mask?.copyWith(),
       keyframes: keyframes
           .map((keyframe) => keyframe.cloneWithNewId())
           .toList(),
@@ -633,7 +920,7 @@ class EditorEffect {
       enabled: enabled,
       intensity: intensity,
       parameters: parameters,
-      mask: mask,
+      mask: mask?.trimmedFromStart(removed),
       keyframes: trimmed,
     );
   }
@@ -670,13 +957,13 @@ class EditorEffect {
         );
       }
     }
-    return copyWith(keyframes: trimmed);
+    return copyWith(keyframes: trimmed, mask: mask?.trimmedToDuration(end));
   }
 
   EditorEffect retimed(Duration oldDuration, Duration newDuration) {
     final oldUs = oldDuration.inMicroseconds;
     final newUs = math.max(0, newDuration.inMicroseconds);
-    if (keyframes.isEmpty || oldUs <= 0 || oldUs == newUs) return this;
+    if (oldUs <= 0 || oldUs == newUs) return this;
     return copyWith(
       keyframes: keyframes
           .map(
@@ -688,6 +975,7 @@ class EditorEffect {
             ),
           )
           .toList(),
+      mask: mask?.retimed(oldDuration, newDuration),
     );
   }
 
@@ -1138,6 +1426,24 @@ class EditorColorCurve {
       (points.last.input - 1).abs() < 0.0001 &&
       (points.last.output - 1).abs() < 0.0001;
 
+  double valueAt(double input) {
+    final normalizedInput = input.clamp(0.0, 1.0).toDouble();
+    final sorted = points.map((point) => point.normalized()).toList()
+      ..sort((first, second) => first.input.compareTo(second.input));
+    if (sorted.isEmpty) return normalizedInput;
+    if (normalizedInput <= sorted.first.input) return sorted.first.output;
+    if (normalizedInput >= sorted.last.input) return sorted.last.output;
+    for (var index = 1; index < sorted.length; index++) {
+      final previous = sorted[index - 1];
+      final next = sorted[index];
+      if (normalizedInput > next.input) continue;
+      final span = math.max(0.000001, next.input - previous.input);
+      final progress = (normalizedInput - previous.input) / span;
+      return previous.output + (next.output - previous.output) * progress;
+    }
+    return sorted.last.output;
+  }
+
   EditorColorCurve copyWith({List<EditorColorCurvePoint>? points}) {
     return EditorColorCurve(points: List.unmodifiable(points ?? this.points));
   }
@@ -1275,57 +1581,92 @@ class EditorColorWheels {
 
 class EditorColorQualifier {
   final bool enabled;
+  final bool skinTone;
   final int color;
   final double hueRange;
   final double saturationRange;
   final double luminanceRange;
   final double softness;
+  final double hueShift;
+  final double saturationShift;
+  final double luminanceShift;
+  final EditorEffectMask? spatialMask;
 
   const EditorColorQualifier({
     this.enabled = false,
+    this.skinTone = false,
     this.color = 0xFFFF0000,
     this.hueRange = 0.08,
     this.saturationRange = 0.25,
     this.luminanceRange = 0.3,
     this.softness = 0.15,
+    this.hueShift = 0,
+    this.saturationShift = 0,
+    this.luminanceShift = 0,
+    this.spatialMask,
   });
 
   EditorColorQualifier copyWith({
     bool? enabled,
+    bool? skinTone,
     int? color,
     double? hueRange,
     double? saturationRange,
     double? luminanceRange,
     double? softness,
+    double? hueShift,
+    double? saturationShift,
+    double? luminanceShift,
+    EditorEffectMask? spatialMask,
+    bool clearSpatialMask = false,
   }) {
     return EditorColorQualifier(
       enabled: enabled ?? this.enabled,
+      skinTone: skinTone ?? this.skinTone,
       color: color ?? this.color,
       hueRange: hueRange ?? this.hueRange,
       saturationRange: saturationRange ?? this.saturationRange,
       luminanceRange: luminanceRange ?? this.luminanceRange,
       softness: softness ?? this.softness,
+      hueShift: hueShift ?? this.hueShift,
+      saturationShift: saturationShift ?? this.saturationShift,
+      luminanceShift: luminanceShift ?? this.luminanceShift,
+      spatialMask: clearSpatialMask ? null : (spatialMask ?? this.spatialMask),
     );
   }
 
   Map<String, dynamic> toJson() => {
     'enabled': enabled,
+    'skinTone': skinTone,
     'color': color,
     'hueRange': hueRange,
     'saturationRange': saturationRange,
     'luminanceRange': luminanceRange,
     'softness': softness,
+    'hueShift': hueShift.clamp(-180.0, 180.0),
+    'saturationShift': saturationShift.clamp(-1.0, 1.0),
+    'luminanceShift': luminanceShift.clamp(-1.0, 1.0),
+    'spatialMask': spatialMask?.toJson(),
   };
 
   factory EditorColorQualifier.fromJson(Object? value) {
     final json = _effectMap(value);
     return EditorColorQualifier(
       enabled: json['enabled'] as bool? ?? false,
+      skinTone: json['skinTone'] as bool? ?? false,
       color: _effectInt(json['color'], 0xFFFF0000),
       hueRange: _effectDouble(json['hueRange'], 0.08),
       saturationRange: _effectDouble(json['saturationRange'], 0.25),
       luminanceRange: _effectDouble(json['luminanceRange'], 0.3),
       softness: _effectDouble(json['softness'], 0.15),
+      hueShift: _effectDouble(json['hueShift'], 0),
+      saturationShift: _effectDouble(json['saturationShift'], 0),
+      luminanceShift: _effectDouble(json['luminanceShift'], 0),
+      spatialMask: json['spatialMask'] is Map
+          ? EditorEffectMask.fromJson(
+              Map<String, dynamic>.from(json['spatialMask'] as Map),
+            )
+          : null,
     );
   }
 }
@@ -1384,6 +1725,9 @@ class EditorColorManagementSettings {
   final EditorColorSpace outputSpace;
   final bool automaticLogTransform;
   final bool preserveHdr;
+  final double referenceWhiteNits;
+  final double peakLuminanceNits;
+  final EditorToneMapMode toneMapMode;
   final List<EditorLutAsset> luts;
 
   const EditorColorManagementSettings({
@@ -1391,6 +1735,9 @@ class EditorColorManagementSettings {
     this.outputSpace = EditorColorSpace.sdr709,
     this.automaticLogTransform = true,
     this.preserveHdr = false,
+    this.referenceWhiteNits = 203,
+    this.peakLuminanceNits = 1000,
+    this.toneMapMode = EditorToneMapMode.hable,
     this.luts = const [],
   });
 
@@ -1399,6 +1746,9 @@ class EditorColorManagementSettings {
     EditorColorSpace? outputSpace,
     bool? automaticLogTransform,
     bool? preserveHdr,
+    double? referenceWhiteNits,
+    double? peakLuminanceNits,
+    EditorToneMapMode? toneMapMode,
     List<EditorLutAsset>? luts,
   }) {
     return EditorColorManagementSettings(
@@ -1407,6 +1757,9 @@ class EditorColorManagementSettings {
       automaticLogTransform:
           automaticLogTransform ?? this.automaticLogTransform,
       preserveHdr: preserveHdr ?? this.preserveHdr,
+      referenceWhiteNits: referenceWhiteNits ?? this.referenceWhiteNits,
+      peakLuminanceNits: peakLuminanceNits ?? this.peakLuminanceNits,
+      toneMapMode: toneMapMode ?? this.toneMapMode,
       luts: List.unmodifiable(luts ?? this.luts),
     );
   }
@@ -1416,6 +1769,9 @@ class EditorColorManagementSettings {
     'outputSpace': outputSpace.name,
     'automaticLogTransform': automaticLogTransform,
     'preserveHdr': preserveHdr,
+    'referenceWhiteNits': referenceWhiteNits.clamp(80.0, 500.0),
+    'peakLuminanceNits': peakLuminanceNits.clamp(100.0, 10000.0),
+    'toneMapMode': toneMapMode.name,
     'luts': luts.map((lut) => lut.toJson()).toList(),
   };
 
@@ -1443,7 +1799,75 @@ class EditorColorManagementSettings {
       ),
       automaticLogTransform: json['automaticLogTransform'] as bool? ?? true,
       preserveHdr: json['preserveHdr'] as bool? ?? false,
+      referenceWhiteNits: _effectDouble(
+        json['referenceWhiteNits'],
+        203,
+      ).clamp(80.0, 500.0).toDouble(),
+      peakLuminanceNits: _effectDouble(
+        json['peakLuminanceNits'],
+        1000,
+      ).clamp(100.0, 10000.0).toDouble(),
+      toneMapMode: EditorToneMapMode.values.firstWhere(
+        (candidate) => candidate.name == json['toneMapMode'],
+        orElse: () => EditorToneMapMode.hable,
+      ),
       luts: List.unmodifiable(luts),
+    );
+  }
+}
+
+class AudioLoudnessAnalysis {
+  final double integratedLufs;
+  final double truePeakDb;
+  final double samplePeakDb;
+  final double rmsDb;
+  final double loudnessRange;
+  final double thresholdLufs;
+  final double targetOffset;
+  final String sourceFingerprint;
+  final DateTime analyzedAt;
+
+  AudioLoudnessAnalysis({
+    required this.integratedLufs,
+    required this.truePeakDb,
+    required this.samplePeakDb,
+    required this.rmsDb,
+    required this.loudnessRange,
+    required this.thresholdLufs,
+    required this.targetOffset,
+    required this.sourceFingerprint,
+    DateTime? analyzedAt,
+  }) : analyzedAt = analyzedAt ?? DateTime.now();
+
+  Map<String, dynamic> toJson() => {
+    'integratedLufs': integratedLufs,
+    'truePeakDb': truePeakDb,
+    'samplePeakDb': samplePeakDb,
+    'rmsDb': rmsDb,
+    'loudnessRange': loudnessRange,
+    'thresholdLufs': thresholdLufs,
+    'targetOffset': targetOffset,
+    'sourceFingerprint': sourceFingerprint,
+    'analyzedAt': analyzedAt.toIso8601String(),
+  };
+
+  factory AudioLoudnessAnalysis.fromJson(Object? value) {
+    final json = _effectMap(value);
+    return AudioLoudnessAnalysis(
+      integratedLufs: _effectDouble(json['integratedLufs'], -24),
+      truePeakDb: _effectDouble(json['truePeakDb'], -1),
+      samplePeakDb: _effectDouble(
+        json['samplePeakDb'],
+        _effectDouble(json['truePeakDb'], -1),
+      ),
+      rmsDb: _effectDouble(json['rmsDb'], -24),
+      loudnessRange: _effectDouble(json['loudnessRange'], 0),
+      thresholdLufs: _effectDouble(json['thresholdLufs'], -34),
+      targetOffset: _effectDouble(json['targetOffset'], 0),
+      sourceFingerprint: json['sourceFingerprint'] as String? ?? '',
+      analyzedAt:
+          DateTime.tryParse(json['analyzedAt'] as String? ?? '') ??
+          DateTime.fromMillisecondsSinceEpoch(0),
     );
   }
 }

@@ -52,6 +52,63 @@ void main() {
     ]);
   });
 
+  testWidgets('selected audio clips expose direct draggable fade handles', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(500, 320));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final clip = TimelineClip(
+      id: 'audio_fade',
+      trackId: 'audio',
+      type: TimelineTrackType.audio,
+      label: 'Music',
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 4),
+      sourceDuration: const Duration(seconds: 4),
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    final notifier = container.read(editorProvider.notifier);
+    notifier.loadProject(
+      videoPath: 'missing.mp4',
+      projectId: 'audio-fade-handles',
+      projectName: 'Audio fade handles',
+      timeline: EditorTimeline(
+        tracks: [
+          TimelineTrack(
+            id: 'audio',
+            name: 'Audio',
+            type: TimelineTrackType.audio,
+            section: TimelineTrackSection.audio,
+            clips: [clip],
+          ),
+        ],
+      ),
+    );
+    notifier
+      ..selectTrack('audio')
+      ..selectClip(clip.id);
+
+    await tester.pumpWidget(_timelineHarness(container));
+    await tester.pumpAndSettle();
+    final fadeIn = find.byKey(const ValueKey('timeline_fade_in_audio_fade'));
+    final fadeOut = find.byKey(const ValueKey('timeline_fade_out_audio_fade'));
+    expect(fadeIn, findsOneWidget);
+    expect(fadeOut, findsOneWidget);
+
+    await tester.drag(fadeIn, const Offset(50, 0));
+    await tester.pumpAndSettle();
+    final updated = container
+        .read(editorProvider)
+        .timeline
+        .tracks
+        .single
+        .clips
+        .single;
+    expect(updated.audioMix.fadeInMs, inInclusiveRange(500, 700));
+    expect(container.read(editorProvider).canUndo, isTrue);
+  });
+
   testWidgets('timeline mounts only the horizontal clip window', (
     tester,
   ) async {

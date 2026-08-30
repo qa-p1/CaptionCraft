@@ -1432,7 +1432,7 @@ void main() {
         timelineDuration: timelineDuration,
       );
       expect(frozenPlan.filterGraph, contains('[1:v]'));
-      expect(frozenPlan.filterGraph, contains('[0:a]'));
+      expect(frozenPlan.filterGraph, contains('[0:a:0]'));
       expect(frozenPlan.filterGraph, contains('trim=end=1.000001,reverse'));
       expect(frozenPlan.filterGraph, isNot(contains('trim=end=10.400001')));
       expect(

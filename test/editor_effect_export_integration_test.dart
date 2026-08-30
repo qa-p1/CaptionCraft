@@ -225,6 +225,287 @@ DOMAIN_MAX 1.0 1.0 1.0
     },
     timeout: const Timeout(Duration(minutes: 2)),
   );
+
+  test(
+    'HLG input exports as tagged ten-bit PQ without SDR fallback',
+    () async {
+      if (!await _commandExists('ffmpeg') || !await _commandExists('ffprobe')) {
+        markTestSkipped('Desktop FFmpeg tools are not installed.');
+        return;
+      }
+      final directory = await Directory.systemTemp.createTemp(
+        'captioncraft_hdr_export_',
+      );
+      addTearDown(() async {
+        if (await directory.exists()) await directory.delete(recursive: true);
+      });
+      final sourcePath = path.join(directory.path, 'hlg_source.mp4');
+      final outputPath = path.join(directory.path, 'pq_output.mp4');
+      await _runFfmpeg([
+        '-f',
+        'lavfi',
+        '-i',
+        'testsrc2=size=160x90:rate=12:duration=0.5',
+        '-vf',
+        'format=yuv420p10le',
+        '-c:v',
+        'libx265',
+        '-x265-params',
+        'pools=1:frame-threads=1',
+        '-pix_fmt',
+        'yuv420p10le',
+        '-color_primaries',
+        'bt2020',
+        '-color_trc',
+        'arib-std-b67',
+        '-colorspace',
+        'bt2020nc',
+        sourcePath,
+      ]);
+      final asset = EditorAssetReference(
+        id: 'hdr-asset',
+        type: EditorAssetType.video,
+        label: 'HLG source',
+        sourcePath: sourcePath,
+        metadata: const {
+          'durationMs': 500,
+          'width': 160,
+          'height': 90,
+          'frameRate': 12,
+          'colorPrimaries': 'bt2020',
+          'colorTransfer': 'arib-std-b67',
+          'colorSpace': 'bt2020nc',
+          'colorRange': 'tv',
+          'bitDepth': 10,
+        },
+      );
+      final clip = TimelineClip(
+        id: 'hdr-clip',
+        trackId: 'base',
+        type: TimelineTrackType.video,
+        label: 'HLG source',
+        assetId: asset.id,
+        startTime: Duration.zero,
+        endTime: const Duration(milliseconds: 500),
+        sourceDuration: const Duration(milliseconds: 500),
+      );
+      final track = TimelineTrack(
+        id: 'base',
+        name: 'Base',
+        type: TimelineTrackType.video,
+        section: TimelineTrackSection.baseVideo,
+        clips: [clip],
+      );
+      final timeline = EditorTimeline(
+        assets: [asset],
+        tracks: [track],
+        colorManagement: const EditorColorManagementSettings(
+          workingSpace: EditorColorSpace.hlg,
+          outputSpace: EditorColorSpace.pq,
+          preserveHdr: true,
+          peakLuminanceNits: 1000,
+        ),
+      );
+      final arguments = TimelineExportService.buildFfmpegArguments(
+        timeline: timeline,
+        inputs: [
+          TimelineRenderInput(
+            index: 0,
+            trackIndex: 0,
+            track: track,
+            clip: clip,
+            asset: asset,
+            sourcePath: sourcePath,
+            hasAudio: false,
+            frameRate: 12,
+            colorPrimaries: 'bt2020',
+            colorTransfer: 'arib-std-b67',
+            colorSpace: 'bt2020nc',
+            colorRange: 'tv',
+            bitDepth: 10,
+          ),
+        ],
+        settings: const ExportSettings(
+          resolution: ExportResolution.p480,
+          frameRate: ExportFrameRate.fps24,
+          quality: ExportQuality.compact,
+          burnSubtitles: false,
+          saveToGallery: false,
+        ),
+        canvasSize: const ExportCanvasSize(
+          width: 160,
+          height: 90,
+          framesPerSecond: 12,
+        ),
+        timelineDuration: const Duration(milliseconds: 500),
+        assPath: null,
+        videoPreset: 'ultrafast',
+        outputPath: outputPath,
+      );
+      final graph = arguments[arguments.indexOf('-filter_complex') + 1];
+      expect(graph, contains('zscale='));
+      expect(arguments, containsAllInOrder(['-c:v', 'libx265']));
+      expect(arguments, containsAllInOrder(['-pix_fmt', 'yuv420p10le']));
+      expect(arguments, containsAllInOrder(['-profile:v', 'main10']));
+      expect(arguments, contains('-x265-params'));
+      expect(arguments.join(' '), contains('master-display='));
+
+      final render = await Process.run('ffmpeg', arguments);
+      expect(render.exitCode, 0, reason: '${render.stdout}\n${render.stderr}');
+      final probe = await Process.run('ffprobe', [
+        '-v',
+        'error',
+        '-select_streams',
+        'v:0',
+        '-show_entries',
+        'stream=codec_name,pix_fmt,color_primaries,color_transfer,color_space',
+        '-of',
+        'json',
+        outputPath,
+      ]);
+      expect(probe.exitCode, 0, reason: '${probe.stderr}');
+      final metadata =
+          jsonDecode(probe.stdout as String) as Map<String, dynamic>;
+      final stream = ((metadata['streams'] as List).single as Map)
+          .cast<String, dynamic>();
+      expect(stream['codec_name'], 'hevc');
+      expect(stream['pix_fmt'], 'yuv420p10le');
+      expect(stream['color_primaries'], 'bt2020');
+      expect(stream['color_transfer'], 'smpte2084');
+      expect(stream['color_space'], 'bt2020nc');
+      final frameProbe = await Process.run('ffprobe', [
+        '-v',
+        'error',
+        '-select_streams',
+        'v:0',
+        '-read_intervals',
+        '%+#1',
+        '-show_frames',
+        '-show_entries',
+        'frame=side_data_list',
+        '-of',
+        'json',
+        outputPath,
+      ]);
+      expect(frameProbe.exitCode, 0, reason: '${frameProbe.stderr}');
+      expect(
+        (frameProbe.stdout as String).toLowerCase(),
+        contains('mastering display metadata'),
+      );
+    },
+    timeout: const Timeout(Duration(minutes: 2)),
+  );
+
+  test(
+    'detected generic Log footage is transformed automatically into Rec.709',
+    () async {
+      if (!await _commandExists('ffmpeg')) {
+        markTestSkipped('Desktop FFmpeg is not installed.');
+        return;
+      }
+      final directory = await Directory.systemTemp.createTemp(
+        'captioncraft_log_export_',
+      );
+      addTearDown(() async {
+        if (await directory.exists()) await directory.delete(recursive: true);
+      });
+      final sourcePath = path.join(directory.path, 'log_source.mp4');
+      final outputPath = path.join(directory.path, 'rec709_output.mp4');
+      await _runFfmpeg([
+        '-f',
+        'lavfi',
+        '-i',
+        'testsrc2=size=160x90:rate=12:duration=0.4',
+        '-c:v',
+        'libx264',
+        '-pix_fmt',
+        'yuv420p',
+        '-color_primaries',
+        'bt709',
+        '-color_trc',
+        'log100',
+        '-colorspace',
+        'bt709',
+        sourcePath,
+      ]);
+      final asset = EditorAssetReference(
+        id: 'log-asset',
+        type: EditorAssetType.video,
+        label: 'Log source',
+        sourcePath: sourcePath,
+        metadata: const {
+          'durationMs': 400,
+          'width': 160,
+          'height': 90,
+          'frameRate': 12,
+          'colorPrimaries': 'bt709',
+          'colorTransfer': 'log100',
+          'colorSpace': 'bt709',
+          'colorRange': 'tv',
+        },
+      );
+      final clip = TimelineClip(
+        id: 'log-clip',
+        trackId: 'base',
+        type: TimelineTrackType.video,
+        label: 'Log source',
+        assetId: asset.id,
+        startTime: Duration.zero,
+        endTime: const Duration(milliseconds: 400),
+        sourceDuration: const Duration(milliseconds: 400),
+      );
+      final track = TimelineTrack(
+        id: 'base',
+        name: 'Base',
+        type: TimelineTrackType.video,
+        section: TimelineTrackSection.baseVideo,
+        clips: [clip],
+      );
+      final timeline = EditorTimeline(assets: [asset], tracks: [track]);
+      final arguments = TimelineExportService.buildFfmpegArguments(
+        timeline: timeline,
+        inputs: [
+          TimelineRenderInput(
+            index: 0,
+            trackIndex: 0,
+            track: track,
+            clip: clip,
+            asset: asset,
+            sourcePath: sourcePath,
+            hasAudio: false,
+            frameRate: 12,
+            colorPrimaries: 'bt709',
+            colorTransfer: 'log100',
+            colorSpace: 'bt709',
+            colorRange: 'tv',
+          ),
+        ],
+        settings: const ExportSettings(
+          resolution: ExportResolution.p480,
+          frameRate: ExportFrameRate.fps24,
+          quality: ExportQuality.compact,
+          burnSubtitles: false,
+          saveToGallery: false,
+        ),
+        canvasSize: const ExportCanvasSize(
+          width: 160,
+          height: 90,
+          framesPerSecond: 12,
+        ),
+        timelineDuration: const Duration(milliseconds: 400),
+        assPath: null,
+        videoPreset: 'ultrafast',
+        outputPath: outputPath,
+      );
+      final graph = arguments[arguments.indexOf('-filter_complex') + 1];
+      expect(graph, contains('tin=log100'));
+      expect(graph, contains('t=bt709'));
+      final render = await Process.run('ffmpeg', arguments);
+      expect(render.exitCode, 0, reason: '${render.stderr}');
+      expect(await File(outputPath).length(), greaterThan(0));
+    },
+    timeout: const Timeout(Duration(minutes: 2)),
+  );
 }
 
 Future<bool> _commandExists(String command) async {

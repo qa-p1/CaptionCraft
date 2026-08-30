@@ -887,6 +887,22 @@ class EditorNotifier extends StateNotifier<EditorState> {
         .where((candidate) => candidate.id == presetId)
         .firstOrNull;
     if (preset == null) return false;
+    return applyEffectPresetValue(
+      preset: preset,
+      scope: scope,
+      targetId: targetId,
+      append: append,
+      domain: domain,
+    );
+  }
+
+  bool applyEffectPresetValue({
+    required EditorEffectPreset preset,
+    required EditorEffectScope scope,
+    String? targetId,
+    bool append = false,
+    EditorEffectDomain? domain,
+  }) {
     final copied = EditorEffectStack(
       effects: preset.stack.effects
           .where((effect) => domain == null || effect.domain == domain)
@@ -1645,7 +1661,10 @@ class EditorNotifier extends StateNotifier<EditorState> {
       final safeVolume = volume.clamp(0.0, 2.0).toDouble();
       if (!clip.hasVolumeKeyframes) {
         return clip.copyWith(
-          audioMix: clip.audioMix.copyWith(volume: safeVolume),
+          audioMix: clip.audioMix.copyWith(
+            volume: safeVolume,
+            clearLoudnessAnalysis: true,
+          ),
         );
       }
       final time = _snappedKeyframeTime(clip, absolutePosition);
@@ -1667,7 +1686,7 @@ class EditorNotifier extends StateNotifier<EditorState> {
                 .blurAt(absolutePosition)
                 .safeStrength,
         },
-      );
+      ).copyWith(audioMix: clip.audioMix.copyWith(clearLoudnessAnalysis: true));
     }, recordHistory: recordHistory);
   }
 

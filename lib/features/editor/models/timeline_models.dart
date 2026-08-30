@@ -817,7 +817,7 @@ class ClipColorAdjustments {
     this.qualifier = const EditorColorQualifier(),
     this.lutPath,
     this.lutIntensity = 1,
-    this.inputColorSpace = EditorColorSpace.sdr709,
+    this.inputColorSpace = EditorColorSpace.automatic,
   });
 
   bool get isNeutral =>
@@ -849,7 +849,7 @@ class ClipColorAdjustments {
       wheels.isIdentity &&
       !qualifier.enabled &&
       (lutPath == null || lutPath!.trim().isEmpty || lutIntensity <= 0) &&
-      inputColorSpace == EditorColorSpace.sdr709;
+      inputColorSpace == EditorColorSpace.automatic;
 
   ClipColorAdjustments copyWith({
     double? exposure,
@@ -998,7 +998,7 @@ class ClipColorAdjustments {
           .toDouble(),
       inputColorSpace: EditorColorSpace.values.firstWhere(
         (space) => space.name == json['inputColorSpace'],
-        orElse: () => EditorColorSpace.sdr709,
+        orElse: () => EditorColorSpace.automatic,
       ),
     );
   }
@@ -1143,6 +1143,9 @@ class AudioMixSettings {
   final AudioFadeShape fadeInShape;
   final AudioFadeShape fadeOutShape;
   final EditorAudioChannelMode channelMode;
+  final int sourceStreamIndex;
+  final int sourceLeftChannel;
+  final int sourceRightChannel;
   final double leftGain;
   final double rightGain;
   final double targetLufs;
@@ -1150,6 +1153,7 @@ class AudioMixSettings {
   final double pitchSemitones;
   final double timeStretch;
   final bool preservePitch;
+  final AudioLoudnessAnalysis? loudnessAnalysis;
 
   const AudioMixSettings({
     this.volume = 1,
@@ -1161,6 +1165,9 @@ class AudioMixSettings {
     this.fadeInShape = AudioFadeShape.linear,
     this.fadeOutShape = AudioFadeShape.linear,
     this.channelMode = EditorAudioChannelMode.stereo,
+    this.sourceStreamIndex = 0,
+    this.sourceLeftChannel = 0,
+    this.sourceRightChannel = 1,
     this.leftGain = 1,
     this.rightGain = 1,
     this.targetLufs = -16,
@@ -1168,6 +1175,7 @@ class AudioMixSettings {
     this.pitchSemitones = 0,
     this.timeStretch = 1,
     this.preservePitch = true,
+    this.loudnessAnalysis,
   });
 
   bool get hasMixAdjustment =>
@@ -1178,6 +1186,9 @@ class AudioMixSettings {
       fadeInMs > 0 ||
       fadeOutMs > 0 ||
       channelMode != EditorAudioChannelMode.stereo ||
+      sourceStreamIndex != 0 ||
+      sourceLeftChannel != 0 ||
+      sourceRightChannel != 1 ||
       (leftGain - 1).abs() > 0.0001 ||
       (rightGain - 1).abs() > 0.0001 ||
       (targetLufs + 16).abs() > 0.0001 ||
@@ -1195,6 +1206,9 @@ class AudioMixSettings {
     AudioFadeShape? fadeInShape,
     AudioFadeShape? fadeOutShape,
     EditorAudioChannelMode? channelMode,
+    int? sourceStreamIndex,
+    int? sourceLeftChannel,
+    int? sourceRightChannel,
     double? leftGain,
     double? rightGain,
     double? targetLufs,
@@ -1202,6 +1216,8 @@ class AudioMixSettings {
     double? pitchSemitones,
     double? timeStretch,
     bool? preservePitch,
+    AudioLoudnessAnalysis? loudnessAnalysis,
+    bool clearLoudnessAnalysis = false,
   }) {
     return AudioMixSettings(
       volume: volume ?? this.volume,
@@ -1213,6 +1229,9 @@ class AudioMixSettings {
       fadeInShape: fadeInShape ?? this.fadeInShape,
       fadeOutShape: fadeOutShape ?? this.fadeOutShape,
       channelMode: channelMode ?? this.channelMode,
+      sourceStreamIndex: sourceStreamIndex ?? this.sourceStreamIndex,
+      sourceLeftChannel: sourceLeftChannel ?? this.sourceLeftChannel,
+      sourceRightChannel: sourceRightChannel ?? this.sourceRightChannel,
       leftGain: leftGain ?? this.leftGain,
       rightGain: rightGain ?? this.rightGain,
       targetLufs: targetLufs ?? this.targetLufs,
@@ -1220,6 +1239,9 @@ class AudioMixSettings {
       pitchSemitones: pitchSemitones ?? this.pitchSemitones,
       timeStretch: timeStretch ?? this.timeStretch,
       preservePitch: preservePitch ?? this.preservePitch,
+      loudnessAnalysis: clearLoudnessAnalysis
+          ? null
+          : (loudnessAnalysis ?? this.loudnessAnalysis),
     );
   }
 
@@ -1234,6 +1256,9 @@ class AudioMixSettings {
       'fadeInShape': fadeInShape.name,
       'fadeOutShape': fadeOutShape.name,
       'channelMode': channelMode.name,
+      'sourceStreamIndex': sourceStreamIndex.clamp(0, 31),
+      'sourceLeftChannel': sourceLeftChannel.clamp(0, 63),
+      'sourceRightChannel': sourceRightChannel.clamp(0, 63),
       'leftGain': leftGain.clamp(0.0, 2.0),
       'rightGain': rightGain.clamp(0.0, 2.0),
       'targetLufs': targetLufs.clamp(-60.0, 0.0),
@@ -1241,6 +1266,7 @@ class AudioMixSettings {
       'pitchSemitones': pitchSemitones.clamp(-24.0, 24.0),
       'timeStretch': timeStretch.clamp(0.25, 4.0),
       'preservePitch': preservePitch,
+      'loudnessAnalysis': loudnessAnalysis?.toJson(),
     };
   }
 
@@ -1264,6 +1290,16 @@ class AudioMixSettings {
         (mode) => mode.name == json['channelMode'],
         orElse: () => EditorAudioChannelMode.stereo,
       ),
+      sourceStreamIndex: _timelineInt(
+        json['sourceStreamIndex'],
+      ).clamp(0, 31).toInt(),
+      sourceLeftChannel: _timelineInt(
+        json['sourceLeftChannel'],
+      ).clamp(0, 63).toInt(),
+      sourceRightChannel: _timelineInt(
+        json['sourceRightChannel'],
+        fallback: 1,
+      ).clamp(0, 63).toInt(),
       leftGain: ((json['leftGain'] as num?)?.toDouble() ?? 1)
           .clamp(0.0, 2.0)
           .toDouble(),
@@ -1283,6 +1319,9 @@ class AudioMixSettings {
           .clamp(0.25, 4.0)
           .toDouble(),
       preservePitch: json['preservePitch'] as bool? ?? true,
+      loudnessAnalysis: json['loudnessAnalysis'] is Map
+          ? AudioLoudnessAnalysis.fromJson(json['loudnessAnalysis'])
+          : null,
     );
   }
 }
@@ -2569,7 +2608,7 @@ class CanvasSettings {
 }
 
 class EditorTimeline {
-  static const int currentSchemaVersion = 8;
+  static const int currentSchemaVersion = 9;
 
   final int schemaVersion;
   final CanvasSettings canvasSettings;
@@ -2968,8 +3007,30 @@ class EditorTimeline {
   }
 
   EditorTimeline canonicalized() {
+    final migratedInputColorTracks = schemaVersion < 9
+        ? tracks
+              .map(
+                (track) => track.copyWith(
+                  clips: track.clips
+                      .map(
+                        (clip) => clip.colorAdjustments.inputColorSpace ==
+                                EditorColorSpace.sdr709
+                            ? clip.copyWith(
+                                colorAdjustments: clip.colorAdjustments
+                                    .copyWith(
+                                      inputColorSpace:
+                                          EditorColorSpace.automatic,
+                                    ),
+                              )
+                            : clip,
+                      )
+                      .toList(),
+                ),
+              )
+              .toList()
+        : tracks;
     final normalizedTracks = _foldRedundantLegacySourceAudio(
-      _canonicalizeTimelineTracks(tracks),
+      _canonicalizeTimelineTracks(migratedInputColorTracks),
     );
     final orderedTracks = schemaVersion < 5
         ? _migrateLegacyTrackOrder(normalizedTracks)
@@ -3732,7 +3793,24 @@ EditorColorManagementSettings _canonicalizeColorManagement(
     if (lut.path.trim().isEmpty) continue;
     lutsById.putIfAbsent(lut.id, () => lut);
   }
-  return settings.copyWith(luts: lutsById.values.toList());
+  final workingSpace = settings.workingSpace == EditorColorSpace.automatic
+      ? EditorColorSpace.sdr709
+      : settings.workingSpace;
+  final outputSpace = switch (settings.outputSpace) {
+    EditorColorSpace.automatic || EditorColorSpace.log =>
+      EditorColorSpace.sdr709,
+    _ => settings.outputSpace,
+  };
+  return settings.copyWith(
+    workingSpace: workingSpace,
+    outputSpace: outputSpace,
+    preserveHdr:
+        settings.preserveHdr &&
+        (outputSpace == EditorColorSpace.hlg ||
+            outputSpace == EditorColorSpace.pq ||
+            outputSpace == EditorColorSpace.wideGamut),
+    luts: lutsById.values.toList(),
+  );
 }
 
 List<TimelineTrack> _canonicalizeTimelineTracks(

@@ -1,9 +1,15 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:math' as math;
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as path;
 
 import '../../../core/theme/app_theme.dart';
+import '../../../core/utils/effect_preset_library_service.dart';
+import '../../../core/utils/mask_tracking_service.dart';
 import '../../../core/utils/media_import_service.dart';
 import '../models/editor_effect_models.dart';
 import '../models/asset_pack_models.dart';
@@ -50,6 +56,11 @@ class _EffectStackEditorSheetState
   late String _targetKey;
   String? _expandedEffectId;
   bool _clipboardAvailable = false;
+  final Set<String> _trackingEffectIds = <String>{};
+  final EffectPresetLibraryService _presetLibrary =
+      EffectPresetLibraryService();
+  List<EditorEffectPreset> _globalPresets = const [];
+  bool _loadingGlobalPresets = true;
 
   @override
   void initState() {
@@ -58,6 +69,16 @@ class _EffectStackEditorSheetState
         widget.targets.any((target) => target.key == widget.initialTargetKey)
         ? widget.initialTargetKey
         : widget.targets.first.key;
+    unawaited(_loadGlobalPresets());
+  }
+
+  Future<void> _loadGlobalPresets() async {
+    final presets = await _presetLibrary.load();
+    if (!mounted) return;
+    setState(() {
+      _globalPresets = presets;
+      _loadingGlobalPresets = false;
+    });
   }
 
   EffectStackTargetOption get _target => widget.targets.firstWhere(
@@ -611,9 +632,8 @@ class _EffectStackEditorSheetState
           ),
           if (mask != null) ...[
             DropdownButtonFormField<EditorEffectMaskShape>(
-              initialValue: mask.shape == EditorEffectMaskShape.freeform
-                  ? EditorEffectMaskShape.rectangle
-                  : mask.shape,
+              key: ValueKey('${effect.id}_${mask.shape.name}_mask_shape'),
+              initialValue: mask.shape,
               decoration: const InputDecoration(labelText: 'Mask shape'),
               items: const [
                 DropdownMenuItem(
@@ -624,27 +644,79 @@ class _EffectStackEditorSheetState
                   value: EditorEffectMaskShape.ellipse,
                   child: Text('Ellipse'),
                 ),
+                DropdownMenuItem(
+                  value: EditorEffectMaskShape.freeform,
+                  child: Text('Freeform polygon'),
+                ),
               ],
               onChanged: (shape) {
                 if (shape == null) return;
-                _updateMask(effect.id, mask.copyWith(shape: shape));
+                _updateMask(
+                  effect.id,
+                  mask.copyWith(
+                    shape: shape,
+                    points:
+                        shape == EditorEffectMaskShape.freeform &&
+                            mask.safePoints.length < 3
+                        ? const [
+                            EditorMaskPoint(0.25, 0.25),
+                            EditorMaskPoint(0.75, 0.25),
+                            EditorMaskPoint(0.75, 0.75),
+                            EditorMaskPoint(0.25, 0.75),
+                          ]
+                        : mask.points,
+                  ),
+                );
               },
             ),
             const SizedBox(height: 8),
-            _maskSlider(effect.id, mask, 'Horizontal', mask.x, 0, 1, (value) {
-              return mask.copyWith(x: value);
-            }),
-            _maskSlider(effect.id, mask, 'Vertical', mask.y, 0, 1, (value) {
-              return mask.copyWith(y: value);
-            }),
-            _maskSlider(effect.id, mask, 'Width', mask.width, 0.02, 1, (value) {
-              return mask.copyWith(width: value);
-            }),
-            _maskSlider(effect.id, mask, 'Height', mask.height, 0.02, 1, (
-              value,
-            ) {
-              return mask.copyWith(height: value);
-            }),
+            if (mask.shape == EditorEffectMaskShape.freeform) ...[
+              _FreeformMaskEditor(
+                points: mask.safePoints,
+                onChanged: (points) =>
+                    _updateMask(effect.id, mask.copyWith(points: points)),
+                onChangeStart: () => _beginGesture(0),
+                onChangeEnd: () => _endGesture(0),
+              ),
+              const SizedBox(height: 8),
+            ] else ...[
+              _maskSlider(
+                effect.id,
+                mask,
+                'Horizontal',
+                mask.x,
+                0,
+                1,
+                (value) => mask.copyWith(x: value),
+              ),
+              _maskSlider(
+                effect.id,
+                mask,
+                'Vertical',
+                mask.y,
+                0,
+                1,
+                (value) => mask.copyWith(y: value),
+              ),
+              _maskSlider(
+                effect.id,
+                mask,
+                'Width',
+                mask.width,
+                0.02,
+                1,
+                (value) => mask.copyWith(width: value),
+              ),
+              _maskSlider(
+                effect.id,
+                mask,
+                'Height',
+                mask.height,
+                0.02,
+                1,
+                (value) => mask.copyWith(height: value),
+              ),
+            ],
             _maskSlider(effect.id, mask, 'Feather', mask.feather, 0, 1, (
               value,
             ) {
@@ -661,6 +733,56 @@ class _EffectStackEditorSheetState
               onChanged: (value) =>
                   _updateMask(effect.id, mask.copyWith(inverted: value)),
             ),
+            const SizedBox(height: 4),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: _trackingEffectIds.contains(effect.id)
+                    ? null
+                    : () => _trackMaskForward(effect),
+                icon: _trackingEffectIds.contains(effect.id)
+                    ? const SizedBox.square(
+                        dimension: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.center_focus_strong_rounded, size: 18),
+                label: Text(
+                  _trackingEffectIds.contains(effect.id)
+                      ? 'Tracking object…'
+                      : mask.hasTrackedMotion
+                      ? 'Track again from playhead'
+                      : 'Track object forward',
+                ),
+              ),
+            ),
+            if (mask.hasTrackedMotion)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        '${mask.trackingKeyframes.length} tracked samples are saved with this effect.',
+                        style: const TextStyle(
+                          color: kTextSecondary,
+                          fontSize: 9,
+                        ),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () => _updateMask(
+                        effect.id,
+                        mask.copyWith(
+                          trackingEnabled: false,
+                          clearTrackingTargetId: true,
+                          clearTrackingKeyframes: true,
+                        ),
+                      ),
+                      child: const Text('Clear'),
+                    ),
+                  ],
+                ),
+              ),
           ],
         ],
       ),
@@ -745,6 +867,109 @@ class _EffectStackEditorSheetState
     _updateEffect(effectId, (effect) => effect.copyWith(mask: mask));
   }
 
+  Future<void> _trackMaskForward(EditorEffect effect) async {
+    final mask = effect.mask;
+    if (mask == null) return;
+    if (_target.scope != EditorEffectScope.clip || _target.targetId == null) {
+      _showMessage('Object tracking starts from an individual video clip.');
+      return;
+    }
+    final timeline = ref.read(editorProvider).timeline;
+    final clip = timeline.tracks
+        .expand((track) => track.clips)
+        .where((candidate) => candidate.id == _target.targetId)
+        .firstOrNull;
+    if (clip == null || clip.type != TimelineTrackType.video) {
+      _showMessage('Object tracking requires a video clip.');
+      return;
+    }
+    final sourcePath = timeline.assetForClip(clip)?.sourcePath?.trim();
+    if (sourcePath == null ||
+        sourcePath.isEmpty ||
+        !await File(sourcePath).exists()) {
+      _showMessage('The video source is unavailable for tracking.');
+      return;
+    }
+    final playhead = ref.read(playbackProvider).position;
+    final relativeUs = (playhead - clip.startTime).inMicroseconds
+        .clamp(0, clip.duration.inMicroseconds)
+        .toInt();
+    final remainingUs = clip.duration.inMicroseconds - relativeUs;
+    if (remainingUs < const Duration(milliseconds: 200).inMicroseconds) {
+      _showMessage('Move the playhead earlier to track forward.');
+      return;
+    }
+    final rate = clip.playbackRate.clamp(0.25, 4).toDouble();
+    final declaredSpanUs = clip.sourceDuration.inMicroseconds > 0
+        ? clip.sourceDuration.inMicroseconds
+        : (clip.duration.inMicroseconds * rate).round();
+    final remainingSourceUs = math.min(
+      (remainingUs * rate).round(),
+      declaredSpanUs,
+    );
+    final sourceStartOffsetUs = clip.isReversed
+        ? math.max(
+            0,
+            declaredSpanUs - (relativeUs * rate).round() - remainingSourceUs,
+          )
+        : math.min(declaredSpanUs, (relativeUs * rate).round());
+    var trackingMask = mask;
+    if (mask.shape == EditorEffectMaskShape.freeform &&
+        mask.safePoints.length >= 3) {
+      final xs = mask.safePoints.map((point) => point.x);
+      final ys = mask.safePoints.map((point) => point.y);
+      final left = xs.reduce(math.min);
+      final top = ys.reduce(math.min);
+      final right = xs.reduce(math.max);
+      final bottom = ys.reduce(math.max);
+      trackingMask = mask.copyWith(
+        x: left,
+        y: top,
+        width: math.max(0.02, right - left),
+        height: math.max(0.02, bottom - top),
+      );
+    }
+
+    setState(() => _trackingEffectIds.add(effect.id));
+    try {
+      final result = await MaskTrackingService.trackForward(
+        sourcePath: sourcePath,
+        sourceStartTime:
+            clip.sourceStartTime + Duration(microseconds: sourceStartOffsetUs),
+        sourceDuration: Duration(microseconds: remainingSourceUs),
+        timelineOffset: Duration(microseconds: relativeUs),
+        timelineDuration: Duration(microseconds: remainingUs),
+        playbackRate: rate,
+        reversed: clip.isReversed,
+        initialMask: trackingMask,
+      );
+      if (!mounted) return;
+      final retained = mask.trackingKeyframes
+          .where((frame) => frame.time.inMicroseconds < relativeUs)
+          .toList();
+      _updateMask(
+        effect.id,
+        trackingMask.copyWith(
+          trackingEnabled: true,
+          trackingTargetId: clip.id,
+          trackingKeyframes: [...retained, ...result.keyframes],
+        ),
+      );
+      _showMessage(
+        'Tracked ${result.keyframes.length} samples '
+        '(${(result.averageConfidence * 100).round()}% confidence).',
+      );
+    } catch (error) {
+      if (mounted) {
+        _showMessage(error.toString().replaceFirst('Exception: ', ''));
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _trackingEffectIds.remove(effect.id));
+      }
+    }
+  }
+
   Future<void> _pickAndAddEffect() async {
     final type = await showModalBottomSheet<EditorEffectType>(
       context: context,
@@ -817,13 +1042,20 @@ class _EffectStackEditorSheetState
       context: context,
       backgroundColor: Colors.transparent,
       builder: (context) {
-        final matching = timeline.effectPresets
-            .where(
-              (preset) => preset.stack.effects.any(
-                (effect) => effect.domain == widget.domain,
-              ),
-            )
-            .toList();
+        final presetsById = <String, EditorEffectPreset>{
+          for (final preset in timeline.effectPresets) preset.id: preset,
+          for (final preset in _globalPresets) preset.id: preset,
+        };
+        final matching =
+            presetsById.values
+                .where(
+                  (preset) => preset.stack.effects.any(
+                    (effect) => effect.domain == widget.domain,
+                  ),
+                )
+                .toList()
+              ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+        final globalIds = _globalPresets.map((preset) => preset.id).toSet();
         return Container(
           padding: const EdgeInsets.fromLTRB(16, 12, 16, 22),
           decoration: const BoxDecoration(
@@ -848,6 +1080,15 @@ class _EffectStackEditorSheetState
                         ),
                       ),
                     ),
+                    IconButton(
+                      key: const ValueKey('effect_preset_import'),
+                      tooltip: 'Import .ccfx preset',
+                      onPressed: () async {
+                        Navigator.of(context).pop();
+                        await _importPreset();
+                      },
+                      icon: const Icon(Icons.file_open_outlined),
+                    ),
                     FilledButton.icon(
                       onPressed: stack.isEmpty
                           ? null
@@ -861,7 +1102,12 @@ class _EffectStackEditorSheetState
                   ],
                 ),
                 const SizedBox(height: 10),
-                if (matching.isEmpty)
+                if (_loadingGlobalPresets)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 24),
+                    child: Center(child: CircularProgressIndicator()),
+                  )
+                else if (matching.isEmpty)
                   const Padding(
                     padding: EdgeInsets.symmetric(vertical: 24),
                     child: Center(
@@ -891,29 +1137,41 @@ class _EffectStackEditorSheetState
                             style: const TextStyle(color: kTextPrimary),
                           ),
                           subtitle: Text(
-                            '${preset.stack.effects.length} effect${preset.stack.effects.length == 1 ? '' : 's'}',
+                            '${preset.stack.effects.length} effect${preset.stack.effects.length == 1 ? '' : 's'} • '
+                            '${globalIds.contains(preset.id) ? 'Reusable library' : 'This project'}',
                             style: const TextStyle(color: kTextSecondary),
                           ),
                           onTap: () {
                             ref
                                 .read(editorProvider.notifier)
-                                .applyEffectPreset(
-                                  presetId: preset.id,
+                                .applyEffectPresetValue(
+                                  preset: preset,
                                   scope: _target.scope,
                                   targetId: _target.targetId,
                                   domain: widget.domain,
                                 );
                             Navigator.of(context).pop();
                           },
-                          trailing: IconButton(
-                            tooltip: 'Delete preset',
-                            onPressed: () {
-                              ref
-                                  .read(editorProvider.notifier)
-                                  .deleteEffectPreset(preset.id);
-                              Navigator.of(context).pop();
-                            },
-                            icon: const Icon(Icons.delete_outline_rounded),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                tooltip: 'Export .ccfx preset',
+                                onPressed: () async {
+                                  Navigator.of(context).pop();
+                                  await _exportPreset(preset);
+                                },
+                                icon: const Icon(Icons.ios_share_rounded),
+                              ),
+                              IconButton(
+                                tooltip: 'Delete preset',
+                                onPressed: () async {
+                                  Navigator.of(context).pop();
+                                  await _deletePreset(preset.id);
+                                },
+                                icon: const Icon(Icons.delete_outline_rounded),
+                              ),
+                            ],
                           ),
                         );
                       },
@@ -965,7 +1223,78 @@ class _EffectStackEditorSheetState
           targetId: _target.targetId,
           domain: widget.domain,
         );
-    if (id != null) _showMessage('Preset saved');
+    if (id == null) return;
+    final preset = ref
+        .read(editorProvider)
+        .timeline
+        .effectPresets
+        .where((candidate) => candidate.id == id)
+        .firstOrNull;
+    if (preset == null) return;
+    try {
+      await _presetLibrary.save(preset);
+      await _loadGlobalPresets();
+      _showMessage('Preset saved to the reusable library');
+    } catch (error) {
+      _showMessage(
+        'Preset saved to this project, but library save failed: $error',
+      );
+    }
+  }
+
+  Future<void> _importPreset() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: const ['ccfx'],
+      allowMultiple: false,
+      withData: false,
+    );
+    final sourcePath = result?.files.single.path;
+    if (sourcePath == null || !mounted) return;
+    try {
+      final preset = await _presetLibrary.importPreset(sourcePath);
+      await _loadGlobalPresets();
+      _showMessage('${preset.name} imported');
+    } catch (error) {
+      _showMessage('Could not import preset: $error');
+    }
+  }
+
+  Future<void> _exportPreset(EditorEffectPreset preset) async {
+    var outputPath = await FilePicker.platform.saveFile(
+      dialogTitle: 'Export effect preset',
+      fileName: '${_safePresetFileName(preset.name)}.ccfx',
+      type: FileType.custom,
+      allowedExtensions: const ['ccfx'],
+    );
+    if (outputPath == null || !mounted) return;
+    if (path.extension(outputPath).toLowerCase() != '.ccfx') {
+      outputPath = '$outputPath.ccfx';
+    }
+    try {
+      await _presetLibrary.exportPreset(preset: preset, outputPath: outputPath);
+      _showMessage('Preset exported');
+    } catch (error) {
+      _showMessage('Could not export preset: $error');
+    }
+  }
+
+  Future<void> _deletePreset(String presetId) async {
+    ref.read(editorProvider.notifier).deleteEffectPreset(presetId);
+    try {
+      await _presetLibrary.delete(presetId);
+      await _loadGlobalPresets();
+      _showMessage('Preset deleted');
+    } catch (error) {
+      _showMessage(
+        'Project preset deleted, but library cleanup failed: $error',
+      );
+    }
+  }
+
+  String _safePresetFileName(String value) {
+    final safe = value.trim().replaceAll(RegExp(r'[^A-Za-z0-9._-]+'), '_');
+    return safe.isEmpty ? 'effect_preset' : safe;
   }
 
   void _showMessage(String message) {
@@ -1313,6 +1642,181 @@ class _EmptyStack extends StatelessWidget {
   }
 }
 
+class _FreeformMaskEditor extends StatelessWidget {
+  final List<EditorMaskPoint> points;
+  final ValueChanged<List<EditorMaskPoint>> onChanged;
+  final VoidCallback onChangeStart;
+  final VoidCallback onChangeEnd;
+
+  const _FreeformMaskEditor({
+    required this.points,
+    required this.onChanged,
+    required this.onChangeStart,
+    required this.onChangeEnd,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'Tap to add points, then drag handles around the subject.',
+          style: TextStyle(color: kTextSecondary, fontSize: 9),
+        ),
+        const SizedBox(height: 7),
+        AspectRatio(
+          aspectRatio: 16 / 9,
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              return GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTapDown: points.length >= 16
+                    ? null
+                    : (details) {
+                        onChanged([
+                          ...points,
+                          EditorMaskPoint(
+                            details.localPosition.dx / constraints.maxWidth,
+                            details.localPosition.dy / constraints.maxHeight,
+                          ).normalized,
+                        ]);
+                      },
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.28),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: kBorder),
+                  ),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(11),
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        CustomPaint(painter: _FreeformMaskPainter(points)),
+                        for (var index = 0; index < points.length; index++)
+                          Positioned(
+                            left: points[index].x * constraints.maxWidth - 12,
+                            top: points[index].y * constraints.maxHeight - 12,
+                            width: 24,
+                            height: 24,
+                            child: GestureDetector(
+                              behavior: HitTestBehavior.opaque,
+                              onPanStart: (_) => onChangeStart(),
+                              onPanUpdate: (details) {
+                                final updated = [...points];
+                                updated[index] = EditorMaskPoint(
+                                  updated[index].x +
+                                      details.delta.dx / constraints.maxWidth,
+                                  updated[index].y +
+                                      details.delta.dy / constraints.maxHeight,
+                                ).normalized;
+                                onChanged(updated);
+                              },
+                              onPanEnd: (_) => onChangeEnd(),
+                              child: DecoratedBox(
+                                decoration: BoxDecoration(
+                                  color: kAccent,
+                                  shape: BoxShape.circle,
+                                  border: Border.all(
+                                    color: Colors.white,
+                                    width: 2,
+                                  ),
+                                  boxShadow: const [
+                                    BoxShadow(
+                                      color: Colors.black54,
+                                      blurRadius: 4,
+                                    ),
+                                  ],
+                                ),
+                                child: Center(
+                                  child: Text(
+                                    '${index + 1}',
+                                    style: const TextStyle(
+                                      color: Colors.black,
+                                      fontSize: 8,
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+        const SizedBox(height: 6),
+        Row(
+          children: [
+            Text(
+              '${points.length} points',
+              style: const TextStyle(color: kTextSecondary, fontSize: 9),
+            ),
+            const Spacer(),
+            TextButton.icon(
+              onPressed: points.length <= 3
+                  ? null
+                  : () => onChanged(points.sublist(0, points.length - 1)),
+              icon: const Icon(Icons.undo_rounded, size: 15),
+              label: const Text('Remove last'),
+            ),
+            TextButton.icon(
+              onPressed: () => onChanged(const [
+                EditorMaskPoint(0.25, 0.25),
+                EditorMaskPoint(0.75, 0.25),
+                EditorMaskPoint(0.75, 0.75),
+                EditorMaskPoint(0.25, 0.75),
+              ]),
+              icon: const Icon(Icons.restart_alt_rounded, size: 15),
+              label: const Text('Reset'),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+}
+
+class _FreeformMaskPainter extends CustomPainter {
+  final List<EditorMaskPoint> points;
+
+  const _FreeformMaskPainter(this.points);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (points.length < 2) return;
+    final path = Path()
+      ..moveTo(points.first.x * size.width, points.first.y * size.height);
+    for (final point in points.skip(1)) {
+      path.lineTo(point.x * size.width, point.y * size.height);
+    }
+    if (points.length >= 3) path.close();
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = kAccent.withValues(alpha: 0.17)
+        ..style = PaintingStyle.fill,
+    );
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = kAccent
+        ..strokeWidth = 2
+        ..style = PaintingStyle.stroke,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _FreeformMaskPainter oldDelegate) {
+    return oldDelegate.points != points;
+  }
+}
+
 class _EffectParameterSpec {
   final String name;
   final String label;
@@ -1393,6 +1897,28 @@ _EffectParameterSpec _parameterSpec(
       maximum = 24;
       divisions = 96;
       format = (value) => '${value.toStringAsFixed(1)} dB';
+    case 'floor':
+      minimum = -80;
+      maximum = -20;
+      divisions = 120;
+      format = (value) => '${value.toStringAsFixed(1)} dB';
+    case 'harmonics':
+      minimum = 1;
+      maximum = 6;
+      divisions = 5;
+      format = (value) => value.round().toString();
+    case 'cutoff':
+      minimum = 40;
+      maximum = 500;
+      divisions = 92;
+      format = (value) => '${value.round()} Hz';
+    case 'width':
+      if (type.domain == EditorEffectDomain.audio) {
+        minimum = 0.1;
+        maximum = 10;
+        divisions = 99;
+        format = (value) => value.toStringAsFixed(1);
+      }
     case 'threshold':
       if (type.domain == EditorEffectDomain.audio) {
         minimum = -60;

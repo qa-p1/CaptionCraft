@@ -870,11 +870,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         sourcePath: nextPath,
         metadata: {
           ...?targetAsset?.metadata,
+          ...info,
           if (replacementDurationMs > 0) 'durationMs': replacementDurationMs,
-          if (info['width'] != null) 'width': info['width'],
-          if (info['height'] != null) 'height': info['height'],
-          if (info['hasAudio'] != null) 'hasAudio': info['hasAudio'],
-          if (info['frameRate'] != null) 'frameRate': info['frameRate'],
         },
       );
 

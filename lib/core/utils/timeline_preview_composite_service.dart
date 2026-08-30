@@ -225,6 +225,20 @@ class TimelinePreviewCompositeService {
           frameRate: _metadataNumber(
             selected[index].asset?.metadata['frameRate'],
           ),
+          colorPrimaries:
+              selected[index].asset?.metadata['colorPrimaries'] as String?,
+          colorTransfer:
+              selected[index].asset?.metadata['colorTransfer'] as String?,
+          colorSpace: selected[index].asset?.metadata['colorSpace'] as String?,
+          colorRange: selected[index].asset?.metadata['colorRange'] as String?,
+          bitDepth: selected[index].asset?.metadata['bitDepth'] as int?,
+          audioStreamCount:
+              selected[index].asset?.metadata['audioStreamCount'] as int?,
+          audioChannels:
+              selected[index].asset?.metadata['audioChannels'] as int?,
+          audioChannelsByStream: audioChannelsByStreamFromMetadata(
+            selected[index].asset?.metadata['audioStreams'],
+          ),
         ),
     ];
     final canvasReference = inputs.firstWhere(
@@ -401,6 +415,7 @@ class TimelinePreviewCompositeService {
         captionFontDirectory: fontDirectory,
         videoPreset: 'ultrafast',
         videoCrf: 30,
+        previewMode: true,
         outputPath: partialPath,
       );
       final completion =

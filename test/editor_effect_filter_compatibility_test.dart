@@ -86,6 +86,104 @@ void main() {
     timeout: const Timeout(Duration(minutes: 2)),
   );
 
+  test(
+    'lens and depth effects execute source-preserving composite graphs',
+    () async {
+      if (!await _commandExists('ffmpeg')) {
+        markTestSkipped('Desktop FFmpeg is not installed.');
+        return;
+      }
+      const source =
+          'color=c=black@0.0:size=160x120:rate=12:duration=0.4,'
+          'format=rgba,'
+          'drawbox=x=35:y=25:w=90:h=70:color=red@1:t=fill';
+      final baseline = await Process.run('ffmpeg', [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-f',
+        'lavfi',
+        '-i',
+        source,
+        '-frames:v',
+        '4',
+        '-pix_fmt',
+        'rgba',
+        '-f',
+        'framemd5',
+        '-',
+      ]);
+      expect(baseline.exitCode, 0, reason: '${baseline.stderr}');
+      final failures = <String>[];
+      const types = <EditorEffectType>[
+        EditorEffectType.glow,
+        EditorEffectType.bloom,
+        EditorEffectType.cinematicGlow,
+        EditorEffectType.glare,
+        EditorEffectType.bokeh,
+        EditorEffectType.flare,
+        EditorEffectType.lightLeak,
+        EditorEffectType.prism,
+        EditorEffectType.dropShadow,
+        EditorEffectType.outline,
+        EditorEffectType.stroke,
+        EditorEffectType.reflection,
+      ];
+      for (final type in types) {
+        final plan = TimelineExportService.buildEditorEffectGraphPlanForTesting(
+          EditorEffect(
+            type: type,
+            intensity: 0.74,
+            mask: const EditorEffectMask(
+              shape: EditorEffectMaskShape.ellipse,
+              x: 0.08,
+              y: 0.08,
+              width: 0.84,
+              height: 0.84,
+              feather: 0.12,
+            ),
+          ),
+          sourceLabel: '0:v',
+        );
+        if (!plan.filterGraph.contains('maskedmerge=') ||
+            !plan.filterGraph.contains('split=')) {
+          failures.add('${type.name}: graph was not composited and masked');
+          continue;
+        }
+        final graph =
+            '${plan.filterGraph};'
+            '[${plan.outputLabel}]format=rgba[out]';
+        final result = await Process.run('ffmpeg', [
+          '-hide_banner',
+          '-loglevel',
+          'error',
+          '-f',
+          'lavfi',
+          '-i',
+          source,
+          '-filter_complex',
+          graph,
+          '-map',
+          '[out]',
+          '-frames:v',
+          '4',
+          '-pix_fmt',
+          'rgba',
+          '-f',
+          'framemd5',
+          '-',
+        ]);
+        if (result.exitCode != 0) {
+          failures.add('${type.name}: ${result.stderr}');
+        } else if (result.stdout == baseline.stdout) {
+          failures.add('${type.name}: rendered pixels were unchanged');
+        }
+      }
+      expect(failures, isEmpty, reason: failures.join('\n'));
+    },
+    timeout: const Timeout(Duration(minutes: 2)),
+  );
+
   test('every exposed numeric parameter changes its render filter', () {
     final ignored = <String>[];
     for (final type in EditorEffectType.values) {
@@ -170,6 +268,51 @@ void main() {
           globalRed: 0.1,
         ),
       ),
+      'hueVsHue': const ClipColorAdjustments(
+        hueVsHueCurve: EditorColorCurve(
+          points: [
+            EditorColorCurvePoint(0, 0),
+            EditorColorCurvePoint(0.5, 0.62),
+            EditorColorCurvePoint(1, 1),
+          ],
+        ),
+      ),
+      'hueVsSaturation': const ClipColorAdjustments(
+        hueVsSaturationCurve: EditorColorCurve(
+          points: [
+            EditorColorCurvePoint(0, 0),
+            EditorColorCurvePoint(0.5, 0.35),
+            EditorColorCurvePoint(1, 1),
+          ],
+        ),
+      ),
+      'hueVsLuminance': const ClipColorAdjustments(
+        hueVsLuminanceCurve: EditorColorCurve(
+          points: [
+            EditorColorCurvePoint(0, 0),
+            EditorColorCurvePoint(0.5, 0.58),
+            EditorColorCurvePoint(1, 1),
+          ],
+        ),
+      ),
+      'luminanceVsSaturation': const ClipColorAdjustments(
+        luminanceVsSaturationCurve: EditorColorCurve(
+          points: [
+            EditorColorCurvePoint(0, 0),
+            EditorColorCurvePoint(0.5, 0.7),
+            EditorColorCurvePoint(1, 1),
+          ],
+        ),
+      ),
+      'saturationVsSaturation': const ClipColorAdjustments(
+        saturationVsSaturationCurve: EditorColorCurve(
+          points: [
+            EditorColorCurvePoint(0, 0),
+            EditorColorCurvePoint(0.5, 0.3),
+            EditorColorCurvePoint(1, 1),
+          ],
+        ),
+      ),
     };
     final neutral = TimelineExportService.buildColorFiltersForTesting(
       const ClipColorAdjustments(),
@@ -185,57 +328,213 @@ void main() {
   });
 
   test(
-    'unsupported color pipelines stop instead of silently exporting SDR',
-    () {
-      EditorTimeline timelineWith(ClipColorAdjustments adjustments) {
-        return EditorTimeline(
-          tracks: [
-            TimelineTrack(
-              id: 'track',
-              name: 'Video',
-              type: TimelineTrackType.video,
-              section: TimelineTrackSection.baseVideo,
-              clips: [
-                TimelineClip(
-                  id: 'clip',
-                  trackId: 'track',
-                  type: TimelineTrackType.video,
-                  label: 'Camera clip',
-                  startTime: Duration.zero,
-                  endTime: const Duration(seconds: 1),
-                  colorAdjustments: adjustments,
-                ),
-              ],
-            ),
-          ],
+    'exposure plus both directions of black and white controls change pixels',
+    () async {
+      if (!await _commandExists('ffmpeg')) {
+        markTestSkipped('Desktop FFmpeg is not installed.');
+        return;
+      }
+      Future<String> render(ClipColorAdjustments adjustments) async {
+        final plan = TimelineExportService.buildColorAdjustmentGraphPlan(
+          adjustments,
+          sourceLabel: '0:v',
         );
+        final graph = plan.filterGraph.isEmpty
+            ? '[0:v]format=yuv420p[out]'
+            : '${plan.filterGraph};'
+                  '[${plan.outputLabel}]format=yuv420p[out]';
+        final result = await Process.run('ffmpeg', [
+          '-hide_banner',
+          '-loglevel',
+          'error',
+          '-f',
+          'lavfi',
+          '-i',
+          'testsrc2=size=160x120:rate=12:duration=0.4',
+          '-filter_complex',
+          graph,
+          '-map',
+          '[out]',
+          '-frames:v',
+          '4',
+          '-f',
+          'framemd5',
+          '-',
+        ]);
+        expect(result.exitCode, 0, reason: '${result.stderr}');
+        return result.stdout as String;
       }
 
-      expect(
-        () => TimelineExportService.validateColorPipelineForTesting(
-          timelineWith(
-            const ClipColorAdjustments(inputColorSpace: EditorColorSpace.log),
-          ),
-        ),
-        throwsUnsupportedError,
-      );
-      expect(
-        () => TimelineExportService.validateColorPipelineForTesting(
-          timelineWith(
-            const ClipColorAdjustments(
-              hueVsHueCurve: EditorColorCurve(
-                points: [
-                  EditorColorCurvePoint(0, 0),
-                  EditorColorCurvePoint(0.5, 0.6),
-                  EditorColorCurvePoint(1, 1),
-                ],
+      final neutral = await render(const ClipColorAdjustments());
+      final controls = <String, ClipColorAdjustments>{
+        'positive exposure': const ClipColorAdjustments(exposure: 1),
+        'negative exposure': const ClipColorAdjustments(exposure: -1),
+        'lift blacks': const ClipColorAdjustments(blacks: 0.5),
+        'crush blacks': const ClipColorAdjustments(blacks: -0.5),
+        'raise whites': const ClipColorAdjustments(whites: 0.5),
+        'lower whites': const ClipColorAdjustments(whites: -0.5),
+      };
+      final unchanged = <String>[];
+      for (final entry in controls.entries) {
+        if (await render(entry.value) == neutral) unchanged.add(entry.key);
+      }
+      expect(unchanged, isEmpty, reason: 'No pixel change: $unchanged');
+    },
+    timeout: const Timeout(Duration(minutes: 2)),
+  );
+
+  test('camera input transforms and HDR pipelines validate', () {
+    EditorTimeline timelineWith(ClipColorAdjustments adjustments) {
+      return EditorTimeline(
+        tracks: [
+          TimelineTrack(
+            id: 'track',
+            name: 'Video',
+            type: TimelineTrackType.video,
+            section: TimelineTrackSection.baseVideo,
+            clips: [
+              TimelineClip(
+                id: 'clip',
+                trackId: 'track',
+                type: TimelineTrackType.video,
+                label: 'Camera clip',
+                startTime: Duration.zero,
+                endTime: const Duration(seconds: 1),
+                colorAdjustments: adjustments,
               ),
+            ],
+          ),
+        ],
+      );
+    }
+
+    expect(
+      () => TimelineExportService.validateColorPipelineForTesting(
+        timelineWith(
+          const ClipColorAdjustments(inputColorSpace: EditorColorSpace.log),
+        ),
+      ),
+      returnsNormally,
+    );
+    expect(
+      () => TimelineExportService.validateColorPipelineForTesting(
+        timelineWith(
+          const ClipColorAdjustments(
+            hueVsHueCurve: EditorColorCurve(
+              points: [
+                EditorColorCurvePoint(0, 0),
+                EditorColorCurvePoint(0.5, 0.6),
+                EditorColorCurvePoint(1, 1),
+              ],
             ),
           ),
         ),
-        throwsUnsupportedError,
+      ),
+      returnsNormally,
+    );
+    expect(
+      () => TimelineExportService.validateColorPipelineForTesting(
+        EditorTimeline(
+          colorManagement: const EditorColorManagementSettings(
+            workingSpace: EditorColorSpace.hlg,
+            outputSpace: EditorColorSpace.pq,
+            preserveHdr: true,
+          ),
+        ),
+      ),
+      returnsNormally,
+    );
+    expect(
+      () => TimelineExportService.validateColorPipelineForTesting(
+        EditorTimeline(
+          colorManagement: const EditorColorManagementSettings(
+            outputSpace: EditorColorSpace.automatic,
+          ),
+        ),
+      ),
+      throwsArgumentError,
+    );
+  });
+
+  test(
+    'secondary curves and a masked qualifier are accepted by FFmpeg',
+    () async {
+      if (!await _commandExists('ffmpeg')) {
+        markTestSkipped('Desktop FFmpeg is not installed.');
+        return;
+      }
+      final adjustments = ClipColorAdjustments(
+        hueVsHueCurve: const EditorColorCurve(
+          points: [
+            EditorColorCurvePoint(0, 0),
+            EditorColorCurvePoint(0.33, 0.46),
+            EditorColorCurvePoint(1, 1),
+          ],
+        ),
+        luminanceVsSaturationCurve: const EditorColorCurve(
+          points: [
+            EditorColorCurvePoint(0, 0),
+            EditorColorCurvePoint(0.5, 0.7),
+            EditorColorCurvePoint(1, 1),
+          ],
+        ),
+        saturationVsSaturationCurve: const EditorColorCurve(
+          points: [
+            EditorColorCurvePoint(0, 0),
+            EditorColorCurvePoint(0.5, 0.35),
+            EditorColorCurvePoint(1, 1),
+          ],
+        ),
+        qualifier: EditorColorQualifier(
+          enabled: true,
+          color: 0xFFFF0000,
+          hueShift: 18,
+          saturationShift: 0.2,
+          spatialMask: const EditorEffectMask(
+            shape: EditorEffectMaskShape.freeform,
+            points: [
+              EditorMaskPoint(0.1, 0.1),
+              EditorMaskPoint(0.9, 0.2),
+              EditorMaskPoint(0.75, 0.9),
+              EditorMaskPoint(0.2, 0.8),
+            ],
+            feather: 0.15,
+          ),
+        ),
       );
+      final plan = TimelineExportService.buildColorAdjustmentGraphPlan(
+        adjustments,
+        sourceLabel: '0:v',
+      );
+      expect(plan.filterGraph, contains('huesaturation='));
+      expect(plan.filterGraph, contains('format=gbrp,geq='));
+      expect(plan.filterGraph, contains('maskedmerge='));
+      expect(plan.filterGraph, contains('mod('));
+      expect(plan.filterGraph, contains('min(abs('));
+      final graph =
+          '${plan.filterGraph};'
+          '[${plan.outputLabel}]format=yuv420p[out]';
+      final result = await Process.run('ffmpeg', [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-f',
+        'lavfi',
+        '-i',
+        'testsrc2=size=160x120:rate=12:duration=0.4',
+        '-filter_complex',
+        graph,
+        '-map',
+        '[out]',
+        '-frames:v',
+        '4',
+        '-f',
+        'null',
+        '-',
+      ]);
+      expect(result.exitCode, 0, reason: '${result.stdout}\n${result.stderr}');
     },
+    timeout: const Timeout(Duration(minutes: 2)),
   );
 }
 

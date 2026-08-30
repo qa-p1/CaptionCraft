@@ -3494,6 +3494,12 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         EditorEffectType.deEsser ||
         EditorEffectType.noiseReduction ||
         EditorEffectType.humReduction ||
+        EditorEffectType.hissReduction ||
+        EditorEffectType.windReduction ||
+        EditorEffectType.clickRemoval ||
+        EditorEffectType.declip ||
+        EditorEffectType.dialogueEnhance ||
+        EditorEffectType.deReverb ||
         EditorEffectType.reverb ||
         EditorEffectType.delay ||
         EditorEffectType.distortion ||
@@ -3505,7 +3511,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         effected = _applyMaskedEffectPreview(
           before,
           effected,
-          mask,
+          mask.resolvedAt(time),
           key: effect.id,
           opacity: effect.intensity,
         );
@@ -3534,50 +3540,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         if (!constraints.hasBoundedWidth || !constraints.hasBoundedHeight) {
           return effected;
         }
-        final left = constraints.maxWidth * mask.safeX;
-        final top = constraints.maxHeight * mask.safeY;
-        final width = constraints.maxWidth * mask.safeWidth;
-        final height = constraints.maxHeight * mask.safeHeight;
-        Widget region = ClipRect(
-          child: OverflowBox(
-            alignment: Alignment.topLeft,
-            minWidth: constraints.maxWidth,
-            maxWidth: constraints.maxWidth,
-            minHeight: constraints.maxHeight,
-            maxHeight: constraints.maxHeight,
-            child: Transform.translate(
-              offset: Offset(-left, -top),
-              child: SizedBox(
-                width: constraints.maxWidth,
-                height: constraints.maxHeight,
-                child: effected,
-              ),
-            ),
-          ),
-        );
-        if (mask.shape == EditorEffectMaskShape.ellipse) {
-          region = ClipOval(child: region);
-        }
-        Widget originalRegion = ClipRect(
-          child: OverflowBox(
-            alignment: Alignment.topLeft,
-            minWidth: constraints.maxWidth,
-            maxWidth: constraints.maxWidth,
-            minHeight: constraints.maxHeight,
-            maxHeight: constraints.maxHeight,
-            child: Transform.translate(
-              offset: Offset(-left, -top),
-              child: SizedBox(
-                width: constraints.maxWidth,
-                height: constraints.maxHeight,
-                child: original,
-              ),
-            ),
-          ),
-        );
-        if (mask.shape == EditorEffectMaskShape.ellipse) {
-          originalRegion = ClipOval(child: originalRegion);
-        }
         final mixedEffect = opacity >= 0.999
             ? effected
             : Stack(
@@ -3592,14 +3554,14 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
           fit: StackFit.expand,
           children: [
             mask.inverted ? mixedEffect : original,
-            Positioned(
-              left: left,
-              top: top,
-              width: width,
-              height: height,
+            ClipPath(
+              clipper: _EditorEffectMaskClipper(mask),
               child: mask.inverted
-                  ? originalRegion
-                  : Opacity(opacity: opacity.clamp(0.0, 1.0), child: region),
+                  ? original
+                  : Opacity(
+                      opacity: opacity.clamp(0.0, 1.0),
+                      child: effected,
+                    ),
             ),
           ],
         );
@@ -7930,6 +7892,63 @@ Duration _previewSourcePosition(
       .clamp(0, math.max(0, spanMs - 1))
       .toInt();
   return clip.sourceStartTime + Duration(milliseconds: reversedOffsetMs);
+}
+
+class _EditorEffectMaskClipper extends CustomClipper<Path> {
+  final EditorEffectMask mask;
+
+  const _EditorEffectMaskClipper(this.mask);
+
+  @override
+  Path getClip(Size size) {
+    switch (mask.shape) {
+      case EditorEffectMaskShape.rectangle:
+        return Path()..addRect(
+          Rect.fromLTWH(
+            size.width * mask.safeX,
+            size.height * mask.safeY,
+            size.width * mask.safeWidth,
+            size.height * mask.safeHeight,
+          ),
+        );
+      case EditorEffectMaskShape.ellipse:
+        return Path()..addOval(
+          Rect.fromLTWH(
+            size.width * mask.safeX,
+            size.height * mask.safeY,
+            size.width * mask.safeWidth,
+            size.height * mask.safeHeight,
+          ),
+        );
+      case EditorEffectMaskShape.freeform:
+        final points = mask.safePoints;
+        if (points.length < 3) {
+          return Path()..addRect(
+            Rect.fromLTWH(
+              size.width * mask.safeX,
+              size.height * mask.safeY,
+              size.width * mask.safeWidth,
+              size.height * mask.safeHeight,
+            ),
+          );
+        }
+        return Path()
+          ..addPolygon(
+            points
+                .map(
+                  (point) =>
+                      Offset(size.width * point.x, size.height * point.y),
+                )
+                .toList(),
+            true,
+          );
+    }
+  }
+
+  @override
+  bool shouldReclip(covariant _EditorEffectMaskClipper oldClipper) {
+    return oldClipper.mask != mask;
+  }
 }
 
 class _CanvasBoundLayer extends StatelessWidget {
