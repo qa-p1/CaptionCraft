@@ -37,11 +37,11 @@ void main() async {
       try {
         await FirebaseAppCheck.instance.activate(
           providerAndroid: kDebugMode
-              ? AndroidProvider.debug
-              : AndroidProvider.playIntegrity,
+              ? const AndroidDebugProvider()
+              : const AndroidPlayIntegrityProvider(),
           providerApple: kDebugMode
-              ? AppleProvider.debug
-              : AppleProvider.appAttestWithDeviceCheckFallback,
+              ? const AppleDebugProvider()
+              : const AppleAppAttestWithDeviceCheckFallbackProvider(),
         );
       } catch (error, stackTrace) {
         // Core auth and local editing remain available. Services that require

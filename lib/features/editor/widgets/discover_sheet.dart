@@ -384,12 +384,12 @@ class _UnsupportedWindowsBrowser extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const Center(
+    return Center(
       child: Padding(
-        padding: EdgeInsets.all(28),
+        padding: const EdgeInsets.all(28),
         child: ConstrainedBox(
-          constraints: BoxConstraints(maxWidth: 480),
-          child: Column(
+          constraints: const BoxConstraints(maxWidth: 480),
+          child: const Column(
             mainAxisSize: MainAxisSize.min,
             children: [
               Icon(Icons.public_off_outlined, size: 44, color: kTextSecondary),
