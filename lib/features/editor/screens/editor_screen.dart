@@ -48,6 +48,7 @@ import '../models/sound_effect_library_asset.dart';
 import '../providers/editor_provider.dart';
 import '../providers/playback_provider.dart';
 import '../providers/subtitle_provider.dart';
+import '../services/editor_shortcuts.dart';
 import '../services/timeline_keyframe_editing.dart';
 import 'creator_lab_screen.dart';
 import 'export_video_screen.dart';
@@ -1012,6 +1013,129 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     }
   }
 
+  bool _textEntryHasFocus() {
+    final focusContext = FocusManager.instance.primaryFocus?.context;
+    if (focusContext == null) return false;
+    return focusContext.widget is EditableText ||
+        focusContext.findAncestorWidgetOfExactType<EditableText>() != null;
+  }
+
+  KeyEventResult _handleEditorKeyEvent(FocusNode _, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    if (_textEntryHasFocus()) return KeyEventResult.ignored;
+
+    final keyboard = HardwareKeyboard.instance;
+    final command = resolveEditorShortcut(
+      key: event.logicalKey,
+      controlOrMeta: keyboard.isControlPressed || keyboard.isMetaPressed,
+      shift: keyboard.isShiftPressed,
+      alt: keyboard.isAltPressed,
+    );
+    if (command == null) return KeyEventResult.ignored;
+    if (event is KeyRepeatEvent && !isRepeatableEditorShortcut(command)) {
+      return KeyEventResult.handled;
+    }
+
+    _runEditorShortcut(command);
+    return KeyEventResult.handled;
+  }
+
+  void _runEditorShortcut(EditorShortcutCommand command) {
+    switch (command) {
+      case EditorShortcutCommand.undo:
+        _undoLatestChange();
+      case EditorShortcutCommand.redo:
+        _redoLatestChange();
+      case EditorShortcutCommand.save:
+        unawaited(_saveFromShortcut());
+      case EditorShortcutCommand.export:
+        _showExportDialog();
+      case EditorShortcutCommand.importMedia:
+        unawaited(_pickOverlayMedia());
+      case EditorShortcutCommand.selectAll:
+        _selectAllClips();
+      case EditorShortcutCommand.togglePlayPause:
+        _requestTransport(PlaybackTransportCommand.togglePlayPause);
+      case EditorShortcutCommand.pause:
+        _requestTransport(PlaybackTransportCommand.pause);
+      case EditorShortcutCommand.playForward:
+        _requestTransport(PlaybackTransportCommand.playForward);
+      case EditorShortcutCommand.stepBackward:
+        _requestTransport(PlaybackTransportCommand.stepBackward);
+      case EditorShortcutCommand.stepForward:
+        _requestTransport(PlaybackTransportCommand.stepForward);
+      case EditorShortcutCommand.nudgeBackward:
+        _nudgeSelectedClips(-1);
+      case EditorShortcutCommand.nudgeForward:
+        _nudgeSelectedClips(1);
+      case EditorShortcutCommand.jumpToStart:
+        _requestTransport(PlaybackTransportCommand.jumpToStart);
+      case EditorShortcutCommand.jumpToEnd:
+        _requestTransport(PlaybackTransportCommand.jumpToEnd);
+      case EditorShortcutCommand.deleteSelectedClip:
+        final selected = _selectedClipFromState(ref.read(editorProvider));
+        if (selected != null) unawaited(_deleteClip(selected));
+      case EditorShortcutCommand.splitAtPlayhead:
+        _splitEveryTrackAtPlayhead();
+      case EditorShortcutCommand.addMarker:
+        _addChapterMarker();
+      case EditorShortcutCommand.toggleFullscreen:
+        _setPreviewFullscreen(!_isPreviewFullscreen);
+      case EditorShortcutCommand.dismiss:
+        if (_isPreviewFullscreen) {
+          _setPreviewFullscreen(false);
+        } else {
+          ref.read(editorProvider.notifier).clearClipSelection();
+        }
+      case EditorShortcutCommand.showShortcutHelp:
+        _showKeyboardShortcuts();
+    }
+  }
+
+  void _requestTransport(PlaybackTransportCommand command) {
+    ref.read(playbackProvider.notifier).requestTransport(command);
+  }
+
+  void _undoLatestChange() {
+    final editor = ref.read(editorProvider.notifier);
+    final subtitles = ref.read(subtitleProvider.notifier);
+    final editorSequence = editor.latestUndoSequence ?? -1;
+    final subtitleSequence = subtitles.latestUndoSequence ?? -1;
+    if (editorSequence >= subtitleSequence && editor.canUndo) {
+      editor.undo();
+    } else if (subtitles.canUndo) {
+      subtitles.undo();
+    }
+  }
+
+  void _redoLatestChange() {
+    final editor = ref.read(editorProvider.notifier);
+    final subtitles = ref.read(subtitleProvider.notifier);
+    final editorSequence = editor.latestRedoSequence ?? -1;
+    final subtitleSequence = subtitles.latestRedoSequence ?? -1;
+    if (editorSequence >= subtitleSequence && editor.canRedo) {
+      editor.redo();
+    } else if (subtitles.canRedo) {
+      subtitles.redo();
+    }
+  }
+
+  Future<void> _saveFromShortcut() async {
+    await _flushProjectSave(
+      syncRemote: false,
+      changeType: 'desktop_save_shortcut',
+    );
+    if (!mounted) return;
+    final error = _localSaveError;
+    if (error == null) {
+      SnackBarHelper.showSuccess(context, 'Project saved locally');
+    } else {
+      SnackBarHelper.showError(context, 'Local save failed: $error');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     _currentUserUid = ref.watch(currentUserProvider)?.uid;
@@ -1052,19 +1176,23 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           );
         }
       },
-      child: Scaffold(
-        key: _scaffoldKey,
-        backgroundColor: kBackground,
-        // Text editing manages the keyboard inside its bottom sheet. Keeping
-        // the canvas at its normal size prevents the video preview collapsing
-        // to a thumbnail while the user types.
-        resizeToAvoidBottomInset: false,
-        appBar: _isPreviewFullscreen ? null : _buildEditorToolbar(context),
-        body: _isPreviewFullscreen
-            ? _buildFullscreenPreview()
-            : isLandscape
-            ? _buildLandscape(context, selectedClip)
-            : _buildPortrait(context, selectedClip),
+      child: Focus(
+        autofocus: Platform.isWindows,
+        onKeyEvent: _handleEditorKeyEvent,
+        child: Scaffold(
+          key: _scaffoldKey,
+          backgroundColor: kBackground,
+          // Text editing manages the keyboard inside its bottom sheet. Keeping
+          // the canvas at its normal size prevents the video preview collapsing
+          // to a thumbnail while the user types.
+          resizeToAvoidBottomInset: false,
+          appBar: _isPreviewFullscreen ? null : _buildEditorToolbar(context),
+          body: _isPreviewFullscreen
+              ? _buildFullscreenPreview()
+              : isLandscape
+              ? _buildLandscape(context, selectedClip)
+              : _buildPortrait(context, selectedClip),
+        ),
       ),
     );
   }
@@ -1145,6 +1273,90 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   ),
           ),
         ),
+      ),
+    );
+  }
+
+  Future<void> _showKeyboardShortcuts() async {
+    final modifier = Platform.isMacOS ? '⌘' : 'Ctrl';
+    const transport = <(String, String)>[
+      ('Space', 'Play or pause'),
+      ('J / K / L', 'Previous frame / pause / play'),
+      ('← / →', 'Previous / next frame'),
+      ('Alt + ← / →', 'Nudge selected clips'),
+      ('Home / End', 'Jump to start / end'),
+    ];
+    final editing = <(String, String)>[
+      ('$modifier+Z / $modifier+Shift+Z', 'Undo / redo'),
+      ('$modifier+S', 'Save locally'),
+      ('$modifier+E', 'Export project'),
+      ('$modifier+I', 'Import media'),
+      ('$modifier+A', 'Select all clips'),
+      ('$modifier+B', 'Split at playhead'),
+      ('Delete', 'Delete selected clip'),
+      ('M', 'Add chapter marker'),
+      ('F / Esc', 'Toggle fullscreen / dismiss'),
+      ('Shift+/', 'Show this shortcut guide'),
+    ];
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Keyboard shortcuts'),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 520),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Editing',
+                  style: TextStyle(fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 8),
+                for (final shortcut in editing)
+                  ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(shortcut.$2),
+                    trailing: Text(
+                      shortcut.$1,
+                      style: const TextStyle(
+                        color: kTextSecondary,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Playback',
+                  style: TextStyle(fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 8),
+                for (final shortcut in transport)
+                  ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(shortcut.$2),
+                    trailing: Text(
+                      shortcut.$1,
+                      style: const TextStyle(
+                        color: kTextSecondary,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Close'),
+          ),
+        ],
       ),
     );
   }
@@ -1236,6 +1448,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         ],
       ),
       actions: [
+        if (Platform.isWindows && !phoneToolbar)
+          IconButton(
+            key: const ValueKey('editor_keyboard_shortcuts_button'),
+            tooltip: 'Keyboard shortcuts (?)',
+            onPressed: _showKeyboardShortcuts,
+            icon: const Icon(Icons.keyboard_alt_outlined),
+          ),
         Padding(
           padding: const EdgeInsets.symmetric(vertical: 10),
           child: Tooltip(

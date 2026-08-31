@@ -36,10 +36,10 @@ void main() async {
       );
       try {
         await FirebaseAppCheck.instance.activate(
-          androidProvider: kDebugMode
+          providerAndroid: kDebugMode
               ? AndroidProvider.debug
               : AndroidProvider.playIntegrity,
-          appleProvider: kDebugMode
+          providerApple: kDebugMode
               ? AppleProvider.debug
               : AppleProvider.appAttestWithDeviceCheckFallback,
         );

@@ -5,7 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   test('release transcription requires a valid HTTPS proxy', () {
     expect(
-      GroqConstants.isConfiguredForValues(
+      GroqConstants.isConfiguredFor(
         proxyUrl: '',
         apiKey: 'must-not-be-used-in-a-client',
         releaseMode: true,
@@ -13,7 +13,7 @@ void main() {
       isFalse,
     );
     expect(
-      GroqConstants.isConfiguredForValues(
+      GroqConstants.isConfiguredFor(
         proxyUrl: 'https://api.example.com/v1/transcribe',
         apiKey: '',
         releaseMode: true,
@@ -21,7 +21,7 @@ void main() {
       isTrue,
     );
     expect(
-      GroqConstants.isConfiguredForValues(
+      GroqConstants.isConfiguredFor(
         proxyUrl: 'http://api.example.com/transcribe',
         apiKey: '',
         releaseMode: true,

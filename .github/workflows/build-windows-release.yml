@@ -1,0 +1,81 @@
+name: Build Windows release
+
+on:
+  push:
+    branches:
+      - "release-readiness-*"
+    paths:
+      - "lib/**"
+      - "windows/**"
+      - "test/**"
+      - "pubspec.yaml"
+      - "pubspec.lock"
+      - ".github/workflows/build-windows-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Flutter 3.41.2 / Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install pinned Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.2"
+          channel: stable
+          cache: true
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Restore locked Dart packages
+        run: flutter pub get --enforce-lockfile
+
+      - name: Analyze Windows source
+        run: flutter analyze
+
+      - name: Run desktop regression tests
+        run: >-
+          flutter test
+          test/app_startup_failure_test.dart
+          test/editor_shortcuts_test.dart
+          test/export_dialog_platform_test.dart
+          test/export_storage_preflight_test.dart
+          test/playback_provider_test.dart
+
+      - name: Build Windows release
+        run: flutter build windows --release
+
+      - name: Verify release bundle
+        shell: pwsh
+        run: |
+          $releaseDir = "build/windows/x64/runner/Release"
+          $executable = Join-Path $releaseDir "caption_craft.exe"
+          if (-not (Test-Path $executable -PathType Leaf)) {
+            throw "Windows release executable was not produced."
+          }
+          if (-not (Test-Path (Join-Path $releaseDir "data/flutter_assets") -PathType Container)) {
+            throw "Flutter assets are missing from the Windows release bundle."
+          }
+          Compress-Archive -Path "$releaseDir/*" -DestinationPath "CaptionCraft-Windows-x64.zip" -Force
+
+      - name: Upload Windows release
+        uses: actions/upload-artifact@v4
+        with:
+          name: CaptionCraft-Windows-x64
+          path: CaptionCraft-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

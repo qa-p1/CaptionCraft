@@ -57,8 +57,7 @@ class GroqConstants {
     return null;
   }
 
-  @visibleForTesting
-  static bool isConfiguredForValues({
+  static bool isConfiguredFor({
     required String proxyUrl,
     required String apiKey,
     required bool releaseMode,

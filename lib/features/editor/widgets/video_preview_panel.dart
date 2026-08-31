@@ -2106,6 +2106,27 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     }
   }
 
+  Future<void> _handleTransportCommand(PlaybackTransportCommand command) async {
+    if (!_initialized || !mounted) return;
+    switch (command) {
+      case PlaybackTransportCommand.togglePlayPause:
+        _togglePlayPause();
+      case PlaybackTransportCommand.pause:
+        if (_playRequested) _togglePlayPause();
+      case PlaybackTransportCommand.playForward:
+        if (_playbackSpeed != 1) await _setPlaybackSpeed(1);
+        if (mounted && !_playRequested) _togglePlayPause();
+      case PlaybackTransportCommand.stepBackward:
+        _stepFrame(-1);
+      case PlaybackTransportCommand.stepForward:
+        _stepFrame(1);
+      case PlaybackTransportCommand.jumpToStart:
+        _seekTo(Duration.zero);
+      case PlaybackTransportCommand.jumpToEnd:
+        _seekTo(ref.read(playbackProvider).duration);
+    }
+  }
+
   Future<void> _pauseOwnedTransportControllers() async {
     final controllers = <VideoPlayerController?>[
       _controller,
@@ -4914,6 +4935,19 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         await _seekTimelinePosition(target, forceSeek: true);
         if (!mounted) return;
         ref.read(playbackProvider.notifier).acknowledgeSeek(requestId);
+      }());
+    });
+    ref.listen(playbackProvider.select((state) => state.transportRequestId), (
+      _,
+      requestId,
+    ) {
+      if (!mounted) return;
+      final command = ref.read(playbackProvider).pendingTransportCommand;
+      if (command == null) return;
+      unawaited(() async {
+        await _handleTransportCommand(command);
+        if (!mounted) return;
+        ref.read(playbackProvider.notifier).acknowledgeTransport(requestId);
       }());
     });
     ref.listen(editorProvider.select((state) => state.editRevision), (_, _) {

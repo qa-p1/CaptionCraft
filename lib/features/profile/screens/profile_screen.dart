@@ -495,6 +495,16 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
               onTap: () => _handlePasswordReset(user.email!),
             ),
           _ActionTile(
+            icon: Icons.description_outlined,
+            title: 'Open-source licenses',
+            subtitle: 'Review licenses for bundled software',
+            enabled: !isBusy,
+            onTap: () => showLicensePage(
+              context: context,
+              applicationName: 'CaptionCraft',
+            ),
+          ),
+          _ActionTile(
             icon: Icons.logout_rounded,
             title: 'Sign out',
             subtitle: 'Local projects remain on this device',

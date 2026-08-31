@@ -39,7 +39,7 @@ jobs:
       - name: Build unsigned iPhone application
         shell: bash
         env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL: ${{ vars.CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL }}
           GIPHY_API_KEY: ${{ secrets.GIPHY_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
@@ -48,7 +48,7 @@ jobs:
           set -euo pipefail
 
           required_values=(
-            GROQ_API_KEY
+            CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL
             GIPHY_API_KEY
             PEXELS_API_KEY
             PIXABAY_API_KEY
@@ -65,7 +65,7 @@ jobs:
           trap 'rm -f "$define_file"' EXIT
           umask 077
           printf '%s\n' \
-            "GROQ_API_KEY=$GROQ_API_KEY" \
+            "CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL=$CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL" \
             "GIPHY_API_KEY=$GIPHY_API_KEY" \
             "PEXELS_API_KEY=$PEXELS_API_KEY" \
             "PIXABAY_API_KEY=$PIXABAY_API_KEY" \

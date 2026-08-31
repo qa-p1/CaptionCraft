@@ -53,6 +53,15 @@ jobs:
       - name: Test
         run: flutter test
 
+      - name: Upload golden failures
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-test-failures-linux
+          path: test/failures/**
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Validate Android application packaging
         if: ${{ always() }}
         run: flutter build apk --debug

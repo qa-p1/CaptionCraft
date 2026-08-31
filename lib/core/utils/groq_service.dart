@@ -14,7 +14,7 @@ import '../../features/editor/models/word_timing.dart';
 class GroqService {
   GroqService._();
 
-  static bool get isConfigured => GroqConstants.isConfiguredForValues(
+  static bool get isConfigured => GroqConstants.isConfiguredFor(
     proxyUrl: GroqConstants.transcriptionProxyUrl,
     apiKey: GroqConstants.apiKey,
     releaseMode: kReleaseMode,

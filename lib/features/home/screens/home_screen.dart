@@ -1291,6 +1291,16 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           style: TextStyle(color: kTextSecondary, height: 1.45),
         ),
         actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(dialogContext);
+              showLicensePage(
+                context: context,
+                applicationName: 'CaptionCraft',
+              );
+            },
+            child: const Text('Licenses'),
+          ),
           FilledButton(
             onPressed: () => Navigator.pop(dialogContext),
             child: const Text('Got it'),
