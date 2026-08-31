@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:caption_craft/core/utils/instagram_download_service.dart';
 import 'package:caption_craft/features/editor/models/discover_models.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -117,10 +119,152 @@ void main() {
       expect(
         service.inspect('https://www.instagram.com/reel/Caption123/'),
         throwsA(
-          isA<StateError>().having(
-            (error) => error.message,
-            'message',
-            contains('No downloadable media'),
+          isA<InstagramDownloadException>()
+              .having(
+                (error) => error.kind,
+                'kind',
+                InstagramFailureKind.privateOrLoginRequired,
+              )
+              .having(
+                (error) => error.message,
+                'message',
+                contains('requires a login'),
+              ),
+        ),
+      );
+    });
+
+    test('falls back to public embed pages when the canonical page is gated', () async {
+      final requested = <Uri>[];
+      final service = InstagramDownloadService(
+        pageLoader: (uri) async {
+          requested.add(uri);
+          if (uri.path == '/reel/Caption123/') {
+            return '<html>Log in to continue</html>';
+          }
+          return r'''
+            <meta property="og:title" content="Creator on Instagram: Reel">
+            <meta property="og:image" content="https://cdn.example.test/thumb.jpg">
+            <script type="application/json">
+              {"contentUrl":"https:\/\/cdn.example.test\/fallback.mp4?x=1\u0026y=2"}
+            </script>
+          ''';
+        },
+      );
+      addTearDown(service.dispose);
+
+      final info = await service.inspect(
+        'https://www.instagram.com/reel/Caption123/',
+      );
+
+      expect(requested.map((uri) => uri.path), <String>[
+        '/reel/Caption123/',
+        '/reel/Caption123/embed/captioned/',
+      ]);
+      expect(info.media, hasLength(1));
+      expect(info.media.single.kind, DiscoverMediaKind.video);
+      expect(
+        info.media.single.url,
+        'https://cdn.example.test/fallback.mp4?x=1&y=2',
+      );
+    });
+
+    test('extracts video_versions URLs used by current page payloads', () async {
+      final service = InstagramDownloadService(
+        pageLoader: (_) async => r'''
+          <meta property="og:title" content="Creator on Instagram: Reel">
+          <script type="application/json">
+            {"video_versions":[
+              {"type":101,"url":"https:\/\/cdn.example.test\/version.mp4?token=a\u0026b=c"}
+            ]}
+          </script>
+        ''',
+      );
+      addTearDown(service.dispose);
+
+      final info = await service.inspect(
+        'https://www.instagram.com/reel/Caption123/',
+      );
+
+      expect(info.media.single.kind, DiscoverMediaKind.video);
+      expect(
+        info.media.single.url,
+        'https://cdn.example.test/version.mp4?token=a&b=c',
+      );
+    });
+
+    test('classifies rate limits instead of reporting unsupported media', () {
+      final service = InstagramDownloadService(
+        pageLoader: (_) async => '<html>Please wait a few minutes</html>',
+      );
+      addTearDown(service.dispose);
+
+      expect(
+        service.inspect('https://www.instagram.com/p/Caption123/'),
+        throwsA(
+          isA<InstagramDownloadException>().having(
+            (error) => error.kind,
+            'kind',
+            InstagramFailureKind.rateLimited,
+          ),
+        ),
+      );
+    });
+
+    test('reports Instagram error shells as anonymous access blocking', () {
+      final service = InstagramDownloadService(
+        pageLoader: (_) async =>
+            '<script>{"pageID":"httpErrorPage","root":"PolarisErrorRoot"}</script>',
+      );
+      addTearDown(service.dispose);
+
+      expect(
+        service.inspect('https://www.instagram.com/p/Caption123/'),
+        throwsA(
+          isA<InstagramDownloadException>().having(
+            (error) => error.kind,
+            'kind',
+            InstagramFailureKind.accessBlocked,
+          ),
+        ),
+      );
+    });
+
+    test('bounds custom page loaders and reports a timeout', () {
+      final never = Completer<String>();
+      final service = InstagramDownloadService(
+        pageLoader: (_) => never.future,
+        pageRequestTimeout: const Duration(milliseconds: 1),
+      );
+      addTearDown(service.dispose);
+
+      expect(
+        service.inspect('https://www.instagram.com/p/Caption123/'),
+        throwsA(
+          isA<InstagramDownloadException>().having(
+            (error) => error.kind,
+            'kind',
+            InstagramFailureKind.timedOut,
+          ),
+        ),
+      );
+    });
+
+    test('dispose is idempotent and prevents later inspections', () {
+      final service = InstagramDownloadService(
+        pageLoader: (_) async => '<html></html>',
+      );
+
+      service.dispose();
+      service.dispose();
+
+      expect(
+        service.inspect('https://www.instagram.com/p/Caption123/'),
+        throwsA(
+          isA<InstagramDownloadException>().having(
+            (error) => error.kind,
+            'kind',
+            InstagramFailureKind.disposed,
           ),
         ),
       );

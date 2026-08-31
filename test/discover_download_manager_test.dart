@@ -296,6 +296,10 @@ void main() {
           dio.headersByRequest.single['Referer'],
           instagram.initialInfo.canonicalUrl,
         );
+        expect(
+          dio.headersByRequest.single['Origin'],
+          'https://www.instagram.com',
+        );
 
         final completed = manager.items
             .expand((items) => items)

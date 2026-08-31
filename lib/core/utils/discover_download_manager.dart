@@ -68,7 +68,9 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
     DiscoverCatalogWriter? catalogWriter,
     this.maxDirectBytes = 512 * 1024 * 1024,
     this.maxYoutubeBytes = YoutubeDownloadService.defaultMaxBytes,
-  }) : _dio = dio ?? Dio(),
+  }) : _dio =
+           dio ??
+           Dio(BaseOptions(connectTimeout: const Duration(seconds: 30))),
        _youtubeService = youtubeService ?? YoutubeDownloadService(),
        _instagramService = instagramService ?? InstagramDownloadService(),
        _storageDirectoryOverride = storageDirectory,
@@ -442,7 +444,7 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
                 ? null
                 : control.exceededLimit
                 ? 'The download exceeded the ${_sizeLabel(maxDirectBytes)} limit.'
-                : _friendlyError(error),
+                : _friendlyDownloadError(item.source, error),
             updatedAt: _clock().toUtc(),
             clearLocalPath: true,
           ),
@@ -1376,6 +1378,37 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
       '',
     );
     return message.length <= 300 ? message : '${message.substring(0, 297)}...';
+  }
+
+  static String _friendlyDownloadError(
+    DiscoverDownloadSource source,
+    Object error,
+  ) {
+    if (source != DiscoverDownloadSource.instagram) {
+      return _friendlyError(error);
+    }
+    if (error is DioException) {
+      if (error.type == DioExceptionType.connectionTimeout ||
+          error.type == DioExceptionType.receiveTimeout ||
+          error.type == DioExceptionType.sendTimeout) {
+        return 'The Instagram media download timed out. Check the connection and retry.';
+      }
+      final status = error.response?.statusCode;
+      if (status == 401 || status == 403) {
+        return 'Instagram rejected the temporary media link. Retry to refresh it; private or login-only media is unsupported.';
+      }
+      if (status == 404 || status == 410) {
+        return 'The temporary Instagram media link expired. Retry to request a fresh link.';
+      }
+      if (status == 429) {
+        return 'Instagram is temporarily rate-limiting downloads. Wait a few minutes and retry.';
+      }
+    }
+    final normalized = error.toString().toLowerCase();
+    if (normalized.contains('web page instead of a media file')) {
+      return 'Instagram returned a login or error page instead of media. Retry to refresh the link; private posts are unsupported.';
+    }
+    return _friendlyError(error);
   }
 
   static String _sizeLabel(int bytes) =>

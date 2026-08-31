@@ -1,9 +1,10 @@
-name: Validate editor feature branch
+name: Validate CaptionCraft
 
 on:
   push:
     branches:
       - editor-heavy-project-foundation
+      - "release-readiness-*"
   pull_request:
     paths:
       - "lib/**"
@@ -46,3 +47,6 @@ jobs:
 
       - name: Test
         run: flutter test
+
+      - name: Validate Android application packaging
+        run: flutter build apk --debug

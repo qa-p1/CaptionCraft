@@ -19,7 +19,23 @@ void main() async {
   // supplied with `--dart-define-from-file=.env` and are never committed.
   await dotenv.load(fileName: '.env.example');
 
-  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  var firebaseReady = false;
+  try {
+    await Firebase.initializeApp(
+      options: DefaultFirebaseOptions.currentPlatform,
+    );
+    firebaseReady = true;
+  } catch (error, stackTrace) {
+    // Do not terminate before Flutter can render a useful recovery message.
+    // The detailed exception remains in development logs without exposing
+    // configuration values in the user-facing UI.
+    debugPrint('Firebase initialization failed: $error');
+    debugPrintStack(stackTrace: stackTrace);
+  }
 
-  runApp(const ProviderScope(child: CaptionCraftApp()));
+  runApp(
+    ProviderScope(
+      child: CaptionCraftApp(startupFailure: !firebaseReady),
+    ),
+  );
 }

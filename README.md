@@ -49,6 +49,8 @@ using a debug key.
   partial, and outstanding timeline/editor requirements for the feature branch.
 - [Effects, color, and audio status](docs/editor_effects_audio_status.md) —
   implemented delivery paths and explicit unsupported boundaries.
+- [Release-readiness audit](docs/release-readiness-2026-08-31.md) — fixed
+  failure modes, automated coverage, and real-device/store release gates.
 
 ## Optional Elements libraries
 

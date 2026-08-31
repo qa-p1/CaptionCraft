@@ -9,10 +9,20 @@ import 'shared/widgets/app_surface.dart';
 import 'shared/widgets/captioncraft_brand.dart';
 
 class CaptionCraftApp extends ConsumerWidget {
-  const CaptionCraftApp({super.key});
+  const CaptionCraftApp({super.key, this.startupFailure = false});
+
+  final bool startupFailure;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    if (startupFailure) {
+      return MaterialApp(
+        title: 'CaptionCraft',
+        debugShowCheckedModeBanner: false,
+        theme: AppTheme.darkTheme,
+        home: const _AppStartupErrorScreen(),
+      );
+    }
     final authState = ref.watch(authStateProvider);
 
     return MaterialApp(
@@ -38,6 +48,46 @@ class CaptionCraftApp extends ConsumerWidget {
             onRetry: () => ref.invalidate(authStateProvider),
           );
         },
+      ),
+    );
+  }
+}
+
+class _AppStartupErrorScreen extends StatelessWidget {
+  const _AppStartupErrorScreen();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Scaffold(
+      backgroundColor: kBackground,
+      body: SafeArea(
+        child: Center(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxWidth: 430),
+            child: Padding(
+              padding: EdgeInsets.all(24),
+              child: AppPanel(
+                elevated: true,
+                padding: EdgeInsets.zero,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Padding(
+                      padding: EdgeInsets.only(top: 24),
+                      child: CaptionCraftMark(size: 42, radius: 11),
+                    ),
+                    AppEmptyState(
+                      icon: Icons.cloud_off_rounded,
+                      title: 'CaptionCraft could not start securely',
+                      message:
+                          'Account services could not be initialized. Close and reopen the app. If this continues, install the latest build or contact support.',
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }

@@ -1,6 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1254" height="1254" viewBox="0 0 1254 1254" role="img" aria-label="CaptionCraft logo" shape-rendering="geometricPrecision">
   <rect width="1254" height="1254" rx="232" fill="#090B0D"/>
 
+  <!-- Keep the mark inside platform icon safe zones. The background remains
+       full bleed; only the CaptionCraft geometry receives optical padding. -->
+  <g id="app-icon-mark" transform="translate(125.4 125.4) scale(0.8)">
+
   <!-- Left caption/CC frame: same proportions, rebuilt as clean vector geometry. -->
   <path
     d="M 526 346 H 248 C 199.4 346 160 385.4 160 434 V 818 C 160 866.6 199.4 906 248 906 H 526"
@@ -33,5 +37,6 @@
     <rect x="291" y="641" width="235" height="56"/>
     <rect x="726" y="547" width="320" height="56"/>
     <rect x="726" y="641" width="196" height="56"/>
+  </g>
   </g>
 </svg>
