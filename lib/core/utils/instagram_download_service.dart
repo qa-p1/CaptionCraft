@@ -40,9 +40,8 @@ class InstagramDownloadService implements InstagramMediaService {
   InstagramDownloadService({
     Dio? dio,
     InstagramPageLoader? pageLoader,
-    Duration pageRequestTimeout = const Duration(seconds: 12),
-  }) : pageRequestTimeout = pageRequestTimeout,
-       _dio = dio ?? Dio(BaseOptions(connectTimeout: pageRequestTimeout)),
+    this.pageRequestTimeout = const Duration(seconds: 12),
+  }) : _dio = dio ?? Dio(BaseOptions(connectTimeout: pageRequestTimeout)),
        _ownsDio = dio == null,
        _pageLoader = pageLoader;
 
