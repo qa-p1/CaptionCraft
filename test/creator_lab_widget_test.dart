@@ -64,6 +64,8 @@ void main() {
       260,
       scrollable: find.byType(Scrollable).last,
     );
+    await tester.ensureVisible(find.text('Text cleanup'));
+    await tester.pumpAndSettle();
     await tester.tap(find.text('Text cleanup'));
     await tester.pumpAndSettle();
     await tester.scrollUntilVisible(
@@ -187,6 +189,8 @@ void main() {
           .descendant(of: sheet, matching: find.byType(Scrollable))
           .last,
     );
+    await tester.ensureVisible(secondSuggestion);
+    await tester.pumpAndSettle();
     await tester.tap(secondSuggestion);
     await tester.pumpAndSettle();
 
