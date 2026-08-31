@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import '../../../core/theme/app_theme.dart';
@@ -14,8 +16,16 @@ class ExportDialog extends StatefulWidget {
 }
 
 class _ExportDialogState extends State<ExportDialog> {
-  ExportSettings _settings = const ExportSettings();
+  late ExportSettings _settings;
   bool _isExporting = false;
+
+  bool get _supportsGallery => Platform.isAndroid || Platform.isIOS;
+
+  @override
+  void initState() {
+    super.initState();
+    _settings = ExportSettings(saveToGallery: _supportsGallery);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -126,17 +136,18 @@ class _ExportDialogState extends State<ExportDialog> {
                         ),
                       ),
                     ),
-                    _toggle(
-                      icon: Icons.photo_library_outlined,
-                      label: 'Copy to gallery',
-                      description: 'Keep the master in Exports as well',
-                      value: _settings.saveToGallery,
-                      onChanged: (value) => setState(
-                        () => _settings = _settings.copyWith(
-                          saveToGallery: value,
+                    if (_supportsGallery)
+                      _toggle(
+                        icon: Icons.photo_library_outlined,
+                        label: 'Copy to gallery',
+                        description: 'Keep the master in Exports as well',
+                        value: _settings.saveToGallery,
+                        onChanged: (value) => setState(
+                          () => _settings = _settings.copyWith(
+                            saveToGallery: value,
+                          ),
                         ),
                       ),
-                    ),
                     const SizedBox(height: 16),
                     _buildDeliverySummary(),
                   ],

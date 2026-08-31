@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'core/constants/app_mode_constants.dart';
 import 'core/theme/app_theme.dart';
 import 'core/utils/firebase_service.dart';
 import 'features/auth/screens/login_screen.dart';
@@ -8,14 +9,19 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'shared/widgets/app_surface.dart';
 import 'shared/widgets/captioncraft_brand.dart';
 
-class CaptionCraftApp extends ConsumerWidget {
-  const CaptionCraftApp({super.key, this.startupFailure = false});
+enum CaptionCraftLaunchMode { cloud, localDesktop, startupFailure }
 
-  final bool startupFailure;
+class CaptionCraftApp extends ConsumerWidget {
+  const CaptionCraftApp({
+    super.key,
+    this.launchMode = CaptionCraftLaunchMode.cloud,
+  });
+
+  final CaptionCraftLaunchMode launchMode;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    if (startupFailure) {
+    if (launchMode == CaptionCraftLaunchMode.startupFailure) {
       return MaterialApp(
         title: 'CaptionCraft',
         debugShowCheckedModeBanner: false,
@@ -23,6 +29,15 @@ class CaptionCraftApp extends ConsumerWidget {
         home: const _AppStartupErrorScreen(),
       );
     }
+    if (launchMode == CaptionCraftLaunchMode.localDesktop) {
+      return MaterialApp(
+        title: 'CaptionCraft',
+        debugShowCheckedModeBanner: false,
+        theme: AppTheme.darkTheme,
+        home: const HomeScreen(localOwnerUid: localDesktopOwnerUid),
+      );
+    }
+
     final authState = ref.watch(authStateProvider);
 
     return MaterialApp(

@@ -52,6 +52,8 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
   VideoPlayerController? _previewController;
   bool _previewReady = false;
 
+  bool get _supportsGallery => Platform.isAndroid || Platform.isIOS;
+
   @override
   void initState() {
     super.initState();
@@ -135,7 +137,7 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
 
       var savedToGallery = false;
       String? galleryWarning;
-      if (widget.settings.saveToGallery) {
+      if (widget.settings.saveToGallery && _supportsGallery) {
         try {
           await Gal.putVideo(outputPath);
           savedToGallery = true;
@@ -274,6 +276,7 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
   }
 
   Future<void> _openGalleryApp() async {
+    if (!_supportsGallery) return;
     try {
       await Gal.open();
     } catch (_) {
@@ -286,7 +289,9 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
 
   Future<void> _retryGallerySave() async {
     final outputPath = _outputPath;
-    if (outputPath == null || _gallerySaveInProgress) return;
+    if (outputPath == null || _gallerySaveInProgress || !_supportsGallery) {
+      return;
+    }
     setState(() => _gallerySaveInProgress = true);
     try {
       await Gal.putVideo(outputPath);

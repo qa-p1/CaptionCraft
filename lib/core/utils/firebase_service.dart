@@ -8,6 +8,9 @@ import 'package:firebase_core/firebase_core.dart';
 class FirebaseService {
   FirebaseService._();
 
+  static const Duration _authTimeout = Duration(seconds: 20);
+  static const Duration _requestTimeout = Duration(seconds: 12);
+  static const Duration _projectListTimeout = Duration(seconds: 35);
   static final Map<String, Future<void>> _projectWriteQueues = {};
   static final Map<String, DateTime> _latestQueuedProjectWrite = {};
 
@@ -39,10 +42,9 @@ class FirebaseService {
   }
 
   static Future<UserCredential> signIn(String email, String password) async {
-    return _auth.signInWithEmailAndPassword(
-      email: email.trim(),
-      password: password,
-    );
+    return _auth
+        .signInWithEmailAndPassword(email: email.trim(), password: password)
+        .timeout(_authTimeout);
   }
 
   static Future<UserCredential> register(
@@ -50,12 +52,13 @@ class FirebaseService {
     String password,
     String displayName,
   ) async {
-    final credential = await _auth.createUserWithEmailAndPassword(
-      email: email.trim(),
-      password: password,
-    );
+    final credential = await _auth
+        .createUserWithEmailAndPassword(email: email.trim(), password: password)
+        .timeout(_authTimeout);
     try {
-      await credential.user?.updateDisplayName(displayName.trim());
+      await credential.user
+          ?.updateDisplayName(displayName.trim())
+          .timeout(_requestTimeout);
     } catch (_) {
       // Account creation is already committed. Keep registration successful
       // and let the profile document preserve the requested display name.
@@ -81,11 +84,13 @@ class FirebaseService {
   }
 
   static Future<void> signOut() async {
-    await _auth.signOut();
+    await _auth.signOut().timeout(_authTimeout);
   }
 
   static Future<void> sendPasswordReset(String email) async {
-    await _auth.sendPasswordResetEmail(email: email.trim());
+    await _auth
+        .sendPasswordResetEmail(email: email.trim())
+        .timeout(_authTimeout);
   }
 
   static Future<void> updateDisplayName(String displayName) async {
@@ -97,7 +102,7 @@ class FirebaseService {
     if (normalizedName.isEmpty) {
       throw ArgumentError.value(displayName, 'displayName', 'Cannot be empty.');
     }
-    await user.updateDisplayName(normalizedName);
+    await user.updateDisplayName(normalizedName).timeout(_requestTimeout);
     try {
       await _firestore
           .collection('users')
@@ -201,7 +206,9 @@ class FirebaseService {
       } catch (_) {
         // A delete should still proceed after an unsuccessful pending write.
       }
-      await _userProjectsRef(uid).doc(projectId).delete();
+      await _userProjectsRef(
+        uid,
+      ).doc(projectId).delete().timeout(_requestTimeout);
     }();
     _projectWriteQueues[queueKey] = deletion;
     try {
@@ -215,6 +222,10 @@ class FirebaseService {
   }
 
   static Future<List<Map<String, dynamic>>> loadProjects(String uid) async {
+    return _loadProjects(uid).timeout(_projectListTimeout);
+  }
+
+  static Future<List<Map<String, dynamic>>> _loadProjects(String uid) async {
     const pageSize = 100;
     final projects = <Map<String, dynamic>>[];
     QueryDocumentSnapshot<Map<String, dynamic>>? cursor;
@@ -225,7 +236,7 @@ class FirebaseService {
       ).orderBy('lastModifiedAt', descending: true).limit(pageSize);
       if (cursor != null) query = query.startAfterDocument(cursor);
 
-      final snapshot = await query.get();
+      final snapshot = await query.get().timeout(_requestTimeout);
       projects.addAll(
         snapshot.docs.map((doc) => {...doc.data(), 'id': doc.id}),
       );
@@ -240,7 +251,9 @@ class FirebaseService {
     String uid,
     String projectId,
   ) async {
-    final doc = await _userProjectsRef(uid).doc(projectId).get();
+    final doc = await _userProjectsRef(
+      uid,
+    ).doc(projectId).get().timeout(_requestTimeout);
     if (!doc.exists) return null;
     return {...doc.data()!, 'id': doc.id};
   }
@@ -261,7 +274,8 @@ class FirebaseService {
     final doc = await _firestore
         .collection('device_quotas')
         .doc(deviceFingerprint)
-        .get();
+        .get()
+        .timeout(_requestTimeout);
 
     if (!doc.exists) return 0;
     return (doc.data()?['runs_used'] as num?)?.toInt() ?? 0;
@@ -278,33 +292,36 @@ class FirebaseService {
         .collection('device_quotas')
         .doc(deviceFingerprint);
 
-    return _firestore.runTransaction<int>((transaction) async {
-      final snapshot = await transaction.get(docRef);
+    return _firestore
+        .runTransaction<int>((transaction) async {
+          final snapshot = await transaction.get(docRef);
 
-      final storedRuns = (snapshot.data()?['runs_used'] as num?)?.toInt() ?? 0;
-      final currentRuns = math.max(storedRuns, minimumRunsUsed);
-      if (currentRuns >= maxRuns) {
-        throw QuotaLimitReachedException(maxRuns);
-      }
-      final newRuns = currentRuns + 1;
+          final storedRuns =
+              (snapshot.data()?['runs_used'] as num?)?.toInt() ?? 0;
+          final currentRuns = math.max(storedRuns, minimumRunsUsed);
+          if (currentRuns >= maxRuns) {
+            throw QuotaLimitReachedException(maxRuns);
+          }
+          final newRuns = currentRuns + 1;
 
-      if (!snapshot.exists) {
-        transaction.set(docRef, {
-          'runs_used': newRuns,
-          'bound_uid': uid,
-          'created_at': FieldValue.serverTimestamp(),
-          'last_used_at': FieldValue.serverTimestamp(),
-        });
-        return newRuns;
-      }
+          if (!snapshot.exists) {
+            transaction.set(docRef, {
+              'runs_used': newRuns,
+              'bound_uid': uid,
+              'created_at': FieldValue.serverTimestamp(),
+              'last_used_at': FieldValue.serverTimestamp(),
+            });
+            return newRuns;
+          }
 
-      transaction.update(docRef, {
-        'runs_used': newRuns,
-        'last_used_at': FieldValue.serverTimestamp(),
-      });
+          transaction.update(docRef, {
+            'runs_used': newRuns,
+            'last_used_at': FieldValue.serverTimestamp(),
+          });
 
-      return newRuns;
-    });
+          return newRuns;
+        })
+        .timeout(_requestTimeout);
   }
 }
 

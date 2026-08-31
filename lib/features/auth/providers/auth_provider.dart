@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:google_sign_in/google_sign_in.dart';
@@ -30,6 +32,7 @@ final authNotifierProvider =
 class AuthNotifier extends StateNotifier<AsyncValue<void>> {
   AuthNotifier() : super(const AsyncData(null));
 
+  static const Duration _interactiveAuthTimeout = Duration(seconds: 45);
   final GoogleSignIn _googleSignIn = GoogleSignIn.instance;
   bool _googleInitialized = false;
 
@@ -54,6 +57,8 @@ class AuthNotifier extends StateNotifier<AsyncValue<void>> {
       state = const AsyncData(null);
     } on FirebaseAuthException catch (e) {
       state = AsyncError(_mapFirebaseError(e.code), StackTrace.current);
+    } on TimeoutException {
+      state = AsyncError(_timeoutMessage, StackTrace.current);
     } catch (e, st) {
       state = AsyncError(e, st);
     }
@@ -70,6 +75,8 @@ class AuthNotifier extends StateNotifier<AsyncValue<void>> {
       state = const AsyncData(null);
     } on FirebaseAuthException catch (e) {
       state = AsyncError(_mapFirebaseError(e.code), StackTrace.current);
+    } on TimeoutException {
+      state = AsyncError(_timeoutMessage, StackTrace.current);
     } catch (e, st) {
       state = AsyncError(e, st);
     }
@@ -78,8 +85,10 @@ class AuthNotifier extends StateNotifier<AsyncValue<void>> {
   Future<void> signInWithGoogle() async {
     state = const AsyncLoading();
     try {
-      await _initializeGoogleSignInIfNeeded();
-      final googleUser = await _googleSignIn.authenticate();
+      await _initializeGoogleSignInIfNeeded().timeout(_interactiveAuthTimeout);
+      final googleUser = await _googleSignIn.authenticate().timeout(
+        _interactiveAuthTimeout,
+      );
 
       final googleAuth = googleUser.authentication;
       if (googleAuth.idToken == null || googleAuth.idToken!.isEmpty) {
@@ -89,7 +98,9 @@ class AuthNotifier extends StateNotifier<AsyncValue<void>> {
         idToken: googleAuth.idToken,
       );
 
-      await FirebaseAuth.instance.signInWithCredential(credential);
+      await FirebaseAuth.instance
+          .signInWithCredential(credential)
+          .timeout(_interactiveAuthTimeout);
       final uid = FirebaseService.currentUser?.uid;
       if (uid != null) {
         await DeviceQuotaService.storeCurrentUid(uid);
@@ -108,6 +119,8 @@ class AuthNotifier extends StateNotifier<AsyncValue<void>> {
       );
     } on FirebaseAuthException catch (e) {
       state = AsyncError(_mapFirebaseError(e.code), StackTrace.current);
+    } on TimeoutException {
+      state = AsyncError(_timeoutMessage, StackTrace.current);
     } catch (e, st) {
       state = AsyncError(e, st);
     }
@@ -128,6 +141,8 @@ class AuthNotifier extends StateNotifier<AsyncValue<void>> {
       await DeviceQuotaService.clearCurrentUid();
       await FirebaseService.signOut();
       state = const AsyncData(null);
+    } on TimeoutException {
+      state = AsyncError(_timeoutMessage, StackTrace.current);
     } catch (e, st) {
       state = AsyncError(e, st);
     }
@@ -140,12 +155,17 @@ class AuthNotifier extends StateNotifier<AsyncValue<void>> {
       state = const AsyncData(null);
     } on FirebaseAuthException catch (e) {
       state = AsyncError(_mapFirebaseError(e.code), StackTrace.current);
+    } on TimeoutException {
+      state = AsyncError(_timeoutMessage, StackTrace.current);
     } catch (e, st) {
       state = AsyncError(e, st);
     }
   }
 
   /// Map Firebase error codes to user-friendly messages.
+  static const String _timeoutMessage =
+      'The account service took too long to respond. Check your connection and try again.';
+
   static String _mapFirebaseError(String code) {
     switch (code) {
       case 'wrong-password':

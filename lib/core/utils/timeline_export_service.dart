@@ -8,7 +8,7 @@ import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit_config.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:ffmpeg_kit_flutter_new/statistics.dart';
-import 'package:flutter/foundation.dart' show listEquals;
+import 'package:flutter/foundation.dart' show listEquals, visibleForTesting;
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -22,6 +22,7 @@ import '../../shared/models/project_model.dart';
 import 'caption_font_service.dart';
 import 'ffmpeg_service.dart';
 import 'subtitle_export_service.dart';
+import 'storage_capacity_service.dart';
 
 class ExportCanvasSize {
   final int width;
@@ -55,12 +56,59 @@ class TimelineExportResult {
   });
 }
 
+class ExportStorageEstimate {
+  const ExportStorageEstimate({
+    required this.outputBytes,
+    required this.workingBytes,
+  });
+
+  final int outputBytes;
+  final int workingBytes;
+
+  int get combinedBytes => outputBytes + workingBytes;
+}
+
 class TimelineExportService {
   TimelineExportService._();
 
   static const _freezeFramePreroll = Duration(seconds: 1);
   static const _maxNetworkAssetBytes = 64 * 1024 * 1024;
   static CancelToken? _activeDownloadCancelToken;
+
+  @visibleForTesting
+  static ExportStorageEstimate estimateStorageRequirements({
+    required ExportCanvasSize canvasSize,
+    required Duration duration,
+    required ExportQuality quality,
+    required bool includeAudio,
+    required int networkAssetCount,
+  }) {
+    const referencePixelRate = 1920 * 1080 * 30;
+    final pixelRate =
+        canvasSize.width * canvasSize.height * canvasSize.framesPerSecond;
+    final scale = math
+        .pow(math.max(0.1, pixelRate / referencePixelRate), 0.7)
+        .toDouble()
+        .clamp(0.25, 4.0);
+    final referenceMbps = switch (quality) {
+      ExportQuality.compact => 6.0,
+      ExportQuality.balanced => 10.0,
+      ExportQuality.high => 18.0,
+      ExportQuality.maximum => 28.0,
+    };
+    final seconds = math.max(1.0, duration.inMilliseconds / 1000);
+    final audioMbps = includeAudio ? 0.24 : 0.0;
+    final estimatedFileBytes =
+        ((referenceMbps * scale + audioMbps) * 1000000 / 8 * seconds).ceil();
+    final outputBytes = (estimatedFileBytes * 1.6).ceil() + 128 * 1024 * 1024;
+    final safeNetworkCount = networkAssetCount.clamp(0, 128).toInt();
+    final workingBytes =
+        safeNetworkCount * _maxNetworkAssetBytes + 256 * 1024 * 1024;
+    return ExportStorageEstimate(
+      outputBytes: outputBytes,
+      workingBytes: workingBytes,
+    );
+  }
 
   static Future<void> cancelActiveExport() async {
     final downloadToken = _activeDownloadCancelToken;
@@ -142,6 +190,42 @@ class TimelineExportService {
         sourceFrameRate:
             (firstMediaInfo['frameRate'] as num?)?.toDouble() ?? 30,
       );
+      final networkAssetCount = timeline.tracks
+          .expand((track) => track.clips)
+          .where((clip) => clip.enabled && clip.endTime > clip.startTime)
+          .map(timeline.assetForClip)
+          .whereType<EditorAssetReference>()
+          .where((asset) => asset.isNetworkBacked)
+          .map((asset) => asset.id)
+          .toSet()
+          .length;
+      final storageEstimate = estimateStorageRequirements(
+        canvasSize: canvasSize,
+        duration: timelineDuration,
+        quality: settings.quality,
+        includeAudio: settings.includeAudio,
+        networkAssetCount: networkAssetCount,
+      );
+      final outputDirectory = File(outputPath).parent;
+      await outputDirectory.create(recursive: true);
+      if (_volumeRoot(outputDirectory.path) == _volumeRoot(workingRoot.path)) {
+        await StorageCapacityService.requireAvailable(
+          directory: outputDirectory,
+          requiredBytes: storageEstimate.combinedBytes,
+          operation: 'This export',
+        );
+      } else {
+        await StorageCapacityService.requireAvailable(
+          directory: outputDirectory,
+          requiredBytes: storageEstimate.outputBytes,
+          operation: 'The exported video',
+        );
+        await StorageCapacityService.requireAvailable(
+          directory: workingRoot,
+          requiredBytes: storageEstimate.workingBytes,
+          operation: 'Export working files',
+        );
+      }
 
       final renderInputs = <TimelineRenderInput>[];
       var nextInputIndex = 0;
@@ -281,6 +365,13 @@ class TimelineExportService {
         fileSize: await outputFile.length(),
         hasAudio: outputInfo['hasAudio'] as bool? ?? false,
       );
+    } on FileSystemException catch (error) {
+      if (StorageCapacityService.isDiskFull(error)) {
+        throw Exception(
+          'The device ran out of storage during export. The partial video was removed; free storage or choose a smaller export and try again.',
+        );
+      }
+      rethrow;
     } finally {
       if (identical(_activeDownloadCancelToken, downloadCancelToken)) {
         _activeDownloadCancelToken = null;
@@ -309,6 +400,13 @@ class TimelineExportService {
         // Network-backed working media is temporary and can be retried later.
       }
     }
+  }
+
+  static String _volumeRoot(String path) {
+    if (Platform.isWindows) {
+      return p.windows.rootPrefix(p.windows.normalize(path)).toLowerCase();
+    }
+    return p.rootPrefix(p.normalize(p.absolute(path)));
   }
 
   /// Builds the exact argument list used by the mobile FFmpeg renderer.

@@ -44,8 +44,9 @@ enum _ProjectAction {
 
 class HomeScreen extends ConsumerStatefulWidget {
   final List<Project>? initialProjects;
+  final String? localOwnerUid;
 
-  const HomeScreen({super.key, this.initialProjects});
+  const HomeScreen({super.key, this.initialProjects, this.localOwnerUid});
 
   @override
   ConsumerState<HomeScreen> createState() => _HomeScreenState();
@@ -65,6 +66,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   _ProjectView _view = _ProjectView.grid;
   int _loadRequestId = 0;
   final Set<String> _busyProjectIds = {};
+
+  bool get _isLocalDesktopMode => widget.localOwnerUid != null;
+
+  String? get _activeOwnerUid =>
+      ref.read(currentUserProvider)?.uid ?? widget.localOwnerUid;
 
   @override
   void initState() {
@@ -118,9 +124,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     }
 
     final user = ref.read(currentUserProvider);
+    final ownerUid = user?.uid ?? widget.localOwnerUid;
     unawaited(_refreshQuotaAndDeviceNotice(user, requestId));
 
-    if (user == null) {
+    if (ownerUid == null) {
       if (mounted && requestId == _loadRequestId) {
         setState(() {
           _projects = [];
@@ -129,8 +136,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       }
       return;
     }
-    final localProjects = await _loadLocalProjects(requestId, user.uid);
-    unawaited(_syncCloudProjects(user.uid, localProjects, requestId));
+    final localProjects = await _loadLocalProjects(requestId, ownerUid);
+    if (user != null) {
+      unawaited(_syncCloudProjects(user.uid, localProjects, requestId));
+    }
   }
 
   Future<List<Project>> _loadLocalProjects(
@@ -244,20 +253,25 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   Future<void> _cacheVideoAvailability(List<Project> projects) async {
-    final availability = await Future.wait(
-      projects.map((project) async {
-        final paths = project.mediaPaths.toSet();
-        final pathAvailability = <String, bool>{};
-        await Future.wait(
-          paths.map((mediaPath) async {
-            pathAvailability[mediaPath] = await File(mediaPath).exists();
-          }),
-        );
-        return project.evaluateVideoAvailability(
-          pathExists: (mediaPath) => pathAvailability[mediaPath] ?? false,
-        );
-      }),
-    );
+    const batchSize = 24;
+    final paths = projects.expand((project) => project.mediaPaths).toSet();
+    final pathAvailability = <String, bool>{};
+    final pathList = paths.toList(growable: false);
+    for (var offset = 0; offset < pathList.length; offset += batchSize) {
+      final end = math.min(offset + batchSize, pathList.length);
+      await Future.wait(
+        pathList.sublist(offset, end).map((mediaPath) async {
+          pathAvailability[mediaPath] = await File(mediaPath).exists();
+        }),
+      );
+    }
+    final availability = projects
+        .map(
+          (project) => project.evaluateVideoAvailability(
+            pathExists: (mediaPath) => pathAvailability[mediaPath] ?? false,
+          ),
+        )
+        .toList(growable: false);
     for (var index = 0; index < projects.length; index++) {
       projects[index].cacheVideoAvailabilityDetails(availability[index]);
     }
@@ -532,6 +546,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     if (_isCreatingProject) return;
     setState(() => _isCreatingProject = true);
     final user = ref.read(currentUserProvider);
+    final ownerUid = user?.uid ?? widget.localOwnerUid;
+    final importedCopies = <String>[];
+    var projectCommitted = false;
     try {
       SnackBarHelper.showInfo(context, 'Securing media and building timeline…');
       final durableSources = <ImportedMediaSource>[];
@@ -540,6 +557,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           source.filePath,
           originalFileName: source.displayName,
         );
+        if (!path.equals(
+          path.normalize(durablePath),
+          path.normalize(source.filePath),
+        )) {
+          importedCopies.add(durablePath);
+        }
         durableSources.add(
           ImportedMediaSource(
             filePath: durablePath,
@@ -550,12 +573,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       final result = await ProjectCreationService.createProjectFromMedia(
         sources: durableSources,
         ownerUid:
-            user?.uid ??
+            ownerUid ??
             (throw StateError('Sign in before creating a project.')),
         projectName: projectName,
         generateThumbnail: false,
       );
       await ProjectLocalStorage.saveProject(result);
+      projectCommitted = true;
       if (user != null) {
         unawaited(_syncProjectToCloud(user.uid, result));
       }
@@ -564,6 +588,18 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       setState(() => _projects = [result, ..._projects]);
       await _openEditor(result);
     } catch (error) {
+      if (!projectCommitted) {
+        await Future.wait(
+          importedCopies.map((copyPath) async {
+            try {
+              final copy = File(copyPath);
+              if (await copy.exists()) await copy.delete();
+            } on FileSystemException {
+              // Keep the original creation error; cleanup is best-effort.
+            }
+          }),
+        );
+      }
       if (mounted) {
         SnackBarHelper.showError(context, 'Project creation failed: $error');
       }
@@ -613,7 +649,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         context,
         MaterialPageRoute(builder: (_) => EditorScreen(project: projectToOpen)),
       );
-      if (mounted && ref.read(currentUserProvider) != null) {
+      if (mounted && _activeOwnerUid != null) {
         await _loadData();
       }
     } catch (error) {
@@ -627,24 +663,27 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   Future<void> _persistProject(Project project) async {
     final user = ref.read(currentUserProvider);
-    if (user == null) {
+    final ownerUid = user?.uid ?? widget.localOwnerUid;
+    if (ownerUid == null) {
       throw StateError('Sign in before saving a project.');
     }
-    if (project.ownerUid != null && project.ownerUid != user.uid) {
+    if (project.ownerUid != null && project.ownerUid != ownerUid) {
       throw StateError('This project belongs to another account.');
     }
     final ownedProject = project.ownerUid == null
-        ? project.copyWith(ownerUid: user.uid)
+        ? project.copyWith(ownerUid: ownerUid)
         : project;
     await ProjectLocalStorage.saveProject(ownedProject);
-    try {
-      await FirebaseService.saveProject(
-        user.uid,
-        ownedProject.id,
-        ownedProject.toFirestore(),
-      );
-    } catch (_) {
-      // Local changes remain available and will win on the next sync.
+    if (user != null) {
+      try {
+        await FirebaseService.saveProject(
+          user.uid,
+          ownedProject.id,
+          ownedProject.toFirestore(),
+        );
+      } catch (_) {
+        // Local changes remain available and will win on the next sync.
+      }
     }
     if (!mounted) return;
     setState(() {
@@ -988,7 +1027,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       builder: (dialogContext) => AlertDialog(
         title: const Text('Delete project?'),
         content: Text(
-          '“${project.name}” will be removed from this device and your synced project library. Imported media and exported files are not deleted.',
+          _isLocalDesktopMode
+              ? '“${project.name}” will be removed from this PC. Imported media and exported files are not deleted.'
+              : '“${project.name}” will be removed from this device and your synced project library. Imported media and exported files are not deleted.',
           style: const TextStyle(color: kTextSecondary, height: 1.45),
         ),
         actions: [
@@ -1007,7 +1048,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     if (confirmed != true) return;
 
     final user = ref.read(currentUserProvider);
-    await ProjectLocalStorage.deleteProject(project.id, ownerUid: user?.uid);
+    await ProjectLocalStorage.deleteProject(
+      project.id,
+      ownerUid: user?.uid ?? widget.localOwnerUid,
+    );
     if (user != null) {
       try {
         await FirebaseService.deleteProject(user.uid, project.id);
@@ -1169,6 +1213,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   Widget _buildTopBar(dynamic user) {
     final displayName = (user?.displayName as String?)?.trim();
+    final resolvedName = _isLocalDesktopMode
+        ? 'Local creator'
+        : displayName?.isNotEmpty == true
+        ? displayName!
+        : 'Creator';
     return Row(
       children: [
         const CaptionCraftLockup(),
@@ -1180,24 +1229,31 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
                 Text(
-                  displayName?.isNotEmpty == true ? displayName! : 'Creator',
+                  resolvedName,
                   style: TextStyle(
                     color: kTextPrimary,
                     fontWeight: FontWeight.w700,
                     fontSize: 12,
                   ),
                 ),
-                Text('LOCAL STUDIO', style: AppTextStyles.label),
+                Text(
+                  _isLocalDesktopMode ? 'WINDOWS · LOCAL ONLY' : 'LOCAL STUDIO',
+                  style: AppTextStyles.label,
+                ),
               ],
             ),
           ),
         Tooltip(
-          message: 'Profile and account',
+          message: _isLocalDesktopMode
+              ? 'About local desktop mode'
+              : 'Profile and account',
           child: InkWell(
-            onTap: () => Navigator.push(
-              context,
-              MaterialPageRoute(builder: (_) => const ProfileScreen()),
-            ),
+            onTap: _isLocalDesktopMode
+                ? _showLocalDesktopModeInfo
+                : () => Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const ProfileScreen()),
+                  ),
             customBorder: const CircleBorder(),
             child: Container(
               width: 40,
@@ -1209,9 +1265,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 border: Border.all(color: kBorder),
               ),
               child: Text(
-                displayName?.isNotEmpty == true
-                    ? displayName![0].toUpperCase()
-                    : 'C',
+                resolvedName[0].toUpperCase(),
                 style: TextStyle(
                   color: kAccentSecondary,
                   fontWeight: FontWeight.w800,
@@ -1222,6 +1276,27 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           ),
         ),
       ],
+    );
+  }
+
+  void _showLocalDesktopModeInfo() {
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Local desktop mode'),
+        content: const Text(
+          'Projects and autosaves stay on this PC. Cloud accounts and AI '
+          'transcription are unavailable until a Windows Firebase application '
+          'and an authenticated transcription proxy are configured.',
+          style: TextStyle(color: kTextSecondary, height: 1.45),
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Got it'),
+          ),
+        ],
+      ),
     );
   }
 
