@@ -512,6 +512,25 @@ class TimelineWorkspaceSettings {
     );
   }
 
+  /// Sets the work-area In marker and discards an older Out marker that no
+  /// longer falls after it. This keeps partial I/O marking predictable while
+  /// the user chooses the replacement boundary.
+  TimelineWorkspaceSettings withWorkAreaStart(Duration position) {
+    final shouldClearEnd = workAreaEnd != null && position >= workAreaEnd!;
+    return copyWith(workAreaStart: position, clearWorkAreaEnd: shouldClearEnd);
+  }
+
+  /// Sets the work-area Out marker and discards an older In marker that no
+  /// longer falls before it.
+  TimelineWorkspaceSettings withWorkAreaEnd(Duration position) {
+    final shouldClearStart =
+        workAreaStart != null && position <= workAreaStart!;
+    return copyWith(
+      workAreaEnd: position,
+      clearWorkAreaStart: shouldClearStart,
+    );
+  }
+
   Duration? get normalizedWorkAreaStart {
     final start = workAreaStart;
     final end = workAreaEnd;

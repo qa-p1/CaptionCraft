@@ -257,6 +257,10 @@ lavfi.rect.score=0.045000
 }
 
 Future<bool> _commandExists(String command) async {
-  final result = await Process.run(command, const ['-version']);
-  return result.exitCode == 0;
+  try {
+    final result = await Process.run(command, const ['-version']);
+    return result.exitCode == 0;
+  } on ProcessException {
+    return false;
+  }
 }

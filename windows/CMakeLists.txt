@@ -10,6 +10,13 @@ set(BINARY_NAME "caption_craft")
 # versions of CMake.
 cmake_policy(VERSION 3.14...3.25)
 
+# Firebase C++ 13.4.0 still declares compatibility with CMake 3.1. CMake 4
+# removed policy modes older than 3.5, so give bundled third-party projects the
+# supported compatibility floor without modifying package-cache sources.
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "4.0")
+  set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+endif()
+
 # Define build configuration option.
 get_property(IS_MULTICONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 if(IS_MULTICONFIG)

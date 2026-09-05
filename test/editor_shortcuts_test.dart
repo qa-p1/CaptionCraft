@@ -62,6 +62,30 @@ void main() {
     expect(resolve(LogicalKeyboardKey.home), EditorShortcutCommand.jumpToStart);
     expect(resolve(LogicalKeyboardKey.end), EditorShortcutCommand.jumpToEnd);
     expect(
+      resolve(LogicalKeyboardKey.arrowUp),
+      EditorShortcutCommand.previousEditPoint,
+    );
+    expect(
+      resolve(LogicalKeyboardKey.arrowDown),
+      EditorShortcutCommand.nextEditPoint,
+    );
+    expect(
+      resolve(LogicalKeyboardKey.keyI),
+      EditorShortcutCommand.setWorkAreaStart,
+    );
+    expect(
+      resolve(LogicalKeyboardKey.keyO),
+      EditorShortcutCommand.setWorkAreaEnd,
+    );
+    expect(
+      resolve(LogicalKeyboardKey.keyX, alt: true),
+      EditorShortcutCommand.clearWorkArea,
+    );
+    expect(
+      resolve(LogicalKeyboardKey.keyN),
+      EditorShortcutCommand.toggleSnapping,
+    );
+    expect(
       resolve(LogicalKeyboardKey.delete),
       EditorShortcutCommand.deleteSelectedClip,
     );
@@ -74,6 +98,10 @@ void main() {
     );
     expect(
       isRepeatableEditorShortcut(EditorShortcutCommand.nudgeBackward),
+      isTrue,
+    );
+    expect(
+      isRepeatableEditorShortcut(EditorShortcutCommand.nextEditPoint),
       isTrue,
     );
     expect(isRepeatableEditorShortcut(EditorShortcutCommand.save), isFalse);

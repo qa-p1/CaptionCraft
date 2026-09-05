@@ -11,11 +11,14 @@ class PexelsService {
   final Dio _client;
   final String _apiKey;
   final Uri _baseUri;
+  final bool _ownsClient;
+  bool _closed = false;
 
   PexelsService({Dio? client, String? apiKey, String? baseUrl})
     : _client = client ?? _createClient(),
       _apiKey = (apiKey ?? PexelsConstants.apiKey).trim(),
-      _baseUri = _parseBaseUrl(baseUrl ?? PexelsConstants.baseUrl);
+      _baseUri = _parseBaseUrl(baseUrl ?? PexelsConstants.baseUrl),
+      _ownsClient = client == null;
 
   Future<List<ElementLibraryAsset>> search({
     String query = '',
@@ -23,6 +26,7 @@ class PexelsService {
     int page = 1,
     int limit = PexelsConstants.defaultLimit,
   }) async {
+    _ensureOpen();
     _ensureApiKey();
     final normalizedQuery = query.trim();
     final safePage = math.max(1, page);
@@ -259,6 +263,18 @@ class PexelsService {
     if (_apiKey.isEmpty) {
       throw StateError('Missing PEXELS_API_KEY configuration.');
     }
+  }
+
+  void _ensureOpen() {
+    if (_closed) throw StateError('PexelsService is closed.');
+  }
+
+  /// Cancels requests and releases sockets only when this service created the
+  /// underlying client. A caller-injected client remains caller-owned.
+  void close() {
+    if (_closed) return;
+    _closed = true;
+    if (_ownsClient) _client.close(force: true);
   }
 
   static Dio _createClient() => Dio(

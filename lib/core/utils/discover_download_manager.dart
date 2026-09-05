@@ -69,8 +69,8 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
     this.maxDirectBytes = 512 * 1024 * 1024,
     this.maxYoutubeBytes = YoutubeDownloadService.defaultMaxBytes,
   }) : _dio =
-           dio ??
-           Dio(BaseOptions(connectTimeout: const Duration(seconds: 30))),
+           dio ?? Dio(BaseOptions(connectTimeout: const Duration(seconds: 30))),
+       _ownsDio = dio == null,
        _youtubeService = youtubeService ?? YoutubeDownloadService(),
        _instagramService = instagramService ?? InstagramDownloadService(),
        _storageDirectoryOverride = storageDirectory,
@@ -84,6 +84,7 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
   static const int catalogVersion = 1;
 
   final Dio _dio;
+  final bool _ownsDio;
   final YoutubeMediaService _youtubeService;
   final InstagramMediaService _instagramService;
   final Directory? _storageDirectoryOverride;
@@ -1442,6 +1443,9 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
     }
     _youtubeService.dispose();
     _instagramService.dispose();
+    if (_ownsDio) {
+      _dio.close(force: true);
+    }
     _lastProgressEmitMicros.clear();
     _progressClock.stop();
     unawaited(_itemsController.close());

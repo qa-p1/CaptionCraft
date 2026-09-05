@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 
@@ -41,12 +42,32 @@ class InstagramDownloadService implements InstagramMediaService {
     Dio? dio,
     InstagramPageLoader? pageLoader,
     this.pageRequestTimeout = const Duration(seconds: 12),
+    this.inspectionTimeout = const Duration(seconds: 30),
   }) : _dio = dio ?? Dio(BaseOptions(connectTimeout: pageRequestTimeout)),
        _ownsDio = dio == null,
-       _pageLoader = pageLoader;
+       _pageLoader = pageLoader,
+       assert(pageRequestTimeout > Duration.zero),
+       assert(inspectionTimeout > Duration.zero);
 
-  static const int _maximumPageCharacters = 4 * 1024 * 1024;
+  static const int _maximumPageBytes = 4 * 1024 * 1024;
   static const int _maximumMediaItems = 24;
+  static const int _maximumRedirects = 5;
+  static const Set<int> _redirectStatuses = <int>{301, 302, 303, 307, 308};
+  static const InstagramDownloadException _timeoutFailure =
+      InstagramDownloadException(
+        InstagramFailureKind.timedOut,
+        'Instagram took too long to respond. Check the connection and retry.',
+      );
+  static const InstagramDownloadException _disposedFailure =
+      InstagramDownloadException(
+        InstagramFailureKind.disposed,
+        'Instagram inspection was cancelled.',
+      );
+  static const InstagramDownloadException
+  _loginRequiredFailure = InstagramDownloadException(
+    InstagramFailureKind.privateOrLoginRequired,
+    'Instagram requires a login to access this post. Only anonymously accessible public media is supported.',
+  );
   static const String browserUserAgent =
       'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36';
@@ -55,23 +76,34 @@ class InstagramDownloadService implements InstagramMediaService {
   final bool _ownsDio;
   final InstagramPageLoader? _pageLoader;
   final Duration pageRequestTimeout;
+  final Duration inspectionTimeout;
   final Set<CancelToken> _activeRequests = <CancelToken>{};
+  final Completer<void> _disposedSignal = Completer<void>();
   bool _disposed = false;
 
   static ({String shortcode, Uri canonicalUri, bool isReel})? parseUrl(
     String value,
   ) {
-    final uri = Uri.tryParse(value.trim());
+    final normalizedValue = value.trim();
+    if (normalizedValue.isEmpty || normalizedValue.length > 2048) return null;
+    final uri = Uri.tryParse(normalizedValue);
     if (uri == null ||
         uri.scheme.toLowerCase() != 'https' ||
         !_instagramHosts.contains(uri.host.toLowerCase()) ||
-        uri.userInfo.isNotEmpty) {
+        uri.userInfo.isNotEmpty ||
+        (uri.hasPort && uri.port != 443)) {
       return null;
     }
-    final segments = uri.pathSegments
-        .where((segment) => segment.trim().isNotEmpty)
-        .toList(growable: false);
-    if (segments.length < 2) return null;
+    final rawSegments = uri.pathSegments;
+    // Instagram's copied links conventionally end in `/`. Dart represents
+    // that final slash as an empty path segment, so discard exactly that one
+    // while continuing to reject doubled slashes and extra route components.
+    final segments = rawSegments.isNotEmpty && rawSegments.last.isEmpty
+        ? rawSegments.sublist(0, rawSegments.length - 1)
+        : rawSegments;
+    if (segments.length != 2 || segments.any((segment) => segment.isEmpty)) {
+      return null;
+    }
     final route = segments.first.toLowerCase();
     if (!const {'p', 'reel', 'reels', 'tv'}.contains(route)) return null;
     final shortcode = segments[1];
@@ -111,12 +143,23 @@ class InstagramDownloadService implements InstagramMediaService {
     final seenMediaUrls = <String>{};
     final failures = <InstagramDownloadException>[];
     Map<String, String> metadata = const <String, String>{};
+    final inspectionClock = Stopwatch()..start();
 
     for (final inspectionUri in _inspectionUris(parsed)) {
       _ensureNotDisposed();
       try {
-        final body = await _loadPage(inspectionUri);
-        if (body.isEmpty || body.length > _maximumPageCharacters) {
+        final remaining = inspectionTimeout - inspectionClock.elapsed;
+        if (remaining <= Duration.zero) {
+          failures.add(_timeoutFailure);
+          break;
+        }
+        final body = await _loadPage(
+          inspectionUri,
+          timeout: remaining < pageRequestTimeout
+              ? remaining
+              : pageRequestTimeout,
+        );
+        if (body.isEmpty || utf8.encode(body).length > _maximumPageBytes) {
           failures.add(
             const InstagramDownloadException(
               InstagramFailureKind.unsupported,
@@ -125,18 +168,27 @@ class InstagramDownloadService implements InstagramMediaService {
           );
           continue;
         }
-        final pageMetadata = _openGraphMetadata(body);
-        if (metadata.isEmpty || pageMetadata.containsKey('og:title')) {
-          metadata = pageMetadata;
+        // Error/login documents can contain Instagram's own Open Graph image
+        // and generic serialized URLs. Never treat those shell assets as the
+        // requested post; only extract media from a page that passed the
+        // availability classification.
+        final pageFailure = _classifyPage(body);
+        if (pageFailure != null) {
+          failures.add(pageFailure);
+          continue;
         }
+        final pageMetadata = _openGraphMetadata(body);
+        // Preserve useful fields from the canonical document when an embed
+        // response only supplies the playable URL (and vice versa).
+        metadata = <String, String>{...metadata, ...pageMetadata};
         final extracted = _extractMedia(
           body: body,
-          metadata: pageMetadata,
+          metadata: metadata,
           shortcode: parsed.shortcode,
           thumbnailUrl: _safeHttpsUrl(
-            pageMetadata['og:image:secure_url'] ??
-                pageMetadata['og:image'] ??
-                pageMetadata['twitter:image'],
+            metadata['og:image:secure_url'] ??
+                metadata['og:image'] ??
+                metadata['twitter:image'],
           ),
           isReel: parsed.isReel,
         );
@@ -157,9 +209,8 @@ class InstagramDownloadService implements InstagramMediaService {
             media.any((item) => item.kind == DiscoverMediaKind.video)) {
           break;
         }
-        final pageFailure = _classifyPage(body);
-        if (pageFailure != null) failures.add(pageFailure);
       } on InstagramDownloadException catch (error) {
+        if (error.kind == InstagramFailureKind.disposed) rethrow;
         failures.add(error);
       }
     }
@@ -194,6 +245,7 @@ class InstagramDownloadService implements InstagramMediaService {
     ({String shortcode, Uri canonicalUri, bool isReel}) parsed,
   ) sync* {
     yield parsed.canonicalUri;
+    yield Uri.https('www.instagram.com', '${parsed.canonicalUri.path}embed/');
     yield Uri.https(
       'www.instagram.com',
       '${parsed.canonicalUri.path}embed/captioned/',
@@ -202,6 +254,7 @@ class InstagramDownloadService implements InstagramMediaService {
       // Instagram's embed service also accepts the post-style route for many
       // Reel shortcodes. It remains public and is a useful fallback when the
       // normal Reel document is only a login shell.
+      yield Uri.https('www.instagram.com', '/p/${parsed.shortcode}/embed/');
       yield Uri.https(
         'www.instagram.com',
         '/p/${parsed.shortcode}/embed/captioned/',
@@ -209,91 +262,149 @@ class InstagramDownloadService implements InstagramMediaService {
     }
   }
 
-  Future<String> _loadPage(Uri uri) async {
+  Future<String> _loadPage(Uri uri, {required Duration timeout}) async {
     final loader = _pageLoader;
     if (loader != null) {
       try {
-        return await loader(uri).timeout(pageRequestTimeout);
+        final guardedLoad = Future<String>.sync(
+          () => loader(uri),
+        ).timeout(timeout);
+        return await Future.any<String>(<Future<String>>[
+          guardedLoad,
+          _disposedSignal.future.then<String>((_) => throw _disposedFailure),
+        ]);
+      } on InstagramDownloadException {
+        rethrow;
       } on TimeoutException {
+        throw _timeoutFailure;
+      } catch (_) {
+        if (_disposed) throw _disposedFailure;
         throw const InstagramDownloadException(
-          InstagramFailureKind.timedOut,
-          'Instagram took too long to respond. Check the connection and retry.',
+          InstagramFailureKind.network,
+          'Instagram could not be reached. Check the connection and retry.',
         );
       }
     }
     final cancelToken = CancelToken();
     _activeRequests.add(cancelToken);
     try {
-      final response = await _dio
-          .get<String>(
-            uri.toString(),
-            cancelToken: cancelToken,
-            options: Options(
-              responseType: ResponseType.plain,
-              followRedirects: true,
-              maxRedirects: 5,
-              receiveTimeout: pageRequestTimeout,
-              sendTimeout: pageRequestTimeout,
-              headers: const <String, String>{
-                'User-Agent': browserUserAgent,
-                'Accept':
-                    'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.8',
+      var currentUri = uri;
+      final visited = <String>{currentUri.toString()};
+      final requestClock = Stopwatch()..start();
+
+      for (var redirectCount = 0; ; redirectCount++) {
+        _ensureNotDisposed();
+        final remaining = timeout - requestClock.elapsed;
+        if (remaining <= Duration.zero) throw _timeoutFailure;
+
+        final response = await _dio
+            .get<ResponseBody>(
+              currentUri.toString(),
+              cancelToken: cancelToken,
+              options: Options(
+                responseType: ResponseType.stream,
+                followRedirects: false,
+                maxRedirects: 0,
+                receiveTimeout: remaining,
+                sendTimeout: remaining,
+                headers: const <String, String>{
+                  'User-Agent': browserUserAgent,
+                  'Accept':
+                      'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                  'Accept-Language': 'en-US,en;q=0.8',
+                },
+                validateStatus: (status) =>
+                    status != null &&
+                    ((status >= 200 && status < 300) ||
+                        _redirectStatuses.contains(status)),
+              ),
+            )
+            .timeout(
+              remaining,
+              onTimeout: () {
+                cancelToken.cancel('Instagram page request timed out.');
+                throw _timeoutFailure;
               },
-              validateStatus: (status) =>
-                  status != null && status >= 200 && status < 300,
-            ),
-          )
-          .timeout(
-            pageRequestTimeout,
-            onTimeout: () {
-              cancelToken.cancel('Instagram page request timed out.');
-              throw const InstagramDownloadException(
-                InstagramFailureKind.timedOut,
-                'Instagram took too long to respond. Check the connection and retry.',
-              );
-            },
+            );
+        final status = response.statusCode;
+        if (status != null && _redirectStatuses.contains(status)) {
+          await _cancelResponseBody(response.data);
+          if (redirectCount >= _maximumRedirects) {
+            throw const InstagramDownloadException(
+              InstagramFailureKind.accessBlocked,
+              'Instagram redirected this request too many times.',
+            );
+          }
+          final location = response.headers.value('location');
+          if (location == null || location.trim().isEmpty) {
+            throw const InstagramDownloadException(
+              InstagramFailureKind.accessBlocked,
+              'Instagram returned an invalid redirect while inspecting this post.',
+            );
+          }
+          final nextUri = currentUri.resolve(location.trim());
+          if (!_isSafeInstagramPageUri(nextUri)) {
+            throw const InstagramDownloadException(
+              InstagramFailureKind.accessBlocked,
+              'Instagram redirected this request to an unsupported destination.',
+            );
+          }
+          if (_isLoginUri(nextUri)) throw _loginRequiredFailure;
+          if (!visited.add(nextUri.toString())) {
+            throw const InstagramDownloadException(
+              InstagramFailureKind.accessBlocked,
+              'Instagram returned a redirect loop while inspecting this post.',
+            );
+          }
+          currentUri = nextUri;
+          continue;
+        }
+
+        if (!_isSafeInstagramPageUri(response.realUri)) {
+          await _cancelResponseBody(response.data);
+          throw const InstagramDownloadException(
+            InstagramFailureKind.accessBlocked,
+            'Instagram redirected this request to an unsupported destination.',
           );
-      final announcedBytes = int.tryParse(
-        response.headers.value(Headers.contentLengthHeader) ?? '',
-      );
-      final finalUri = response.realUri;
-      if (finalUri.scheme.toLowerCase() != 'https' ||
-          !_instagramHosts.contains(finalUri.host.toLowerCase())) {
-        throw const InstagramDownloadException(
-          InstagramFailureKind.accessBlocked,
-          'Instagram redirected this request to an unsupported destination.',
+        }
+        if (_isLoginUri(response.realUri)) {
+          await _cancelResponseBody(response.data);
+          throw _loginRequiredFailure;
+        }
+        final announcedBytes = int.tryParse(
+          response.headers.value(Headers.contentLengthHeader) ?? '',
+        );
+        if (announcedBytes != null && announcedBytes > _maximumPageBytes) {
+          await _cancelResponseBody(response.data);
+          throw const InstagramDownloadException(
+            InstagramFailureKind.unsupported,
+            'Instagram returned an unexpectedly large media page.',
+          );
+        }
+        final bodyTimeout = timeout - requestClock.elapsed;
+        if (bodyTimeout <= Duration.zero) {
+          await _cancelResponseBody(response.data);
+          throw _timeoutFailure;
+        }
+        return await _readBoundedPage(response.data).timeout(
+          bodyTimeout,
+          onTimeout: () {
+            cancelToken.cancel('Instagram page response timed out.');
+            throw _timeoutFailure;
+          },
         );
       }
-      if (finalUri.path.toLowerCase().startsWith('/accounts/login')) {
-        throw const InstagramDownloadException(
-          InstagramFailureKind.privateOrLoginRequired,
-          'Instagram requires a login to access this post. Only anonymously accessible public media is supported.',
-        );
-      }
-      if (announcedBytes != null &&
-          announcedBytes > _maximumPageCharacters * 4) {
-        throw const InstagramDownloadException(
-          InstagramFailureKind.unsupported,
-          'Instagram returned an unexpectedly large media page.',
-        );
-      }
-      return response.data ?? '';
+    } on InstagramDownloadException {
+      rethrow;
     } on DioException catch (error) {
       if (_disposed || error.type == DioExceptionType.cancel) {
-        throw const InstagramDownloadException(
-          InstagramFailureKind.disposed,
-          'Instagram inspection was cancelled.',
-        );
+        throw _disposedFailure;
       }
       final status = error.response?.statusCode;
       if (error.type == DioExceptionType.connectionTimeout ||
           error.type == DioExceptionType.receiveTimeout ||
           error.type == DioExceptionType.sendTimeout) {
-        throw const InstagramDownloadException(
-          InstagramFailureKind.timedOut,
-          'Instagram took too long to respond. Check the connection and retry.',
-        );
+        throw _timeoutFailure;
       }
       if (status == 401 || status == 403) {
         throw InstagramDownloadException(
@@ -323,10 +434,52 @@ class InstagramDownloadService implements InstagramMediaService {
             : 'Instagram is temporarily unavailable (HTTP $status).',
         statusCode: status,
       );
+    } catch (_) {
+      if (_disposed) throw _disposedFailure;
+      throw const InstagramDownloadException(
+        InstagramFailureKind.network,
+        'Instagram could not be reached. Check the connection and retry.',
+      );
     } finally {
       _activeRequests.remove(cancelToken);
     }
   }
+
+  static Future<String> _readBoundedPage(ResponseBody? responseBody) async {
+    if (responseBody == null) return '';
+    final bytes = BytesBuilder(copy: false);
+    final iterator = StreamIterator<Uint8List>(responseBody.stream);
+    try {
+      while (await iterator.moveNext()) {
+        final chunk = iterator.current;
+        if (bytes.length + chunk.length > _maximumPageBytes) {
+          throw const InstagramDownloadException(
+            InstagramFailureKind.unsupported,
+            'Instagram returned an unexpectedly large media page.',
+          );
+        }
+        bytes.add(chunk);
+      }
+    } finally {
+      await iterator.cancel();
+    }
+    return utf8.decode(bytes.takeBytes(), allowMalformed: true);
+  }
+
+  static Future<void> _cancelResponseBody(ResponseBody? responseBody) async {
+    if (responseBody == null) return;
+    final subscription = responseBody.stream.listen(null);
+    await subscription.cancel();
+  }
+
+  static bool _isSafeInstagramPageUri(Uri uri) =>
+      uri.scheme.toLowerCase() == 'https' &&
+      _instagramHosts.contains(uri.host.toLowerCase()) &&
+      uri.userInfo.isEmpty &&
+      (!uri.hasPort || uri.port == 443);
+
+  static bool _isLoginUri(Uri uri) =>
+      uri.path.toLowerCase().startsWith('/accounts/login');
 
   static InstagramDownloadException? _classifyPage(String body) {
     final normalized = body.toLowerCase();
@@ -389,9 +542,8 @@ class InstagramDownloadService implements InstagramMediaService {
     };
     if (failures.isNotEmpty) {
       failures.sort(
-        (first, second) => (priority[first.kind] ?? 99).compareTo(
-          priority[second.kind] ?? 99,
-        ),
+        (first, second) =>
+            (priority[first.kind] ?? 99).compareTo(priority[second.kind] ?? 99),
       );
       return failures.first;
     }
@@ -597,6 +749,7 @@ class InstagramDownloadService implements InstagramMediaService {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    _disposedSignal.complete();
     for (final request in _activeRequests.toList(growable: false)) {
       request.cancel('InstagramDownloadService disposed.');
     }

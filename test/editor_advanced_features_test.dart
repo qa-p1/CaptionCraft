@@ -35,6 +35,20 @@ void main() {
     );
   });
 
+  test('reversed work-area markers replace the stale opposite boundary', () {
+    const withOut = TimelineWorkspaceSettings(
+      workAreaEnd: Duration(seconds: 8),
+    );
+    final movedIn = withOut.withWorkAreaStart(const Duration(seconds: 9));
+
+    expect(movedIn.workAreaStart, const Duration(seconds: 9));
+    expect(movedIn.workAreaEnd, isNull);
+
+    final movedOut = movedIn.withWorkAreaEnd(const Duration(seconds: 4));
+    expect(movedOut.workAreaStart, isNull);
+    expect(movedOut.workAreaEnd, const Duration(seconds: 4));
+  });
+
   test('professional audio controls survive persistence with old defaults', () {
     final clip = TimelineClip(
       id: 'music',

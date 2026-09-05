@@ -1,9 +1,12 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:caption_craft/core/utils/timeline_export_service.dart';
 import 'package:caption_craft/features/editor/models/export_settings.dart';
 import 'package:caption_craft/features/editor/models/timeline_models.dart';
 import 'package:caption_craft/shared/models/project_model.dart';
+import 'package:dio/dio.dart';
+import 'package:dio/io.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 
@@ -188,6 +191,198 @@ void main() {
     );
   });
 
+  test('public cleartext remote media is rejected before export', () async {
+    final source = _remoteSource(
+      remoteUrl: 'http://media.example.test/source.mp4',
+      label: 'Cleartext remote',
+    );
+
+    await expectLater(
+      TimelineExportService.resolveSourcePathForTesting(
+        project: source.project,
+        timeline: source.timeline,
+        clip: source.clip,
+        workingDirectory: workingDirectory,
+      ),
+      throwsA(
+        isA<Exception>().having(
+          (error) => error.toString(),
+          'message',
+          contains('Unsupported media URL'),
+        ),
+      ),
+    );
+  });
+
+  test('HTML remote-media responses are rejected and removed', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    server.listen((request) async {
+      request.response.headers.contentType = ContentType.html;
+      request.response.write('<html><body>Sign in to continue</body></html>');
+      await request.response.close();
+    });
+    final source = _remoteSource(
+      remoteUrl: 'http://${server.address.address}:${server.port}/source.mp4',
+      label: 'Expired remote clip',
+    );
+
+    await expectLater(
+      TimelineExportService.resolveSourcePathForTesting(
+        project: source.project,
+        timeline: source.timeline,
+        clip: source.clip,
+        workingDirectory: workingDirectory,
+      ),
+      throwsA(
+        isA<StateError>().having(
+          (error) => error.toString(),
+          'message',
+          contains('web page instead of media'),
+        ),
+      ),
+    );
+    final leftovers = await workingDirectory
+        .list()
+        .where(
+          (entity) =>
+              entity is File && p.basename(entity.path).startsWith('network_'),
+        )
+        .toList();
+    expect(leftovers, isEmpty);
+  });
+
+  test('remote-media downloads have a hard overall deadline', () async {
+    final dio = _HangingDownloadDio();
+    addTearDown(() => dio.close(force: true));
+    final source = _remoteSource(
+      remoteUrl: 'https://media.example.test/slow.mp4',
+      label: 'Slow remote clip',
+    );
+
+    await expectLater(
+      TimelineExportService.resolveSourcePathForTesting(
+        project: source.project,
+        timeline: source.timeline,
+        clip: source.clip,
+        workingDirectory: workingDirectory,
+        dioOverride: dio,
+        networkRequestTimeout: const Duration(milliseconds: 40),
+      ),
+      throwsA(
+        isA<Exception>().having(
+          (error) => error.toString(),
+          'message',
+          contains('timed out'),
+        ),
+      ),
+    );
+    expect(dio.cancelToken?.isCancelled, isTrue);
+    expect(
+      await workingDirectory
+          .list()
+          .where(
+            (entity) =>
+                entity is File &&
+                p.basename(entity.path).startsWith('network_'),
+          )
+          .toList(),
+      isEmpty,
+    );
+  });
+
+  test('unsafe redirects are rejected before requesting the target', () async {
+    final requestedPaths = <String>[];
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    server.listen((request) async {
+      requestedPaths.add(request.uri.path);
+      request.response
+        ..statusCode = HttpStatus.found
+        ..headers.set(
+          HttpHeaders.locationHeader,
+          'http://media.example.test/redirected.mp4',
+        );
+      await request.response.close();
+    });
+    final source = _remoteSource(
+      remoteUrl: 'http://${server.address.address}:${server.port}/source.mp4',
+      label: 'Redirected clip',
+    );
+
+    await expectLater(
+      TimelineExportService.resolveSourcePathForTesting(
+        project: source.project,
+        timeline: source.timeline,
+        clip: source.clip,
+        workingDirectory: workingDirectory,
+      ),
+      throwsA(
+        isA<StateError>().having(
+          (error) => error.toString(),
+          'message',
+          contains('unsafe URL'),
+        ),
+      ),
+    );
+    expect(requestedPaths, <String>['/source.mp4']);
+    expect(
+      await workingDirectory
+          .list()
+          .where(
+            (entity) =>
+                entity is File &&
+                p.basename(entity.path).startsWith('network_'),
+          )
+          .toList(),
+      isEmpty,
+    );
+  });
+
+  test(
+    'safe relative redirects are followed within the overall limit',
+    () async {
+      final requestedPaths = <String>[];
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      server.listen((request) async {
+        requestedPaths.add(request.uri.path);
+        if (request.uri.path == '/source.mp4') {
+          request.response
+            ..statusCode = HttpStatus.temporaryRedirect
+            ..headers.set(HttpHeaders.locationHeader, '/media/final.mp4');
+        } else {
+          request.response.headers.contentType = ContentType('video', 'mp4');
+          request.response.add(const <int>[0, 0, 0, 24, 102, 116, 121, 112]);
+        }
+        await request.response.close();
+      });
+      final source = _remoteSource(
+        remoteUrl: 'http://${server.address.address}:${server.port}/source.mp4',
+        label: 'Redirected clip',
+      );
+
+      final path = await TimelineExportService.resolveSourcePathForTesting(
+        project: source.project,
+        timeline: source.timeline,
+        clip: source.clip,
+        workingDirectory: workingDirectory,
+      );
+
+      expect(requestedPaths, <String>['/source.mp4', '/media/final.mp4']);
+      expect(await File(path).readAsBytes(), <int>[
+        0,
+        0,
+        0,
+        24,
+        102,
+        116,
+        121,
+        112,
+      ]);
+    },
+  );
+
   test('oversized network media is stopped during download', () async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     addTearDown(() => server.close(force: true));
@@ -367,4 +562,75 @@ void main() {
       expect(filterGraph, contains('(3-2*'));
     },
   );
+}
+
+({Project project, EditorTimeline timeline, TimelineClip clip}) _remoteSource({
+  required String remoteUrl,
+  required String label,
+}) {
+  final asset = EditorAssetReference(
+    id: 'remote-asset',
+    type: EditorAssetType.video,
+    label: label,
+    remoteUrl: remoteUrl,
+    isNetworkBacked: true,
+  );
+  final clip = TimelineClip(
+    id: 'remote-clip',
+    trackId: 'base',
+    type: TimelineTrackType.video,
+    label: label,
+    assetId: asset.id,
+    startTime: Duration.zero,
+    endTime: const Duration(seconds: 1),
+  );
+  final timeline = EditorTimeline(
+    assets: [asset],
+    tracks: [
+      TimelineTrack(
+        id: 'base',
+        name: 'Video',
+        type: TimelineTrackType.video,
+        section: TimelineTrackSection.baseVideo,
+        clips: [clip],
+      ),
+    ],
+  );
+  return (
+    project: Project(
+      id: 'remote-project',
+      name: 'Remote project',
+      videoPath: '',
+      durationMs: 1000,
+      timeline: timeline,
+    ),
+    timeline: timeline,
+    clip: clip,
+  );
+}
+
+class _HangingDownloadDio extends DioForNative {
+  CancelToken? cancelToken;
+
+  @override
+  Future<Response> download(
+    String urlPath,
+    dynamic savePath, {
+    ProgressCallback? onReceiveProgress,
+    Map<String, dynamic>? queryParameters,
+    CancelToken? cancelToken,
+    bool deleteOnError = true,
+    FileAccessMode fileAccessMode = FileAccessMode.write,
+    String lengthHeader = Headers.contentLengthHeader,
+    Object? data,
+    Options? options,
+  }) async {
+    this.cancelToken = cancelToken;
+    final headers = Headers();
+    final resolvedPath = savePath is String
+        ? savePath
+        : await (savePath as FutureOr<String> Function(Headers))(headers);
+    await File(resolvedPath).writeAsBytes(const <int>[1, 2, 3]);
+    return Completer<Response<dynamic>>().future;
+  }
 }

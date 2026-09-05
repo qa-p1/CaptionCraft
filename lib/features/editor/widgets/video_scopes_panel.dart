@@ -89,9 +89,7 @@ class _VideoScopesPanelState extends ConsumerState<VideoScopesPanel> {
       setState(() => _imagePath = rendered);
     } catch (error) {
       if (!mounted) return;
-      setState(
-        () => _error = error.toString().replaceFirst('Exception: ', ''),
-      );
+      setState(() => _error = error.toString().replaceFirst('Exception: ', ''));
     } finally {
       _rendering = false;
       if (_pending && mounted) _scheduleRender();
@@ -107,8 +105,8 @@ class _VideoScopesPanelState extends ConsumerState<VideoScopesPanel> {
   @override
   Widget build(BuildContext context) {
     ref.listen<PlaybackState>(playbackProvider, (previous, next) {
-      final moved = (next.position - _playbackPosition).inMilliseconds.abs() >=
-          100;
+      final moved =
+          (next.position - _playbackPosition).inMilliseconds.abs() >= 100;
       _playbackPosition = next.position;
       _isPlaying = next.isPlaying;
       if (moved) _scheduleRender();

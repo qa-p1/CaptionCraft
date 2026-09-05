@@ -55,29 +55,31 @@ void main() {
 
     for (final entry in expected.entries) {
       final dimensions = await _pngDimensions(File(entry.key));
-      expect(dimensions, (width: entry.value, height: entry.value), reason: entry.key);
+      expect(dimensions, (
+        width: entry.value,
+        height: entry.value,
+      ), reason: entry.key);
     }
   });
 
-  test('vector sources retain optical padding for raster and adaptive icons', () async {
-    final logo = await File('captioncraft_logo.svg').readAsString();
-    final androidForeground = await File(
-      'android/app/src/main/res/drawable/ic_launcher_foreground.xml',
-    ).readAsString();
+  test(
+    'vector sources retain optical padding for raster and adaptive icons',
+    () async {
+      final logo = await File('captioncraft_logo.svg').readAsString();
+      final androidForeground = await File(
+        'android/app/src/main/res/drawable/ic_launcher_foreground.xml',
+      ).readAsString();
 
-    expect(logo, contains('id="app-icon-mark"'));
-    expect(logo, contains('translate(125.4 125.4) scale(0.8)'));
-    expect(androidForeground, contains('android:scaleX="0.66"'));
-    expect(androidForeground, contains('android:scaleY="0.66"'));
-  });
+      expect(logo, contains('id="app-icon-mark"'));
+      expect(logo, contains('translate(125.4 125.4) scale(0.8)'));
+      expect(androidForeground, contains('android:scaleX="0.66"'));
+      expect(androidForeground, contains('android:scaleY="0.66"'));
+    },
+  );
 }
 
 ({int width, int height, int left, int top, int right, int bottom})
-_visibleBounds(
-  Uint8List rgba,
-  int width,
-  int height,
-) {
+_visibleBounds(Uint8List rgba, int width, int height) {
   final background = rgba.sublist(0, 3);
   var minX = width;
   var minY = height;
@@ -114,11 +116,16 @@ _visibleBounds(
 Future<({int width, int height})> _pngDimensions(File file) async {
   final bytes = await file.readAsBytes();
   expect(bytes.length, greaterThanOrEqualTo(24), reason: file.path);
-  expect(
-    bytes.sublist(0, 8),
-    <int>[137, 80, 78, 71, 13, 10, 26, 10],
-    reason: file.path,
-  );
+  expect(bytes.sublist(0, 8), <int>[
+    137,
+    80,
+    78,
+    71,
+    13,
+    10,
+    26,
+    10,
+  ], reason: file.path);
   final data = ByteData.sublistView(bytes);
   return (
     width: data.getUint32(16, Endian.big),

@@ -1,12 +1,21 @@
 #include "flutter_window.h"
 
 #include <cstdint>
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <variant>
 
+#include <flutter/method_result_functions.h>
+
 #include "flutter/generated_plugin_registrant.h"
 #include "utils.h"
+
+namespace {
+
+constexpr UINT kCloseApprovedMessage = WM_APP + 0x47;
+
+}  // namespace
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
@@ -29,6 +38,11 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
+  window_lifecycle_channel_ = std::make_unique<
+      flutter::MethodChannel<flutter::EncodableValue>>(
+      flutter_controller_->engine()->messenger(),
+      "captioncraft/window_lifecycle",
+      &flutter::StandardMethodCodec::GetInstance());
   storage_channel_ = std::make_unique<
       flutter::MethodChannel<flutter::EncodableValue>>(
       flutter_controller_->engine()->messenger(),
@@ -84,6 +98,7 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  window_lifecycle_channel_.reset();
   storage_channel_.reset();
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
@@ -100,9 +115,81 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     const UINT window_dpi = ::GetDpiForWindow(hwnd);
     const UINT dpi = window_dpi == 0 ? 96 : window_dpi;
     auto* min_max = reinterpret_cast<MINMAXINFO*>(lparam);
-    min_max->ptMinTrackSize.x = ::MulDiv(1024, dpi, 96);
-    min_max->ptMinTrackSize.y = ::MulDiv(640, dpi, 96);
+    const LONG requested_width = ::MulDiv(800, dpi, 96);
+    const LONG requested_height = ::MulDiv(520, dpi, 96);
+    min_max->ptMinTrackSize.x = requested_width;
+    min_max->ptMinTrackSize.y = requested_height;
+
+    MONITORINFO monitor_info{};
+    monitor_info.cbSize = sizeof(monitor_info);
+    const HMONITOR monitor =
+        ::MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (::GetMonitorInfo(monitor, &monitor_info)) {
+      const LONG work_width =
+          monitor_info.rcWork.right - monitor_info.rcWork.left;
+      const LONG work_height =
+          monitor_info.rcWork.bottom - monitor_info.rcWork.top;
+      if (work_width > 0) {
+        min_max->ptMinTrackSize.x =
+            std::min<LONG>(requested_width, work_width);
+      }
+      if (work_height > 0) {
+        min_max->ptMinTrackSize.y =
+            std::min<LONG>(requested_height, work_height);
+      }
+    }
     return 0;
+  }
+
+  if (message == WM_CLOSE && !close_approved_) {
+    if (close_request_pending_) {
+      const int force_close = ::MessageBox(
+          hwnd,
+          L"CaptionCraft is still saving or stopping a render. Force closing "
+          L"now may lose recent changes or leave a partial export.\n\nClose "
+          L"anyway?",
+          L"CaptionCraft is still working", MB_YESNO | MB_ICONWARNING |
+                                                MB_DEFBUTTON2);
+      if (force_close == IDYES) {
+        close_approved_ = true;
+        return Win32Window::MessageHandler(hwnd, message, wparam, lparam);
+      }
+      return 0;
+    }
+    if (!window_lifecycle_channel_) {
+      return Win32Window::MessageHandler(hwnd, message, wparam, lparam);
+    }
+
+    close_request_pending_ = true;
+    window_lifecycle_channel_->InvokeMethod(
+        "requestClose", nullptr,
+        std::make_unique<
+            flutter::MethodResultFunctions<flutter::EncodableValue>>(
+            [this, hwnd](const flutter::EncodableValue* value) {
+              close_request_pending_ = false;
+              const bool* allow_close =
+                  value == nullptr ? nullptr : std::get_if<bool>(value);
+              if (allow_close != nullptr && *allow_close &&
+                  GetHandle() == hwnd) {
+                ::PostMessage(hwnd, kCloseApprovedMessage, 0, 0);
+              }
+            },
+            [this](const std::string&, const std::string&,
+                   const flutter::EncodableValue*) {
+              close_request_pending_ = false;
+            },
+            [this, hwnd]() {
+              close_request_pending_ = false;
+              if (GetHandle() == hwnd) {
+                ::PostMessage(hwnd, kCloseApprovedMessage, 0, 0);
+              }
+            }));
+    return 0;
+  }
+
+  if (message == kCloseApprovedMessage) {
+    close_approved_ = true;
+    return Win32Window::MessageHandler(hwnd, WM_CLOSE, 0, 0);
   }
 
   // Give Flutter, including plugins, an opportunity to handle window messages.

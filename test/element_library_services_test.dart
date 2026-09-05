@@ -1,10 +1,12 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:caption_craft/core/utils/giphy_service.dart';
 import 'package:caption_craft/core/utils/pexels_service.dart';
 import 'package:caption_craft/core/utils/pixabay_service.dart';
 import 'package:caption_craft/features/editor/models/element_library_asset.dart';
+import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -265,6 +267,27 @@ void main() {
 
       expect(service.search(), throwsA(isA<StateError>()));
     });
+
+    test(
+      'close is idempotent without taking ownership of an injected client',
+      () async {
+        final adapter = _CloseTrackingAdapter();
+        final client = Dio()..httpClientAdapter = adapter;
+        final service = PexelsService(
+          client: client,
+          apiKey: 'key',
+          baseUrl: 'https://api.pexels.test/v1',
+        );
+
+        service.close();
+        service.close();
+
+        await expectLater(service.search(), throwsA(isA<StateError>()));
+        expect(adapter.closed, isFalse);
+        client.close(force: true);
+        expect(adapter.closed, isTrue);
+      },
+    );
   });
 
   group('PixabayService', () {
@@ -455,7 +478,46 @@ void main() {
 
       expect(service.search(), throwsA(isA<StateError>()));
     });
+
+    test(
+      'close is idempotent without taking ownership of an injected client',
+      () async {
+        final adapter = _CloseTrackingAdapter();
+        final client = Dio()..httpClientAdapter = adapter;
+        final service = PixabayService(
+          client: client,
+          apiKey: 'key',
+          baseUrl: 'https://pixabay.test/api',
+        );
+
+        service.close();
+        service.close();
+
+        await expectLater(service.search(), throwsA(isA<StateError>()));
+        expect(adapter.closed, isFalse);
+        client.close(force: true);
+        expect(adapter.closed, isTrue);
+      },
+    );
   });
+}
+
+class _CloseTrackingAdapter implements HttpClientAdapter {
+  bool closed = false;
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) {
+    throw UnimplementedError('No request is expected in this test.');
+  }
+
+  @override
+  void close({bool force = false}) {
+    closed = true;
+  }
 }
 
 Future<HttpServer> _jsonServer(

@@ -2,7 +2,6 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
 
 import '../../shared/models/project_model.dart';
 
@@ -25,7 +24,7 @@ class EditorChangeLogService {
   }
 
   static Future<String> get _logDir async {
-    final appDir = await getApplicationDocumentsDirectory();
+    final appDir = await ProjectLocalStorage.applicationDocumentsDirectory;
     final dir = Directory(p.join(appDir.path, 'caption_craft_change_logs'));
     if (!await dir.exists()) {
       await dir.create(recursive: true);

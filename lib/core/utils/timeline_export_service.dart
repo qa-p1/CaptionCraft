@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
@@ -73,6 +74,7 @@ class TimelineExportService {
 
   static const _freezeFramePreroll = Duration(seconds: 1);
   static const _maxNetworkAssetBytes = 64 * 1024 * 1024;
+  static const _maxNetworkRedirects = 5;
   static CancelToken? _activeDownloadCancelToken;
 
   @visibleForTesting
@@ -794,6 +796,8 @@ class TimelineExportService {
     required EditorTimeline timeline,
     required TimelineClip clip,
     required Directory workingDirectory,
+    Dio? dioOverride,
+    Duration networkRequestTimeout = const Duration(minutes: 6),
   }) {
     return _sourcePathForClip(
       project: project,
@@ -801,6 +805,8 @@ class TimelineExportService {
       clip: clip,
       workingDirectory: workingDirectory,
       downloadCancelToken: CancelToken(),
+      dioOverride: dioOverride,
+      networkRequestTimeout: networkRequestTimeout,
     );
   }
 
@@ -810,6 +816,8 @@ class TimelineExportService {
     required TimelineClip clip,
     required Directory workingDirectory,
     required CancelToken downloadCancelToken,
+    Dio? dioOverride,
+    Duration networkRequestTimeout = const Duration(minutes: 6),
   }) async {
     final asset = timeline.assetForClip(clip);
     final localPath = asset?.sourcePath;
@@ -821,9 +829,7 @@ class TimelineExportService {
     final remoteUrl = asset?.remoteUrl;
     if (remoteUrl != null && remoteUrl.isNotEmpty) {
       final uri = Uri.tryParse(remoteUrl);
-      if (uri == null ||
-          !const {'http', 'https'}.contains(uri.scheme.toLowerCase()) ||
-          uri.host.isEmpty) {
+      if (uri == null || !_isAllowedNetworkMediaUri(uri)) {
         throw Exception(
           'Unsupported media URL for ${asset?.label ?? clip.label}.',
         );
@@ -845,35 +851,59 @@ class TimelineExportService {
         await cachedDownload.delete();
       }
       var exceededDownloadLimit = false;
+      final ownsDio = dioOverride == null;
+      final dio =
+          dioOverride ??
+          Dio(
+            BaseOptions(
+              connectTimeout: const Duration(seconds: 25),
+              receiveTimeout: const Duration(minutes: 5),
+              sendTimeout: const Duration(seconds: 25),
+            ),
+          );
       try {
-        await Dio(
-          BaseOptions(
-            connectTimeout: const Duration(seconds: 25),
-            receiveTimeout: const Duration(minutes: 5),
-          ),
-        ).download(
-          remoteUrl,
-          (headers) {
-            final declaredLength = int.tryParse(
-              headers.value(Headers.contentLengthHeader) ?? '',
+        final response =
+            await _downloadNetworkMedia(
+              dio: dio,
+              initialUri: uri,
+              outputPath: outputPath,
+              cancelToken: downloadCancelToken,
+              onSizeLimitExceeded: () => exceededDownloadLimit = true,
+            ).timeout(
+              networkRequestTimeout,
+              onTimeout: () {
+                if (!downloadCancelToken.isCancelled) {
+                  downloadCancelToken.cancel('Network media timed out.');
+                }
+                throw TimeoutException(
+                  'Network media download exceeded its time limit.',
+                );
+              },
             );
-            if (declaredLength != null &&
-                declaredLength > _maxNetworkAssetBytes) {
-              exceededDownloadLimit = true;
-              throw StateError('Network media exceeds the export size limit.');
-            }
-            return outputPath;
-          },
-          cancelToken: downloadCancelToken,
-          onReceiveProgress: (received, total) {
-            if (received > _maxNetworkAssetBytes ||
-                total > _maxNetworkAssetBytes) {
-              exceededDownloadLimit = true;
-              throw StateError('Network media exceeds the export size limit.');
-            }
-          },
+        final contentType = response.headers
+            .value(Headers.contentTypeHeader)
+            ?.split(';')
+            .first
+            .trim()
+            .toLowerCase();
+        if (_isNonMediaContentType(contentType) ||
+            await _looksLikeHtmlResponse(File(outputPath))) {
+          throw StateError(
+            'The server returned a web page instead of media for '
+            '${asset.label}.',
+          );
+        }
+      } on TimeoutException {
+        // Force the owned client closed before cleanup so Windows releases its
+        // output handle; Dio.close is idempotent when the finally block runs.
+        if (ownsDio) dio.close(force: true);
+        await _deleteNetworkDownload(outputPath);
+        throw Exception(
+          'Downloading ${asset.label} timed out. Check the connection and try again.',
         );
       } on DioException catch (error) {
+        if (ownsDio) dio.close(force: true);
+        await _deleteNetworkDownload(outputPath);
         if (exceededDownloadLimit) {
           throw Exception(
             '${asset.label} exceeds the 64 MB network-media export limit.',
@@ -887,12 +917,16 @@ class TimelineExportService {
           '${error.message ?? 'network error'}.',
         );
       } catch (_) {
+        if (ownsDio) dio.close(force: true);
+        await _deleteNetworkDownload(outputPath);
         if (exceededDownloadLimit) {
           throw Exception(
             '${asset.label} exceeds the 64 MB network-media export limit.',
           );
         }
         rethrow;
+      } finally {
+        if (ownsDio) dio.close(force: true);
       }
       final outputFile = File(outputPath);
       if (!await outputFile.exists() || await outputFile.length() == 0) {
@@ -920,6 +954,135 @@ class TimelineExportService {
     }
 
     throw Exception('Media is missing for "${clip.label}". Relink it first.');
+  }
+
+  static Future<Response<dynamic>> _downloadNetworkMedia({
+    required Dio dio,
+    required Uri initialUri,
+    required String outputPath,
+    required CancelToken cancelToken,
+    required VoidCallback onSizeLimitExceeded,
+  }) async {
+    var currentUri = initialUri;
+    var redirectCount = 0;
+
+    while (true) {
+      final response = await dio.download(
+        currentUri.toString(),
+        (headers) {
+          final declaredLength = int.tryParse(
+            headers.value(Headers.contentLengthHeader) ?? '',
+          );
+          if (declaredLength != null &&
+              declaredLength > _maxNetworkAssetBytes) {
+            onSizeLimitExceeded();
+            throw StateError('Network media exceeds the export size limit.');
+          }
+          return outputPath;
+        },
+        cancelToken: cancelToken,
+        onReceiveProgress: (received, total) {
+          if (received > _maxNetworkAssetBytes ||
+              total > _maxNetworkAssetBytes) {
+            onSizeLimitExceeded();
+            throw StateError('Network media exceeds the export size limit.');
+          }
+        },
+        options: Options(
+          followRedirects: false,
+          validateStatus: (status) =>
+              status != null && status >= 200 && status < 400,
+        ),
+      );
+      if (response.redirects.isNotEmpty ||
+          !_isAllowedNetworkMediaUri(response.realUri)) {
+        throw StateError('Network media redirected to an unsafe URL.');
+      }
+
+      final statusCode = response.statusCode ?? 0;
+      if (statusCode < 300 || statusCode >= 400) return response;
+      if (redirectCount >= _maxNetworkRedirects) {
+        throw StateError('Network media redirected too many times.');
+      }
+
+      final location = response.headers.value(HttpHeaders.locationHeader);
+      final nextUri = _resolveNetworkRedirect(currentUri, location);
+      if (nextUri == null ||
+          !_isAllowedNetworkMediaUri(nextUri) ||
+          (currentUri.scheme.toLowerCase() == 'https' &&
+              nextUri.scheme.toLowerCase() != 'https')) {
+        throw StateError('Network media redirected to an unsafe URL.');
+      }
+
+      await _deleteNetworkDownload(outputPath);
+      currentUri = nextUri;
+      redirectCount++;
+    }
+  }
+
+  static Uri? _resolveNetworkRedirect(Uri currentUri, String? location) {
+    final normalized = location?.trim();
+    if (normalized == null || normalized.isEmpty) return null;
+    try {
+      return currentUri.resolve(normalized);
+    } on FormatException {
+      return null;
+    }
+  }
+
+  static bool _isAllowedNetworkMediaUri(Uri uri) {
+    if (uri.host.isEmpty || uri.userInfo.isNotEmpty || uri.hasFragment) {
+      return false;
+    }
+    final scheme = uri.scheme.toLowerCase();
+    if (scheme == 'https') return true;
+    return scheme == 'http' &&
+        const {
+          'localhost',
+          '127.0.0.1',
+          '::1',
+        }.contains(uri.host.toLowerCase());
+  }
+
+  static bool _isNonMediaContentType(String? contentType) {
+    if (contentType == null || contentType.isEmpty) return false;
+    return contentType.startsWith('text/') ||
+        contentType.contains('html') ||
+        contentType.contains('json') ||
+        contentType.contains('xml');
+  }
+
+  static Future<bool> _looksLikeHtmlResponse(File file) async {
+    if (!await file.exists() || await file.length() == 0) return false;
+    final reader = await file.open();
+    try {
+      final prefix = await reader.read(math.min(512, await file.length()));
+      final text = utf8
+          .decode(prefix, allowMalformed: true)
+          .trimLeft()
+          .toLowerCase();
+      return text.startsWith('<!doctype html') ||
+          text.startsWith('<html') ||
+          text.startsWith('<head') ||
+          text.startsWith('<body');
+    } finally {
+      await reader.close();
+    }
+  }
+
+  static Future<void> _deleteNetworkDownload(String path) async {
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        final file = File(path);
+        if (await file.exists()) await file.delete();
+        return;
+      } on FileSystemException {
+        if (attempt == 2) return;
+        // Cancellation can release a Windows file handle one event-loop turn
+        // after the request future completes.
+        await Future<void>.delayed(Duration(milliseconds: 25 * (attempt + 1)));
+      }
+    }
   }
 
   static Future<Map<String, dynamic>> _mediaInfoForInput(

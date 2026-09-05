@@ -125,7 +125,14 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
     final user = ref.read(currentUserProvider);
     final ownerUid = user?.uid ?? widget.localOwnerUid;
-    unawaited(_refreshQuotaAndDeviceNotice(user, requestId));
+    // Local desktop mode deliberately has no Firebase-backed transcription or
+    // device quota. Touching the quota service here would still initialize
+    // secure storage and attempt a cloud read, delaying an otherwise entirely
+    // local project library (and hanging on platforms where those plugins are
+    // unavailable). Only cloud-account sessions need this refresh.
+    if (!_isLocalDesktopMode) {
+      unawaited(_refreshQuotaAndDeviceNotice(user, requestId));
+    }
 
     if (ownerUid == null) {
       if (mounted && requestId == _loadRequestId) {
@@ -1173,10 +1180,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                   if (_isLoadingProjects)
                     _buildLoadingSliver(constraints.maxWidth, horizontalPadding)
                   else if (_projects.isEmpty)
-                    SliverFillRemaining(
-                      hasScrollBody: false,
-                      child: _buildEmptyState(),
-                    )
+                    SliverToBoxAdapter(child: _buildEmptyState())
                   else if (projects.isEmpty)
                     SliverFillRemaining(
                       hasScrollBody: false,
@@ -1947,6 +1951,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 460),
           child: Column(
+            mainAxisSize: MainAxisSize.min,
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               const _EmptyFilmFrame(),

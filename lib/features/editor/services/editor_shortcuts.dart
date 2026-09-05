@@ -14,8 +14,14 @@ enum EditorShortcutCommand {
   stepForward,
   nudgeBackward,
   nudgeForward,
+  previousEditPoint,
+  nextEditPoint,
   jumpToStart,
   jumpToEnd,
+  setWorkAreaStart,
+  setWorkAreaEnd,
+  clearWorkArea,
+  toggleSnapping,
   deleteSelectedClip,
   splitAtPlayhead,
   addMarker,
@@ -69,6 +75,24 @@ EditorShortcutCommand? resolveEditorShortcut({
         ? EditorShortcutCommand.nudgeForward
         : EditorShortcutCommand.stepForward;
   }
+  if (key == LogicalKeyboardKey.arrowUp) {
+    return EditorShortcutCommand.previousEditPoint;
+  }
+  if (key == LogicalKeyboardKey.arrowDown) {
+    return EditorShortcutCommand.nextEditPoint;
+  }
+  if (key == LogicalKeyboardKey.keyI) {
+    return EditorShortcutCommand.setWorkAreaStart;
+  }
+  if (key == LogicalKeyboardKey.keyO) {
+    return EditorShortcutCommand.setWorkAreaEnd;
+  }
+  if (alt && key == LogicalKeyboardKey.keyX) {
+    return EditorShortcutCommand.clearWorkArea;
+  }
+  if (key == LogicalKeyboardKey.keyN) {
+    return EditorShortcutCommand.toggleSnapping;
+  }
   if (key == LogicalKeyboardKey.home) {
     return EditorShortcutCommand.jumpToStart;
   }
@@ -93,5 +117,7 @@ bool isRepeatableEditorShortcut(EditorShortcutCommand command) {
   return command == EditorShortcutCommand.stepBackward ||
       command == EditorShortcutCommand.stepForward ||
       command == EditorShortcutCommand.nudgeBackward ||
-      command == EditorShortcutCommand.nudgeForward;
+      command == EditorShortcutCommand.nudgeForward ||
+      command == EditorShortcutCommand.previousEditPoint ||
+      command == EditorShortcutCommand.nextEditPoint;
 }

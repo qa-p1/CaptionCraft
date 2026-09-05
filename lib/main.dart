@@ -5,10 +5,12 @@ import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'app.dart';
+import 'core/utils/desktop_window_close_service.dart';
 import 'firebase_options.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  DesktopWindowCloseService.initialize();
 
   // Browsing stock media can otherwise leave hundreds of full-size thumbnails
   // in Flutter's process-wide cache. Keep a bounded working set so returning
@@ -47,15 +49,19 @@ void main() async {
         // Core auth and local editing remain available. Services that require
         // App Check (notably the production transcription proxy) will reject
         // requests with their own actionable message.
-        debugPrint('Firebase App Check activation failed: $error');
-        debugPrintStack(stackTrace: stackTrace);
+        if (kDebugMode) {
+          debugPrint('Firebase App Check activation failed: $error');
+          debugPrintStack(stackTrace: stackTrace);
+        }
       }
     } catch (error, stackTrace) {
       // Do not terminate before Flutter can render a useful recovery message.
       // The detailed exception remains in development logs without exposing
       // configuration values in the user-facing UI.
-      debugPrint('Firebase initialization failed: $error');
-      debugPrintStack(stackTrace: stackTrace);
+      if (kDebugMode) {
+        debugPrint('Firebase initialization failed: $error');
+        debugPrintStack(stackTrace: stackTrace);
+      }
       launchMode = CaptionCraftLaunchMode.startupFailure;
     }
   }

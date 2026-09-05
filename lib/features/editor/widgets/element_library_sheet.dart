@@ -96,6 +96,8 @@ class _ElementLibrarySheetState extends ConsumerState<ElementLibrarySheet> {
 
   PexelsService? _pexelsService;
   PixabayService? _pixabayService;
+  bool _ownsPexelsService = false;
+  bool _ownsPixabayService = false;
   late ElementLibraryDestination _destination;
 
   Timer? _searchTimer;
@@ -148,9 +150,67 @@ class _ElementLibrarySheetState extends ConsumerState<ElementLibrarySheet> {
   }
 
   @override
+  void didUpdateWidget(covariant ElementLibrarySheet oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final pexelsServiceChanged = !identical(
+      oldWidget.pexelsService,
+      widget.pexelsService,
+    );
+    final pixabayServiceChanged = !identical(
+      oldWidget.pixabayService,
+      widget.pixabayService,
+    );
+    if (pexelsServiceChanged) {
+      if (_ownsPexelsService) _pexelsService?.close();
+      _pexelsService = widget.pexelsService;
+      _ownsPexelsService = false;
+    }
+    if (pixabayServiceChanged) {
+      if (_ownsPixabayService) _pixabayService?.close();
+      _pixabayService = widget.pixabayService;
+      _ownsPixabayService = false;
+    }
+    if (widget.pexelsSearch != null && _ownsPexelsService) {
+      _pexelsService?.close();
+      _pexelsService = null;
+      _ownsPexelsService = false;
+    }
+    if (widget.pixabaySearch != null && _ownsPixabayService) {
+      _pixabayService?.close();
+      _pixabayService = null;
+      _ownsPixabayService = false;
+    }
+
+    final activeSearchSourceChanged = switch (_destination) {
+      ElementLibraryDestination.giphy => !identical(
+        oldWidget.giphySearch,
+        widget.giphySearch,
+      ),
+      ElementLibraryDestination.pexels =>
+        pexelsServiceChanged ||
+            !identical(oldWidget.pexelsSearch, widget.pexelsSearch),
+      ElementLibraryDestination.pixabay =>
+        pixabayServiceChanged ||
+            !identical(oldWidget.pixabaySearch, widget.pixabaySearch),
+      _ => false,
+    };
+    if (activeSearchSourceChanged) {
+      _onlineRequestGeneration++;
+      final destination = _destination;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _destination == destination) {
+          unawaited(_loadOnlineResults());
+        }
+      });
+    }
+  }
+
+  @override
   void dispose() {
     _onlineRequestGeneration++;
     _searchTimer?.cancel();
+    if (_ownsPexelsService) _pexelsService?.close();
+    if (_ownsPixabayService) _pixabayService?.close();
     _onlineSearchController.dispose();
     _packSearchController.dispose();
     super.dispose();
@@ -616,19 +676,25 @@ class _ElementLibrarySheetState extends ConsumerState<ElementLibrarySheet> {
   Future<List<ElementLibraryAsset>> _searchPexels(String query) {
     final callback = widget.pexelsSearch;
     if (callback != null) return callback(query, _pexelsFilter);
-    return (_pexelsService ??= PexelsService()).search(
-      query: query,
-      filter: _pexelsFilter,
-    );
+    var service = _pexelsService;
+    if (service == null) {
+      service = PexelsService();
+      _pexelsService = service;
+      _ownsPexelsService = true;
+    }
+    return service.search(query: query, filter: _pexelsFilter);
   }
 
   Future<List<ElementLibraryAsset>> _searchPixabay(String query) {
     final callback = widget.pixabaySearch;
     if (callback != null) return callback(query, _pixabayFilter);
-    return (_pixabayService ??= PixabayService()).search(
-      query: query,
-      filter: _pixabayFilter,
-    );
+    var service = _pixabayService;
+    if (service == null) {
+      service = PixabayService();
+      _pixabayService = service;
+      _ownsPixabayService = true;
+    }
+    return service.search(query: query, filter: _pixabayFilter);
   }
 
   ElementLibraryAsset _normalizeGiphyResult(GiphyAssetResult result) {

@@ -3,6 +3,8 @@
 #include <dwmapi.h>
 #include <flutter_windows.h>
 
+#include <algorithm>
+
 #include "resource.h"
 
 namespace {
@@ -134,10 +136,31 @@ bool Win32Window::Create(const std::wstring& title,
   UINT dpi = FlutterDesktopGetDpiForMonitor(monitor);
   double scale_factor = dpi / 96.0;
 
+  MONITORINFO monitor_info{};
+  monitor_info.cbSize = sizeof(monitor_info);
+  if (!GetMonitorInfo(monitor, &monitor_info)) {
+    monitor_info.rcWork.left = 0;
+    monitor_info.rcWork.top = 0;
+    monitor_info.rcWork.right = GetSystemMetrics(SM_CXSCREEN);
+    monitor_info.rcWork.bottom = GetSystemMetrics(SM_CYSCREEN);
+  }
+  const int work_width =
+      std::max(1L, monitor_info.rcWork.right - monitor_info.rcWork.left);
+  const int work_height =
+      std::max(1L, monitor_info.rcWork.bottom - monitor_info.rcWork.top);
+  const int scaled_width = std::min(Scale(size.width, scale_factor), work_width);
+  const int scaled_height =
+      std::min(Scale(size.height, scale_factor), work_height);
+  const int scaled_x = std::clamp(
+      Scale(origin.x, scale_factor), static_cast<int>(monitor_info.rcWork.left),
+      static_cast<int>(monitor_info.rcWork.right - scaled_width));
+  const int scaled_y = std::clamp(
+      Scale(origin.y, scale_factor), static_cast<int>(monitor_info.rcWork.top),
+      static_cast<int>(monitor_info.rcWork.bottom - scaled_height));
+
   HWND window = CreateWindow(
       window_class, title.c_str(), WS_OVERLAPPEDWINDOW,
-      Scale(origin.x, scale_factor), Scale(origin.y, scale_factor),
-      Scale(size.width, scale_factor), Scale(size.height, scale_factor),
+      scaled_x, scaled_y, scaled_width, scaled_height,
       nullptr, nullptr, GetModuleHandle(nullptr), this);
 
   if (!window) {

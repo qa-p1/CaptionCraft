@@ -14,6 +14,13 @@ service cloud.firestore {
       return value is timestamp && value == request.time;
     }
 
+    function ownsExistingQuota() {
+      return signedIn()
+        && resource != null
+        && resource.data.bound_uid is string
+        && resource.data.bound_uid == request.auth.uid;
+    }
+
     match /users/{uid} {
       allow read, create, update, delete: if owns(uid);
     }
@@ -28,7 +35,11 @@ service cloud.firestore {
     }
 
     match /device_quotas/{fingerprint} {
-      allow get: if signedIn();
+      // A transaction must be able to observe that its own random
+      // installation fingerprint is unused before creating it. Existing quota
+      // documents, however, contain account data and are owner-readable only.
+      allow get: if signedIn()
+        && (resource == null || ownsExistingQuota());
       allow list: if false;
 
       allow create: if signedIn()
@@ -45,13 +56,22 @@ service cloud.firestore {
         && isCurrentServerTimestamp(request.resource.data.created_at)
         && isCurrentServerTimestamp(request.resource.data.last_used_at);
 
-      allow update: if signedIn()
+      allow update: if ownsExistingQuota()
+        && request.resource.data.keys().hasOnly([
+          'runs_used',
+          'bound_uid',
+          'created_at',
+          'last_used_at'
+        ])
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
           'runs_used',
           'last_used_at'
         ])
-        && resource.data.bound_uid is string
+        && request.resource.data.bound_uid is string
+        && request.resource.data.bound_uid == request.auth.uid
         && request.resource.data.bound_uid == resource.data.bound_uid
+        && resource.data.created_at is timestamp
+        && request.resource.data.created_at == resource.data.created_at
         && resource.data.runs_used is int
         && request.resource.data.runs_used is int
         && request.resource.data.runs_used > resource.data.runs_used

@@ -1,9 +1,14 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:caption_craft/core/theme/app_theme.dart';
+import 'package:caption_craft/core/utils/desktop_window_close_service.dart';
 import 'package:caption_craft/features/auth/providers/auth_provider.dart';
 import 'package:caption_craft/features/editor/models/subtitle_entry.dart';
 import 'package:caption_craft/features/editor/models/subtitle_style_model.dart';
 import 'package:caption_craft/features/editor/models/timeline_models.dart';
 import 'package:caption_craft/features/editor/providers/editor_provider.dart';
+import 'package:caption_craft/features/editor/providers/playback_provider.dart';
 import 'package:caption_craft/features/editor/providers/subtitle_provider.dart';
 import 'package:caption_craft/features/editor/screens/editor_screen.dart';
 import 'package:caption_craft/features/editor/widgets/subtitle_edit_modal.dart';
@@ -11,16 +16,37 @@ import 'package:caption_craft/features/home/screens/home_screen.dart';
 import 'package:caption_craft/shared/models/project_model.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  late Directory documentsDirectory;
+
+  setUp(() async {
+    await ProjectLocalStorage.waitForPendingSavesForTesting();
+    documentsDirectory = await Directory.systemTemp.createTemp(
+      'captioncraft_editor_widget_',
+    );
+    ProjectLocalStorage.setDocumentsDirectoryForTesting(documentsDirectory);
+  });
+
+  tearDown(() async {
+    await ProjectLocalStorage.waitForPendingSavesForTesting();
+    ProjectLocalStorage.setDocumentsDirectoryForTesting(null);
+    if (await documentsDirectory.exists()) {
+      await documentsDirectory.delete(recursive: true);
+    }
+  });
+
   testWidgets('a newly created project mounts the editor on a phone', (
     tester,
   ) async {
     _setTestView(tester, const Size(390, 844));
     final project = _freshProject();
 
-    await tester.pumpWidget(_testApp(home: EditorScreen(project: project)));
+    await tester.pumpWidget(
+      _testApp(home: EditorScreen.withoutPersistence(project: project)),
+    );
     await tester.pump(const Duration(milliseconds: 500));
 
     expect(find.text(project.name), findsOneWidget);
@@ -36,6 +62,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 300));
     expect(find.byType(EditorScreen), findsOneWidget);
     expect(tester.takeException(), isNull);
+    await _disposeEditorAndDrain(tester);
   });
 
   testWidgets('a restored legacy project opens from the home screen', (
@@ -67,7 +94,7 @@ void main() {
     expect(tester.takeException(), isNull);
 
     await tester.pageBack();
-    await tester.pumpAndSettle();
+    await _waitForEditorToClose(tester);
 
     expect(find.byType(HomeScreen), findsOneWidget);
     expect(tester.takeException(), isNull);
@@ -87,7 +114,7 @@ void main() {
         child: MaterialApp(
           debugShowCheckedModeBanner: false,
           theme: AppTheme.darkTheme,
-          home: EditorScreen(project: _freshProject()),
+          home: EditorScreen.withoutPersistence(project: _freshProject()),
         ),
       ),
     );
@@ -188,6 +215,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.byType(EditorScreen), findsOneWidget);
     expect(tester.takeException(), isNull);
+    await _disposeEditorAndDrain(tester);
   });
 
   testWidgets('compact add choices stay fixed and libraries resize', (
@@ -204,7 +232,7 @@ void main() {
         child: MaterialApp(
           debugShowCheckedModeBanner: false,
           theme: AppTheme.darkTheme,
-          home: EditorScreen(project: _layeredProject()),
+          home: EditorScreen.withoutPersistence(project: _layeredProject()),
         ),
       ),
     );
@@ -337,6 +365,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Library placeholder'), findsOneWidget);
     expect(tester.takeException(), isNull);
+    await _disposeEditorAndDrain(tester);
   });
 
   testWidgets('subtitle editor saves before dismiss without dispose errors', (
@@ -374,6 +403,323 @@ void main() {
     expect(container.read(subtitleProvider).entries.single.text, 'After edit');
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets('opening a project clears stale playback state', (tester) async {
+    _setTestView(tester, const Size(1180, 820));
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
+    addTearDown(container.dispose);
+    container.read(playbackProvider.notifier)
+      ..updateDuration(const Duration(seconds: 30))
+      ..updatePosition(const Duration(seconds: 17))
+      ..requestTransport(PlaybackTransportCommand.playForward);
+
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: MaterialApp(
+          theme: AppTheme.darkTheme,
+          home: EditorScreen.withoutPersistence(project: _freshProject()),
+        ),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 600));
+
+    expect(container.read(playbackProvider).position, Duration.zero);
+    expect(container.read(playbackProvider).pendingTransportCommand, isNull);
+    expect(tester.takeException(), isNull);
+    await _disposeEditorAndDrain(tester);
+  });
+
+  testWidgets('desktop shortcuts update work range and snapping state', (
+    tester,
+  ) async {
+    _setTestView(tester, const Size(1180, 820));
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
+    addTearDown(container.dispose);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: MaterialApp(
+          theme: AppTheme.darkTheme,
+          home: EditorScreen.withoutPersistence(project: _freshProject()),
+        ),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 600));
+
+    final shortcutRegion = find.byKey(
+      const ValueKey('editor_keyboard_shortcut_focus'),
+    );
+    final scaffold = find.descendant(
+      of: shortcutRegion,
+      matching: find.byType(Scaffold),
+    );
+    Focus.of(tester.element(scaffold)).requestFocus();
+    await tester.pump();
+
+    final playback = container.read(playbackProvider.notifier)
+      ..updateDuration(const Duration(seconds: 12))
+      ..updatePosition(const Duration(seconds: 3));
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyI);
+    expect(
+      container.read(editorProvider).timeline.workspaceSettings.workAreaStart,
+      const Duration(seconds: 3),
+    );
+
+    playback.updatePosition(const Duration(seconds: 8));
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyO);
+    var workspace = container.read(editorProvider).timeline.workspaceSettings;
+    expect(workspace.workAreaEnd, const Duration(seconds: 8));
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyN);
+    workspace = container.read(editorProvider).timeline.workspaceSettings;
+    expect(workspace.snapping.enabled, isFalse);
+
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyX);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
+    workspace = container.read(editorProvider).timeline.workspaceSettings;
+    expect(workspace.workAreaStart, isNull);
+    expect(workspace.workAreaEnd, isNull);
+
+    playback.updatePosition(const Duration(seconds: 8));
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyO);
+    playback.updatePosition(const Duration(seconds: 9));
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyI);
+    workspace = container.read(editorProvider).timeline.workspaceSettings;
+    expect(workspace.workAreaStart, const Duration(seconds: 9));
+    expect(workspace.workAreaEnd, isNull);
+
+    playback.updatePosition(const Duration(seconds: 4));
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyO);
+    workspace = container.read(editorProvider).timeline.workspaceSettings;
+    expect(workspace.workAreaStart, isNull);
+    expect(workspace.workAreaEnd, const Duration(seconds: 4));
+    expect(tester.takeException(), isNull);
+    await _disposeEditorAndDrain(tester);
+  });
+
+  testWidgets('back navigation waits for the latest local project save', (
+    tester,
+  ) async {
+    _setTestView(tester, const Size(1180, 820));
+    final project = _freshProject();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
+    addTearDown(container.dispose);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: MaterialApp(
+          theme: AppTheme.darkTheme,
+          home: Builder(
+            builder: (context) => Scaffold(
+              body: Center(
+                child: FilledButton(
+                  key: const ValueKey('open-editor'),
+                  onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => EditorScreen(project: project),
+                    ),
+                  ),
+                  child: const Text('Open editor'),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.byKey(const ValueKey('open-editor')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 600));
+
+    container
+        .read(editorProvider.notifier)
+        .setWorkspaceSettings(
+          (settings) => settings.copyWith(
+            snapping: settings.snapping.copyWith(enabled: false),
+          ),
+        );
+    await tester.pump();
+    final shortcutRegion = find.byKey(
+      const ValueKey('editor_keyboard_shortcut_focus'),
+    );
+    final editorScaffold = find.descendant(
+      of: shortcutRegion,
+      matching: find.byType(Scaffold),
+    );
+    Focus.of(tester.element(editorScaffold)).requestFocus();
+    await tester.pump();
+    await tester.pageBack();
+    await tester.pump();
+    expect(
+      find.byType(EditorScreen),
+      findsOneWidget,
+      reason: 'The route must remain mounted until its local write completes.',
+    );
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyN);
+    expect(
+      container
+          .read(editorProvider)
+          .timeline
+          .workspaceSettings
+          .snapping
+          .enabled,
+      isFalse,
+      reason: 'Keyboard edits must be blocked after the exit save begins.',
+    );
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 100)),
+    );
+    await _waitForEditorToClose(tester);
+
+    expect(find.byType(EditorScreen), findsNothing);
+    final saved = await tester.runAsync(
+      () => ProjectLocalStorage.loadProject(project.id),
+    );
+    expect(saved, isNotNull);
+    expect(saved!.timeline.workspaceSettings.snapping.enabled, isFalse);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('native Windows close waits for the latest local project save', (
+    tester,
+  ) async {
+    _setTestView(tester, const Size(1180, 820));
+    final project = _freshProject();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
+    addTearDown(container.dispose);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: MaterialApp(
+          theme: AppTheme.darkTheme,
+          home: EditorScreen(project: project),
+        ),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 600));
+
+    container
+        .read(editorProvider.notifier)
+        .setWorkspaceSettings(
+          (settings) => settings.copyWith(
+            snapping: settings.snapping.copyWith(enabled: false),
+          ),
+        );
+    await tester.pump();
+
+    final closeRequest = DesktopWindowCloseService.requestCloseForTesting();
+    bool? closeAllowed;
+    Object? closeError;
+    unawaited(
+      closeRequest.then<void>(
+        (value) => closeAllowed = value,
+        onError: (Object error) => closeError = error,
+      ),
+    );
+    for (var attempt = 0; attempt < 40 && closeAllowed == null; attempt++) {
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 20)),
+      );
+      await tester.pump(const Duration(milliseconds: 50));
+    }
+    expect(closeError, isNull);
+    expect(closeAllowed, isTrue);
+    expect(
+      find.byType(EditorScreen),
+      findsOneWidget,
+      reason: 'The native runner owns process shutdown after save approval.',
+    );
+
+    final saved = await tester.runAsync(
+      () => ProjectLocalStorage.loadProject(project.id),
+    );
+    expect(saved, isNotNull);
+    expect(saved!.timeline.workspaceSettings.snapping.enabled, isFalse);
+    expect(tester.takeException(), isNull);
+
+    await _disposeEditorAndDrain(tester);
+    expect(
+      await DesktopWindowCloseService.requestCloseForTesting(),
+      isTrue,
+      reason: 'With no editor mounted, Windows can close immediately.',
+    );
+  });
+
+  testWidgets('a failed exit save keeps the editor open unless confirmed', (
+    tester,
+  ) async {
+    _setTestView(tester, const Size(1180, 820));
+    final blockedPath =
+        '${documentsDirectory.path}${Platform.pathSeparator}not_a_directory';
+    await tester.runAsync(() => File(blockedPath).writeAsString('blocked'));
+    ProjectLocalStorage.setDocumentsDirectoryForTesting(Directory(blockedPath));
+
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
+    addTearDown(container.dispose);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: MaterialApp(
+          theme: AppTheme.darkTheme,
+          home: Builder(
+            builder: (context) => Scaffold(
+              body: FilledButton(
+                key: const ValueKey('open-editor-with-blocked-storage'),
+                onPressed: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) => EditorScreen(project: _freshProject()),
+                  ),
+                ),
+                child: const Text('Open editor'),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(
+      find.byKey(const ValueKey('open-editor-with-blocked-storage')),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 600));
+
+    await tester.pageBack();
+    await tester.pump();
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 100)),
+    );
+    await _waitForText(tester, 'Project could not be saved');
+    expect(find.text('Project could not be saved'), findsOneWidget);
+    expect(find.byType(EditorScreen), findsOneWidget);
+
+    await tester.tap(find.text('Keep editing'));
+    await tester.pump();
+    expect(find.byType(EditorScreen), findsOneWidget);
+
+    await tester.pageBack();
+    await tester.pump();
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 100)),
+    );
+    await _waitForText(tester, 'Project could not be saved');
+    await tester.tap(find.text('Leave without saving'));
+    await tester.pump();
+    await _waitForEditorToClose(tester);
+    expect(find.byType(EditorScreen), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
 }
 
 Widget _testApp({required Widget home}) {
@@ -394,6 +740,34 @@ void _setTestView(WidgetTester tester, Size size) {
     tester.view.resetDevicePixelRatio();
     tester.view.resetPhysicalSize();
   });
+}
+
+Future<void> _waitForEditorToClose(WidgetTester tester) async {
+  for (var attempt = 0; attempt < 40; attempt++) {
+    if (find.byType(EditorScreen).evaluate().isEmpty) return;
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 20)),
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+  }
+  fail('Editor did not close after its bounded save wait.');
+}
+
+Future<void> _disposeEditorAndDrain(WidgetTester tester) async {
+  await tester.pumpWidget(const SizedBox.shrink());
+  await tester.pump();
+  await tester.runAsync(ProjectLocalStorage.waitForPendingSavesForTesting);
+}
+
+Future<void> _waitForText(WidgetTester tester, String text) async {
+  for (var attempt = 0; attempt < 40; attempt++) {
+    await tester.pump(const Duration(milliseconds: 50));
+    if (find.text(text).evaluate().isNotEmpty) return;
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 20)),
+    );
+  }
+  fail('Timed out waiting for "$text".');
 }
 
 Project _freshProject() {

@@ -15,11 +15,14 @@ class PixabayService {
   final Dio _client;
   final String _apiKey;
   final Uri _baseUri;
+  final bool _ownsClient;
+  bool _closed = false;
 
   PixabayService({Dio? client, String? apiKey, String? baseUrl})
     : _client = client ?? _createClient(),
       _apiKey = (apiKey ?? PixabayConstants.apiKey).trim(),
-      _baseUri = _parseBaseUrl(baseUrl ?? PixabayConstants.baseUrl);
+      _baseUri = _parseBaseUrl(baseUrl ?? PixabayConstants.baseUrl),
+      _ownsClient = client == null;
 
   Future<List<ElementLibraryAsset>> search({
     String query = '',
@@ -27,6 +30,7 @@ class PixabayService {
     int page = 1,
     int limit = PixabayConstants.defaultLimit,
   }) async {
+    _ensureOpen();
     _ensureApiKey();
     final normalizedQuery = query.trim();
     final safePage = math.max(1, page);
@@ -291,6 +295,18 @@ class PixabayService {
     if (_apiKey.isEmpty) {
       throw StateError('Missing PIXABAY_API_KEY configuration.');
     }
+  }
+
+  void _ensureOpen() {
+    if (_closed) throw StateError('PixabayService is closed.');
+  }
+
+  /// Cancels requests and releases sockets only when this service created the
+  /// underlying client. A caller-injected client remains caller-owned.
+  void close() {
+    if (_closed) return;
+    _closed = true;
+    if (_ownsClient) _client.close(force: true);
   }
 
   static Dio _createClient() => Dio(

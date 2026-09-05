@@ -32,6 +32,10 @@ class FlutterWindow : public Win32Window {
   std::unique_ptr<flutter::FlutterViewController> flutter_controller_;
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
       storage_channel_;
+  std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
+      window_lifecycle_channel_;
+  bool close_request_pending_ = false;
+  bool close_approved_ = false;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

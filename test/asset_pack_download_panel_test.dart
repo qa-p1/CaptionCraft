@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:caption_craft/core/theme/app_theme.dart';
 import 'package:caption_craft/features/editor/widgets/asset_pack_download_panel.dart';
 import 'package:flutter/material.dart';
@@ -369,26 +371,33 @@ void main() {
     expect(find.text('Still used by Project One.'), findsOne);
   });
 
-  testWidgets('available pack visual regression', (tester) async {
-    await tester.binding.setSurfaceSize(const Size(430, 800));
-    addTearDown(() => tester.binding.setSurfaceSize(null));
-    await _pumpPanel(
-      tester,
-      model: _model(
-        AssetPackPanelStage.available,
-        version: '1.0.0',
-        assetCount: 40,
-        downloadBytes: _downloadBytes,
-        temporarySpaceBytes: _temporarySpaceBytes,
-      ),
-      onDownload: () {},
-    );
+  testWidgets(
+    'available pack visual regression',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(430, 800));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await _pumpPanel(
+        tester,
+        model: _model(
+          AssetPackPanelStage.available,
+          version: '1.0.0',
+          assetCount: 40,
+          downloadBytes: _downloadBytes,
+          temporarySpaceBytes: _temporarySpaceBytes,
+        ),
+        onDownload: () {},
+      );
 
-    await expectLater(
-      find.byType(Scaffold),
-      matchesGoldenFile('goldens/asset_pack_download_available.png'),
-    );
-  });
+      await expectLater(
+        find.byType(Scaffold),
+        matchesGoldenFile('goldens/asset_pack_download_available.png'),
+      );
+    },
+    // Flutter's text and anti-aliasing rasterization is OS-specific. Linux is
+    // the pinned canonical renderer in CI; semantic widget coverage above runs
+    // on every platform.
+    skip: !Platform.isLinux,
+  );
 }
 
 AssetPackDownloadViewModel _model(

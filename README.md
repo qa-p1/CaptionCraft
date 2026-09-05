@@ -1,9 +1,8 @@
 # CaptionCraft
 
 CaptionCraft is a local-first Flutter video editor for Android, iOS, and
-Windows. It
-combines a multi-track timeline, word-timed captions, Creator Lab tools, and an
-FFmpeg H.264/AAC export pipeline.
+Windows. It combines a multi-track timeline, word-timed captions, Creator Lab
+tools, and an FFmpeg H.264/AAC export pipeline.
 
 ## Highlights
 
