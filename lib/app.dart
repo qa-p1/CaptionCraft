@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'core/constants/app_mode_constants.dart';
 import 'core/theme/app_theme.dart';
 import 'core/utils/firebase_service.dart';
+import 'core/utils/api_key_vault.dart';
 import 'features/auth/screens/login_screen.dart';
 import 'features/home/screens/home_screen.dart';
 import 'features/auth/providers/auth_provider.dart';
@@ -30,6 +31,7 @@ class CaptionCraftApp extends ConsumerWidget {
       );
     }
     if (launchMode == CaptionCraftLaunchMode.localDesktop) {
+      ApiKeys.selectOwner(localDesktopOwnerUid, cloud: false);
       return MaterialApp(
         title: 'CaptionCraft',
         debugShowCheckedModeBanner: false,
@@ -46,17 +48,20 @@ class CaptionCraftApp extends ConsumerWidget {
       theme: AppTheme.darkTheme,
       home: authState.when(
         data: (user) {
+          ApiKeys.selectOwner(user?.uid);
           if (user == null) {
             return const LoginScreen();
           }
-          return const HomeScreen();
+          return HomeScreen(key: ValueKey(user.uid));
         },
         loading: () => const _AppBootScreen(),
         error: (error, _) {
           // A transient auth-stream failure is not a sign-out event. Keep an
           // already restored Firebase session usable; otherwise offer retry.
           if (FirebaseService.currentUser != null) {
-            return const HomeScreen();
+            final uid = FirebaseService.currentUser!.uid;
+            ApiKeys.selectOwner(uid);
+            return HomeScreen(key: ValueKey(uid));
           }
           return _AppAuthErrorScreen(
             message: error.toString(),

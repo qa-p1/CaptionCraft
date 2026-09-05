@@ -1,57 +1,30 @@
 import 'package:caption_craft/core/constants/groq_constants.dart';
+import 'package:caption_craft/core/utils/api_key_vault.dart';
 import 'package:caption_craft/core/utils/groq_service.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('release transcription requires a valid HTTPS proxy', () {
-    expect(
-      GroqConstants.isConfiguredFor(
-        proxyUrl: '',
-        apiKey: 'must-not-be-used-in-a-client',
-        releaseMode: true,
-      ),
-      isFalse,
-    );
-    expect(
-      GroqConstants.isConfiguredFor(
-        proxyUrl: 'https://api.example.com/v1/transcribe',
-        apiKey: '',
-        releaseMode: true,
-      ),
-      isTrue,
-    );
-    expect(
-      GroqConstants.isConfiguredFor(
-        proxyUrl: 'http://api.example.com/transcribe',
-        apiKey: '',
-        releaseMode: true,
-      ),
-      isFalse,
-    );
-  });
+  test(
+    'missing user key gives Settings guidance without requiring a proxy',
+    () {
+      ApiKeys.selectOwner(null);
+      expect(GroqConstants.apiKey, isEmpty);
+      expect(GroqService.isConfigured, isFalse);
+      expect(
+        GroqService.ensureConfigured,
+        throwsA(predicate((e) => e.toString().contains('Settings'))),
+      );
+    },
+  );
 
-  test('transcription proxy validation rejects credential and query leaks', () {
-    expect(
-      GroqConstants.validatedProxyUri(
-        'https://user:secret@example.com/transcribe',
-        allowLoopbackHttp: false,
-      ),
-      isNull,
+  test('transcription endpoint is fixed HTTPS without user credentials', () {
+    final endpoint = Uri.parse(
+      '${GroqConstants.baseUrl}${GroqConstants.transcriptionsEndpoint}',
     );
-    expect(
-      GroqConstants.validatedProxyUri(
-        'https://example.com/transcribe?token=secret',
-        allowLoopbackHttp: false,
-      ),
-      isNull,
-    );
-    expect(
-      GroqConstants.validatedProxyUri(
-        'http://127.0.0.1:8080/transcribe',
-        allowLoopbackHttp: true,
-      ),
-      isNotNull,
-    );
+    expect(endpoint.scheme, 'https');
+    expect(endpoint.host, 'api.groq.com');
+    expect(endpoint.userInfo, isEmpty);
+    expect(endpoint.query, isEmpty);
   });
 
   test('Groq word parsing clamps or rejects invalid timestamps', () {

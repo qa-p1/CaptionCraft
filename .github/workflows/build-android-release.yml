@@ -9,7 +9,6 @@ on:
       - "android/**"
       - "assets/**"
       - "captioncraft_logo.svg"
-      - ".env.example"
       - "pubspec.yaml"
       - "pubspec.lock"
       - ".github/workflows/build-android-release.yml"
@@ -68,11 +67,6 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL: ${{ vars.CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL }}
-          GIPHY_API_KEY: ${{ secrets.GIPHY_API_KEY }}
-          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
-          CAPTIONCRAFT_ASSET_MANIFEST_URL: ${{ vars.CAPTIONCRAFT_ASSET_MANIFEST_URL }}
         run: |
           set -euo pipefail
           required_values=(
@@ -80,11 +74,6 @@ jobs:
             ANDROID_KEYSTORE_PASSWORD
             ANDROID_KEY_ALIAS
             ANDROID_KEY_PASSWORD
-            CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL
-            GIPHY_API_KEY
-            PEXELS_API_KEY
-            PIXABAY_API_KEY
-            CAPTIONCRAFT_ASSET_MANIFEST_URL
           )
           missing_values=false
           for value_name in "${required_values[@]}"; do
@@ -105,20 +94,13 @@ jobs:
           keyAlias=$ANDROID_KEY_ALIAS
           keyPassword=$ANDROID_KEY_PASSWORD
           EOF
-          printf '%s\n' \
-            "CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL=$CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL" \
-            "GIPHY_API_KEY=$GIPHY_API_KEY" \
-            "PEXELS_API_KEY=$PEXELS_API_KEY" \
-            "PIXABAY_API_KEY=$PIXABAY_API_KEY" \
-            "CAPTIONCRAFT_ASSET_MANIFEST_URL=$CAPTIONCRAFT_ASSET_MANIFEST_URL" \
-            > "$RUNNER_TEMP/captioncraft.env"
 
       - name: Build signed app bundle and APKs
         shell: bash
         run: |
           set -euo pipefail
-          flutter build appbundle --release --dart-define-from-file="$RUNNER_TEMP/captioncraft.env"
-          flutter build apk --release --split-per-abi --dart-define-from-file="$RUNNER_TEMP/captioncraft.env"
+          flutter build appbundle --release
+          flutter build apk --release --split-per-abi
 
       - name: Verify signed outputs
         shell: bash
@@ -180,4 +162,4 @@ jobs:
       - name: Remove signing material
         if: always()
         shell: bash
-        run: rm -f android/upload-keystore.jks android/key.properties "$RUNNER_TEMP/captioncraft.env"
+        run: rm -f android/upload-keystore.jks android/key.properties

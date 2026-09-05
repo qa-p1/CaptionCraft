@@ -14,20 +14,28 @@ tools, and an FFmpeg H.264/AAC export pipeline.
 ## Run locally
 
 ```sh
-cp .env.example .env
-# For local debug transcription, add GROQ_API_KEY. Production releases ignore
-# direct Groq keys and require CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL.
-# Add GIPHY_API_KEY, PEXELS_API_KEY, and PIXABAY_API_KEY as needed.
-# Set CAPTIONCRAFT_ASSET_MANIFEST_URL after publishing optional media packs.
 flutter pub get
-flutter run --dart-define-from-file=.env
+flutter run
 ```
+
+On first login, optionally connect Groq, GIPHY, Pexels and Pixabay in
+**Settings → Connected services**. Each provider link opens in your device's
+browser. Editing, manual captions and export work without keys. No .env file,
+embedded developer API key, or transcription proxy is required.
+
+Keys are encrypted with AES-256-GCM before cloud backup and cached in the
+device's secure storage. Keep the recovery code in a password manager: another
+device or reinstall needs it once to unlock the backup. CaptionCraft cannot
+recover a lost code. Windows local mode stores keys on that PC only.
+If the code is lost, Settings can replace the locked backup after confirmation;
+you will need to enter your provider keys again. See [Connected services](docs/connected-services.md)
+for setup, privacy, offline behavior and recovery details.
 
 Firebase client options are tracked. Deploy the matching Firestore policy before
 using cloud sync:
 
 ```sh
-firebase deploy --only firestore:rules
+firebase deploy --only firestore:rules --project captioncraft-b1abb
 ```
 
 ## Verify and build
@@ -35,8 +43,8 @@ firebase deploy --only firestore:rules
 ```sh
 flutter analyze
 flutter test
-flutter build apk --release --split-per-abi --dart-define-from-file=.env
-flutter build windows --release --dart-define-from-file=.env
+flutter build apk --release --split-per-abi
+flutter build windows --release
 ```
 
 Release builds require `android/key.properties` with `storeFile`,
@@ -96,7 +104,8 @@ unchanged.
 
 ## Distribution note
 
-Do not ship a Groq key in a public client: proxy transcription through an
-authenticated backend with App Check and server-side quota enforcement. The
+Users supply their own service credentials at runtime. No developer API keys
+are embedded in binaries. Requests use the provider's HTTPS API; users manage
+quotas, billing, and revocation in their provider accounts. The
 FFmpeg package includes Full-GPL components, so satisfy its licensing and source
 distribution requirements before publishing binaries.

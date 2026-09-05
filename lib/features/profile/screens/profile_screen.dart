@@ -3,10 +3,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/utils/firebase_service.dart';
+import '../../../core/utils/api_key_vault.dart';
+import '../../settings/screens/api_settings_screen.dart';
 import '../../../shared/widgets/captioncraft_brand.dart';
 import '../../../shared/widgets/snack_bar_helper.dart';
 import '../../auth/providers/auth_provider.dart';
-import '../../quota/providers/quota_provider.dart';
 
 class ProfileScreen extends ConsumerStatefulWidget {
   const ProfileScreen({super.key});
@@ -21,7 +22,6 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
   @override
   Widget build(BuildContext context) {
     final user = ref.watch(currentUserProvider);
-    final quota = ref.watch(quotaProvider);
     final authState = ref.watch(authNotifierProvider);
     final isBusy = authState is AsyncLoading || _isUpdatingProfile;
 
@@ -98,7 +98,7 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
                 email: email,
                 enabled: !isBusy,
               );
-              final usage = _buildUsageCard(quota);
+              final usage = _buildUsageCard();
               final workspace = _buildWorkspaceCard();
               final account = _buildActionCard(
                 user: user,
@@ -339,82 +339,18 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
     );
   }
 
-  Widget _buildUsageCard(QuotaState quota) {
-    final used = quota.runsUsed.clamp(0, quota.maxRuns);
-    final remaining = quota.remaining;
-    return _StudioCard(
+  Widget _buildUsageCard() {
+    return const _StudioCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Row(
-            children: [
-              _SectionIcon(icon: Icons.closed_caption_rounded),
-              SizedBox(width: 11),
-              Expanded(
-                child: Text(
-                  'Automatic captions',
-                  style: TextStyle(
-                    color: kTextPrimary,
-                    fontSize: 17,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-              ),
-              Text(
-                'DEVICE PLAN',
-                style: TextStyle(
-                  color: kTextSecondary,
-                  fontSize: 8,
-                  fontWeight: FontWeight.w900,
-                  letterSpacing: 1.1,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 22),
           Text(
-            quota.isLoading ? 'Checking usage…' : '$remaining runs available',
-            style: const TextStyle(
-              color: kTextPrimary,
-              fontSize: 25,
-              fontWeight: FontWeight.w900,
-              letterSpacing: -0.65,
-            ),
+            'Your services, your usage',
+            style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
           ),
-          const SizedBox(height: 7),
+          SizedBox(height: 12),
           Text(
-            quota.isLoading
-                ? 'Usage is securely tied to this device.'
-                : '$used of ${quota.maxRuns} successful transcription runs used. '
-                      'Failed and cancelled attempts are not charged.',
-            style: const TextStyle(
-              color: kTextSecondary,
-              fontSize: 12,
-              height: 1.5,
-            ),
-          ),
-          const SizedBox(height: 19),
-          Row(
-            children: List.generate(quota.maxRuns, (index) {
-              final consumed = index < used;
-              return Expanded(
-                child: Container(
-                  height: 8,
-                  margin: EdgeInsets.only(
-                    right: index == quota.maxRuns - 1 ? 0 : 7,
-                  ),
-                  decoration: BoxDecoration(
-                    color: consumed ? kAccent : kSurfaceHigh,
-                    borderRadius: BorderRadius.circular(999),
-                    border: Border.all(
-                      color: consumed
-                          ? kAccent.withValues(alpha: 0.7)
-                          : kBorder,
-                    ),
-                  ),
-                ),
-              );
-            }),
+            'Connect your own Groq key in Settings for automatic captions. Your provider account controls quotas and billing. Manual captions, editing and exports require no API keys.',
           ),
         ],
       ),
@@ -494,6 +430,23 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
               enabled: !isBusy,
               onTap: () => _handlePasswordReset(user.email!),
             ),
+          _ActionTile(
+            icon: Icons.key_rounded,
+            title: 'Settings · Connected services',
+            subtitle: 'Manage your API keys and encrypted backup',
+            enabled: !isBusy,
+            onTap: () {
+              final vault = ApiKeys.active;
+              if (vault != null) {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute<void>(
+                    builder: (_) => ApiSettingsScreen(vault: vault),
+                  ),
+                );
+              }
+            },
+          ),
           _ActionTile(
             icon: Icons.description_outlined,
             title: 'Open-source licenses',

@@ -9,7 +9,6 @@ on:
       - "ios/**"
       - "assets/**"
       - "captioncraft_logo.svg"
-      - ".env.example"
       - "pubspec.yaml"
       - "pubspec.lock"
       - ".github/workflows/build-ios-ipa.yml"
@@ -62,49 +61,7 @@ jobs:
           echo "CAPTIONCRAFT_RELEASE_VERSION=$release_version" >> "$GITHUB_ENV"
 
       - name: Build unsigned iPhone application
-        shell: bash
-        env:
-          CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL: ${{ vars.CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL }}
-          GIPHY_API_KEY: ${{ secrets.GIPHY_API_KEY }}
-          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
-          CAPTIONCRAFT_ASSET_MANIFEST_URL: ${{ vars.CAPTIONCRAFT_ASSET_MANIFEST_URL }}
-        run: |
-          set -euo pipefail
-
-          required_values=(
-            CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL
-            GIPHY_API_KEY
-            PEXELS_API_KEY
-            PIXABAY_API_KEY
-            CAPTIONCRAFT_ASSET_MANIFEST_URL
-          )
-          missing_values=false
-          for value_name in "${required_values[@]}"; do
-            if [[ -z "${!value_name:-}" ]]; then
-              echo "::error::Missing GitHub Actions configuration: $value_name"
-              missing_values=true
-            fi
-          done
-          if [[ "$missing_values" == true ]]; then
-            exit 1
-          fi
-
-          define_file="$RUNNER_TEMP/captioncraft.env"
-          trap 'rm -f "$define_file"' EXIT
-          umask 077
-          printf '%s\n' \
-            "CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL=$CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL" \
-            "GIPHY_API_KEY=$GIPHY_API_KEY" \
-            "PEXELS_API_KEY=$PEXELS_API_KEY" \
-            "PIXABAY_API_KEY=$PIXABAY_API_KEY" \
-            "CAPTIONCRAFT_ASSET_MANIFEST_URL=$CAPTIONCRAFT_ASSET_MANIFEST_URL" \
-            > "$define_file"
-
-          flutter build ios \
-            --release \
-            --no-codesign \
-            --dart-define-from-file="$define_file"
+        run: flutter build ios --release --no-codesign
 
       - name: Package unsigned IPA
         shell: bash

@@ -12,9 +12,10 @@ import 'package:uuid/uuid.dart';
 
 import '../../../core/theme/app_theme.dart';
 import '../../../core/theme/text_styles.dart';
-import '../../../core/utils/device_quota_service.dart';
 import '../../../core/utils/ffmpeg_service.dart';
 import '../../../core/utils/firebase_service.dart';
+import '../../../core/utils/api_key_vault.dart';
+import '../../settings/screens/api_settings_screen.dart';
 import '../../../core/utils/media_import_service.dart';
 import '../../../core/utils/project_creation_service.dart';
 import '../../../shared/models/project_model.dart';
@@ -26,7 +27,6 @@ import '../../auth/providers/auth_provider.dart';
 import '../../editor/models/timeline_models.dart';
 import '../../editor/screens/editor_screen.dart';
 import '../../profile/screens/profile_screen.dart';
-import '../../quota/providers/quota_provider.dart';
 
 enum _ProjectSort { recent, name, duration }
 
@@ -59,7 +59,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   bool _isLoadingProjects = true;
   bool _isCreatingProject = false;
   bool _isOpeningEditor = false;
-  bool _showDeviceQuotaNotice = false;
   String? _loadWarning;
   String _query = '';
   _ProjectSort _sort = _ProjectSort.recent;
@@ -75,6 +74,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final vault = ApiKeys.active;
+      if (mounted && vault != null) {
+        unawaited(showApiSetupPrompt(context, vault));
+      }
+    });
     final initialProjects = widget.initialProjects;
     if (initialProjects != null) {
       _projects = [...initialProjects];
@@ -125,15 +130,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
     final user = ref.read(currentUserProvider);
     final ownerUid = user?.uid ?? widget.localOwnerUid;
-    // Local desktop mode deliberately has no Firebase-backed transcription or
-    // device quota. Touching the quota service here would still initialize
-    // secure storage and attempt a cloud read, delaying an otherwise entirely
-    // local project library (and hanging on platforms where those plugins are
-    // unavailable). Only cloud-account sessions need this refresh.
-    if (!_isLocalDesktopMode) {
-      unawaited(_refreshQuotaAndDeviceNotice(user, requestId));
-    }
-
     if (ownerUid == null) {
       if (mounted && requestId == _loadRequestId) {
         setState(() {
@@ -234,28 +230,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       setState(() {
         _loadWarning = 'Cloud sync is offline. Local editing still works.';
       });
-    }
-  }
-
-  Future<void> _refreshQuotaAndDeviceNotice(dynamic user, int requestId) async {
-    try {
-      await ref.read(quotaProvider.notifier).loadQuota();
-    } catch (_) {
-      // Keep the most recent quota state while offline.
-    }
-
-    var showDeviceNotice = false;
-    if (user != null) {
-      try {
-        final boundUid = await DeviceQuotaService.getBoundUid();
-        showDeviceNotice = boundUid != null && boundUid != user.uid;
-      } catch (_) {
-        showDeviceNotice = false;
-      }
-    }
-
-    if (mounted && requestId == _loadRequestId) {
-      setState(() => _showDeviceQuotaNotice = showDeviceNotice);
     }
   }
 
@@ -1107,7 +1081,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     final user = ref.watch(currentUserProvider);
-    final quota = ref.watch(quotaProvider);
 
     return Scaffold(
       backgroundColor: kBackground,
@@ -1160,10 +1133,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                               ],
                               const SizedBox(height: 18),
                               _buildStudioHero(constraints.maxWidth),
-                              if (_showDeviceQuotaNotice) ...[
-                                const SizedBox(height: 12),
-                                _buildDeviceQuotaNotice(quota),
-                              ],
                               if (_loadWarning != null) ...[
                                 const SizedBox(height: 12),
                                 _buildLoadWarning(),
@@ -1226,6 +1195,21 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       children: [
         const CaptionCraftLockup(),
         const Spacer(),
+        IconButton(
+          tooltip: 'Settings · Connected services',
+          icon: const Icon(Icons.settings_outlined),
+          onPressed: () {
+            final vault = ApiKeys.active;
+            if (vault != null) {
+              Navigator.push(
+                context,
+                MaterialPageRoute<void>(
+                  builder: (_) => ApiSettingsScreen(vault: vault),
+                ),
+              );
+            }
+          },
+        ),
         if (MediaQuery.sizeOf(context).width >= 650)
           Padding(
             padding: const EdgeInsets.only(right: 14),
@@ -1289,9 +1273,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       builder: (dialogContext) => AlertDialog(
         title: const Text('Local desktop mode'),
         content: const Text(
-          'Projects and autosaves stay on this PC. Cloud accounts and AI '
-          'transcription are unavailable until a Windows Firebase application '
-          'and an authenticated transcription proxy are configured.',
+          'Projects and autosaves stay on this PC. Add your own API keys in '
+          'Settings to enable automatic captions and stock media. Cloud '
+          'account sync is unavailable in local desktop mode.',
           style: TextStyle(color: kTextSecondary, height: 1.45),
         ),
         actions: [
@@ -2023,15 +2007,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           ],
         ),
       ),
-    );
-  }
-
-  Widget _buildDeviceQuotaNotice(QuotaState quota) {
-    return _NoticeBanner(
-      icon: Icons.speed_rounded,
-      color: kWarning,
-      message:
-          'This device has used ${quota.runsUsed} of ${quota.maxRuns} free subtitle generations. Editing and exporting are unaffected.',
     );
   }
 

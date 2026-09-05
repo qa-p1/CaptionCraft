@@ -4,7 +4,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import '../../../core/utils/firebase_service.dart';
-import '../../../core/utils/device_quota_service.dart';
+import '../../../core/utils/api_key_vault.dart';
 
 /// Stream of auth state changes — null means signed out.
 final authStateProvider = StreamProvider<User?>((ref) {
@@ -51,7 +51,6 @@ class AuthNotifier extends StateNotifier<AsyncValue<void>> {
       await FirebaseService.signIn(email, password);
       final uid = FirebaseService.currentUser?.uid;
       if (uid != null) {
-        await DeviceQuotaService.storeCurrentUid(uid);
         await FirebaseService.updateLastLogin();
       }
       state = const AsyncData(null);
@@ -68,10 +67,6 @@ class AuthNotifier extends StateNotifier<AsyncValue<void>> {
     state = const AsyncLoading();
     try {
       await FirebaseService.register(email, password, name);
-      final uid = FirebaseService.currentUser?.uid;
-      if (uid != null) {
-        await DeviceQuotaService.storeCurrentUid(uid);
-      }
       state = const AsyncData(null);
     } on FirebaseAuthException catch (e) {
       state = AsyncError(_mapFirebaseError(e.code), StackTrace.current);
@@ -103,7 +98,6 @@ class AuthNotifier extends StateNotifier<AsyncValue<void>> {
           .timeout(_interactiveAuthTimeout);
       final uid = FirebaseService.currentUser?.uid;
       if (uid != null) {
-        await DeviceQuotaService.storeCurrentUid(uid);
         await FirebaseService.updateLastLogin();
       }
       state = const AsyncData(null);
@@ -138,8 +132,8 @@ class AuthNotifier extends StateNotifier<AsyncValue<void>> {
       } catch (_) {
         // Clearing the Firebase session below is the authoritative sign-out.
       }
-      await DeviceQuotaService.clearCurrentUid();
       await FirebaseService.signOut();
+      ApiKeys.selectOwner(null);
       state = const AsyncData(null);
     } on TimeoutException {
       state = AsyncError(_timeoutMessage, StackTrace.current);

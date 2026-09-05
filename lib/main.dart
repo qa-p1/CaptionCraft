@@ -1,7 +1,6 @@
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'app.dart';
@@ -18,10 +17,6 @@ void main() async {
   PaintingBinding.instance.imageCache
     ..maximumSize = 180
     ..maximumSizeBytes = 64 * 1024 * 1024;
-
-  // The tracked template keeps clean checkouts buildable. Real credentials are
-  // supplied with `--dart-define-from-file=.env` and are never committed.
-  await dotenv.load(fileName: '.env.example');
 
   var launchMode = CaptionCraftLaunchMode.cloud;
   if (!kIsWeb &&
@@ -47,7 +42,7 @@ void main() async {
         );
       } catch (error, stackTrace) {
         // Core auth and local editing remain available. Services that require
-        // App Check (notably the production transcription proxy) will reject
+        // App Check (when enforced for Firebase cloud data) will reject
         // requests with their own actionable message.
         if (kDebugMode) {
           debugPrint('Firebase App Check activation failed: $error');

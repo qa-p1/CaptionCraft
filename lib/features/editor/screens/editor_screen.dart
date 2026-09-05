@@ -35,8 +35,9 @@ import '../../../shared/widgets/snack_bar_helper.dart';
 import '../../auth/providers/auth_provider.dart';
 import '../../home/providers/transcription_pipeline.dart';
 import '../../home/screens/processing_screen.dart';
-import '../../quota/providers/quota_provider.dart';
-import '../../quota/screens/quota_exhausted_screen.dart';
+import '../../../core/utils/groq_service.dart';
+import '../../../core/utils/api_key_vault.dart';
+import '../../settings/screens/api_settings_screen.dart';
 import '../models/subtitle_entry.dart';
 import '../models/subtitle_style_model.dart';
 import '../models/keyframe_curve_presets.dart';
@@ -3416,14 +3417,17 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     if (_isGeneratingSubtitles) return;
     setState(() => _isGeneratingSubtitles = true);
     try {
-      final quota = ref.read(quotaProvider);
-      if (!quota.canRun) {
-        if (!mounted) return;
-        await Navigator.push(
-          context,
-          MaterialPageRoute(builder: (_) => const QuotaExhaustedScreen()),
-        );
-        return;
+      if (!GroqService.isConfigured) {
+        final vault = ApiKeys.active;
+        if (vault != null) {
+          await Navigator.push(
+            context,
+            MaterialPageRoute<void>(
+              builder: (_) => ApiSettingsScreen(vault: vault),
+            ),
+          );
+        }
+        if (!mounted || !GroqService.isConfigured) return;
       }
 
       final timeline = ref.read(editorProvider).timeline;
@@ -3539,12 +3543,6 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       return;
     }
 
-    final user = ref.read(currentUserProvider);
-    if (user == null) {
-      SnackBarHelper.showError(context, 'Sign in to generate subtitles.');
-      return;
-    }
-
     final mediaPath = resolveCaptionMediaPath(
       timeline: timeline,
       sourceClip: targetClip,
@@ -3558,11 +3556,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       return;
     }
 
-    if (!ref.read(quotaProvider).canRun) {
-      if (!mounted) return;
-      await Navigator.push(
+    if (!GroqService.isConfigured) {
+      SnackBarHelper.showError(
         context,
-        MaterialPageRoute(builder: (_) => const QuotaExhaustedScreen()),
+        'Add your Groq key in Settings → Connected services.',
       );
       return;
     }
@@ -3617,12 +3614,6 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         return;
       }
 
-      // A free run is charged only after transcription produces usable cues.
-      // Failed, cancelled, and silent-media attempts do not consume the quota.
-      final quotaRecorded = await ref
-          .read(quotaProvider.notifier)
-          .consumeRun(user.uid);
-
       final shiftedEntries = targetClip.mapSourceSubtitlesToTimeline(
         generatedEntries,
       );
@@ -3663,12 +3654,6 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           context,
           'Generated ${shiftedEntries.length} captions for ${targetClip.label}',
         );
-        if (!quotaRecorded) {
-          SnackBarHelper.showWarning(
-            context,
-            'Captions were created, but usage could not be synced.',
-          );
-        }
       }
     } catch (e) {
       closeProcessingRoute();

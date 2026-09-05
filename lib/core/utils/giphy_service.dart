@@ -1,9 +1,12 @@
 import 'dart:async';
+import 'dart:convert';
 
+import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 
 import '../constants/giphy_constants.dart';
+import 'api_service_error.dart';
 
 enum GiphySearchKind { gifs, stickers, both }
 
@@ -42,7 +45,8 @@ class GiphyService {
   static final GiphyService shared = GiphyService();
 
   final Dio _client;
-  final String _apiKey;
+  final String? _suppliedApiKey;
+  String get _apiKey => _suppliedApiKey ?? GiphyConstants.apiKey;
   final Uri _baseUri;
   final DateTime Function() _clock;
   final Duration cacheLifetime;
@@ -60,7 +64,7 @@ class GiphyService {
   }) : assert(!cacheLifetime.isNegative),
        assert(maximumCachedQueries > 0),
        _client = client ?? _createClient(),
-       _apiKey = (apiKey ?? GiphyConstants.apiKey).trim(),
+       _suppliedApiKey = apiKey?.trim(),
        _baseUri = _parseBaseUrl(baseUrl ?? GiphyConstants.baseUrl),
        _clock = clock ?? DateTime.now;
 
@@ -75,6 +79,7 @@ class GiphyService {
     final safeLimit = limit.clamp(1, 25);
     final cacheKey = [
       _baseUri,
+      sha256.convert(utf8.encode(_apiKey)),
       normalizedQuery.toLowerCase(),
       kind.name,
       safeLimit,
@@ -185,7 +190,15 @@ class GiphyService {
             if (!isTrending) 'q': query,
           },
         );
-    final response = await _client.getUri<dynamic>(uri);
+    final Response<dynamic> response;
+    try {
+      response = await _client.getUri<dynamic>(
+        uri,
+        options: Options(followRedirects: false),
+      );
+    } on DioException catch (error) {
+      throw Exception(apiServiceError('GIPHY', error));
+    }
     final body = _asMap(response.data);
     final data = body?['data'];
     if (data is! List) return const [];
@@ -262,7 +275,9 @@ class GiphyService {
 
   void _ensureApiKey() {
     if (_apiKey.isEmpty) {
-      throw StateError('Missing GIPHY_API_KEY configuration.');
+      throw StateError(
+        'Add your GIPHY API key in Settings → Connected services.',
+      );
     }
   }
 

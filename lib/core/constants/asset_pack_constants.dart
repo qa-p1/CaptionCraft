@@ -1,11 +1,6 @@
-import 'package:flutter_dotenv/flutter_dotenv.dart';
-
 class AssetPackConstants {
   AssetPackConstants._();
 
-  static const _definedManifestUrl = String.fromEnvironment(
-    'CAPTIONCRAFT_ASSET_MANIFEST_URL',
-  );
   static const _definedBuildNumber = String.fromEnvironment(
     'FLUTTER_BUILD_NUMBER',
   );
@@ -13,12 +8,8 @@ class AssetPackConstants {
   /// Public, credential-free JSON endpoint describing downloadable packs.
   ///
   /// This value is deliberately only read when a user requests a download.
-  static String get manifestUrl {
-    final defined = _definedManifestUrl.trim();
-    if (defined.isNotEmpty) return defined;
-    if (!dotenv.isInitialized) return '';
-    return dotenv.env['CAPTIONCRAFT_ASSET_MANIFEST_URL']?.trim() ?? '';
-  }
+  static const manifestUrl =
+      'https://caption.heliostech.shop/asset-pack-manifest.json';
 
   static int get clientBuildNumber =>
       int.tryParse(_definedBuildNumber.trim()) ?? 0;

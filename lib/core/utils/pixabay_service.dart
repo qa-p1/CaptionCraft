@@ -1,9 +1,12 @@
 import 'dart:math' as math;
+import 'dart:convert';
 
+import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
 
 import '../../features/editor/models/element_library_asset.dart';
 import '../constants/pixabay_constants.dart';
+import 'api_service_error.dart';
 
 enum PixabayMediaFilter { all, photos, illustrations, vectors, videos }
 
@@ -13,14 +16,15 @@ class PixabayService {
   static final Map<String, _PixabayCacheEntry> _responseCache = {};
 
   final Dio _client;
-  final String _apiKey;
+  final String? _suppliedApiKey;
+  String get _apiKey => _suppliedApiKey ?? PixabayConstants.apiKey;
   final Uri _baseUri;
   final bool _ownsClient;
   bool _closed = false;
 
   PixabayService({Dio? client, String? apiKey, String? baseUrl})
     : _client = client ?? _createClient(),
-      _apiKey = (apiKey ?? PixabayConstants.apiKey).trim(),
+      _suppliedApiKey = apiKey?.trim(),
       _baseUri = _parseBaseUrl(baseUrl ?? PixabayConstants.baseUrl),
       _ownsClient = client == null;
 
@@ -37,6 +41,7 @@ class PixabayService {
     final safeLimit = limit.clamp(1, PixabayConstants.maximumLimit);
     final cacheKey = [
       _baseUri,
+      sha256.convert(utf8.encode(_apiKey)),
       normalizedQuery.toLowerCase(),
       filter.name,
       safePage,
@@ -174,7 +179,14 @@ class PixabayService {
             (key, value) => MapEntry(key, value.toString()),
           ),
         );
-    return _client.getUri(uri);
+    return _client
+        .getUri(uri, options: Options(followRedirects: false))
+        .catchError((Object error) {
+          if (error is DioException) {
+            throw Exception(apiServiceError('Pixabay', error));
+          }
+          throw error;
+        });
   }
 
   ElementLibraryAsset? _parseImage(Map<String, dynamic> item) {
@@ -293,7 +305,9 @@ class PixabayService {
 
   void _ensureApiKey() {
     if (_apiKey.isEmpty) {
-      throw StateError('Missing PIXABAY_API_KEY configuration.');
+      throw StateError(
+        'Add your Pixabay API key in Settings → Connected services.',
+      );
     }
   }
 

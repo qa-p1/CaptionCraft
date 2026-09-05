@@ -1,5 +1,10 @@
 # CaptionCraft release-readiness audit
 
+Configuration update: the proxy and embedded stock-provider configuration described
+in this historical audit have been replaced by optional, user-supplied API keys.
+See [Connected services](connected-services.md) for the current behavior. Production
+builds no longer require service environment variables or a transcription proxy.
+
 Base: `origin/master` at `32ebd5d1d7f68d93804659a7832906aa659fadf1`.
 
 ## Fixed in code

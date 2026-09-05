@@ -24,12 +24,12 @@
     # FFmpeg for audio extraction, compression, video export
     ffmpeg_kit_flutter_new: ^4.6.2
 
-    # File picking and local configuration
+    # File picking
     file_picker: ^10.3.10
-    flutter_dotenv: ^6.0.0
 
     # Secure local storage
     flutter_secure_storage: ^10.0.0
+    cryptography: ^2.7.0
 
     # Firebase
     firebase_core: ^4.5.0
@@ -91,7 +91,6 @@
   flutter:
     uses-material-design: true
     assets:
-      - .env.example
       - captioncraft_logo.svg
       - assets/fonts/licenses/
     fonts:

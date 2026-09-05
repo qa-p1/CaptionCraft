@@ -1,15 +1,9 @@
-import 'package:flutter_dotenv/flutter_dotenv.dart';
+import '../utils/api_key_vault.dart';
 
 class PixabayConstants {
   PixabayConstants._();
 
-  static const _definedApiKey = String.fromEnvironment('PIXABAY_API_KEY');
-
-  static String get apiKey {
-    final defined = _definedApiKey.trim();
-    if (defined.isNotEmpty) return defined;
-    return dotenv.env['PIXABAY_API_KEY']?.trim() ?? '';
-  }
+  static String get apiKey => ApiKeys.key(ApiService.pixabay);
 
   static const String baseUrl = 'https://pixabay.com/api';
   static const int defaultLimit = 24;

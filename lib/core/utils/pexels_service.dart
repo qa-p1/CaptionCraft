@@ -4,19 +4,21 @@ import 'package:dio/dio.dart';
 
 import '../../features/editor/models/element_library_asset.dart';
 import '../constants/pexels_constants.dart';
+import 'api_service_error.dart';
 
 enum PexelsMediaFilter { all, photos, videos }
 
 class PexelsService {
   final Dio _client;
-  final String _apiKey;
+  final String? _suppliedApiKey;
+  String get _apiKey => _suppliedApiKey ?? PexelsConstants.apiKey;
   final Uri _baseUri;
   final bool _ownsClient;
   bool _closed = false;
 
   PexelsService({Dio? client, String? apiKey, String? baseUrl})
     : _client = client ?? _createClient(),
-      _apiKey = (apiKey ?? PexelsConstants.apiKey).trim(),
+      _suppliedApiKey = apiKey?.trim(),
       _baseUri = _parseBaseUrl(baseUrl ?? PexelsConstants.baseUrl),
       _ownsClient = client == null;
 
@@ -124,10 +126,20 @@ class PexelsService {
             (key, value) => MapEntry(key, value.toString()),
           ),
         );
-    return _client.getUri(
-      uri,
-      options: Options(headers: {'Authorization': _apiKey}),
-    );
+    return _client
+        .getUri(
+          uri,
+          options: Options(
+            followRedirects: false,
+            headers: {'Authorization': _apiKey},
+          ),
+        )
+        .catchError((Object error) {
+          if (error is DioException) {
+            throw Exception(apiServiceError('Pexels', error));
+          }
+          throw error;
+        });
   }
 
   ElementLibraryAsset? _parsePhoto(Map<String, dynamic> item) {
@@ -261,7 +273,9 @@ class PexelsService {
 
   void _ensureApiKey() {
     if (_apiKey.isEmpty) {
-      throw StateError('Missing PEXELS_API_KEY configuration.');
+      throw StateError(
+        'Add your Pexels API key in Settings → Connected services.',
+      );
     }
   }
 

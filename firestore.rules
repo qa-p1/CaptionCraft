@@ -25,6 +25,26 @@ service cloud.firestore {
       allow read, create, update, delete: if owns(uid);
     }
 
+    // The decryption/recovery key is never stored in Firestore.
+    match /users/{uid}/private/apiKeys {
+      allow get: if owns(uid);
+      allow list, delete: if false;
+      allow create, update: if owns(uid)
+        && request.resource.data.keys().hasOnly([
+          'version', 'revision', 'nonce', 'ciphertext', 'mac'
+        ])
+        && request.resource.data.version == 1
+        && request.resource.data.revision is int
+        && request.resource.data.revision == (resource == null ? 1 : resource.data.revision + 1)
+        && request.resource.data.nonce is string
+        && request.resource.data.nonce.size() == 16
+        && request.resource.data.mac is string
+        && request.resource.data.mac.size() == 24
+        && request.resource.data.ciphertext is string
+        && request.resource.data.ciphertext.size() > 0
+        && request.resource.data.ciphertext.size() <= 4096;
+    }
+
     match /projects/{uid}/user_projects/{projectId} {
       allow read, delete: if owns(uid);
       allow create, update: if owns(uid)
