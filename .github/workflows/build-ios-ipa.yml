@@ -48,6 +48,19 @@ jobs:
       - name: Restore locked Dart packages
         run: flutter pub get --enforce-lockfile
 
+      - name: Resolve release identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_version="$(sed -nE 's/^[[:space:]]*version:[[:space:]]*([^[:space:]]+).*$/\1/p' pubspec.yaml)"
+          if [[ ! "$build_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+$ ]]; then
+            echo "::error::pubspec.yaml has an invalid release version: $build_version"
+            exit 1
+          fi
+          release_version="v${build_version%%+*}"
+          echo "CAPTIONCRAFT_BUILD_VERSION=$build_version" >> "$GITHUB_ENV"
+          echo "CAPTIONCRAFT_RELEASE_VERSION=$release_version" >> "$GITHUB_ENV"
+
       - name: Build unsigned iPhone application
         shell: bash
         env:
@@ -66,12 +79,16 @@ jobs:
             PIXABAY_API_KEY
             CAPTIONCRAFT_ASSET_MANIFEST_URL
           )
+          missing_values=false
           for value_name in "${required_values[@]}"; do
             if [[ -z "${!value_name:-}" ]]; then
-              echo "::error::Missing GitHub Actions configuration: ${value_name}"
-              exit 1
+              echo "::error::Missing GitHub Actions configuration: $value_name"
+              missing_values=true
             fi
           done
+          if [[ "$missing_values" == true ]]; then
+            exit 1
+          fi
 
           define_file="$RUNNER_TEMP/captioncraft.env"
           trap 'rm -f "$define_file"' EXIT
@@ -100,15 +117,19 @@ jobs:
           mkdir -p "$ipa_root/Payload"
           ditto build/ios/iphoneos/Runner.app "$ipa_root/Payload/Runner.app"
           cd "$ipa_root"
-          ditto -c -k --keepParent Payload "$GITHUB_WORKSPACE/CaptionCraft-unsigned.ipa"
+          ipa_name="CaptionCraft-${CAPTIONCRAFT_RELEASE_VERSION}-iOS-unsigned.ipa"
+          ditto -c -k --keepParent Payload "$GITHUB_WORKSPACE/$ipa_name"
+          cd "$GITHUB_WORKSPACE"
+          shasum -a 256 "$ipa_name" > "$ipa_name.sha256"
 
       - name: Upload IPA and resolved pods
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: CaptionCraft-unsigned-ipa
+          name: CaptionCraft-${{ env.CAPTIONCRAFT_RELEASE_VERSION }}-iOS-unsigned
           path: |
-            CaptionCraft-unsigned.ipa
+            CaptionCraft-${{ env.CAPTIONCRAFT_RELEASE_VERSION }}-iOS-unsigned.ipa
+            CaptionCraft-${{ env.CAPTIONCRAFT_RELEASE_VERSION }}-iOS-unsigned.ipa.sha256
             ios/Podfile.lock
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 14
           compression-level: 0

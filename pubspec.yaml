@@ -1,7 +1,7 @@
   name: caption_craft
   description: "CaptionCraft — AI-powered subtitle editor"
   publish_to: 'none'
-  version: 0.1.1+2005
+  version: 0.10.0+2006
 
   environment:
     sdk: ^3.11.0
@@ -46,7 +46,7 @@
     flutter_svg: ^2.3.0
 
     # Media saving / export to gallery
-    gal: ^2.3.0
+    gal: ^2.3.3
     open_filex: ^4.6.0
 
     # Path helpers

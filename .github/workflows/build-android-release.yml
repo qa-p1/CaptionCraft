@@ -48,6 +48,19 @@ jobs:
       - name: Restore locked Dart packages
         run: flutter pub get --enforce-lockfile
 
+      - name: Resolve release identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_version="$(sed -nE 's/^[[:space:]]*version:[[:space:]]*([^[:space:]]+).*$/\1/p' pubspec.yaml)"
+          if [[ ! "$build_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+$ ]]; then
+            echo "::error::pubspec.yaml has an invalid release version: $build_version"
+            exit 1
+          fi
+          release_version="v${build_version%%+*}"
+          echo "CAPTIONCRAFT_BUILD_VERSION=$build_version" >> "$GITHUB_ENV"
+          echo "CAPTIONCRAFT_RELEASE_VERSION=$release_version" >> "$GITHUB_ENV"
+
       - name: Configure release inputs
         shell: bash
         env:
@@ -73,12 +86,16 @@ jobs:
             PIXABAY_API_KEY
             CAPTIONCRAFT_ASSET_MANIFEST_URL
           )
+          missing_values=false
           for value_name in "${required_values[@]}"; do
             if [[ -z "${!value_name:-}" ]]; then
-              echo "::error::Missing GitHub Actions configuration: ${value_name}"
-              exit 1
+              echo "::error::Missing GitHub Actions configuration: $value_name"
+              missing_values=true
             fi
           done
+          if [[ "$missing_values" == true ]]; then
+            exit 1
+          fi
 
           umask 077
           printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/upload-keystore.jks
@@ -132,13 +149,30 @@ jobs:
             "$apksigner_path" verify --verbose --print-certs "$apk"
           done
 
+      - name: Stage versioned Android release
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="$RUNNER_TEMP/captioncraft-android-release"
+          mkdir -p "$release_dir"
+          cp build/app/outputs/bundle/release/app-release.aab \
+            "$release_dir/CaptionCraft-${CAPTIONCRAFT_RELEASE_VERSION}-Android.aab"
+          for apk in build/app/outputs/flutter-apk/app-*-release.apk; do
+            abi="$(basename "$apk" | sed -E 's/^app-(.+)-release\.apk$/\1/')"
+            cp "$apk" \
+              "$release_dir/CaptionCraft-${CAPTIONCRAFT_RELEASE_VERSION}-Android-${abi}.apk"
+          done
+          (
+            cd "$release_dir"
+            sha256sum -- *.aab *.apk > SHA256SUMS.txt
+          )
+          echo "CAPTIONCRAFT_ANDROID_RELEASE_DIR=$release_dir" >> "$GITHUB_ENV"
+
       - name: Upload Android release
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: CaptionCraft-Android-release
-          path: |
-            build/app/outputs/bundle/release/app-release.aab
-            build/app/outputs/flutter-apk/app-*-release.apk
+          name: CaptionCraft-${{ env.CAPTIONCRAFT_RELEASE_VERSION }}-Android
+          path: ${{ env.CAPTIONCRAFT_ANDROID_RELEASE_DIR }}
           if-no-files-found: error
           retention-days: 14
           compression-level: 0

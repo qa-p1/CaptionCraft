@@ -63,6 +63,18 @@ add_subdirectory("runner")
 # them to the application.
 include(flutter/generated_plugins.cmake)
 
+# flutter_inappwebview_windows 0.6.0 currently consumes a WebView2/WIL header
+# that includes <experimental/coroutine>. MSVC 14.50+ turns that deprecation
+# into STL1011 unless consumers opt in to the compatibility path. Keep this
+# scoped to the affected target/compiler and remove it when the plugin updates
+# its WIL dependency: https://github.com/pichillilorenzo/flutter_inappwebview/issues/2839
+if(MSVC_VERSION GREATER_EQUAL 1950 AND TARGET flutter_inappwebview_windows_plugin)
+  target_compile_definitions(
+    flutter_inappwebview_windows_plugin
+    PRIVATE _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
+  )
+endif()
+
 
 # === Installation ===
 # Support files are copied into place next to the executable, so that it can
