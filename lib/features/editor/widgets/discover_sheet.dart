@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -31,6 +32,7 @@ class DiscoverSheet extends ConsumerStatefulWidget {
   final DiscoverBrowserSurfaceBuilder? browserSurfaceBuilder;
   final DiscoverBrowserController? browserControllerOverride;
   final Uri? browserHomeUri;
+  final bool? browserSupportedOverride;
 
   const DiscoverSheet({
     super.key,
@@ -40,6 +42,7 @@ class DiscoverSheet extends ConsumerStatefulWidget {
     this.browserSurfaceBuilder,
     this.browserControllerOverride,
     this.browserHomeUri,
+    this.browserSupportedOverride,
   });
 
   @override
@@ -48,6 +51,12 @@ class DiscoverSheet extends ConsumerStatefulWidget {
 
 class _DiscoverSheetState extends ConsumerState<DiscoverSheet> {
   late int _selectedIndex;
+
+  bool get _browserSupported =>
+      widget.browserSupportedOverride ??
+      !Platform.isWindows ||
+          widget.browserSurfaceBuilder != null ||
+          widget.browserControllerOverride != null;
 
   @override
   void initState() {
@@ -142,28 +151,31 @@ class _DiscoverSheetState extends ConsumerState<DiscoverSheet> {
                 key: const ValueKey('discover-tabs'),
                 index: _selectedIndex,
                 children: [
-                  DiscoverBrowserTab(
-                    isActive:
-                        _selectedIndex == DiscoverDestination.browser.index,
-                    homeUri: widget.browserHomeUri,
-                    surfaceBuilder: widget.browserSurfaceBuilder,
-                    controllerOverride: widget.browserControllerOverride,
-                    onDownload: (candidate, headers) async {
-                      final item = await notifier.enqueueDirect(
-                        DiscoverDownloadRequest.fromCandidate(
-                          candidate,
-                          displayName: _candidateName(candidate),
-                          headers: headers,
-                        ),
-                      );
-                      if (item == null) {
-                        throw StateError(
-                          ref.read(discoverProvider).errorMessage ??
-                              'The media could not be added to Downloads.',
+                  if (!_browserSupported)
+                    const _UnsupportedWindowsBrowser()
+                  else
+                    DiscoverBrowserTab(
+                      isActive:
+                          _selectedIndex == DiscoverDestination.browser.index,
+                      homeUri: widget.browserHomeUri,
+                      surfaceBuilder: widget.browserSurfaceBuilder,
+                      controllerOverride: widget.browserControllerOverride,
+                      onDownload: (candidate, headers) async {
+                        final item = await notifier.enqueueDirect(
+                          DiscoverDownloadRequest.fromCandidate(
+                            candidate,
+                            displayName: _candidateName(candidate),
+                            headers: headers,
+                          ),
                         );
-                      }
-                    },
-                  ),
+                        if (item == null) {
+                          throw StateError(
+                            ref.read(discoverProvider).errorMessage ??
+                                'The media could not be added to Downloads.',
+                          );
+                        }
+                      },
+                    ),
                   DiscoverYoutubeTab(
                     videoInfo: state.youtubeInfo,
                     downloads: state.downloads,
@@ -339,6 +351,7 @@ Future<T?> showDiscoverSheet<T>({
   DiscoverBrowserSurfaceBuilder? browserSurfaceBuilder,
   DiscoverBrowserController? browserControllerOverride,
   Uri? browserHomeUri,
+  bool? browserSupportedOverride,
   Color barrierColor = const Color(0x66000000),
 }) {
   return showModalBottomSheet<T>(
@@ -358,9 +371,50 @@ Future<T?> showDiscoverSheet<T>({
         browserSurfaceBuilder: browserSurfaceBuilder,
         browserControllerOverride: browserControllerOverride,
         browserHomeUri: browserHomeUri,
+        browserSupportedOverride: browserSupportedOverride,
         onAddToTimeline: onAddToTimeline,
         onClose: () => Navigator.of(sheetContext).pop(),
       ),
     ),
   );
+}
+
+class _UnsupportedWindowsBrowser extends StatelessWidget {
+  const _UnsupportedWindowsBrowser();
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(28),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 480),
+          child: const Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.public_off_outlined, size: 44, color: kTextSecondary),
+              SizedBox(height: 16),
+              Text(
+                'Embedded browser unavailable on Windows',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: kTextPrimary,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              SizedBox(height: 8),
+              Text(
+                'Use the YouTube or Instagram tabs for supported links, or '
+                'import media from this PC. The embedded browser remains '
+                'disabled until its Windows engine is production-stable.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: kTextSecondary, height: 1.45),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }

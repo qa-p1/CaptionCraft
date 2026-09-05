@@ -472,9 +472,8 @@ class FFmpegService {
         colorSpace = properties['color_space']?.toString();
         colorRange = properties['color_range']?.toString();
         pixelFormat = properties['pix_fmt']?.toString();
-        bitDepth = int.tryParse(
-              properties['bits_per_raw_sample']?.toString() ?? '',
-            ) ??
+        bitDepth =
+            int.tryParse(properties['bits_per_raw_sample']?.toString() ?? '') ??
             _pixelFormatBitDepth(pixelFormat);
       }
       if (type == 'audio') {
@@ -484,7 +483,8 @@ class FFmpegService {
         audioStreams.add({
           'streamIndex': audioStreams.length,
           'codec': stream.getCodec(),
-          'channels': int.tryParse(properties['channels']?.toString() ?? '') ??
+          'channels':
+              int.tryParse(properties['channels']?.toString() ?? '') ??
               _channelsForLayout(stream.getChannelLayout()),
           'channelLayout': stream.getChannelLayout(),
           'sampleRate': int.tryParse(stream.getSampleRate() ?? '') ?? 0,
@@ -518,9 +518,9 @@ class FFmpegService {
   }
 
   static int _pixelFormatBitDepth(String? pixelFormat) {
-    final match = RegExp(r'p(\d{2})(?:le|be)?$').firstMatch(
-      pixelFormat?.toLowerCase() ?? '',
-    );
+    final match = RegExp(
+      r'p(\d{2})(?:le|be)?$',
+    ).firstMatch(pixelFormat?.toLowerCase() ?? '');
     return int.tryParse(match?.group(1) ?? '') ?? 8;
   }
 

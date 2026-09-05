@@ -505,9 +505,35 @@ class ProjectLocalStorage {
     _documentsDirectoryOverride = directory;
   }
 
+  /// Waits until every currently queued project write has released its file.
+  ///
+  /// Widget tests use this after disposing an editor because [State.dispose]
+  /// cannot await its final best-effort snapshot. Production callers should
+  /// await the explicit editor close/save flow instead.
+  static Future<void> waitForPendingSavesForTesting() async {
+    while (_saveQueues.isNotEmpty) {
+      final pending = _saveQueues.values.toList(growable: false);
+      await Future.wait(
+        pending.map((save) async {
+          try {
+            await save;
+          } catch (_) {
+            // A failed test save still has to leave the queue before the next
+            // test can install its isolated documents directory.
+          }
+        }),
+      );
+    }
+  }
+
+  /// Resolves the single application-documents root used by project data and
+  /// its recovery log. Keeping both stores on the same root also lets tests
+  /// isolate every write without invoking a platform plugin.
+  static Future<Directory> get applicationDocumentsDirectory async =>
+      _documentsDirectoryOverride ?? await getApplicationDocumentsDirectory();
+
   static Future<String> get _projectsDir async {
-    final appDir =
-        _documentsDirectoryOverride ?? await getApplicationDocumentsDirectory();
+    final appDir = await applicationDocumentsDirectory;
     final dir = Directory(p.join(appDir.path, 'caption_craft_projects'));
     if (!await dir.exists()) {
       await dir.create(recursive: true);

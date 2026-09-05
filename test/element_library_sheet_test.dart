@@ -195,6 +195,57 @@ void main() {
     expect(pixabayFilters.last, PixabayMediaFilter.vectors);
   });
 
+  testWidgets('replacement never disposes caller-owned stock clients', (
+    tester,
+  ) async {
+    final packs = _FakeAssetPackFacade();
+    final pexels = _TrackingPexelsService();
+    final pixabay = _TrackingPixabayService();
+    addTearDown(pexels.release);
+    addTearDown(pixabay.release);
+    PexelsService? injectedPexels = pexels;
+    PixabayService? injectedPixabay = pixabay;
+    late StateSetter rebuild;
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [assetPackFacadeProvider.overrideWithValue(packs)],
+        child: MaterialApp(
+          theme: AppTheme.darkTheme,
+          home: StatefulBuilder(
+            builder: (context, setState) {
+              rebuild = setState;
+              return ElementLibrarySheet(
+                key: const ValueKey('replaceable-element-library'),
+                giphySearch: (query, kind) async => const [],
+                pexelsService: injectedPexels,
+                pixabayService: injectedPixabay,
+                pexelsSearch: (query, filter) async => const [],
+                pixabaySearch: (query, filter) async => const [],
+                initialDestination: ElementLibraryDestination.pexels,
+                onOnlineAssetSelected: (_) async {},
+                onPackAssetSelected: (_) async {},
+              );
+            },
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    rebuild(() {
+      injectedPexels = null;
+      injectedPixabay = null;
+    });
+    await tester.pumpAndSettle();
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+
+    expect(pexels.closeCalls, 0);
+    expect(pixabay.closeCalls, 0);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets(
     'opening a pack only checks local state until Download is tapped',
     (tester) async {
@@ -472,6 +523,56 @@ class _FakeAssetPackFacade implements AssetPackFacade {
         ),
       );
     }
+  }
+}
+
+class _TrackingPexelsService extends PexelsService {
+  _TrackingPexelsService() : this._(Dio());
+
+  _TrackingPexelsService._(this.client)
+    : super(
+        client: client,
+        apiKey: 'test-key',
+        baseUrl: 'https://pexels.example.test/v1',
+      );
+
+  final Dio client;
+  int closeCalls = 0;
+
+  @override
+  void close() {
+    closeCalls++;
+    super.close();
+  }
+
+  void release() {
+    super.close();
+    client.close(force: true);
+  }
+}
+
+class _TrackingPixabayService extends PixabayService {
+  _TrackingPixabayService() : this._(Dio());
+
+  _TrackingPixabayService._(this.client)
+    : super(
+        client: client,
+        apiKey: 'test-key',
+        baseUrl: 'https://pixabay.example.test/api',
+      );
+
+  final Dio client;
+  int closeCalls = 0;
+
+  @override
+  void close() {
+    closeCalls++;
+    super.close();
+  }
+
+  void release() {
+    super.close();
+    client.close(force: true);
   }
 }
 

@@ -3080,25 +3080,11 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
   }
 
   void _setWorkAreaIn(Duration position) {
-    final timeline = ref.read(editorProvider).timeline;
-    final end = timeline.workspaceSettings.workAreaEnd;
-    _updateWorkspace(
-      (settings) => settings.copyWith(
-        workAreaStart: end != null && position >= end ? null : position,
-        clearWorkAreaStart: end != null && position >= end,
-      ),
-    );
+    _updateWorkspace((settings) => settings.withWorkAreaStart(position));
   }
 
   void _setWorkAreaOut(Duration position) {
-    final timeline = ref.read(editorProvider).timeline;
-    final start = timeline.workspaceSettings.workAreaStart;
-    _updateWorkspace(
-      (settings) => settings.copyWith(
-        workAreaEnd: start != null && position <= start ? null : position,
-        clearWorkAreaEnd: start != null && position <= start,
-      ),
-    );
+    _updateWorkspace((settings) => settings.withWorkAreaEnd(position));
   }
 
   void _clearWorkArea() {

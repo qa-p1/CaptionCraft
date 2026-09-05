@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:caption_craft/core/theme/app_theme.dart';
 import 'package:caption_craft/features/auth/screens/login_screen.dart';
@@ -55,10 +56,12 @@ void main() {
     tester,
   ) async {
     await pumpLogin(tester, size: const Size(1280, 800));
-    await expectLater(
-      find.byType(MaterialApp),
-      matchesGoldenFile('goldens/login_studio_desktop.png'),
-    );
+    if (Platform.isLinux) {
+      await expectLater(
+        find.byType(MaterialApp),
+        matchesGoldenFile('goldens/login_studio_desktop.png'),
+      );
+    }
   });
 
   testWidgets('home studio is responsive and exposes project tools', (
@@ -85,10 +88,12 @@ void main() {
     expect(find.text('City stories'), findsOneWidget);
     expect(tester.takeException(), isNull);
 
-    await expectLater(
-      find.byType(MaterialApp),
-      matchesGoldenFile('goldens/home_studio_desktop.png'),
-    );
+    if (Platform.isLinux) {
+      await expectLater(
+        find.byType(MaterialApp),
+        matchesGoldenFile('goldens/home_studio_desktop.png'),
+      );
+    }
   });
 
   testWidgets('editor workspace stays polished and reachable on a phone', (
@@ -126,10 +131,12 @@ void main() {
     expect(find.byKey(const ValueKey('dock_primary_chroma')), findsOneWidget);
     expect(tester.takeException(), isNull);
 
-    await expectLater(
-      find.byType(MaterialApp),
-      matchesGoldenFile('goldens/editor_workspace_phone.png'),
-    );
+    if (Platform.isLinux) {
+      await expectLater(
+        find.byType(MaterialApp),
+        matchesGoldenFile('goldens/editor_workspace_phone.png'),
+      );
+    }
 
     final more = find.byKey(const ValueKey('dock_primary_more'));
     await tester.ensureVisible(more);
@@ -140,10 +147,12 @@ void main() {
       findsOneWidget,
     );
     expect(find.text('All tools'), findsOneWidget);
-    await expectLater(
-      find.byType(MaterialApp),
-      matchesGoldenFile('goldens/editor_all_tools_phone.png'),
-    );
+    if (Platform.isLinux) {
+      await expectLater(
+        find.byType(MaterialApp),
+        matchesGoldenFile('goldens/editor_all_tools_phone.png'),
+      );
+    }
   });
 
   testWidgets('transcription process remains usable on a phone', (

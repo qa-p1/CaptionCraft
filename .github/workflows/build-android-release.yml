@@ -1,0 +1,149 @@
+name: Build signed Android release
+
+on:
+  push:
+    branches:
+      - "release-readiness-*"
+    paths:
+      - "lib/**"
+      - "android/**"
+      - "assets/**"
+      - "captioncraft_logo.svg"
+      - ".env.example"
+      - "pubspec.yaml"
+      - "pubspec.lock"
+      - ".github/workflows/build-android-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android:
+    name: Flutter 3.41.2 / signed Android
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install Java 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install pinned Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: '3.41.2'
+          channel: stable
+          cache: true
+
+      - name: Restore locked Dart packages
+        run: flutter pub get --enforce-lockfile
+
+      - name: Configure release inputs
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL: ${{ vars.CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL }}
+          GIPHY_API_KEY: ${{ secrets.GIPHY_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          CAPTIONCRAFT_ASSET_MANIFEST_URL: ${{ vars.CAPTIONCRAFT_ASSET_MANIFEST_URL }}
+        run: |
+          set -euo pipefail
+          required_values=(
+            ANDROID_KEYSTORE_BASE64
+            ANDROID_KEYSTORE_PASSWORD
+            ANDROID_KEY_ALIAS
+            ANDROID_KEY_PASSWORD
+            CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL
+            GIPHY_API_KEY
+            PEXELS_API_KEY
+            PIXABAY_API_KEY
+            CAPTIONCRAFT_ASSET_MANIFEST_URL
+          )
+          for value_name in "${required_values[@]}"; do
+            if [[ -z "${!value_name:-}" ]]; then
+              echo "::error::Missing GitHub Actions configuration: ${value_name}"
+              exit 1
+            fi
+          done
+
+          umask 077
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/upload-keystore.jks
+          cat > android/key.properties <<EOF
+          storeFile=upload-keystore.jks
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          keyPassword=$ANDROID_KEY_PASSWORD
+          EOF
+          printf '%s\n' \
+            "CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL=$CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL" \
+            "GIPHY_API_KEY=$GIPHY_API_KEY" \
+            "PEXELS_API_KEY=$PEXELS_API_KEY" \
+            "PIXABAY_API_KEY=$PIXABAY_API_KEY" \
+            "CAPTIONCRAFT_ASSET_MANIFEST_URL=$CAPTIONCRAFT_ASSET_MANIFEST_URL" \
+            > "$RUNNER_TEMP/captioncraft.env"
+
+      - name: Build signed app bundle and APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter build appbundle --release --dart-define-from-file="$RUNNER_TEMP/captioncraft.env"
+          flutter build apk --release --split-per-abi --dart-define-from-file="$RUNNER_TEMP/captioncraft.env"
+
+      - name: Verify signed outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s build/app/outputs/bundle/release/app-release.aab
+          compgen -G 'build/app/outputs/flutter-apk/app-*-release.apk' >/dev/null
+          # Android upload certificates are normally self-signed. `-strict`
+          # turns that expected certificate-chain warning into exit code 4,
+          # so use jarsigner's cryptographic verification for the AAB and the
+          # Android SDK verifier for every installable APK.
+          aab_verification="$RUNNER_TEMP/captioncraft-aab-verification.txt"
+          jarsigner -verify -verbose -certs \
+            build/app/outputs/bundle/release/app-release.aab \
+            >"$aab_verification" 2>&1
+          cat "$aab_verification"
+          if ! grep -Fq 'jar verified.' "$aab_verification"; then
+            echo '::error::The Android App Bundle does not contain a verified JAR signature.'
+            exit 1
+          fi
+          if grep -Fqi 'jar is unsigned' "$aab_verification"; then
+            echo '::error::The Android App Bundle is unsigned.'
+            exit 1
+          fi
+          apksigner_path="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner -print0 | sort -zV | tail -z -n 1 | tr -d '\0')"
+          test -x "$apksigner_path"
+          for apk in build/app/outputs/flutter-apk/app-*-release.apk; do
+            "$apksigner_path" verify --verbose --print-certs "$apk"
+          done
+
+      - name: Upload Android release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: CaptionCraft-Android-release
+          path: |
+            build/app/outputs/bundle/release/app-release.aab
+            build/app/outputs/flutter-apk/app-*-release.apk
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Remove signing material
+        if: always()
+        shell: bash
+        run: rm -f android/upload-keystore.jks android/key.properties "$RUNNER_TEMP/captioncraft.env"

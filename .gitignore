@@ -7,6 +7,7 @@
 .pub-cache/
 build/
 coverage/
+test/failures/
 doc/api/
 **/doc/api/
 **/ios/Flutter/.last_build_id

@@ -5,6 +5,7 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_colorpicker/flutter_colorpicker.dart';
@@ -13,6 +14,7 @@ import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
 import '../../../core/theme/app_theme.dart';
+import '../../../core/utils/desktop_window_close_service.dart';
 import '../../../core/utils/editor_change_log_service.dart';
 import '../../../core/utils/audio_meter_service.dart';
 import '../../../core/utils/discover_media_import_service.dart';
@@ -48,6 +50,7 @@ import '../models/sound_effect_library_asset.dart';
 import '../providers/editor_provider.dart';
 import '../providers/playback_provider.dart';
 import '../providers/subtitle_provider.dart';
+import '../services/editor_shortcuts.dart';
 import '../services/timeline_keyframe_editing.dart';
 import 'creator_lab_screen.dart';
 import 'export_video_screen.dart';
@@ -853,8 +856,16 @@ EditorTimeline replaceGeneratedCaptionsForSource({
 /// Video Preview (top-left), Style Panel (top-right), Timeline (bottom).
 class EditorScreen extends ConsumerStatefulWidget {
   final Project project;
+  final bool _persistenceEnabled;
 
-  const EditorScreen({super.key, required this.project});
+  const EditorScreen({super.key, required this.project})
+    : _persistenceEnabled = true;
+
+  /// Avoids fake-clock file I/O in widget tests that only exercise layout and
+  /// tools. Production navigation always uses the autosaving constructor.
+  @visibleForTesting
+  const EditorScreen.withoutPersistence({super.key, required this.project})
+    : _persistenceEnabled = false;
 
   @override
   ConsumerState<EditorScreen> createState() => _EditorScreenState();
@@ -885,7 +896,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   DateTime? _lastSavedAt;
   Object? _localSaveError;
   bool _remoteSyncPending = false;
+  bool _hasUnsavedLocalChanges = false;
   bool _isClosing = false;
+  bool _isLeaving = false;
+  Future<bool>? _activeExitPreparation;
+  bool _allowPopAfterSave = false;
   bool _editorInitialized = false;
   bool _isInitializingEditor = true;
   Object? _editorInitializationError;
@@ -909,6 +924,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       widget.project.timeline.canvasSettings.aspectRatioPreset,
     );
     WidgetsBinding.instance.addObserver(this);
+    if (widget._persistenceEnabled) {
+      DesktopWindowCloseService.registerHandler(
+        owner: this,
+        handler: _prepareForDesktopWindowClose,
+      );
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _initializeEditor();
     });
@@ -930,6 +951,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         globalStyle: initialStyle,
       );
 
+      // Playback state is shared within the editor provider scope. Reset it
+      // before loading a project so a newly opened timeline cannot inherit the
+      // previous project's playhead or pending keyboard transport request.
+      ref.read(playbackProvider.notifier).reset();
       ref
           .read(subtitleProvider.notifier)
           .initializeFromProject(
@@ -964,7 +989,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         );
       }
     } catch (error, stackTrace) {
-      debugPrint('Editor initialization failed: $error\n$stackTrace');
+      if (kDebugMode) {
+        debugPrint('Editor initialization failed: $error\n$stackTrace');
+      }
       if (!mounted) return;
       setState(() {
         _isInitializingEditor = false;
@@ -983,26 +1010,32 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     _isClosing = true;
     _saveDebounce?.cancel();
     _remoteSaveDebounce?.cancel();
+    DesktopWindowCloseService.unregisterHandler(this);
     WidgetsBinding.instance.removeObserver(this);
     if (_isPreviewFullscreen) {
       unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
     }
-    unawaited(
-      _saveProjectState(
-        project: finalSnapshot,
-        userUid: userUid,
-        syncRemote: false,
-        changeType: 'editor_disposed',
-      ),
-    );
+    if (widget._persistenceEnabled &&
+        (!_allowPopAfterSave || _hasUnsavedLocalChanges)) {
+      unawaited(
+        _saveProjectState(
+          project: finalSnapshot,
+          userUid: userUid,
+          syncRemote: false,
+          changeType: 'editor_disposed',
+        ),
+      );
+    }
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.inactive ||
-        state == AppLifecycleState.paused ||
-        state == AppLifecycleState.detached) {
+    if (widget._persistenceEnabled &&
+        (state == AppLifecycleState.inactive ||
+            state == AppLifecycleState.hidden ||
+            state == AppLifecycleState.paused ||
+            state == AppLifecycleState.detached)) {
       unawaited(
         _flushProjectSave(
           syncRemote: false,
@@ -1010,6 +1043,331 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         ),
       );
     }
+  }
+
+  bool _textEntryHasFocus() {
+    final focusContext = FocusManager.instance.primaryFocus?.context;
+    if (focusContext == null) return false;
+    return focusContext.widget is EditableText ||
+        focusContext.findAncestorWidgetOfExactType<EditableText>() != null;
+  }
+
+  KeyEventResult _handleEditorKeyEvent(FocusNode _, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    if (_isLeaving) return KeyEventResult.handled;
+    if (_textEntryHasFocus()) return KeyEventResult.ignored;
+
+    final keyboard = HardwareKeyboard.instance;
+    final command = resolveEditorShortcut(
+      key: event.logicalKey,
+      controlOrMeta: keyboard.isControlPressed || keyboard.isMetaPressed,
+      shift: keyboard.isShiftPressed,
+      alt: keyboard.isAltPressed,
+    );
+    if (command == null) return KeyEventResult.ignored;
+    if (event is KeyRepeatEvent && !isRepeatableEditorShortcut(command)) {
+      return KeyEventResult.handled;
+    }
+
+    _runEditorShortcut(command);
+    return KeyEventResult.handled;
+  }
+
+  void _runEditorShortcut(EditorShortcutCommand command) {
+    switch (command) {
+      case EditorShortcutCommand.undo:
+        _undoLatestChange();
+      case EditorShortcutCommand.redo:
+        _redoLatestChange();
+      case EditorShortcutCommand.save:
+        unawaited(_saveFromShortcut());
+      case EditorShortcutCommand.export:
+        _showExportDialog();
+      case EditorShortcutCommand.importMedia:
+        unawaited(_pickOverlayMedia());
+      case EditorShortcutCommand.selectAll:
+        _selectAllClips();
+      case EditorShortcutCommand.togglePlayPause:
+        _requestTransport(PlaybackTransportCommand.togglePlayPause);
+      case EditorShortcutCommand.pause:
+        _requestTransport(PlaybackTransportCommand.pause);
+      case EditorShortcutCommand.playForward:
+        _requestTransport(PlaybackTransportCommand.playForward);
+      case EditorShortcutCommand.stepBackward:
+        _requestTransport(PlaybackTransportCommand.stepBackward);
+      case EditorShortcutCommand.stepForward:
+        _requestTransport(PlaybackTransportCommand.stepForward);
+      case EditorShortcutCommand.nudgeBackward:
+        _nudgeSelectedClips(-1);
+      case EditorShortcutCommand.nudgeForward:
+        _nudgeSelectedClips(1);
+      case EditorShortcutCommand.previousEditPoint:
+        _jumpToAdjacentEditPoint(-1);
+      case EditorShortcutCommand.nextEditPoint:
+        _jumpToAdjacentEditPoint(1);
+      case EditorShortcutCommand.jumpToStart:
+        _requestTransport(PlaybackTransportCommand.jumpToStart);
+      case EditorShortcutCommand.jumpToEnd:
+        _requestTransport(PlaybackTransportCommand.jumpToEnd);
+      case EditorShortcutCommand.setWorkAreaStart:
+        _setWorkAreaStartAtPlayhead();
+      case EditorShortcutCommand.setWorkAreaEnd:
+        _setWorkAreaEndAtPlayhead();
+      case EditorShortcutCommand.clearWorkArea:
+        _clearWorkArea();
+      case EditorShortcutCommand.toggleSnapping:
+        _toggleTimelineSnapping();
+      case EditorShortcutCommand.deleteSelectedClip:
+        final selected = _selectedClipFromState(ref.read(editorProvider));
+        if (selected != null) unawaited(_deleteClip(selected));
+      case EditorShortcutCommand.splitAtPlayhead:
+        _splitEveryTrackAtPlayhead();
+      case EditorShortcutCommand.addMarker:
+        _addChapterMarker();
+      case EditorShortcutCommand.toggleFullscreen:
+        _setPreviewFullscreen(!_isPreviewFullscreen);
+      case EditorShortcutCommand.dismiss:
+        if (_isPreviewFullscreen) {
+          _setPreviewFullscreen(false);
+        } else {
+          ref.read(editorProvider.notifier).clearClipSelection();
+        }
+      case EditorShortcutCommand.showShortcutHelp:
+        _showKeyboardShortcuts();
+    }
+  }
+
+  void _requestTransport(PlaybackTransportCommand command) {
+    ref.read(playbackProvider.notifier).requestTransport(command);
+  }
+
+  void _jumpToAdjacentEditPoint(int direction) {
+    final timeline = ref.read(editorProvider).timeline;
+    final currentUs = ref.read(playbackProvider).position.inMicroseconds;
+    final boundaries = <int>{0, timeline.duration.inMicroseconds};
+    for (final track in timeline.tracks) {
+      for (final clip in track.clips) {
+        boundaries
+          ..add(clip.startTime.inMicroseconds)
+          ..add(clip.endTime.inMicroseconds);
+      }
+    }
+    final ordered = boundaries.where((value) => value >= 0).toList()..sort();
+    final targetUs = direction < 0
+        ? ordered.lastWhere((value) => value < currentUs, orElse: () => 0)
+        : ordered.firstWhere(
+            (value) => value > currentUs,
+            orElse: () => timeline.duration.inMicroseconds,
+          );
+    ref
+        .read(playbackProvider.notifier)
+        .requestSeek(Duration(microseconds: targetUs));
+  }
+
+  void _setWorkAreaStartAtPlayhead() {
+    final position = ref.read(playbackProvider).position;
+    ref
+        .read(editorProvider.notifier)
+        .setWorkspaceSettings(
+          (settings) => settings.withWorkAreaStart(position),
+        );
+  }
+
+  void _setWorkAreaEndAtPlayhead() {
+    final position = ref.read(playbackProvider).position;
+    ref
+        .read(editorProvider.notifier)
+        .setWorkspaceSettings((settings) => settings.withWorkAreaEnd(position));
+  }
+
+  void _clearWorkArea() {
+    ref
+        .read(editorProvider.notifier)
+        .setWorkspaceSettings(
+          (settings) => settings.copyWith(
+            clearWorkAreaStart: true,
+            clearWorkAreaEnd: true,
+          ),
+        );
+  }
+
+  void _toggleTimelineSnapping() {
+    final enabled = ref
+        .read(editorProvider)
+        .timeline
+        .workspaceSettings
+        .snapping
+        .enabled;
+    ref
+        .read(editorProvider.notifier)
+        .setWorkspaceSettings(
+          (settings) => settings.copyWith(
+            snapping: settings.snapping.copyWith(enabled: !enabled),
+          ),
+        );
+    SnackBarHelper.showInfo(context, 'Snapping ${enabled ? 'off' : 'on'}');
+  }
+
+  void _undoLatestChange() {
+    final editor = ref.read(editorProvider.notifier);
+    final subtitles = ref.read(subtitleProvider.notifier);
+    final editorSequence = editor.latestUndoSequence ?? -1;
+    final subtitleSequence = subtitles.latestUndoSequence ?? -1;
+    if (editorSequence >= subtitleSequence && editor.canUndo) {
+      editor.undo();
+    } else if (subtitles.canUndo) {
+      subtitles.undo();
+    }
+  }
+
+  void _redoLatestChange() {
+    final editor = ref.read(editorProvider.notifier);
+    final subtitles = ref.read(subtitleProvider.notifier);
+    final editorSequence = editor.latestRedoSequence ?? -1;
+    final subtitleSequence = subtitles.latestRedoSequence ?? -1;
+    if (editorSequence >= subtitleSequence && editor.canRedo) {
+      editor.redo();
+    } else if (subtitles.canRedo) {
+      subtitles.redo();
+    }
+  }
+
+  Future<void> _saveFromShortcut() async {
+    await _flushProjectSave(
+      syncRemote: false,
+      changeType: 'desktop_save_shortcut',
+    );
+    if (!mounted) return;
+    final error = _localSaveError;
+    if (error == null) {
+      SnackBarHelper.showSuccess(context, 'Project saved locally');
+    } else {
+      SnackBarHelper.showError(context, 'Local save failed: $error');
+    }
+  }
+
+  Future<void> _requestEditorExit() async {
+    final canExit = await _prepareEditorExit();
+    if (!canExit || !mounted) return;
+
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted) return;
+    final didPop = await Navigator.of(context).maybePop();
+    if (!didPop && mounted) {
+      setState(() {
+        _allowPopAfterSave = false;
+        _isLeaving = false;
+      });
+    }
+  }
+
+  Future<bool> _prepareForDesktopWindowClose() => _prepareEditorExit();
+
+  Future<bool> _prepareEditorExit() async {
+    final activePreparation = _activeExitPreparation;
+    if (activePreparation != null) return activePreparation;
+
+    final preparation = _doPrepareEditorExit();
+    _activeExitPreparation = preparation;
+    try {
+      return await preparation;
+    } finally {
+      if (identical(_activeExitPreparation, preparation)) {
+        _activeExitPreparation = null;
+      }
+    }
+  }
+
+  Future<bool> _doPrepareEditorExit() async {
+    if (!mounted) return true;
+    if (_isLeaving) return false;
+    setState(() => _isLeaving = true);
+
+    // Do not queue this barrier behind a possibly slow Firestore sync. Local
+    // project storage has its own per-project write queue, so it can safely
+    // persist the newest snapshot as soon as any earlier disk write finishes.
+    for (var attempt = 0; attempt < 5; attempt++) {
+      await _saveLocalProjectForExit();
+      if (!mounted || _localSaveError != null) break;
+      await WidgetsBinding.instance.endOfFrame;
+      if (!_hasUnsavedLocalChanges) break;
+    }
+    if (!mounted) return true;
+
+    var leaveWithoutSaving = false;
+    final error = _localSaveError;
+    if (error != null) {
+      leaveWithoutSaving =
+          await showDialog<bool>(
+            context: context,
+            barrierDismissible: false,
+            builder: (dialogContext) => AlertDialog(
+              title: const Text('Project could not be saved'),
+              content: const Text(
+                'CaptionCraft could not write your latest changes to local '
+                'storage. Check free space and folder access before leaving.',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext, false),
+                  child: const Text('Keep editing'),
+                ),
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext, true),
+                  child: const Text('Leave without saving'),
+                ),
+              ],
+            ),
+          ) ??
+          false;
+      if (!mounted) return true;
+      if (!leaveWithoutSaving) {
+        setState(() => _isLeaving = false);
+        return false;
+      }
+    }
+    if (_hasUnsavedLocalChanges && !leaveWithoutSaving) {
+      setState(() => _isLeaving = false);
+      SnackBarHelper.showWarning(
+        context,
+        'The project changed while closing. Try again after the current task finishes.',
+      );
+      return false;
+    }
+    if (leaveWithoutSaving) {
+      _hasUnsavedLocalChanges = false;
+    }
+
+    setState(() => _allowPopAfterSave = true);
+    return true;
+  }
+
+  Future<void> _saveLocalProjectForExit() async {
+    if (!widget._persistenceEnabled) {
+      _hasUnsavedLocalChanges = false;
+      _localSaveError = null;
+      return;
+    }
+    _saveDebounce?.cancel();
+    _remoteSaveDebounce?.cancel();
+    final project = _captureProjectSnapshot();
+    _hasUnsavedLocalChanges = true;
+    try {
+      await EditorChangeLogService.saveLocalSnapshot(
+        project: project,
+        changeType: 'editor_popped',
+      );
+      _lastSavedAt = DateTime.now();
+      _localSaveError = null;
+      if (identical(project, _projectSnapshot)) {
+        _hasUnsavedLocalChanges = false;
+      }
+    } catch (error) {
+      _localSaveError = error;
+    }
+    if (mounted && !_isClosing) setState(() {});
   }
 
   @override
@@ -1040,31 +1398,37 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     });
 
     return PopScope(
-      canPop: !_isPreviewFullscreen,
+      canPop: _allowPopAfterSave && !_isPreviewFullscreen,
       onPopInvokedWithResult: (didPop, _) {
         if (!didPop && _isPreviewFullscreen) {
           _setPreviewFullscreen(false);
           return;
         }
-        if (didPop) {
-          unawaited(
-            _flushProjectSave(syncRemote: false, changeType: 'editor_popped'),
-          );
+        if (!didPop) {
+          unawaited(_requestEditorExit());
         }
       },
-      child: Scaffold(
-        key: _scaffoldKey,
-        backgroundColor: kBackground,
-        // Text editing manages the keyboard inside its bottom sheet. Keeping
-        // the canvas at its normal size prevents the video preview collapsing
-        // to a thumbnail while the user types.
-        resizeToAvoidBottomInset: false,
-        appBar: _isPreviewFullscreen ? null : _buildEditorToolbar(context),
-        body: _isPreviewFullscreen
-            ? _buildFullscreenPreview()
-            : isLandscape
-            ? _buildLandscape(context, selectedClip)
-            : _buildPortrait(context, selectedClip),
+      child: AbsorbPointer(
+        absorbing: _isLeaving,
+        child: Focus(
+          key: const ValueKey('editor_keyboard_shortcut_focus'),
+          autofocus: Platform.isWindows,
+          onKeyEvent: _handleEditorKeyEvent,
+          child: Scaffold(
+            key: _scaffoldKey,
+            backgroundColor: kBackground,
+            // Text editing manages the keyboard inside its bottom sheet. Keeping
+            // the canvas at its normal size prevents the video preview collapsing
+            // to a thumbnail while the user types.
+            resizeToAvoidBottomInset: false,
+            appBar: _isPreviewFullscreen ? null : _buildEditorToolbar(context),
+            body: _isPreviewFullscreen
+                ? _buildFullscreenPreview()
+                : isLandscape
+                ? _buildLandscape(context, selectedClip)
+                : _buildPortrait(context, selectedClip),
+          ),
+        ),
       ),
     );
   }
@@ -1121,7 +1485,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                       ),
                       const SizedBox(height: 8),
                       Text(
-                        error.toString().replaceFirst('Exception: ', ''),
+                        _editorStartupFailureMessage(error),
                         maxLines: 4,
                         overflow: TextOverflow.ellipsis,
                         textAlign: TextAlign.center,
@@ -1145,6 +1509,106 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   ),
           ),
         ),
+      ),
+    );
+  }
+
+  String _editorStartupFailureMessage(Object error) {
+    if (error is FileSystemException) {
+      return 'A project media file is missing or cannot be read. Check that '
+          'the source drive is connected and the file is still available.';
+    }
+    if (error is FormatException) {
+      return 'The saved project data is damaged or uses an unsupported format.';
+    }
+    return 'Close and reopen the project. If the problem continues, keep the '
+        'project files and contact support.';
+  }
+
+  Future<void> _showKeyboardShortcuts() async {
+    final modifier = Platform.isMacOS ? '⌘' : 'Ctrl';
+    const transport = <(String, String)>[
+      ('Space', 'Play or pause'),
+      ('J / K / L', 'Previous frame / pause / play'),
+      ('← / →', 'Previous / next frame'),
+      ('Alt + ← / →', 'Nudge selected clips'),
+      ('↑ / ↓', 'Previous / next edit point'),
+      ('Home / End', 'Jump to start / end'),
+      ('I / O', 'Set work-area in / out'),
+      ('Alt+X', 'Clear work area'),
+    ];
+    final editing = <(String, String)>[
+      ('$modifier+Z / $modifier+Shift+Z', 'Undo / redo'),
+      ('$modifier+S', 'Save locally'),
+      ('$modifier+E', 'Export project'),
+      ('$modifier+I', 'Import media'),
+      ('$modifier+A', 'Select all clips'),
+      ('$modifier+B', 'Split at playhead'),
+      ('Delete', 'Delete selected clip'),
+      ('M', 'Add chapter marker'),
+      ('N', 'Toggle timeline snapping'),
+      ('F / Esc', 'Toggle fullscreen / dismiss'),
+      ('Shift+/', 'Show this shortcut guide'),
+    ];
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Keyboard shortcuts'),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 520),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Editing',
+                  style: TextStyle(fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 8),
+                for (final shortcut in editing)
+                  ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(shortcut.$2),
+                    trailing: Text(
+                      shortcut.$1,
+                      style: const TextStyle(
+                        color: kTextSecondary,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Playback',
+                  style: TextStyle(fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 8),
+                for (final shortcut in transport)
+                  ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(shortcut.$2),
+                    trailing: Text(
+                      shortcut.$1,
+                      style: const TextStyle(
+                        color: kTextSecondary,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Close'),
+          ),
+        ],
       ),
     );
   }
@@ -1197,6 +1661,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                         decoration: BoxDecoration(
                           color: _localSaveError != null
                               ? kError
+                              : _isLeaving
+                              ? kWarning
                               : _isSavingProject
                               ? kWarning
                               : _remoteSyncPending
@@ -1210,6 +1676,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                         child: Text(
                           _localSaveError != null
                               ? 'LOCAL SAVE FAILED'
+                              : _isLeaving
+                              ? 'SAVING BEFORE EXIT'
                               : _isSavingProject
                               ? 'SAVING LOCALLY'
                               : _remoteSyncPending
@@ -1236,6 +1704,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         ],
       ),
       actions: [
+        if (Platform.isWindows && !phoneToolbar)
+          IconButton(
+            key: const ValueKey('editor_keyboard_shortcuts_button'),
+            tooltip: 'Keyboard shortcuts (?)',
+            onPressed: _showKeyboardShortcuts,
+            icon: const Icon(Icons.keyboard_alt_outlined),
+          ),
         Padding(
           padding: const EdgeInsets.symmetric(vertical: 10),
           child: Tooltip(
@@ -3226,13 +3701,14 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     bool immediate = false,
     String changeType = 'editor_change',
   }) {
-    if (!_editorInitialized) return;
+    if (!_editorInitialized || !widget._persistenceEnabled) return;
     _saveDebounce?.cancel();
     _remoteSaveDebounce?.cancel();
     final userUid = ref.read(currentUserProvider)?.uid;
     final project = _captureProjectSnapshot(
       captionsChanged: _changeAffectsCaptions(changeType),
     );
+    _hasUnsavedLocalChanges = true;
     if (userUid != null) {
       _remoteSyncPending = true;
     }
@@ -3277,10 +3753,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     bool syncRemote = true,
     String changeType = 'editor_flush',
   }) async {
+    if (!widget._persistenceEnabled) return;
     _saveDebounce?.cancel();
     _remoteSaveDebounce?.cancel();
     final userUid = ref.read(currentUserProvider)?.uid;
     final project = _captureProjectSnapshot();
+    _hasUnsavedLocalChanges = true;
     await _saveProjectState(
       project: project,
       userUid: userUid,
@@ -3336,12 +3814,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final activeSave = _activeProjectSave;
     if (activeSave != null) return activeSave;
 
-    late final Future<void> saveDrain;
-    saveDrain = _drainProjectSaves().whenComplete(() {
-      if (identical(_activeProjectSave, saveDrain)) {
-        _activeProjectSave = null;
-      }
-    });
+    final saveDrain = _drainProjectSaves();
     _activeProjectSave = saveDrain;
     return saveDrain;
   }
@@ -3373,6 +3846,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
           savedLocally = true;
           _lastSavedAt = DateTime.now();
           _localSaveError = null;
+          if (identical(project, _projectSnapshot)) {
+            _hasUnsavedLocalChanges = false;
+          }
         } catch (error) {
           _localSaveError = error;
         }
@@ -3396,6 +3872,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         }
       }
     } finally {
+      // Clear the drain synchronously with its final queue check. Leaving the
+      // completed Future installed until a later `whenComplete` callback lets
+      // a save queued in that gap attach to a drain that can no longer see it.
+      _activeProjectSave = null;
       _isSavingProject = false;
       if (mounted && !_isClosing) {
         setState(() {});

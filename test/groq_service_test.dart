@@ -1,7 +1,59 @@
+import 'package:caption_craft/core/constants/groq_constants.dart';
 import 'package:caption_craft/core/utils/groq_service.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('release transcription requires a valid HTTPS proxy', () {
+    expect(
+      GroqConstants.isConfiguredFor(
+        proxyUrl: '',
+        apiKey: 'must-not-be-used-in-a-client',
+        releaseMode: true,
+      ),
+      isFalse,
+    );
+    expect(
+      GroqConstants.isConfiguredFor(
+        proxyUrl: 'https://api.example.com/v1/transcribe',
+        apiKey: '',
+        releaseMode: true,
+      ),
+      isTrue,
+    );
+    expect(
+      GroqConstants.isConfiguredFor(
+        proxyUrl: 'http://api.example.com/transcribe',
+        apiKey: '',
+        releaseMode: true,
+      ),
+      isFalse,
+    );
+  });
+
+  test('transcription proxy validation rejects credential and query leaks', () {
+    expect(
+      GroqConstants.validatedProxyUri(
+        'https://user:secret@example.com/transcribe',
+        allowLoopbackHttp: false,
+      ),
+      isNull,
+    );
+    expect(
+      GroqConstants.validatedProxyUri(
+        'https://example.com/transcribe?token=secret',
+        allowLoopbackHttp: false,
+      ),
+      isNull,
+    );
+    expect(
+      GroqConstants.validatedProxyUri(
+        'http://127.0.0.1:8080/transcribe',
+        allowLoopbackHttp: true,
+      ),
+      isNotNull,
+    );
+  });
+
   test('Groq word parsing clamps or rejects invalid timestamps', () {
     final words = GroqService.parseWordsResponse({
       'words': [

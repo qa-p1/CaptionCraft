@@ -3,8 +3,10 @@ import 'dart:io';
 import 'dart:convert';
 import 'dart:math';
 import 'package:dio/dio.dart';
+import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:flutter/foundation.dart';
 import '../constants/groq_constants.dart';
+import 'firebase_service.dart';
 import '../../features/editor/models/subtitle_entry.dart';
 import '../../features/editor/models/word_timing.dart';
 
@@ -12,22 +14,32 @@ import '../../features/editor/models/word_timing.dart';
 class GroqService {
   GroqService._();
 
-  static bool get isConfigured => GroqConstants.apiKey.isNotEmpty;
+  static bool get isConfigured => GroqConstants.isConfiguredFor(
+    proxyUrl: GroqConstants.transcriptionProxyUrl,
+    apiKey: GroqConstants.apiKey,
+    releaseMode: kReleaseMode,
+  );
 
   /// Fail before media analysis or transcoding when transcription has not
   /// been configured for this build.
   static void ensureConfigured() {
     if (!isConfigured) {
+      if (GroqConstants.transcriptionProxyUrl.isNotEmpty &&
+          GroqConstants.transcriptionProxyUri == null) {
+        throw Exception(
+          'The transcription proxy URL is invalid. Production endpoints must use HTTPS without embedded credentials, query parameters, or fragments.',
+        );
+      }
       throw Exception(
-        'Missing Groq API key. Run with '
-        '`--dart-define-from-file=.env` after adding GROQ_API_KEY.',
+        kReleaseMode
+            ? 'Automatic transcription is not configured for this release. Set CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL to an authenticated HTTPS endpoint.'
+            : 'Automatic transcription is not configured. Add a local GROQ_API_KEY for development or set CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL.',
       );
     }
   }
 
   static final Dio _dio = Dio(
     BaseOptions(
-      baseUrl: GroqConstants.baseUrl,
       connectTimeout: const Duration(seconds: 30),
       sendTimeout: const Duration(seconds: 120),
       receiveTimeout: const Duration(seconds: 120),
@@ -45,6 +57,17 @@ class GroqService {
   }) async {
     ensureConfigured();
     final apiKey = GroqConstants.apiKey;
+    final proxyUri = GroqConstants.transcriptionProxyUri;
+    final endpoint =
+        proxyUri ??
+        Uri.parse(
+          '${GroqConstants.baseUrl}${GroqConstants.transcriptionsEndpoint}',
+        );
+    final requestHeaders = await _requestHeaders(
+      proxyUri: proxyUri,
+      apiKey: apiKey,
+    );
+    final effectiveCancelToken = cancelToken ?? CancelToken();
 
     if (!await audioChunk.exists()) {
       throw Exception('Audio chunk ${audioChunk.path} was not created.');
@@ -60,8 +83,6 @@ class GroqService {
         'exceeds the configured Groq upload limit.',
       );
     }
-
-    _dio.options.headers['Authorization'] = 'Bearer $apiKey';
 
     int retries = 0;
     const maxRetries = 3;
@@ -82,21 +103,24 @@ class GroqService {
 
         if (kDebugMode) {
           debugPrint(
-            '[Groq] POST ${GroqConstants.transcriptionsEndpoint} '
+            '[Transcription] POST ${proxyUri == null ? 'provider' : 'proxy'} '
             'chunk=$chunkIndex size=${(chunkBytes / 1024 / 1024).toStringAsFixed(2)}MB',
           );
         }
 
         final response = await _dio
-            .post(
-              GroqConstants.transcriptionsEndpoint,
+            .postUri(
+              endpoint,
               data: formData,
-              cancelToken: cancelToken,
+              cancelToken: effectiveCancelToken,
+              options: Options(headers: requestHeaders),
             )
             .timeout(const Duration(minutes: 4));
 
         if (kDebugMode) {
-          debugPrint('[Groq] Transcription response ${response.statusCode}');
+          debugPrint(
+            '[Transcription] Response ${response.statusCode} for chunk=$chunkIndex',
+          );
         }
 
         return parseWordsResponse(response.data, chunkStartOffset);
@@ -108,20 +132,26 @@ class GroqService {
           // Rate limited — exponential backoff
           retries++;
           if (retries < maxRetries) {
-            await Future.delayed(Duration(seconds: 1 << retries)); // 2s, 4s, 8s
+            await _waitForRetry(
+              Duration(seconds: 1 << retries),
+              effectiveCancelToken,
+            );
             continue;
           }
         }
         if (retries == 0 && e.type == DioExceptionType.connectionError) {
           // Retry once on network error
           retries++;
-          await Future.delayed(const Duration(seconds: 2));
+          await _waitForRetry(const Duration(seconds: 2), effectiveCancelToken);
           continue;
         }
-        throw Exception(_formatDioError(e));
+        throw Exception(_formatDioError(e, usesProxy: proxyUri != null));
       } on TimeoutException {
+        if (!effectiveCancelToken.isCancelled) {
+          effectiveCancelToken.cancel('Transcription request timed out.');
+        }
         throw Exception(
-          'Groq transcription timed out for chunk ${chunkIndex + 1}.',
+          'Transcription timed out for chunk ${chunkIndex + 1}. Check the connection and try again.',
         );
       }
     }
@@ -366,25 +396,93 @@ class GroqService {
     return dotIndex != -1 ? path.substring(dotIndex) : '';
   }
 
-  static String _formatDioError(DioException error) {
+  static Future<Map<String, String>> _requestHeaders({
+    required Uri? proxyUri,
+    required String apiKey,
+  }) async {
+    if (proxyUri == null) {
+      return {'Authorization': 'Bearer $apiKey'};
+    }
+
+    final user = FirebaseService.currentUser;
+    if (user == null) {
+      throw Exception(
+        'Sign in before using automatic transcription in a production build.',
+      );
+    }
+
+    try {
+      final idToken = await user.getIdToken().timeout(
+        const Duration(seconds: 12),
+      );
+      final appCheckToken = await FirebaseAppCheck.instance.getToken().timeout(
+        const Duration(seconds: 12),
+      );
+      if (idToken == null || idToken.isEmpty) {
+        throw const FormatException('Firebase ID token was empty.');
+      }
+      if (appCheckToken == null || appCheckToken.isEmpty) {
+        throw const FormatException('Firebase App Check token was empty.');
+      }
+      return {
+        'Authorization': 'Bearer $idToken',
+        'X-Firebase-AppCheck': appCheckToken,
+      };
+    } on TimeoutException {
+      throw Exception(
+        'Account verification timed out before transcription could start.',
+      );
+    } catch (_) {
+      throw Exception(
+        'CaptionCraft could not verify this app installation for transcription. Reopen the app and try again.',
+      );
+    }
+  }
+
+  static Future<void> _waitForRetry(
+    Duration duration,
+    CancelToken cancelToken,
+  ) async {
+    const pollInterval = Duration(milliseconds: 100);
+    var elapsed = Duration.zero;
+    while (elapsed < duration) {
+      if (cancelToken.isCancelled) {
+        throw Exception('Transcription cancelled.');
+      }
+      final remaining = duration - elapsed;
+      final wait = remaining < pollInterval ? remaining : pollInterval;
+      await Future<void>.delayed(wait);
+      elapsed += wait;
+    }
+  }
+
+  static String _formatDioError(DioException error, {required bool usesProxy}) {
     final statusCode = error.response?.statusCode;
     final responseData = error.response?.data;
     final message = _responseMessage(responseData) ?? error.message;
 
     if (statusCode == 401) {
-      return 'Groq authentication failed. Check GROQ_API_KEY in .env.';
+      return usesProxy
+          ? 'Your transcription session could not be verified. Sign in again and retry.'
+          : 'Groq authentication failed. Check the development GROQ_API_KEY.';
+    }
+
+    if (statusCode == 403) {
+      return usesProxy
+          ? 'This app installation is not authorized for transcription. Check App Check and proxy configuration.'
+          : 'Groq denied this transcription request.';
     }
 
     if (statusCode == 413) {
-      return 'Groq rejected the audio upload because the chunk is too large.';
+      return 'The transcription service rejected this audio chunk because it is too large.';
     }
 
     if (statusCode != null) {
-      return 'Groq transcription failed with HTTP $statusCode'
+      return 'Transcription failed with HTTP $statusCode'
           '${message == null || message.isEmpty ? '' : ': $message'}';
     }
 
-    return 'Could not reach Groq transcription API'
+    return 'Could not reach the transcription service'
         '${message == null || message.isEmpty ? '' : ': $message'}';
   }
 
@@ -405,7 +503,10 @@ class GroqService {
     }
 
     if (responseData is String && responseData.trim().isNotEmpty) {
-      return responseData.trim();
+      final normalized = responseData.replaceAll(RegExp(r'\s+'), ' ').trim();
+      return normalized.length <= 240
+          ? normalized
+          : '${normalized.substring(0, 240)}…';
     }
 
     return null;

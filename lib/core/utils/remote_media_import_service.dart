@@ -30,12 +30,7 @@ class RemoteMediaImportService {
     @visibleForTesting Directory? documentsDirectoryOverride,
     @visibleForTesting Dio? dioOverride,
   }) async {
-    final uri = Uri.tryParse(url.trim());
-    if (uri == null ||
-        !const {'http', 'https'}.contains(uri.scheme.toLowerCase()) ||
-        uri.host.isEmpty) {
-      throw const RemoteMediaImportException('Media download URL is invalid.');
-    }
+    final uri = _validatedDownloadUri(url);
 
     final documents =
         documentsDirectoryOverride ?? await getApplicationDocumentsDirectory();
@@ -96,7 +91,7 @@ class RemoteMediaImportService {
           ),
         );
     try {
-      await dio.download(
+      final response = await dio.download(
         uri.toString(),
         partial.path,
         cancelToken: effectiveCancelToken,
@@ -111,7 +106,28 @@ class RemoteMediaImportService {
           onProgress?.call(received, total);
         },
       );
+      if (!_isAllowedDownloadUri(response.realUri)) {
+        throw const RemoteMediaImportException(
+          'The media provider redirected to an unsafe download URL.',
+        );
+      }
+      final contentType = response.headers
+          .value(Headers.contentTypeHeader)
+          ?.toLowerCase();
+      if (contentType != null &&
+          (contentType.startsWith('text/') ||
+              contentType.contains('html') ||
+              contentType.contains('json') ||
+              contentType.contains('xml'))) {
+        throw const RemoteMediaImportException(
+          'The media provider returned a web page instead of media.',
+        );
+      }
+    } on RemoteMediaImportException {
+      await _deleteIfPresent(partial);
+      rethrow;
     } on DioException catch (error) {
+      await _deleteIfPresent(partial);
       if (exceededLimit) {
         throw const RemoteMediaImportException(
           'This media exceeds the 512 MB download limit.',
@@ -126,11 +142,7 @@ class RemoteMediaImportService {
     } finally {
       if (ownsDio) dio.close(force: true);
       if (exceededLimit) {
-        try {
-          if (await partial.exists()) await partial.delete();
-        } on FileSystemException {
-          // Preserve the useful download error.
-        }
+        await _deleteIfPresent(partial);
       }
     }
 
@@ -144,9 +156,46 @@ class RemoteMediaImportService {
         'Downloaded media is empty or too large.',
       );
     }
-    if (await destination.exists()) await destination.delete();
-    await partial.rename(destination.path);
+    try {
+      if (await destination.exists()) await destination.delete();
+      await partial.rename(destination.path);
+    } on FileSystemException catch (error) {
+      await _deleteIfPresent(partial);
+      throw RemoteMediaImportException(
+        'Could not save this media: ${error.message}. Check available storage.',
+      );
+    }
     return destination.path;
+  }
+
+  static Uri _validatedDownloadUri(String value) {
+    final uri = Uri.tryParse(value.trim());
+    if (uri == null || !_isAllowedDownloadUri(uri)) {
+      throw const RemoteMediaImportException('Media download URL is invalid.');
+    }
+    return uri;
+  }
+
+  static bool _isAllowedDownloadUri(Uri uri) {
+    if (uri.host.isEmpty || uri.userInfo.isNotEmpty || uri.hasFragment) {
+      return false;
+    }
+    final scheme = uri.scheme.toLowerCase();
+    if (scheme == 'https') return true;
+    final isLoopback = const {
+      'localhost',
+      '127.0.0.1',
+      '::1',
+    }.contains(uri.host.toLowerCase());
+    return scheme == 'http' && isLoopback;
+  }
+
+  static Future<void> _deleteIfPresent(File file) async {
+    try {
+      if (await file.exists()) await file.delete();
+    } on FileSystemException {
+      // Cleanup must not replace the actionable download or storage error.
+    }
   }
 
   static String _safeExtension(String value, {required bool isVideo}) {

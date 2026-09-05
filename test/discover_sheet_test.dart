@@ -101,6 +101,33 @@ void main() {
     );
   });
 
+  testWidgets(
+    'shows a clear fallback when the embedded browser is unsupported',
+    (tester) async {
+      final facade = _FakeDiscoverFacade();
+      addTearDown(facade.dispose);
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [discoverDownloadFacadeProvider.overrideWithValue(facade)],
+          child: MaterialApp(
+            theme: AppTheme.darkTheme,
+            home: DiscoverSheet(
+              browserSupportedOverride: false,
+              onAddToTimeline: (_) async {},
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(
+        find.text('Embedded browser unavailable on Windows'),
+        findsOneWidget,
+      );
+      expect(find.byType(DiscoverBrowserTab), findsNothing);
+    },
+  );
+
   testWidgets('browser enforces HTTPS and queues scanned media only', (
     tester,
   ) async {

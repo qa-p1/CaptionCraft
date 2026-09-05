@@ -108,11 +108,18 @@ class _FilledButton extends StatelessWidget {
     }
     if (icon != null) {
       return Row(
-        mainAxisSize: MainAxisSize.min,
         children: [
           Icon(icon, size: 18),
           const SizedBox(width: 8),
-          Text(label, style: TextStyle(fontWeight: FontWeight.w700)),
+          Expanded(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: TextStyle(fontWeight: FontWeight.w700),
+            ),
+          ),
         ],
       );
     }
@@ -161,11 +168,18 @@ class _GhostButton extends StatelessWidget {
     }
     if (icon != null) {
       return Row(
-        mainAxisSize: MainAxisSize.min,
         children: [
           Icon(icon, size: 18),
           const SizedBox(width: 8),
-          Text(label, style: TextStyle(fontWeight: FontWeight.w500)),
+          Expanded(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: TextStyle(fontWeight: FontWeight.w500),
+            ),
+          ),
         ],
       );
     }
@@ -214,11 +228,18 @@ class _DangerButton extends StatelessWidget {
     }
     if (icon != null) {
       return Row(
-        mainAxisSize: MainAxisSize.min,
         children: [
           Icon(icon, size: 18),
           const SizedBox(width: 8),
-          Text(label, style: const TextStyle(fontWeight: FontWeight.w600)),
+          Expanded(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+          ),
         ],
       );
     }

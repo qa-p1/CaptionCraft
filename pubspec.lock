@@ -197,10 +197,10 @@ packages:
     dependency: "direct main"
     description:
       name: ffmpeg_kit_flutter_new
-      sha256: d127635f27e93a7f21f0a14ce0a1a148e80919c402dac4a2118d73bfb17ce841
+      sha256: "112ca70a36babc2951cddc879990aad98956b75acb69cdc3fbd2d16bfc941753"
       url: "https://pub.dev"
     source: hosted
-    version: "4.1.0"
+    version: "4.6.2"
   ffmpeg_kit_flutter_platform_interface:
     dependency: transitive
     description:
@@ -1101,6 +1101,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.4.0"
+  video_player_win:
+    dependency: "direct main"
+    description:
+      name: video_player_win
+      sha256: a4caca55ead1eb469d10060592e7ecdcbcd4493c6e2b63e4e666ff5446c790f1
+      url: "https://pub.dev"
+    source: hosted
+    version: "3.2.2"
   vm_service:
     dependency: transitive
     description:

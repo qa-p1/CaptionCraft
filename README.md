@@ -1,8 +1,8 @@
 # CaptionCraft
 
-CaptionCraft is a local-first Flutter video editor for Android and iOS. It
-combines a multi-track timeline, word-timed captions, Creator Lab tools, and an
-FFmpeg H.264/AAC export pipeline.
+CaptionCraft is a local-first Flutter video editor for Android, iOS, and
+Windows. It combines a multi-track timeline, word-timed captions, Creator Lab
+tools, and an FFmpeg H.264/AAC export pipeline.
 
 ## Highlights
 
@@ -15,7 +15,9 @@ FFmpeg H.264/AAC export pipeline.
 
 ```sh
 cp .env.example .env
-# Add GROQ_API_KEY, GIPHY_API_KEY, PEXELS_API_KEY, and PIXABAY_API_KEY.
+# For local debug transcription, add GROQ_API_KEY. Production releases ignore
+# direct Groq keys and require CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL.
+# Add GIPHY_API_KEY, PEXELS_API_KEY, and PIXABAY_API_KEY as needed.
 # Set CAPTIONCRAFT_ASSET_MANIFEST_URL after publishing optional media packs.
 flutter pub get
 flutter run --dart-define-from-file=.env
@@ -34,6 +36,7 @@ firebase deploy --only firestore:rules
 flutter analyze
 flutter test
 flutter build apk --release --split-per-abi --dart-define-from-file=.env
+flutter build windows --release --dart-define-from-file=.env
 ```
 
 Release builds require `android/key.properties` with `storeFile`,
@@ -49,6 +52,8 @@ using a debug key.
   partial, and outstanding timeline/editor requirements for the feature branch.
 - [Effects, color, and audio status](docs/editor_effects_audio_status.md) —
   implemented delivery paths and explicit unsupported boundaries.
+- [Release-readiness audit](docs/release-readiness-2026-08-31.md) — fixed
+  failure modes, automated coverage, and real-device/store release gates.
 
 ## Optional Elements libraries
 

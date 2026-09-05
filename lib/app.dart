@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'core/constants/app_mode_constants.dart';
 import 'core/theme/app_theme.dart';
 import 'core/utils/firebase_service.dart';
 import 'features/auth/screens/login_screen.dart';
@@ -8,11 +9,35 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'shared/widgets/app_surface.dart';
 import 'shared/widgets/captioncraft_brand.dart';
 
+enum CaptionCraftLaunchMode { cloud, localDesktop, startupFailure }
+
 class CaptionCraftApp extends ConsumerWidget {
-  const CaptionCraftApp({super.key});
+  const CaptionCraftApp({
+    super.key,
+    this.launchMode = CaptionCraftLaunchMode.cloud,
+  });
+
+  final CaptionCraftLaunchMode launchMode;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    if (launchMode == CaptionCraftLaunchMode.startupFailure) {
+      return MaterialApp(
+        title: 'CaptionCraft',
+        debugShowCheckedModeBanner: false,
+        theme: AppTheme.darkTheme,
+        home: const _AppStartupErrorScreen(),
+      );
+    }
+    if (launchMode == CaptionCraftLaunchMode.localDesktop) {
+      return MaterialApp(
+        title: 'CaptionCraft',
+        debugShowCheckedModeBanner: false,
+        theme: AppTheme.darkTheme,
+        home: const HomeScreen(localOwnerUid: localDesktopOwnerUid),
+      );
+    }
+
     final authState = ref.watch(authStateProvider);
 
     return MaterialApp(
@@ -38,6 +63,46 @@ class CaptionCraftApp extends ConsumerWidget {
             onRetry: () => ref.invalidate(authStateProvider),
           );
         },
+      ),
+    );
+  }
+}
+
+class _AppStartupErrorScreen extends StatelessWidget {
+  const _AppStartupErrorScreen();
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: kBackground,
+      body: SafeArea(
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 430),
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: AppPanel(
+                elevated: true,
+                padding: EdgeInsets.zero,
+                child: const Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Padding(
+                      padding: EdgeInsets.only(top: 24),
+                      child: CaptionCraftMark(size: 42, radius: 11),
+                    ),
+                    AppEmptyState(
+                      icon: Icons.cloud_off_rounded,
+                      title: 'CaptionCraft could not start securely',
+                      message:
+                          'Account services could not be initialized. Close and reopen the app. If this continues, install the latest build or contact support.',
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }

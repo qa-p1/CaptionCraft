@@ -7,12 +7,12 @@ import 'package:archive/archive_io.dart';
 import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import '../../features/editor/models/asset_pack_models.dart';
 import '../constants/asset_pack_constants.dart';
+import 'storage_capacity_service.dart';
 
 typedef AssetPackProgressCallback = void Function(AssetPackProgress progress);
 typedef AssetPackAvailableStorageProbe =
@@ -63,26 +63,8 @@ class AssetPackService {
   final AssetPackAvailableStorageProbe? _availableStorageProbe;
   final Map<String, Future<AssetPackCatalog>> _installOperations = {};
 
-  static const MethodChannel _storageChannel = MethodChannel(
-    'captioncraft/asset_pack_storage',
-  );
-
-  static Future<int?> _platformAvailableStorageBytes(
-    Directory directory,
-  ) async {
-    try {
-      final value = await _storageChannel.invokeMethod<num>('availableBytes', {
-        'path': directory.path,
-      });
-      return value?.toInt();
-    } on MissingPluginException {
-      return null;
-    } on PlatformException {
-      return null;
-    } on FlutterError {
-      return null;
-    }
-  }
+  static Future<int?> _platformAvailableStorageBytes(Directory directory) =>
+      StorageCapacityService.availableBytes(directory);
 
   Future<AssetPackCatalog?> getInstalledCatalog(String packId) async {
     _validatePackId(packId);

@@ -122,6 +122,9 @@ void main() {
         '',
         'not a URL',
         'ftp://example.test/file.mp4',
+        'http://example.test/insecure.mp4',
+        'https://user:secret@example.test/file.mp4',
+        'https://example.test/file.mp4#token',
         'https:///missing-host.mp4',
       ]) {
         await expectLater(
@@ -147,6 +150,32 @@ void main() {
         await Directory(p.join(documents.path, 'CaptionCraft')).exists(),
         isFalse,
       );
+    });
+
+    test('rejects HTML error shells and removes the partial file', () async {
+      final documents = await _temporaryDirectory();
+      final dio = Dio()..httpClientAdapter = _HtmlResponseAdapter();
+      addTearDown(() => dio.close(force: true));
+
+      await expectLater(
+        RemoteMediaImportService.download(
+          url: 'https://media.example.test/source.mp4',
+          provider: 'Pexels',
+          assetId: 'html-shell',
+          isVideo: true,
+          documentsDirectoryOverride: documents,
+          dioOverride: dio,
+        ),
+        throwsA(
+          isA<RemoteMediaImportException>().having(
+            (error) => error.message,
+            'message',
+            contains('web page instead of media'),
+          ),
+        ),
+      );
+
+      await _expectMediaDirectoryHasNoFiles(documents);
     });
 
     test('rejects oversized Content-Length and cleans partial data', () async {
@@ -296,6 +325,26 @@ class _OversizedContentLengthAdapter implements HttpClientAdapter {
         Headers.contentLengthHeader: [
           '${RemoteMediaImportService.maxDownloadBytes + 1}',
         ],
+      },
+    );
+  }
+
+  @override
+  void close({bool force = false}) {}
+}
+
+class _HtmlResponseAdapter implements HttpClientAdapter {
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    return ResponseBody.fromString(
+      '<html><body>Sign in</body></html>',
+      HttpStatus.ok,
+      headers: {
+        Headers.contentTypeHeader: ['text/html; charset=utf-8'],
       },
     );
   }

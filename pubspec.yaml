@@ -12,6 +12,8 @@
 
     # Video playback
     video_player: ^2.8.7
+    # Windows Media Foundation implementation of video_player.
+    video_player_win: ^3.2.2
     chewie: ^1.7.5
 
     # Subtitle display overlay
@@ -20,7 +22,7 @@
     # Subtitle data model & SRT/VTT parsing
     flutter_subtitle: ^0.0.6
     # FFmpeg for audio extraction, compression, video export
-    ffmpeg_kit_flutter_new: ^4.1.0
+    ffmpeg_kit_flutter_new: ^4.6.2
 
     # File picking and local configuration
     file_picker: ^10.3.10

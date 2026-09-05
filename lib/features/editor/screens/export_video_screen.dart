@@ -7,6 +7,7 @@ import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
 import '../../../core/theme/app_theme.dart';
+import '../../../core/utils/desktop_window_close_service.dart';
 import '../../../core/utils/timeline_export_service.dart';
 import '../../../shared/models/project_model.dart';
 import '../../editor/models/export_settings.dart';
@@ -47,27 +48,48 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
   bool _openInProgress = false;
   bool _isExporting = false;
   bool _isCancelling = false;
+  Future<void>? _activeExportTask;
   TimelineExportResult? _exportResult;
 
   VideoPlayerController? _previewController;
   bool _previewReady = false;
 
+  bool get _supportsGallery => Platform.isAndroid || Platform.isIOS;
+
   @override
   void initState() {
     super.initState();
+    DesktopWindowCloseService.registerHandler(
+      owner: this,
+      handler: _prepareForDesktopWindowClose,
+    );
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      _runExport();
+      _startExport();
     });
   }
 
   @override
   void dispose() {
+    DesktopWindowCloseService.unregisterHandler(this);
     if (_isExporting) {
       unawaited(TimelineExportService.cancelActiveExport());
     }
     _previewController?.dispose();
     super.dispose();
+  }
+
+  void _startExport() {
+    if (_activeExportTask != null) return;
+    final task = _runExport();
+    _activeExportTask = task;
+    unawaited(
+      task.whenComplete(() {
+        if (identical(_activeExportTask, task)) {
+          _activeExportTask = null;
+        }
+      }),
+    );
   }
 
   Future<void> _runExport() async {
@@ -135,7 +157,7 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
 
       var savedToGallery = false;
       String? galleryWarning;
-      if (widget.settings.saveToGallery) {
+      if (widget.settings.saveToGallery && _supportsGallery) {
         try {
           await Gal.putVideo(outputPath);
           savedToGallery = true;
@@ -200,6 +222,7 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
       _statusText = 'Cancelling export...';
     });
     await TimelineExportService.cancelActiveExport();
+    await _activeExportTask;
   }
 
   Future<void> _handleBack() async {
@@ -207,30 +230,42 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
       Navigator.pop(context, _outputPath);
       return;
     }
-    final shouldStop = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Stop this render?'),
-        content: const Text(
-          'Leaving now will cancel the current export and remove its partial file.',
-          style: TextStyle(color: kTextSecondary, height: 1.45),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext, false),
-            child: const Text('Keep rendering'),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: kError),
-            onPressed: () => Navigator.pop(dialogContext, true),
-            child: const Text('Stop render'),
-          ),
-        ],
-      ),
-    );
-    if (shouldStop != true || !mounted) return;
+    final shouldStop = await _confirmStopRender();
+    if (!shouldStop || !mounted) return;
     await _cancelExport();
     if (mounted) Navigator.pop(context);
+  }
+
+  Future<bool> _prepareForDesktopWindowClose() async {
+    if (!_isExporting) return true;
+    if (!await _confirmStopRender() || !mounted) return false;
+    await _cancelExport();
+    return true;
+  }
+
+  Future<bool> _confirmStopRender() async {
+    return await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: const Text('Stop this render?'),
+            content: const Text(
+              'Leaving now will cancel the current export and remove its partial file.',
+              style: TextStyle(color: kTextSecondary, height: 1.45),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: const Text('Keep rendering'),
+              ),
+              FilledButton(
+                style: FilledButton.styleFrom(backgroundColor: kError),
+                onPressed: () => Navigator.pop(dialogContext, true),
+                child: const Text('Stop render'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
   }
 
   Future<bool> _initializePreview(String videoPath) async {
@@ -274,6 +309,7 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
   }
 
   Future<void> _openGalleryApp() async {
+    if (!_supportsGallery) return;
     try {
       await Gal.open();
     } catch (_) {
@@ -286,7 +322,9 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
 
   Future<void> _retryGallerySave() async {
     final outputPath = _outputPath;
-    if (outputPath == null || _gallerySaveInProgress) return;
+    if (outputPath == null || _gallerySaveInProgress || !_supportsGallery) {
+      return;
+    }
     setState(() => _gallerySaveInProgress = true);
     try {
       await Gal.putVideo(outputPath);
@@ -1124,7 +1162,7 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
                     const SizedBox(width: 10),
                     Expanded(
                       child: FilledButton.icon(
-                        onPressed: _runExport,
+                        onPressed: _startExport,
                         icon: const Icon(Icons.refresh_rounded, size: 18),
                         label: const Text('Try again'),
                       ),

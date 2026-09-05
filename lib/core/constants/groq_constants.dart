@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 class GroqConstants {
@@ -5,13 +6,65 @@ class GroqConstants {
 
   static const _definedApiKey = String.fromEnvironment('GROQ_API_KEY');
   static const _definedLegacyApiKey = String.fromEnvironment('groq_api_key');
+  static const _definedProxyUrl = String.fromEnvironment(
+    'CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL',
+  );
 
-  static String get apiKey =>
-      _normalizedValue(_definedApiKey) ??
-      _normalizedValue(_definedLegacyApiKey) ??
-      _envValue('GROQ_API_KEY') ??
-      _envValue('groq_api_key') ??
+  /// Direct provider credentials are a development convenience only. The
+  /// compile-time release branch returns no key, so production code cannot
+  /// accidentally authorize requests from a distributable client.
+  static String get apiKey {
+    if (kReleaseMode) return '';
+    return _normalizedValue(_definedApiKey) ??
+        _normalizedValue(_definedLegacyApiKey) ??
+        _envValue('GROQ_API_KEY') ??
+        _envValue('groq_api_key') ??
+        '';
+  }
+
+  static String get transcriptionProxyUrl =>
+      _normalizedValue(_definedProxyUrl) ??
+      _envValue('CAPTIONCRAFT_TRANSCRIPTION_PROXY_URL') ??
       '';
+
+  static Uri? get transcriptionProxyUri => validatedProxyUri(
+    transcriptionProxyUrl,
+    allowLoopbackHttp: !kReleaseMode,
+  );
+
+  @visibleForTesting
+  static Uri? validatedProxyUri(
+    String rawValue, {
+    required bool allowLoopbackHttp,
+  }) {
+    final uri = Uri.tryParse(rawValue.trim());
+    if (uri == null ||
+        uri.host.isEmpty ||
+        uri.userInfo.isNotEmpty ||
+        uri.hasFragment ||
+        uri.query.isNotEmpty) {
+      return null;
+    }
+    if (uri.scheme.toLowerCase() == 'https') return uri;
+    final isLoopback = const {
+      'localhost',
+      '127.0.0.1',
+      '::1',
+    }.contains(uri.host.toLowerCase());
+    if (allowLoopbackHttp && uri.scheme.toLowerCase() == 'http' && isLoopback) {
+      return uri;
+    }
+    return null;
+  }
+
+  static bool isConfiguredFor({
+    required String proxyUrl,
+    required String apiKey,
+    required bool releaseMode,
+  }) {
+    final proxy = validatedProxyUri(proxyUrl, allowLoopbackHttp: !releaseMode);
+    return proxy != null || (!releaseMode && apiKey.trim().isNotEmpty);
+  }
 
   static const String baseUrl = 'https://api.groq.com/openai/v1';
   static const String model = 'whisper-large-v3';
