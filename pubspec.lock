@@ -804,10 +804,10 @@ packages:
     dependency: transitive
     description:
       name: petitparser
-      sha256: "91bd59303e9f769f108f8df05e371341b15d59e995e6806aefab827b58336675"
+      sha256: "07c8f0b1913bcde1ff0d26e57ace2f3012ccbf2b204e070290dad3bb22797646"
       url: "https://pub.dev"
     source: hosted
-    version: "7.0.2"
+    version: "6.1.0"
   platform:
     dependency: transitive
     description:
@@ -856,6 +856,62 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.6.1"
+  serious_python:
+    dependency: "direct main"
+    description:
+      name: serious_python
+      sha256: "459d76cbc7e2d17d2ea1adab0f345c1769f279de22bb7698c9145b83d2eb0992"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.9.5"
+  serious_python_android:
+    dependency: transitive
+    description:
+      name: serious_python_android
+      sha256: "9f9a1142dad2c5d707f8d11d88c41c4f81b2eef8dd091709da77cb03954c2040"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.9.12"
+  serious_python_darwin:
+    dependency: transitive
+    description:
+      name: serious_python_darwin
+      sha256: "97cb59fde6d588fcf183d4bdf2561a2238f8a1cfdcd139b793569f421f27db2d"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.9.12"
+  serious_python_linux:
+    dependency: transitive
+    description:
+      name: serious_python_linux
+      sha256: bdf92c9b674ab15c21df3f4768db85f4f83975ebb32a9a79c831f4a5317ed6d0
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.9.12"
+  serious_python_platform_interface:
+    dependency: transitive
+    description:
+      name: serious_python_platform_interface
+      sha256: "711ab864411dad7937d724938688bfb3cad97e6ad2a3849a0d84ba43dd96ca03"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.9.12"
+  serious_python_windows:
+    dependency: transitive
+    description:
+      name: serious_python_windows
+      sha256: a84301f113337d72ada8a0f6b5858b966e7b2b14e939c24953c9f79bac5afbcc
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.9.12"
+  shelf:
+    dependency: transitive
+    description:
+      name: shelf
+      sha256: e7dd780a7ffb623c57850b33f43309312fc863fb6aa3d276a754bb299839ef12
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.4.2"
   shimmer:
     dependency: "direct main"
     description:
@@ -941,6 +997,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "0.7.9"
+  toml:
+    dependency: transitive
+    description:
+      name: toml
+      sha256: "9968de24e45b632bf1a654fe1ac7b6fe5261c349243df83fd262397799c45a2d"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.15.0"
   typed_data:
     dependency: transitive
     description:
@@ -1161,10 +1225,10 @@ packages:
     dependency: transitive
     description:
       name: xml
-      sha256: "971043b3a0d3da28727e40ed3e0b5d18b742fa5a68665cca88e74b7876d5e025"
+      sha256: b015a8ad1c488f66851d762d3090a21c600e479dc75e68328c52774040cf9226
       url: "https://pub.dev"
     source: hosted
-    version: "6.6.1"
+    version: "6.5.0"
   yaml:
     dependency: transitive
     description:

@@ -17,6 +17,7 @@ import '../models/asset_pack_models.dart';
 import '../models/timeline_models.dart';
 import '../providers/editor_provider.dart';
 import '../providers/playback_provider.dart';
+import 'resizable_editor_sheet.dart';
 
 @immutable
 class EffectStackTargetOption {
@@ -126,6 +127,7 @@ class _EffectStackEditorSheetState
       child: Column(
         children: [
           AppSheetHeader(
+            showHandle: false,
             title: widget.domain == EditorEffectDomain.visual
                 ? 'Effect stack'
                 : 'Audio processing',
@@ -918,6 +920,7 @@ class _EffectStackEditorSheetState
     final type = await showModalBottomSheet<EditorEffectType>(
       context: context,
       isScrollControlled: true,
+      enableDrag: false,
       backgroundColor: Colors.transparent,
       builder: (context) => _EffectBrowser(domain: widget.domain),
     );
@@ -984,6 +987,8 @@ class _EffectStackEditorSheetState
   ) async {
     await showModalBottomSheet<void>(
       context: context,
+      isScrollControlled: true,
+      enableDrag: false,
       backgroundColor: Colors.transparent,
       builder: (context) {
         final presetsById = <String, EditorEffectPreset>{
@@ -1000,13 +1005,18 @@ class _EffectStackEditorSheetState
                 .toList()
               ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
         final globalIds = _globalPresets.map((preset) => preset.id).toSet();
-        return AppSheetSurface(
+        return ResizableEditorSheet(
+          title: 'Effect presets',
+          initialHeightFactor: 0.62,
+          showHeader: false,
+          contentPadding: EdgeInsets.zero,
           child: SafeArea(
             top: false,
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
                 AppSheetHeader(
+                  showHandle: false,
                   title: 'Effect presets',
                   subtitle: 'Reusable stacks for faster grading and styling',
                   icon: Icons.bookmarks_outlined,
@@ -1275,14 +1285,19 @@ class _EffectBrowserState extends State<_EffectBrowser> {
               type.label.toLowerCase().contains(query) ||
               type.category.toLowerCase().contains(query));
     }).toList();
-    return FractionallySizedBox(
-      heightFactor: 0.82,
+    return ResizableEditorSheet(
+      title: 'Effects',
+      initialHeightFactor: 0.82,
+      showHeader: false,
+      scrollable: false,
+      contentPadding: EdgeInsets.zero,
       child: AppSheetSurface(
         child: SafeArea(
           top: false,
           child: Column(
             children: [
               AppSheetHeader(
+                showHandle: false,
                 title: widget.domain == EditorEffectDomain.visual
                     ? 'Add visual effect'
                     : 'Add audio effect',

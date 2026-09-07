@@ -62,6 +62,9 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
     : _historyClock = historyClock ?? EditorHistoryClock(),
       super(const SubtitleState());
 
+  /// Read-only snapshot for timeline command routing.
+  SubtitleState get currentState => state;
+
   final EditorHistoryClock _historyClock;
   final List<SubtitleAction> _undoStack = [];
   final List<SubtitleAction> _redoStack = [];
@@ -497,6 +500,16 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
   }
 
   /// Update the global style.
+  void updateEntriesStyle(Set<String> ids, SubtitleStyleModel style) {
+    if (!state.entries.any((e) => ids.contains(e.id))) return;
+    if (!_isStyleGestureEditing) _pushUndo();
+    state = state.copyWith(
+      entries: state.entries
+          .map((e) => ids.contains(e.id) ? e.copyWith(styleOverride: style) : e)
+          .toList(),
+    );
+  }
+
   void updateGlobalStyle(SubtitleStyleModel style) {
     if (!_isStyleGestureEditing) {
       _pushUndo();

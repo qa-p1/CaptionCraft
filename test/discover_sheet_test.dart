@@ -54,9 +54,7 @@ void main() {
     expect(browser.activeStates, [false, true]);
   });
 
-  testWidgets('modal Discover opens full screen without the old tagline', (
-    tester,
-  ) async {
+  testWidgets('modal Discover opens large and can be resized', (tester) async {
     final facade = _FakeDiscoverFacade();
     await tester.binding.setSurfaceSize(const Size(430, 900));
     addTearDown(() async {
@@ -94,7 +92,13 @@ void main() {
 
     final sheet = find.byKey(const ValueKey('discover-fullscreen-sheet'));
     expect(sheet, findsOne);
-    expect(tester.getSize(sheet), const Size(430, 900));
+    final initialHeight = tester.getSize(sheet).height;
+    expect(initialHeight, greaterThan(400));
+    final handle = find.byKey(const ValueKey('resizable_sheet_handle'));
+    expect(handle, findsOneWidget);
+    await tester.drag(handle, const Offset(0, 100));
+    await tester.pumpAndSettle();
+    expect(tester.getSize(sheet).height, lessThan(initialHeight));
     expect(
       find.text('Find media online, download it, and add it to your timeline.'),
       findsNothing,

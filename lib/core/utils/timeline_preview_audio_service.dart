@@ -10,6 +10,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import '../../features/editor/models/timeline_models.dart';
+import '../../features/editor/models/editor_effect_models.dart';
 import 'ffmpeg_service.dart';
 import 'timeline_export_service.dart';
 import 'timeline_media_cache_pruner.dart';
@@ -57,6 +58,12 @@ class TimelinePreviewAudioService {
   static const _maximumCacheBytes = 512 * 1024 * 1024;
 
   static Future<void> _renderTail = Future<void>.value();
+  static int _latestRequest = 0;
+  static List<Map<String, dynamic>> _audioEffects(EditorEffectStack stack) =>
+      stack.effects
+          .where((e) => e.enabled && e.domain == EditorEffectDomain.audio)
+          .map((e) => e.toJson())
+          .toList();
   static final Map<String, bool> _probedAudioCapabilities = {};
 
   static PreviewAudioMixPlan? buildPlan({
@@ -231,7 +238,7 @@ class TimelinePreviewAudioService {
             'trackSolo': input.track.isSolo,
             'trackGain': input.track.audioGain,
             'trackPan': input.track.audioPan,
-            'trackEffectStack': input.track.effectStack.toJson(),
+            'trackEffectStack': _audioEffects(input.track.effectStack),
             'audioBusId': input.track.audioBusId,
             'audioBus': input.track.audioBusId == null
                 ? null
@@ -253,9 +260,9 @@ class TimelinePreviewAudioService {
             'duckReleaseMs': input.clip.duckReleaseMs,
             'duckSidechainTrackIds': input.clip.duckSidechainTrackIds,
             'denoise': input.clip.denoise,
-            'resolvedEffectStack': timeline
-                .effectStackForClip(input.clip, track: input.track)
-                .toJson(),
+            'resolvedEffectStack': _audioEffects(
+              timeline.effectStackForClip(input.clip, track: input.track),
+            ),
             'volumeKeyframes': [
               for (final keyframe in input.clip.keyframes)
                 if (keyframe.property == TimelineKeyframeProperty.volume)
@@ -263,12 +270,13 @@ class TimelinePreviewAudioService {
             ],
           },
       ],
-      'projectEffectStack': timeline.projectEffectStack.toJson(),
+      'projectEffectStack': _audioEffects(timeline.projectEffectStack),
       // Automatic ducking depends on dialogue/text timing even when those
       // clips do not own an audio stream themselves.
       'dialogueWindows': [
         for (final track in timeline.tracks)
-          if (!track.isHidden &&
+          if (selected.any((item) => item.clip.autoDuck) &&
+              !track.isHidden &&
               (track.type == TimelineTrackType.text ||
                   track.type == TimelineTrackType.subtitle))
             for (final clip in track.clips)
@@ -296,7 +304,13 @@ class TimelinePreviewAudioService {
   static Future<PreviewAudioMixResult> ensureRendered(
     PreviewAudioMixPlan plan,
   ) {
-    final operation = _renderTail.then((_) => _render(plan));
+    final request = ++_latestRequest;
+    final operation = _renderTail.then((_) {
+      if (request != _latestRequest) {
+        throw StateError('Superseded audio preview');
+      }
+      return _render(plan);
+    });
     _renderTail = operation.then<void>((_) {}, onError: (_, _) {});
     return operation;
   }
@@ -327,7 +341,9 @@ class TimelinePreviewAudioService {
       '${DateTime.now().microsecondsSinceEpoch}.partial.m4a',
     );
     final partial = File(partialPath);
-    final renderInputs = await _verifiedAudioInputs(plan.inputs);
+    final renderInputs = await _verifiedAudioInputs(
+      plan.inputs,
+    ).timeout(const Duration(seconds: 12));
     if (renderInputs.isEmpty) {
       throw StateError('No readable audio streams were found for preview.');
     }
@@ -338,7 +354,17 @@ class TimelinePreviewAudioService {
       outputPath: partialPath,
     );
     try {
-      final session = await FFmpegKit.executeWithArguments(arguments);
+      final finished = Completer<void>();
+      final session = await FFmpegKit.executeWithArgumentsAsync(arguments, (_) {
+        if (!finished.isCompleted) finished.complete();
+      });
+      try {
+        await finished.future.timeout(const Duration(seconds: 35));
+      } on TimeoutException {
+        final id = session.getSessionId();
+        if (id != null) await FFmpegKit.cancel(id);
+        rethrow;
+      }
       final returnCode = await session.getReturnCode();
       if (!ReturnCode.isSuccess(returnCode) ||
           !await partial.exists() ||
@@ -406,7 +432,9 @@ class TimelinePreviewAudioService {
       var hasAudio = _probedAudioCapabilities[capabilityKey];
       if (hasAudio == null) {
         try {
-          final mediaInfo = await FFmpegService.getMediaInfo(input.sourcePath);
+          final mediaInfo = await FFmpegService.getMediaInfo(
+            input.sourcePath,
+          ).timeout(const Duration(seconds: 8));
           hasAudio = mediaInfo['hasAudio'] as bool? ?? false;
           if (_probedAudioCapabilities.length >= 256) {
             _probedAudioCapabilities.clear();

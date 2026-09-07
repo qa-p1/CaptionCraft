@@ -413,7 +413,7 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
           const Padding(
             padding: EdgeInsets.fromLTRB(20, 20, 20, 9),
             child: Text(
-              'ACCOUNT TOOLS',
+              'SETTINGS',
               style: TextStyle(
                 color: kTextSecondary,
                 fontSize: 9,
@@ -432,7 +432,7 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
             ),
           _ActionTile(
             icon: Icons.key_rounded,
-            title: 'Settings · Connected services',
+            title: 'Connected services',
             subtitle: 'Manage your API keys and encrypted backup',
             enabled: !isBusy,
             onTap: () {

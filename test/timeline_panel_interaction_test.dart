@@ -1,3 +1,6 @@
+import 'package:caption_craft/features/editor/screens/editor_screen.dart';
+import 'package:caption_craft/features/auth/providers/auth_provider.dart';
+import 'package:caption_craft/shared/models/project_model.dart';
 import 'package:caption_craft/features/editor/models/editor_effect_models.dart';
 import 'package:caption_craft/features/editor/models/timeline_models.dart';
 import 'package:caption_craft/features/editor/models/subtitle_entry.dart';
@@ -66,7 +69,9 @@ void main() {
       endTime: const Duration(seconds: 4),
       sourceDuration: const Duration(seconds: 4),
     );
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     final notifier = container.read(editorProvider.notifier);
     notifier.loadProject(
@@ -126,7 +131,9 @@ void main() {
         sourceDuration: const Duration(milliseconds: 200),
       );
     }, growable: false);
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -210,7 +217,9 @@ void main() {
           section: TimelineTrackSection.audio,
         ),
     ];
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -247,7 +256,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(390, 320));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -311,7 +322,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(390, 300));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -418,7 +431,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(844, 440));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -479,7 +494,9 @@ void main() {
     (tester) async {
       await tester.binding.setSurfaceSize(const Size(844, 440));
       addTearDown(() => tester.binding.setSurfaceSize(null));
-      final container = ProviderContainer();
+      final container = ProviderContainer(
+        overrides: [currentUserProvider.overrideWithValue(null)],
+      );
       addTearDown(container.dispose);
       container
           .read(editorProvider.notifier)
@@ -541,7 +558,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(390, 320));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -614,7 +633,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(390, 320));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -662,7 +683,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(520, 340));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -742,7 +765,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(520, 340));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -794,7 +819,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(844, 420));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -811,9 +838,9 @@ void main() {
         .read(playbackProvider.notifier)
         .updatePosition(const Duration(seconds: 5));
 
-    await tester.pumpWidget(_timelineHarness(container));
+    await _pumpEditorHarness(tester, container);
     await tester.pumpAndSettle();
-    await tester.tap(find.byTooltip('Split'));
+    await tester.tap(find.byKey(const ValueKey('dock_primary_split')));
     await tester.pumpAndSettle();
 
     final timeline = container.read(editorProvider).timeline;
@@ -845,7 +872,9 @@ void main() {
       (offset: Duration(milliseconds: 240), locked: false),
       (offset: Duration.zero, locked: true),
     ]) {
-      final container = ProviderContainer();
+      final container = ProviderContainer(
+        overrides: [currentUserProvider.overrideWithValue(null)],
+      );
       container
           .read(editorProvider.notifier)
           .loadProject(
@@ -872,9 +901,9 @@ void main() {
           .singleWhere((clip) => clip.id == 'linked_audio')
           .toJson();
 
-      await tester.pumpWidget(_timelineHarness(container));
+      await _pumpEditorHarness(tester, container);
       await tester.pumpAndSettle();
-      await tester.tap(find.byTooltip('Split'));
+      await tester.tap(find.byKey(const ValueKey('dock_primary_split')));
       await tester.pumpAndSettle();
 
       final timeline = container.read(editorProvider).timeline;
@@ -947,7 +976,9 @@ void main() {
         ),
       ],
     );
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -964,9 +995,9 @@ void main() {
         .read(playbackProvider.notifier)
         .updatePosition(const Duration(seconds: 2));
 
-    await tester.pumpWidget(_timelineHarness(container));
+    await _pumpEditorHarness(tester, container);
     await tester.pumpAndSettle();
-    await tester.tap(find.byTooltip('Split'));
+    await tester.tap(find.byKey(const ValueKey('dock_primary_split')));
     await tester.pumpAndSettle();
 
     final restored = container.read(editorProvider).timeline;
@@ -992,7 +1023,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(520, 360));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -1062,7 +1095,9 @@ void main() {
       (offset: Duration(milliseconds: 240), locked: false),
       (offset: Duration.zero, locked: true),
     ]) {
-      final container = ProviderContainer();
+      final container = ProviderContainer(
+        overrides: [currentUserProvider.overrideWithValue(null)],
+      );
       container
           .read(editorProvider.notifier)
           .loadProject(
@@ -1114,7 +1149,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(390, 320));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -1174,7 +1211,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(844, 300));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -1200,8 +1239,14 @@ void main() {
     expect(find.text('Text'), findsOne);
     expect(find.text('Audio'), findsOne);
     expect(find.text('Effects'), findsNothing);
-    expect(find.byKey(const ValueKey('fixed_editor_sheet')), findsOneWidget);
-    expect(find.byKey(const ValueKey('resizable_sheet_handle')), findsNothing);
+    expect(
+      find.byKey(const ValueKey('resizable_editor_sheet')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('resizable_sheet_handle')),
+      findsOneWidget,
+    );
 
     final overlayChoice = find.byKey(
       const ValueKey('timeline_track_choice_video'),
@@ -1226,7 +1271,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(844, 520));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -1281,7 +1328,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(844, 360));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -1359,7 +1408,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(844, 520));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     final initialTimeline = _linkedSourceTimeline();
     final originalVideo = initialTimeline.tracks
@@ -1424,7 +1475,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(844, 360));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -1464,7 +1517,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(844, 360));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -1480,9 +1535,13 @@ void main() {
 
     await tester.pumpWidget(_timelineHarness(container));
     await tester.pumpAndSettle();
-    await tester.tap(find.byTooltip('Copy'));
+    await tester.tap(find.byTooltip('Clipboard'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Copy'));
     await tester.pump();
-    await tester.tap(find.byTooltip('Paste at playhead'));
+    await tester.tap(find.byTooltip('Clipboard'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Paste at playhead'));
     await tester.pumpAndSettle();
 
     final overlay = container
@@ -1503,7 +1562,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(844, 360));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -1517,9 +1578,17 @@ void main() {
       ..selectTrack('overlay')
       ..selectClip('overlay_clip');
 
-    await tester.pumpWidget(_timelineHarness(container));
+    await _pumpEditorHarness(tester, container);
     await tester.pumpAndSettle();
-    await tester.tap(find.byTooltip('Duplicate selection'));
+    await tester.ensureVisible(
+      find.byKey(const ValueKey('dock_primary_arrange')),
+    );
+    await tester.tap(find.byKey(const ValueKey('dock_primary_arrange')));
+    await tester.pump();
+    await tester.ensureVisible(
+      find.byKey(const ValueKey('dock_tool_duplicate')),
+    );
+    await tester.tap(find.byKey(const ValueKey('dock_tool_duplicate')));
     await tester.pumpAndSettle();
 
     final overlay = container
@@ -1540,7 +1609,9 @@ void main() {
     (tester) async {
       await tester.binding.setSurfaceSize(const Size(844, 420));
       addTearDown(() => tester.binding.setSurfaceSize(null));
-      final container = ProviderContainer();
+      final container = ProviderContainer(
+        overrides: [currentUserProvider.overrideWithValue(null)],
+      );
       addTearDown(container.dispose);
       container
           .read(editorProvider.notifier)
@@ -1622,7 +1693,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(844, 360));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -1635,32 +1708,22 @@ void main() {
     container.read(editorProvider.notifier)
       ..selectTrack('overlay')
       ..selectClip('overlay_clip');
-    TimelineClip? replaceRequested;
-
-    await tester.pumpWidget(
-      _timelineHarness(
-        container,
-        onReplaceMediaRequested: (clip) => replaceRequested = clip,
-      ),
-    );
+    await _pumpEditorHarness(tester, container);
     await tester.pumpAndSettle();
-    await tester.tap(find.byTooltip('Delete'));
+    await tester.ensureVisible(
+      find.byKey(const ValueKey('dock_primary_delete')),
+    );
+    await tester.tap(find.byKey(const ValueKey('dock_primary_delete')));
     await tester.pumpAndSettle();
 
     expect(
       container.read(editorProvider).timeline.visualMediaClips,
       hasLength(1),
     );
-    expect(
-      find.byKey(const ValueKey('timeline_last_visual_dialog')),
-      findsOneWidget,
-    );
-    expect(replaceRequested, isNull);
-    await tester.tap(
-      find.byKey(const ValueKey('timeline_replace_last_visual')),
-    );
+    expect(find.text('Keep one visual'), findsOneWidget);
+    expect(find.text('Replace'), findsOneWidget);
+    await tester.tap(find.text('Cancel'));
     await tester.pumpAndSettle();
-    expect(replaceRequested?.id, 'overlay_clip');
   });
 
   testWidgets('track deletion cannot remove the project last visual', (
@@ -1668,7 +1731,9 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(844, 360));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(editorProvider.notifier)
@@ -1757,7 +1822,9 @@ void main() {
         ),
       ],
     );
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [currentUserProvider.overrideWithValue(null)],
+    );
     addTearDown(container.dispose);
     container
         .read(subtitleProvider.notifier)
@@ -1780,21 +1847,19 @@ void main() {
     await tester.pumpWidget(_timelineHarness(container));
     await tester.pumpAndSettle();
 
-    InkWell toolbarAction(String tooltip) {
-      final action = find.descendant(
-        of: find.byTooltip(tooltip),
-        matching: find.byType(InkWell),
-      );
-      return tester.widget<InkWell>(action.first);
-    }
+    // Clip mutation controls live in the editor dock; this timeline toolbar
+    // cannot mutate locked captions through duplicate entry points.
+    expect(find.byTooltip('Duplicate selection'), findsNothing);
+    expect(find.byTooltip('Delete'), findsNothing);
+    expect(find.byTooltip('Split'), findsNothing);
 
-    expect(toolbarAction('Duplicate selection').onTap, isNull);
-    expect(toolbarAction('Delete').onTap, isNull);
-    expect(toolbarAction('Split').onTap, isNull);
-
-    await tester.tap(find.byTooltip('Copy'));
+    await tester.tap(find.byTooltip('Clipboard'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Copy'));
     await tester.pump();
-    await tester.tap(find.byTooltip('Paste at playhead'));
+    await tester.tap(find.byTooltip('Clipboard'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Paste at playhead'));
     await tester.pumpAndSettle();
     expect(container.read(subtitleProvider).entries, hasLength(1));
     expect(
@@ -1803,6 +1868,40 @@ void main() {
     );
     expect(tester.takeException(), isNull);
   });
+}
+
+Future<void> _pumpEditorHarness(
+  WidgetTester tester,
+  ProviderContainer container,
+) async {
+  final state = container.read(editorProvider);
+  final subtitles = container.read(subtitleProvider);
+  final position = container.read(playbackProvider).position;
+  await tester.pumpWidget(
+    UncontrolledProviderScope(
+      container: container,
+      child: MaterialApp(
+        theme: ThemeData.dark(useMaterial3: true),
+        home: EditorScreen.withoutPersistence(
+          project: Project(
+            id: 'mutation-test',
+            name: 'Mutation test',
+            videoPath: 'missing.mp4',
+            durationMs: state.timeline.duration.inMilliseconds,
+            timeline: state.timeline,
+            subtitles: subtitles.entries,
+            globalStyle: subtitles.globalStyle,
+          ),
+        ),
+      ),
+    ),
+  );
+  await tester.pump(const Duration(milliseconds: 700));
+  container.read(editorProvider.notifier)
+    ..selectTrack(state.selectedTrackId)
+    ..selectClip(state.selectedClipId);
+  container.read(playbackProvider.notifier).updatePosition(position);
+  await tester.pump();
 }
 
 Future<void> _armTimelineEdit(WidgetTester tester) {

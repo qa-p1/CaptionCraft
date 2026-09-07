@@ -9,7 +9,17 @@ import 'animated_subtitle_overlay.dart';
 
 /// Style panel for customizing subtitle appearance.
 class SubtitleStylePanel extends ConsumerWidget {
-  const SubtitleStylePanel({super.key});
+  const SubtitleStylePanel({super.key, this.entryIds});
+  final Set<String>? entryIds;
+
+  void _updateStyle(WidgetRef ref, SubtitleStyleModel style) {
+    final notifier = ref.read(subtitleProvider.notifier);
+    if (entryIds == null) {
+      notifier.updateGlobalStyle(style);
+    } else {
+      notifier.updateEntriesStyle(entryIds!, style);
+    }
+  }
 
   // Available fonts
   static const _fonts = CaptionFontService.supportedFamilies;
@@ -73,7 +83,14 @@ class SubtitleStylePanel extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final subtitleState = ref.watch(subtitleProvider);
-    final style = subtitleState.globalStyle;
+    final style =
+        (entryIds == null
+            ? null
+            : subtitleState.entries
+                  .where((e) => entryIds!.contains(e.id))
+                  .firstOrNull
+                  ?.styleOverride) ??
+        subtitleState.globalStyle;
 
     return Container(
       color: kSurface,
@@ -90,11 +107,7 @@ class SubtitleStylePanel extends ConsumerWidget {
               // None option
               GestureDetector(
                 onTap: () {
-                  ref
-                      .read(subtitleProvider.notifier)
-                      .updateGlobalStyle(
-                        style.copyWith(clearAnimationPreset: true),
-                      );
+                  _updateStyle(ref, style.copyWith(clearAnimationPreset: true));
                 },
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 150),
@@ -145,11 +158,7 @@ class SubtitleStylePanel extends ConsumerWidget {
                   preset: preset,
                   isSelected: style.animationPreset == preset,
                   onTap: () {
-                    ref
-                        .read(subtitleProvider.notifier)
-                        .updateGlobalStyle(
-                          style.copyWith(animationPreset: preset),
-                        );
+                    _updateStyle(ref, style.copyWith(animationPreset: preset));
                   },
                 );
               }),
@@ -213,9 +222,7 @@ class SubtitleStylePanel extends ConsumerWidget {
                     .toList(),
                 onChanged: (value) {
                   if (value != null) {
-                    ref
-                        .read(subtitleProvider.notifier)
-                        .updateGlobalStyle(style.copyWith(fontFamily: value));
+                    _updateStyle(ref, style.copyWith(fontFamily: value));
                   }
                 },
               ),
@@ -306,16 +313,15 @@ class SubtitleStylePanel extends ConsumerWidget {
               ),
               TextButton(
                 onPressed: () {
-                  ref
-                      .read(subtitleProvider.notifier)
-                      .updateGlobalStyle(
-                        style.copyWith(
-                          offsetX: 0,
-                          offsetY: 0,
-                          verticalOffset: 0,
-                          maxWidthFactor: 0.85,
-                        ),
-                      );
+                  _updateStyle(
+                    ref,
+                    style.copyWith(
+                      offsetX: 0,
+                      offsetY: 0,
+                      verticalOffset: 0,
+                      maxWidthFactor: 0.85,
+                    ),
+                  );
                 },
                 child: const Text('Reset'),
               ),
@@ -428,9 +434,7 @@ class SubtitleStylePanel extends ConsumerWidget {
                 isActive: style.isBold,
                 fontWeight: FontWeight.bold,
                 onTap: () {
-                  ref
-                      .read(subtitleProvider.notifier)
-                      .updateGlobalStyle(style.copyWith(isBold: !style.isBold));
+                  _updateStyle(ref, style.copyWith(isBold: !style.isBold));
                 },
               ),
               const SizedBox(width: 8),
@@ -439,11 +443,7 @@ class SubtitleStylePanel extends ConsumerWidget {
                 isActive: style.isItalic,
                 isItalic: true,
                 onTap: () {
-                  ref
-                      .read(subtitleProvider.notifier)
-                      .updateGlobalStyle(
-                        style.copyWith(isItalic: !style.isItalic),
-                      );
+                  _updateStyle(ref, style.copyWith(isItalic: !style.isItalic));
                 },
               ),
               const SizedBox(width: 8),
@@ -451,11 +451,10 @@ class SubtitleStylePanel extends ConsumerWidget {
                 label: 'AA',
                 isActive: style.isAllCaps,
                 onTap: () {
-                  ref
-                      .read(subtitleProvider.notifier)
-                      .updateGlobalStyle(
-                        style.copyWith(isAllCaps: !style.isAllCaps),
-                      );
+                  _updateStyle(
+                    ref,
+                    style.copyWith(isAllCaps: !style.isAllCaps),
+                  );
                 },
               ),
             ],
@@ -503,9 +502,7 @@ class SubtitleStylePanel extends ConsumerWidget {
           label: labels[bg] ?? '',
           isActive: style.backgroundType == bg,
           onTap: () {
-            ref
-                .read(subtitleProvider.notifier)
-                .updateGlobalStyle(style.copyWith(backgroundType: bg));
+            _updateStyle(ref, style.copyWith(backgroundType: bg));
           },
         );
       }).toList(),
@@ -532,9 +529,7 @@ class SubtitleStylePanel extends ConsumerWidget {
             icon: icons[pos],
             isActive: style.position == pos,
             onTap: () {
-              ref
-                  .read(subtitleProvider.notifier)
-                  .updateGlobalStyle(style.copyWith(position: pos));
+              _updateStyle(ref, style.copyWith(position: pos));
             },
           ),
         );
@@ -550,11 +545,7 @@ class SubtitleStylePanel extends ConsumerWidget {
           label: '',
           isActive: style.textAlignment == TextAlign.left,
           onTap: () {
-            ref
-                .read(subtitleProvider.notifier)
-                .updateGlobalStyle(
-                  style.copyWith(textAlignment: TextAlign.left),
-                );
+            _updateStyle(ref, style.copyWith(textAlignment: TextAlign.left));
           },
         ),
         const SizedBox(width: 8),
@@ -563,11 +554,7 @@ class SubtitleStylePanel extends ConsumerWidget {
           label: '',
           isActive: style.textAlignment == TextAlign.center,
           onTap: () {
-            ref
-                .read(subtitleProvider.notifier)
-                .updateGlobalStyle(
-                  style.copyWith(textAlignment: TextAlign.center),
-                );
+            _updateStyle(ref, style.copyWith(textAlignment: TextAlign.center));
           },
         ),
         const SizedBox(width: 8),
@@ -576,11 +563,7 @@ class SubtitleStylePanel extends ConsumerWidget {
           label: '',
           isActive: style.textAlignment == TextAlign.right,
           onTap: () {
-            ref
-                .read(subtitleProvider.notifier)
-                .updateGlobalStyle(
-                  style.copyWith(textAlignment: TextAlign.right),
-                );
+            _updateStyle(ref, style.copyWith(textAlignment: TextAlign.right));
           },
         ),
       ],
@@ -623,17 +606,12 @@ class SubtitleStylePanel extends ConsumerWidget {
               onPressed: () {
                 final style = ref.read(subtitleProvider).globalStyle;
                 if (isTextColor) {
-                  ref
-                      .read(subtitleProvider.notifier)
-                      .updateGlobalStyle(
-                        style.copyWith(textColor: pickedColor),
-                      );
+                  _updateStyle(ref, style.copyWith(textColor: pickedColor));
                 } else {
-                  ref
-                      .read(subtitleProvider.notifier)
-                      .updateGlobalStyle(
-                        style.copyWith(backgroundColor: pickedColor),
-                      );
+                  _updateStyle(
+                    ref,
+                    style.copyWith(backgroundColor: pickedColor),
+                  );
                 }
                 Navigator.pop(ctx);
               },

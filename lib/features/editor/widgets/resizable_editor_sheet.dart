@@ -19,6 +19,7 @@ class ResizableEditorSheet extends StatefulWidget {
   final double maxHeightFactor;
   final EdgeInsetsGeometry contentPadding;
   final bool scrollable;
+  final bool showHeader;
 
   const ResizableEditorSheet({
     super.key,
@@ -33,6 +34,7 @@ class ResizableEditorSheet extends StatefulWidget {
     this.maxHeightFactor = 0.90,
     this.contentPadding = const EdgeInsets.fromLTRB(18, 16, 18, 28),
     this.scrollable = true,
+    this.showHeader = true,
   });
 
   @override
@@ -43,8 +45,14 @@ class _ResizableEditorSheetState extends State<ResizableEditorSheet> {
   double? _height;
 
   void _resizeBy(double delta, double availableHeight) {
-    final minimum = availableHeight * widget.minHeightFactor;
     final maximum = availableHeight * widget.maxHeightFactor;
+    final minimum = math.min(
+      maximum,
+      math.max(
+        widget.showHeader ? 180.0 : 110.0,
+        availableHeight * widget.minHeightFactor,
+      ),
+    );
     final current = _height ?? availableHeight * widget.initialHeightFactor;
     setState(() {
       _height = (current - delta).clamp(minimum, maximum).toDouble();
@@ -59,8 +67,14 @@ class _ResizableEditorSheetState extends State<ResizableEditorSheet> {
       180.0,
       mediaQuery.size.height - keyboardInset - mediaQuery.padding.top,
     );
-    final minimum = availableHeight * widget.minHeightFactor;
     final maximum = availableHeight * widget.maxHeightFactor;
+    final minimum = math.min(
+      maximum,
+      math.max(
+        widget.showHeader ? 180.0 : 110.0,
+        availableHeight * widget.minHeightFactor,
+      ),
+    );
     final resolvedHeight =
         (_height ?? availableHeight * widget.initialHeightFactor)
             .clamp(minimum, maximum)
@@ -89,15 +103,28 @@ class _ResizableEditorSheetState extends State<ResizableEditorSheet> {
               top: false,
               child: Column(
                 children: [
-                  AppSheetHeader(
-                    title: widget.title,
-                    subtitle: widget.subtitle,
-                    icon: widget.icon,
-                    trailing: widget.trailing,
-                    onClose: widget.onClose,
-                    handle: Semantics(
+                  if (widget.showHeader)
+                    AppSheetHeader(
+                      title: widget.title,
+                      subtitle: widget.subtitle,
+                      icon: widget.icon,
+                      trailing: widget.trailing,
+                      onClose: widget.onClose,
+                      handle: Semantics(
+                        label: 'Resize bottom sheet',
+                        hint: 'Drag up or down to resize',
+                        child: GestureDetector(
+                          key: const ValueKey('resizable_sheet_handle'),
+                          behavior: HitTestBehavior.opaque,
+                          onVerticalDragUpdate: (details) =>
+                              _resizeBy(details.delta.dy, availableHeight),
+                          child: const AppSheetHandle(height: 28),
+                        ),
+                      ),
+                    )
+                  else
+                    Semantics(
                       label: 'Resize bottom sheet',
-                      hint: 'Drag up or down to resize',
                       child: GestureDetector(
                         key: const ValueKey('resizable_sheet_handle'),
                         behavior: HitTestBehavior.opaque,
@@ -106,7 +133,6 @@ class _ResizableEditorSheetState extends State<ResizableEditorSheet> {
                         child: const AppSheetHandle(height: 28),
                       ),
                     ),
-                  ),
                   Expanded(child: body),
                 ],
               ),
@@ -118,9 +144,7 @@ class _ResizableEditorSheetState extends State<ResizableEditorSheet> {
   }
 }
 
-/// A deliberately non-resizable editor sheet for short choices and compact
-/// controls. It shares the editor sheet language without displaying a handle
-/// that promises a resize gesture the content does not need.
+/// Compatibility wrapper: compact sheets start smaller but remain resizable.
 class FixedEditorSheet extends StatelessWidget {
   final String title;
   final String? subtitle;
@@ -146,57 +170,17 @@ class FixedEditorSheet extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) {
-    final mediaQuery = MediaQuery.of(context);
-    final keyboardInset = mediaQuery.viewInsets.bottom;
-    final availableHeight = math.max(
-      180.0,
-      mediaQuery.size.height - keyboardInset - mediaQuery.padding.top,
-    );
-    final resolvedHeight = (availableHeight * heightFactor)
-        .clamp(220.0, availableHeight * 0.88)
-        .toDouble();
-    final body = scrollable
-        ? SingleChildScrollView(
-            padding: contentPadding,
-            keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-            child: child,
-          )
-        : Padding(padding: contentPadding, child: child);
-
-    return AnimatedPadding(
-      duration: const Duration(milliseconds: 120),
-      curve: Curves.easeOut,
-      padding: EdgeInsets.only(bottom: keyboardInset),
-      child: Material(
-        color: Colors.transparent,
-        child: SizedBox(
-          key: const ValueKey('fixed_editor_sheet'),
-          height: resolvedHeight,
-          width: double.infinity,
-          child: AppSheetSurface(
-            child: SafeArea(
-              top: false,
-              child: Column(
-                children: [
-                  AppSheetHeader(
-                    title: title,
-                    subtitle: subtitle,
-                    icon: icon,
-                    trailing: trailing,
-                    onClose: onClose,
-                    showHandle: false,
-                    padding: const EdgeInsets.fromLTRB(18, 15, 10, 13),
-                  ),
-                  Expanded(child: body),
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
+  Widget build(BuildContext context) => ResizableEditorSheet(
+    title: title,
+    subtitle: subtitle,
+    icon: icon,
+    trailing: trailing,
+    onClose: onClose,
+    initialHeightFactor: heightFactor,
+    contentPadding: contentPadding,
+    scrollable: scrollable,
+    child: child,
+  );
 }
 
 Future<T?> showResizableEditorSheet<T>({
@@ -249,7 +233,7 @@ Future<T?> showFixedEditorSheet<T>({
     context: context,
     isScrollControlled: true,
     useSafeArea: false,
-    enableDrag: true,
+    enableDrag: false,
     backgroundColor: Colors.transparent,
     barrierColor: barrierColor,
     builder: (sheetContext) => FixedEditorSheet(

@@ -82,6 +82,7 @@
 
     # Streaming ZIP extraction for optional, user-downloaded asset packs
     archive: ^4.0.9
+    serious_python: 0.9.5
 
   dev_dependencies:
     flutter_test:
@@ -91,6 +92,7 @@
   flutter:
     uses-material-design: true
     assets:
+      - assets/media_runtime.zip
       - captioncraft_logo.svg
       - assets/fonts/licenses/
     fonts:

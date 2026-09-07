@@ -10,6 +10,7 @@ list(APPEND FLUTTER_PLUGIN_LIST
   flutter_inappwebview_windows
   flutter_secure_storage_windows
   gal
+  serious_python_windows
   url_launcher_windows
   video_player_win
 )

@@ -11,6 +11,86 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  testWidgets('pinch and drag remain on the selected lower text layer', (
+    tester,
+  ) async {
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    await tester.binding.setSurfaceSize(const Size(600, 600));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    TimelineClip textClip(String id) => TimelineClip(
+      id: id,
+      trackId: id,
+      type: TimelineTrackType.text,
+      label: id,
+      text: 'Overlapping layer',
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 5),
+    );
+    final clips = [textClip('upper'), textClip('lower')];
+    container
+        .read(editorProvider.notifier)
+        .loadProject(
+          videoPath: 'missing.mp4',
+          projectId: 'gestures',
+          projectName: 'Gestures',
+          timeline: EditorTimeline(
+            tracks: [
+              for (final clip in clips)
+                TimelineTrack(
+                  id: clip.id,
+                  name: clip.id,
+                  type: TimelineTrackType.text,
+                  section: TimelineTrackSection.textSubtitle,
+                  clips: [clip],
+                ),
+            ],
+          ),
+        );
+    container.read(editorProvider.notifier)
+      ..selectTrack('lower')
+      ..selectClip('lower');
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(
+          home: Scaffold(body: VideoPreviewPanel(videoPath: 'missing.mp4')),
+        ),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 300));
+    final target = find.byKey(const ValueKey('gesture_lower'));
+    expect(target, findsOneWidget);
+    final center = tester.getCenter(target);
+    final first = await tester.startGesture(
+      center - const Offset(20, 0),
+      pointer: 1,
+    );
+    final second = await tester.startGesture(
+      center + const Offset(20, 0),
+      pointer: 2,
+    );
+    await first.moveBy(const Offset(-25, -10));
+    await second.moveBy(const Offset(25, 10));
+    await tester.pump();
+    await first.up();
+    await second.up();
+    await tester.pump();
+    final timeline = container.read(editorProvider).timeline;
+    final upper = timeline.tracks
+        .expand((t) => t.clips)
+        .singleWhere((c) => c.id == 'upper');
+    final lower = timeline.tracks
+        .expand((t) => t.clips)
+        .singleWhere((c) => c.id == 'lower');
+    expect(upper.transform.toJson(), clips.first.transform.toJson());
+    expect(lower.transform.scale, greaterThan(1));
+    expect(container.read(editorProvider).selectedClipId, 'lower');
+    expect(container.read(editorProvider).isTimelineGestureEditing, isFalse);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   test('preview bitmap decoding follows display pixels and stays bounded', () {
     expect(
       calculatePreviewDecodeDimensionForTesting(
@@ -1151,137 +1231,133 @@ void main() {
     );
   });
 
-  testWidgets(
-    'preview suppresses fallback controllers while exact mix prepares',
-    (tester) async {
-      final container = ProviderContainer();
-      addTearDown(container.dispose);
-      const existingPath = 'pubspec.yaml';
-      final sourceAsset = EditorAssetReference(
-        id: 'source-asset',
-        type: EditorAssetType.video,
-        label: 'Source',
-        sourcePath: existingPath,
-        metadata: const {'hasAudio': true},
-      );
-      final audioAsset = EditorAssetReference(
-        id: 'audio-asset',
-        type: EditorAssetType.audio,
-        label: 'Audio',
-        sourcePath: existingPath,
-      );
-      final base = TimelineClip(
-        id: 'base',
-        trackId: 'base-track',
-        type: TimelineTrackType.video,
-        label: 'Base',
-        assetId: sourceAsset.id,
-        startTime: Duration.zero,
-        endTime: const Duration(seconds: 2),
-        audioMix: const AudioMixSettings(muted: true),
-      );
-      TimelineClip audio(String id, String trackId, {bool muted = false}) =>
-          TimelineClip(
-            id: id,
-            trackId: trackId,
-            type: TimelineTrackType.audio,
-            label: id,
-            assetId: audioAsset.id,
-            startTime: Duration.zero,
-            endTime: const Duration(seconds: 2),
-            audioMix: AudioMixSettings(muted: muted),
-          );
-      final sourceAudio = TimelineClip(
-        id: 'linked-source-audio',
-        trackId: 'source-track',
-        type: TimelineTrackType.audio,
-        label: 'Source audio',
-        assetId: sourceAsset.id,
-        linkedClipId: base.id,
-        startTime: base.startTime,
-        endTime: base.endTime,
-        sourceStartTime: base.sourceStartTime,
-        sourceDuration: base.sourceDuration,
-      );
-      final timeline = EditorTimeline(
-        assets: [sourceAsset, audioAsset],
-        tracks: [
-          TimelineTrack(
-            id: 'base-track',
-            name: 'Base',
-            type: TimelineTrackType.video,
-            section: TimelineTrackSection.baseVideo,
-            clips: [base],
-          ),
-          TimelineTrack(
-            id: 'source-track',
-            name: 'Source audio',
-            type: TimelineTrackType.audio,
-            section: TimelineTrackSection.audio,
-            role: TimelineTrackRole.sourceAudio,
-            clips: [sourceAudio],
-          ),
-          TimelineTrack(
-            id: 'audible-track',
-            name: 'Audible',
-            type: TimelineTrackType.audio,
-            section: TimelineTrackSection.audio,
-            clips: [audio('audible', 'audible-track')],
-          ),
-          TimelineTrack(
-            id: 'muted-clip-track',
-            name: 'Muted clip',
-            type: TimelineTrackType.audio,
-            section: TimelineTrackSection.audio,
-            clips: [audio('muted-clip', 'muted-clip-track', muted: true)],
-          ),
-          TimelineTrack(
-            id: 'muted-track',
-            name: 'Muted track',
-            type: TimelineTrackType.audio,
-            section: TimelineTrackSection.audio,
-            isMuted: true,
-            clips: [audio('muted-track-clip', 'muted-track')],
-          ),
-        ],
-      );
-      container
-          .read(editorProvider.notifier)
-          .loadProject(
-            videoPath: existingPath,
-            projectId: 'audio-controller-filter',
-            projectName: 'Audio controller filter',
-            timeline: timeline,
-          );
-
-      await tester.pumpWidget(
-        UncontrolledProviderScope(
-          container: container,
-          child: const MaterialApp(
-            home: Scaffold(body: VideoPreviewPanel(videoPath: existingPath)),
-          ),
+  testWidgets('preview keeps live audio available while exact mix prepares', (
+    tester,
+  ) async {
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    const existingPath = 'pubspec.yaml';
+    final sourceAsset = EditorAssetReference(
+      id: 'source-asset',
+      type: EditorAssetType.video,
+      label: 'Source',
+      sourcePath: existingPath,
+      metadata: const {'hasAudio': true},
+    );
+    final audioAsset = EditorAssetReference(
+      id: 'audio-asset',
+      type: EditorAssetType.audio,
+      label: 'Audio',
+      sourcePath: existingPath,
+    );
+    final base = TimelineClip(
+      id: 'base',
+      trackId: 'base-track',
+      type: TimelineTrackType.video,
+      label: 'Base',
+      assetId: sourceAsset.id,
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 2),
+      audioMix: const AudioMixSettings(muted: true),
+    );
+    TimelineClip audio(String id, String trackId, {bool muted = false}) =>
+        TimelineClip(
+          id: id,
+          trackId: trackId,
+          type: TimelineTrackType.audio,
+          label: id,
+          assetId: audioAsset.id,
+          startTime: Duration.zero,
+          endTime: const Duration(seconds: 2),
+          audioMix: AudioMixSettings(muted: muted),
+        );
+    final sourceAudio = TimelineClip(
+      id: 'linked-source-audio',
+      trackId: 'source-track',
+      type: TimelineTrackType.audio,
+      label: 'Source audio',
+      assetId: sourceAsset.id,
+      linkedClipId: base.id,
+      startTime: base.startTime,
+      endTime: base.endTime,
+      sourceStartTime: base.sourceStartTime,
+      sourceDuration: base.sourceDuration,
+    );
+    final timeline = EditorTimeline(
+      assets: [sourceAsset, audioAsset],
+      tracks: [
+        TimelineTrack(
+          id: 'base-track',
+          name: 'Base',
+          type: TimelineTrackType.video,
+          section: TimelineTrackSection.baseVideo,
+          clips: [base],
         ),
-      );
-      await tester.pump();
+        TimelineTrack(
+          id: 'source-track',
+          name: 'Source audio',
+          type: TimelineTrackType.audio,
+          section: TimelineTrackSection.audio,
+          role: TimelineTrackRole.sourceAudio,
+          clips: [sourceAudio],
+        ),
+        TimelineTrack(
+          id: 'audible-track',
+          name: 'Audible',
+          type: TimelineTrackType.audio,
+          section: TimelineTrackSection.audio,
+          clips: [audio('audible', 'audible-track')],
+        ),
+        TimelineTrack(
+          id: 'muted-clip-track',
+          name: 'Muted clip',
+          type: TimelineTrackType.audio,
+          section: TimelineTrackSection.audio,
+          clips: [audio('muted-clip', 'muted-clip-track', muted: true)],
+        ),
+        TimelineTrack(
+          id: 'muted-track',
+          name: 'Muted track',
+          type: TimelineTrackType.audio,
+          section: TimelineTrackSection.audio,
+          isMuted: true,
+          clips: [audio('muted-track-clip', 'muted-track')],
+        ),
+      ],
+    );
+    container
+        .read(editorProvider.notifier)
+        .loadProject(
+          videoPath: existingPath,
+          projectId: 'audio-controller-filter',
+          projectName: 'Audio controller filter',
+          timeline: timeline,
+        );
 
-      expect(
-        find.byKey(const ValueKey('preview-audio-processing-state')),
-        findsOneWidget,
-      );
-      expect(find.byKey(const ValueKey('audio_audible')), findsNothing);
-      expect(
-        find.byKey(const ValueKey('audio_linked-source-audio')),
-        findsNothing,
-      );
-      expect(find.byKey(const ValueKey('audio_muted-clip')), findsNothing);
-      expect(
-        find.byKey(const ValueKey('audio_muted-track-clip')),
-        findsNothing,
-      );
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(
+          home: Scaffold(body: VideoPreviewPanel(videoPath: existingPath)),
+        ),
+      ),
+    );
+    await tester.pump();
 
-      await tester.pumpWidget(const SizedBox.shrink());
-    },
-  );
+    expect(
+      find.byKey(const ValueKey('preview-audio-processing-state')),
+      findsNothing,
+    );
+    expect(find.byKey(const ValueKey('audio_audible')), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('audio_linked-source-audio')),
+      findsNothing, // The base controller monitors its attached source audio.
+    );
+    expect(find.byKey(const ValueKey('audio_muted-clip')), findsNothing);
+    expect(find.byKey(const ValueKey('audio_muted-track-clip')), findsNothing);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
 
   test('ducking intervals are merged once into stable timeline windows', () {
     final ducked = TimelineClip(

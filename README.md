@@ -1,111 +1,149 @@
 # CaptionCraft
 
-CaptionCraft is a local-first Flutter video editor for Android, iOS, and
-Windows. It combines a multi-track timeline, word-timed captions, Creator Lab
-tools, and an FFmpeg H.264/AAC export pipeline.
+A local-first video editor for Android, iOS, and Windows. Cut a multi-track
+timeline, create word-timed captions, add stock media and effects, and export
+H.264/AAC video. Connect your own AI and media services only when needed.
 
-## Highlights
+[Release notes](docs/releases/v0.10.0.md) · [API setup](docs/connected-services.md) ·
+[Report a bug](https://github.com/qa-p1/CaptionCraft/issues) · [GPL-3.0-or-later](LICENSE)
 
-- Multi-video editing with overlays, text, audio, effects, transitions, and keyframes
-- Automatic and manual captions with per-cue styling, karaoke timing, and SRT/VTT I/O
-- Undo/redo, autosave, account-scoped local projects, and Firestore reconciliation
-- Canvas presets, work-area playback, export preview, and gallery delivery
+## Release status
 
-## Run locally
+**v0.10.0 / build 2006:** all three platform release workflows passed for
+[ebec11b](https://github.com/qa-p1/CaptionCraft/commit/ebec11b9cc70f76c9a5c1a7c5a855b9dfb5e4dfd).
+The binary release remains a draft pending verification of corresponding source
+and build materials for its native FFmpeg dependencies. See the
+[distribution checklist](docs/releases/v0.10.0.md#distribution-checklist).
+Build success does not establish store approval or completed real-device QA.
+
+| Platform | Artifact | Installation / limitations |
+| --- | --- | --- |
+| Android 7.0+ | Signed APKs: arm64-v8a, armeabi-v7a, x86_64 | ARM64 suits most current phones. The AAB is for Play Console, not direct installation. |
+| Windows x64 | Portable ZIP | Extract completely; run caption_craft.exe beside its DLLs and data folder. Local projects/keys only; no cloud login. |
+| iOS 15+ | **Unsigned** IPA | Requires Apple signing/provisioning. Not directly installable or an App Store/TestFlight release. |
+
+Public assets will appear on the [Releases page](https://github.com/qa-p1/CaptionCraft/releases).
+Windows is an unsigned portable application, not an installer. Clean Windows
+10/11 testing, runtime prerequisites, and security-reputation checks remain.
+Back up important projects/media before upgrading; do not uninstall merely to
+bypass an Android signing-certificate mismatch.
+
+## Features
+
+- Multi-video timelines with audio, overlays, text, effects, transitions, and keyframes.
+- Automatic or manual captions, per-cue styling, karaoke timing, and SRT/VTT import/export.
+- Undo/redo, autosave, account-scoped local projects, and supported cloud sync.
+- Canvas presets, work-area playback, preview, and H.264/AAC video export.
+- Optional GIF/sticker, stock-media and licensed sound-effect libraries.
+- Desktop keyboard controls and save-before-close handling.
+
+## Get started
+
+1. Open CaptionCraft. Sign in on Android/iOS; Windows opens in local desktop mode.
+2. Choose **Set up services** or **Skip for now**.
+3. Import local media, edit your timeline, add captions, and export.
+
+Local import, editing, manual captions, and export require no API keys.
+Return to **Settings → Connected services** from Home or Profile at any time.
+
+| Optional service | Enables | Get a key |
+| --- | --- | --- |
+| Groq | Automatic captions | [Groq console](https://console.groq.com/keys) |
+| GIPHY | GIFs and stickers | [Developer dashboard](https://developers.giphy.com/dashboard/) |
+| Pexels | Stock photos and videos | [Pexels API](https://www.pexels.com/api/) |
+| Pixabay | Stock images and videos | [Pixabay API](https://pixabay.com/api/docs/) |
+
+Provider links open the native browser. Provider signup/approval may take longer
+than the two-minute in-app setup; your provider's quotas and charges apply.
+There is no .env file, embedded developer key, or transcription proxy to configure.
+
+Keys are encrypted before cloud backup and remembered in device secure storage.
+**Keep your recovery code:** another device may need it once to unlock the backup.
+Windows keys stay on that PC only. See [setup, privacy and recovery](docs/connected-services.md).
+
+## Desktop shortcuts
+
+Press **Shift+/** (`?`) for in-app shortcut help. Editor shortcuts do not replace
+normal typing in text fields.
+
+| Action | Shortcut |
+| --- | --- |
+| Play / pause | Space |
+| Step backward / pause / play forward | J / K / L |
+| Step backward / forward | Left / Right |
+| Previous / next edit point | Up / Down |
+| Undo / redo | Ctrl+Z / Ctrl+Shift+Z or Ctrl+Y |
+| Save / export / import | Ctrl+S / Ctrl+E / Ctrl+I |
+| Split at playhead | Ctrl+B |
+| Work-area in / out / clear | I / O / Alt+X |
+| Toggle snapping / add marker / fullscreen | N / M / F |
+
+J steps backward; it is not reverse shuttle playback. CaptionCraft does not
+claim feature parity with professional desktop editors.
+
+## Media and service limitations
+
+- Instagram can deny anonymous access even to public posts/Reels. Private,
+  removed, login-required, and rate-limited content is not guaranteed downloadable.
+- Automatic captions send selected audio to Groq. Stock searches send the query
+  and corresponding key to their provider.
+- Background-video, overlay, LUT, and local SFX packs are separate optional downloads.
+  Opening Elements fetches only the small public descriptor; media downloads
+  start when requested. Packs may not yet be published.
+- Selected stock items and LUTs are copied into durable project media. Sound
+  effects retain source/license attribution; check licenses for your own use.
+- Openverse sound search requires no API key. The inspected Fairlight sound
+  library is not redistributed. Music remains a placeholder.
+
+## Build from source
+
+Use **Flutter 3.41.2**, the committed lockfile, and your platform's native toolchain:
+Android SDK/JDK, macOS/Xcode for iOS, or Visual Studio C++ desktop tools for Windows.
 
 ```sh
-flutter pub get
+git clone https://github.com/qa-p1/CaptionCraft.git
+cd CaptionCraft
+flutter pub get --enforce-lockfile
 flutter run
 ```
-
-On first login, optionally connect Groq, GIPHY, Pexels and Pixabay in
-**Settings → Connected services**. Each provider link opens in your device's
-browser. Editing, manual captions and export work without keys. No .env file,
-embedded developer API key, or transcription proxy is required.
-
-Keys are encrypted with AES-256-GCM before cloud backup and cached in the
-device's secure storage. Keep the recovery code in a password manager: another
-device or reinstall needs it once to unlock the backup. CaptionCraft cannot
-recover a lost code. Windows local mode stores keys on that PC only.
-If the code is lost, Settings can replace the locked backup after confirmation;
-you will need to enter your provider keys again. See [Connected services](docs/connected-services.md)
-for setup, privacy, offline behavior and recovery details.
-
-Firebase client options are tracked. Deploy the matching Firestore policy before
-using cloud sync:
-
-```sh
-firebase deploy --only firestore:rules --project captioncraft-b1abb
-```
-
-## Verify and build
 
 ```sh
 flutter analyze
 flutter test
 flutter build apk --release --split-per-abi
 flutter build windows --release
+# On macOS:
+flutter build ios --release --no-codesign
 ```
 
-Release builds require `android/key.properties` with `storeFile`,
-`storePassword`, `keyAlias`, and `keyPassword`; they fail instead of silently
-using a debug key.
+Android release signing requires your own `android/key.properties` and keystore;
+missing signing configuration fails rather than using a debug key.
+Windows native archive versions/hashes are pinned in the
+[Windows workflow](.github/workflows/build-windows-release.yml).
+For your own distribution, provision your Firebase project/client options and
+deploy its owner-scoped Firestore rules. Never commit signing material or API keys.
 
-## Editor engineering documentation
+## Documentation and contributing
 
-- [Editor architecture](docs/editor_architecture.md) — playback ownership,
-  timeline scaling, animation, proxy/waveform caches, audio semantics,
-  persistence, and undo boundaries.
-- [Editor core roadmap](docs/editor_core_roadmap.md) — audited complete,
-  partial, and outstanding timeline/editor requirements for the feature branch.
-- [Effects, color, and audio status](docs/editor_effects_audio_status.md) —
-  implemented delivery paths and explicit unsupported boundaries.
-- [Release-readiness audit](docs/release-readiness-2026-08-31.md) — fixed
-  failure modes, automated coverage, and real-device/store release gates.
+- [v0.10.0 release notes and validation](docs/releases/v0.10.0.md)
+- [Connected services and encrypted backups](docs/connected-services.md)
+- [Editor architecture](docs/editor_architecture.md) and [roadmap](docs/editor_core_roadmap.md)
+- [Effects, color and audio](docs/editor_effects_audio_status.md)
+- [Asset-pack publishing](docs/asset-pack-deployment.md), [LUTs](docs/lut-pack.md), [sound effects](docs/sfx-library.md)
+- [Historical release-readiness audit](docs/release-readiness-2026-08-31.md)
 
-## Optional Elements libraries
+For bug reports, include app version, OS/device, reproduction steps and sanitized
+logs. Never post API keys, recovery codes, signing files, or private media.
+Keep changes focused and include regression tests. Contributions to
+CaptionCraft-owned code are accepted under GPL-3.0-or-later.
 
-GIPHY, Pexels, and Pixabay search results are loaded only while their Elements
-tab is active. A selected Pexels or Pixabay item is copied into durable project
-media before it is placed on the timeline.
+## License
 
-The CaptionCraft Background Videos, Overlays, and LUT packs are separate downloads;
-their media is never included in the app bundle. Opening Elements checks local
-state and fetches only the small public release descriptor. Media transfer
-starts only after **Download pack** is tapped. Downloads belong to an app-scoped
-queue, continue when the sheet is closed, resume verified partial data after a
-Stop/network interruption, and can be stopped only with the visible **Stop
-download** action. See `docs/asset-pack-deployment.md` for staging, Cloudflare
-R2 publishing, checksum, multipart, and manifest instructions.
+CaptionCraft-owned code is licensed under **GNU GPL version 3 or later**; see
+[LICENSE](LICENSE). You may use, study, modify and redistribute it under those
+terms. This license choice also covers CaptionCraft-owned code at the v0.10.0
+build commit identified above.
 
-LUTs also have a dedicated **Effects → LUTs** section with a previewable pack,
-custom CUBE/3DL import, strength control, and multi-clip application. Selected
-looks are copied into durable project media before persistence. See
-`docs/lut-pack.md` for the rights manifest, preparation tool, and release flow.
-
-## Sound-effects library
-
-SFX opens a separate resizable library backed by the anonymous Openverse audio
-API. Searches run only when submitted and are restricted to the sound-effect
-category plus CC0, Public Domain Mark, and CC BY licenses. A selected result is
-downloaded into durable project media before timeline insertion, and its
-creator, source, license, and attribution remain in the editor asset metadata.
-The downloaded payload must pass an audio-stream probe before it is committed;
-saved attribution can be copied later from Audio Clip Controls. No Openverse
-credential is required or stored in the app.
-
-The Local SFX destination uses the same manifest-driven installer as Background
-Videos and Overlays. It remains visible before publication and offers a
-refreshable “not published yet” state, so adding a rights-cleared
-`sound-effects` row to the manifest enables it without another app build. The
-inspected Fairlight-based folder cannot be redistributed by CaptionCraft; see
-`docs/sfx-library.md`. Music remains a placeholder and is intentionally
-unchanged.
-
-## Distribution note
-
-Users supply their own service credentials at runtime. No developer API keys
-are embedded in binaries. Requests use the provider's HTTPS API; users manage
-quotas, billing, and revocation in their provider accounts. The
-FFmpeg package includes Full-GPL components, so satisfy its licensing and source
-distribution requirements before publishing binaries.
+Third-party components, fonts and imported media retain their original licenses;
+see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Licensing the application
+does not replace the corresponding-source obligations of its native libraries.

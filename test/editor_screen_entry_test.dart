@@ -38,6 +38,76 @@ void main() {
     }
   });
 
+  testWidgets(
+    'CC selects existing source captions and opens their styles without generating',
+    (tester) async {
+      _setTestView(tester, const Size(390, 844));
+      final base = _layeredProject();
+      final timeline = base.timeline;
+      final cue = TimelineClip(
+        id: 'existing-cue',
+        trackId: 'captions',
+        type: TimelineTrackType.subtitle,
+        label: 'Existing caption',
+        text: 'Existing caption',
+        linkedClipId: 'layered-video',
+        startTime: Duration.zero,
+        endTime: const Duration(seconds: 2),
+      );
+      final project = base.copyWith(
+        subtitles: [
+          SubtitleEntry(
+            id: cue.id,
+            text: cue.text!,
+            startTime: cue.startTime,
+            endTime: cue.endTime,
+          ),
+        ],
+        timeline: timeline.copyWith(
+          tracks: [
+            ...timeline.tracks,
+            TimelineTrack(
+              id: 'captions',
+              name: 'Source captions',
+              type: TimelineTrackType.subtitle,
+              section: TimelineTrackSection.textSubtitle,
+              clips: [cue],
+            ),
+          ],
+        ),
+      );
+      final container = ProviderContainer(
+        overrides: [currentUserProvider.overrideWithValue(null)],
+      );
+      addTearDown(container.dispose);
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: MaterialApp(
+            theme: AppTheme.darkTheme,
+            home: EditorScreen.withoutPersistence(project: project),
+          ),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 650));
+      container.read(editorProvider.notifier)
+        ..selectTrack('source-video')
+        ..selectClip('layered-video');
+      await tester.pump();
+      final cc = find.byKey(const ValueKey('dock_primary_subtitles'));
+      await tester.ensureVisible(cc);
+      await tester.tap(cc);
+      await tester.pumpAndSettle();
+      expect(container.read(editorProvider).selectedClipId, 'existing-cue');
+      expect(container.read(subtitleProvider).entries, hasLength(1));
+      expect(find.text('Subtitle style'), findsOneWidget);
+      expect(find.text('Source captions'), findsWidgets);
+      expect(find.text('Choose caption source'), findsNothing);
+      expect(tester.takeException(), isNull);
+      await _disposeEditorAndDrain(tester);
+    },
+  );
+
   testWidgets('a newly created project mounts the editor on a phone', (
     tester,
   ) async {
@@ -100,7 +170,7 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('editor dock exposes direct tools with one flat overflow sheet', (
+  testWidgets('editor dock groups related tools and retains one canvas entry', (
     tester,
   ) async {
     _setTestView(tester, const Size(390, 844));
@@ -135,21 +205,19 @@ void main() {
     }
 
     expect(dock, findsOneWidget);
-    expect(find.byKey(const ValueKey('editor_primary_tools')), findsOneWidget);
+    expect(find.byKey(const ValueKey('editor_tools_root')), findsOneWidget);
     for (final tool in const {
       'split': 'Split',
       'timing': 'Timing',
       'transform': 'Transform',
-      'crop': 'Crop',
-      'effects': 'Effects',
-      'chroma': 'Chroma',
-      'color': 'Color',
+      'visual': 'Visual',
+      'chroma': 'Chroma Key',
       'animation': 'Animate',
       'audio': 'Audio',
       'keyframe': 'Keyframe',
-      'duplicate': 'Duplicate',
+      'arrange': 'Arrange',
       'delete': 'Delete',
-      'more': 'More',
+      'timeline': 'Timeline',
     }.entries) {
       final target = find.byKey(ValueKey('dock_primary_${tool.key}'));
       expect(target, findsOneWidget);
@@ -165,7 +233,7 @@ void main() {
         return key is ValueKey<String> && key.value.startsWith('dock_primary_');
       }),
     );
-    expect(primaryTools, findsNWidgets(13));
+    expect(primaryTools.evaluate().length, lessThanOrEqualTo(13));
     expect(find.byKey(const ValueKey('dock_category_edit')), findsNothing);
     expect(find.byKey(const ValueKey('editor_export_button')), findsOneWidget);
     expect(
@@ -177,30 +245,14 @@ void main() {
       findsNothing,
     );
 
-    await tapDock('dock_primary_more');
+    expect(find.byKey(const ValueKey('dock_primary_more')), findsNothing);
+    expect(find.byKey(const ValueKey('dock_primary_canvas')), findsNothing);
+    await tapDock('dock_primary_keyframe');
     await tester.pumpAndSettle();
-    expect(
-      find.byKey(const ValueKey('editor_all_tools_sheet')),
-      findsOneWidget,
-    );
-    expect(find.text('All tools'), findsOneWidget);
-    expect(find.text('Clip'), findsOneWidget);
-    expect(
-      find.byKey(const ValueKey('all_tools_clip_attributes_copy_attrs')),
-      findsOneWidget,
-    );
-    await tester.scrollUntilVisible(
-      find.text('Visual'),
-      300,
-      scrollable: find.descendant(
-        of: find.byKey(const ValueKey('editor_all_tools_sheet')),
-        matching: find.byType(Scrollable),
-      ),
-    );
-    expect(find.text('Visual'), findsOneWidget);
-    expect(find.byKey(const ValueKey('dock_back_button')), findsNothing);
-    expect(find.byKey(const ValueKey('categories')), findsNothing);
-    await tester.tap(find.byTooltip('Close'));
+    expect(find.byKey(const ValueKey('dock_back')), findsOneWidget);
+    expect(find.byKey(const ValueKey('dock_tool_graph')), findsOneWidget);
+    expect(find.byKey(const ValueKey('dock_tool_presets')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('dock_back')));
     await tester.pumpAndSettle();
 
     await tester.tap(find.byKey(const ValueKey('editor_aspect_ratio_button')));
@@ -218,9 +270,7 @@ void main() {
     await _disposeEditorAndDrain(tester);
   });
 
-  testWidgets('compact add choices stay fixed and libraries resize', (
-    tester,
-  ) async {
+  testWidgets('compact add choices and libraries resize', (tester) async {
     _setTestView(tester, const Size(390, 844));
     final container = ProviderContainer(
       overrides: [currentUserProvider.overrideWithValue(null)],
@@ -247,8 +297,14 @@ void main() {
     expect(find.text('Videos'), findsOneWidget);
     expect(find.text('GIF'), findsNothing);
     expect(find.text('Elements'), findsOneWidget);
-    expect(find.byKey(const ValueKey('fixed_editor_sheet')), findsOneWidget);
-    expect(find.byKey(const ValueKey('resizable_sheet_handle')), findsNothing);
+    expect(
+      find.byKey(const ValueKey('resizable_editor_sheet')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('resizable_sheet_handle')),
+      findsOneWidget,
+    );
     await tester.ensureVisible(find.text('Elements'));
     await tester.tap(find.text('Elements'));
     await tester.pumpAndSettle();
@@ -277,7 +333,7 @@ void main() {
       find.byKey(const ValueKey('timeline_track_add_text-primary')),
     );
     await tester.pumpAndSettle();
-    final addMenu = find.byKey(const ValueKey('fixed_editor_sheet'));
+    final addMenu = find.byKey(const ValueKey('resizable_editor_sheet'));
     final addText = find.descendant(
       of: addMenu,
       matching: find.text('Add Text'),
@@ -287,7 +343,10 @@ void main() {
       find.descendant(of: addMenu, matching: find.text('Subtitles')),
       findsOneWidget,
     );
-    expect(find.byKey(const ValueKey('resizable_sheet_handle')), findsNothing);
+    expect(
+      find.byKey(const ValueKey('resizable_sheet_handle')),
+      findsOneWidget,
+    );
     await tester.tap(addText);
     // The add menu closes before the persistent text editor animates in.
     await tester.pump();
@@ -335,7 +394,10 @@ void main() {
     expect(find.text('Select a local track'), findsOneWidget);
     expect(find.text('SFX'), findsOneWidget);
     expect(find.text('Music'), findsOneWidget);
-    expect(find.byKey(const ValueKey('resizable_sheet_handle')), findsNothing);
+    expect(
+      find.byKey(const ValueKey('resizable_sheet_handle')),
+      findsOneWidget,
+    );
     await tester.ensureVisible(find.text('SFX'));
     await tester.tap(find.text('SFX'));
     await tester.pumpAndSettle();

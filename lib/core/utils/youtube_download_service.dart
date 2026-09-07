@@ -7,6 +7,7 @@ import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
 import '../../features/editor/models/discover_models.dart';
+import 'yt_dlp_bridge.dart';
 
 typedef YoutubeProgressCallback =
     void Function(int receivedBytes, int? totalBytes);
@@ -104,7 +105,12 @@ class FfmpegYoutubeMuxRunner implements YoutubeMuxRunner {
       if (_cancelledJobs.contains(jobId) && sessionId != null) {
         await FFmpegKit.cancel(sessionId);
       }
-      await completer.future;
+      try {
+        await completer.future.timeout(const Duration(minutes: 2));
+      } on TimeoutException {
+        if (sessionId != null) await FFmpegKit.cancel(sessionId);
+        rethrow;
+      }
     } finally {
       _sessionIds.remove(jobId);
       _cancelledJobs.remove(jobId);
@@ -159,13 +165,16 @@ class YoutubeDownloadService implements YoutubeMediaService {
   YoutubeDownloadService({
     YoutubeExplode Function()? clientFactory,
     YoutubeMuxRunner? muxRunner,
+    MediaExtractor? mediaExtractor,
   }) : _clientFactory = clientFactory ?? YoutubeExplode.new,
-       _muxRunner = muxRunner ?? FfmpegYoutubeMuxRunner();
+       _muxRunner = muxRunner ?? FfmpegYoutubeMuxRunner(),
+       _mediaExtractor = mediaExtractor ?? YtDlpBridge.instance;
 
   static const int defaultMaxBytes = 1024 * 1024 * 1024;
 
   final YoutubeExplode Function() _clientFactory;
   final YoutubeMuxRunner _muxRunner;
+  final MediaExtractor _mediaExtractor;
   final Map<String, _YoutubeJobControl> _jobs = <String, _YoutubeJobControl>{};
   bool _disposed = false;
 
@@ -216,8 +225,10 @@ class YoutubeDownloadService implements YoutubeMediaService {
     }
     final client = _clientFactory();
     try {
-      final video = await client.videos.get(videoId);
-      final manifest = await client.videos.streams.getManifest(videoId);
+      final video = await client.videos
+          .get(videoId)
+          .timeout(const Duration(seconds: 20));
+      final manifest = await _manifest(client, videoId);
       final formats = _buildFormats(manifest);
       if (formats.isEmpty) {
         throw StateError(
@@ -233,9 +244,107 @@ class YoutubeDownloadService implements YoutubeMediaService {
         duration: video.duration ?? Duration.zero,
         formats: List<YoutubeFormatOption>.unmodifiable(formats),
       );
+    } catch (_) {
+      _ensureActive();
+      final data = await _mediaExtractor.inspect(
+        'https://www.youtube.com/watch?v=$videoId',
+      );
+      _ensureActive();
+      return videoInfoFromExtractor(videoId, data);
     } finally {
       client.close();
     }
+  }
+
+  /// Translate package metadata only; extraction remains inside yt-dlp.
+  static YoutubeVideoInfo videoInfoFromExtractor(
+    String videoId,
+    Map<String, dynamic> data,
+  ) {
+    final formats = <YoutubeFormatOption>[];
+    final entries = (data['formats'] as List? ?? []).whereType<Map>().toList();
+    int? number(Map item, String key) => (item[key] as num?)?.round();
+    bool audio(Map item) => item['acodec'] != null && item['acodec'] != 'none';
+    bool video(Map item) => item['vcodec'] != null && item['vcodec'] != 'none';
+    for (final item in entries) {
+      final tag = int.tryParse('${item['format_id']}');
+      final ext = item['ext'] as String?;
+      if (tag == null || !const {'mp4', 'm4a', 'webm'}.contains(ext)) continue;
+      Map? companion;
+      if (video(item) && !audio(item)) {
+        final candidates =
+            entries
+                .where(
+                  (a) =>
+                      audio(a) &&
+                      !video(a) &&
+                      (a['ext'] == ext ||
+                          (ext == 'mp4' && a['ext'] == 'm4a')) &&
+                      int.tryParse('${a['format_id']}') != null,
+                )
+                .toList()
+              ..sort(
+                (a, b) =>
+                    (number(b, 'abr') ?? 0).compareTo(number(a, 'abr') ?? 0),
+              );
+        if (candidates.isEmpty) continue;
+        companion = candidates.first;
+      }
+      if (!audio(item) && !video(item)) continue;
+      final kind = !video(item)
+          ? YoutubeDownloadKind.audioOnly
+          : companion == null
+          ? YoutubeDownloadKind.muxedVideo
+          : YoutubeDownloadKind.splitVideoAudio;
+      final bytes = number(item, 'filesize') ?? number(item, 'filesize_approx');
+      final companionBytes = companion == null
+          ? 0
+          : number(companion, 'filesize') ??
+                number(companion, 'filesize_approx');
+      final total = bytes == null || companionBytes == null
+          ? null
+          : bytes + companionBytes;
+      final height = number(item, 'height');
+      final container = !video(item) && ext == 'mp4' ? 'm4a' : ext!;
+      formats.add(
+        YoutubeFormatOption(
+          id: 'extractor:$tag',
+          label:
+              '${video(item) ? '${height ?? ''}p' : '${number(item, 'abr') ?? 0} kbps'} · ${container.toUpperCase()} · ${_sizeLabel(total ?? 0)}',
+          kind: kind,
+          container: container,
+          videoFormatTag: video(item) ? tag : null,
+          audioFormatTag: companion == null
+              ? (audio(item) ? tag : null)
+              : int.parse('${companion['format_id']}'),
+          width: number(item, 'width'),
+          height: height,
+          framesPerSecond: number(item, 'fps'),
+          estimatedBytes: total,
+          resolutionLabel: height == null ? null : '${height}p',
+          videoCodec: item['vcodec'] as String?,
+          audioCodec: (companion ?? item)['acodec'] as String?,
+        ),
+      );
+    }
+    formats.sort((a, b) {
+      final order = _kindOrder(a.kind).compareTo(_kindOrder(b.kind));
+      return order != 0 ? order : (b.height ?? 0).compareTo(a.height ?? 0);
+    });
+    if (formats.isEmpty) {
+      throw StateError('No downloadable streams are available for this video.');
+    }
+    return YoutubeVideoInfo(
+      videoId: videoId,
+      canonicalUrl: 'https://www.youtube.com/watch?v=$videoId',
+      title: data['title'] as String? ?? 'YouTube video',
+      author: data['uploader'] as String? ?? '',
+      thumbnailUrl: data['thumbnail'] as String? ?? '',
+      duration: Duration(
+        milliseconds: ((data['duration'] as num? ?? 0) * 1000).round(),
+      ),
+      formats: List.unmodifiable(formats),
+    );
   }
 
   List<YoutubeFormatOption> _buildFormats(StreamManifest manifest) {
@@ -398,73 +507,132 @@ class YoutubeDownloadService implements YoutubeMediaService {
       await _deleteIfExists(tempAudio);
       _throwIfCancelled(control);
 
-      final manifest = await control.client.videos.streams.getManifest(
-        info.videoId,
-      );
-      _throwIfCancelled(control);
+      try {
+        final manifest = await _manifest(control.client, info.videoId);
+        _throwIfCancelled(control);
 
-      switch (declaredFormat.kind) {
-        case YoutubeDownloadKind.muxedVideo:
-          final stream = _findStream(
-            manifest.muxed,
-            declaredFormat.videoFormatTag,
-            'muxed',
-          );
-          await _writeStream(
-            control,
-            control.client.videos.streams.get(stream),
-            outputPart,
-            stream.size.totalBytes,
-            maxBytes,
-            onProgress,
-          );
-        case YoutubeDownloadKind.audioOnly:
-          final stream = _findStream(
-            manifest.audioOnly,
-            declaredFormat.audioFormatTag,
-            'audio',
-          );
-          await _writeStream(
-            control,
-            control.client.videos.streams.get(stream),
-            outputPart,
-            stream.size.totalBytes,
-            maxBytes,
-            onProgress,
-          );
-        case YoutubeDownloadKind.splitVideoAudio:
-          final video = _findStream(
-            manifest.videoOnly,
-            declaredFormat.videoFormatTag,
-            'video',
-          );
-          final audio = _findStream(
-            manifest.audioOnly,
-            declaredFormat.audioFormatTag,
-            'audio',
-          );
-          final total = video.size.totalBytes + audio.size.totalBytes;
-          var videoReceived = 0;
-          await _writeStream(
-            control,
-            control.client.videos.streams.get(video),
-            tempVideo,
-            video.size.totalBytes,
-            maxBytes,
-            (received, _) {
-              videoReceived = received;
-              onProgress(received, total);
-            },
-          );
-          await _writeStream(
-            control,
-            control.client.videos.streams.get(audio),
-            tempAudio,
-            audio.size.totalBytes,
-            maxBytes - videoReceived,
-            (received, _) => onProgress(videoReceived + received, total),
+        switch (declaredFormat.kind) {
+          case YoutubeDownloadKind.muxedVideo:
+            final stream = _findStream(
+              manifest.muxed,
+              declaredFormat.videoFormatTag,
+              'muxed',
+            );
+            await _writeStream(
+              control,
+              control.client.videos.streams.get(stream),
+              outputPart,
+              stream.size.totalBytes,
+              maxBytes,
+              onProgress,
+            );
+          case YoutubeDownloadKind.audioOnly:
+            final stream = _findStream(
+              manifest.audioOnly,
+              declaredFormat.audioFormatTag,
+              'audio',
+            );
+            await _writeStream(
+              control,
+              control.client.videos.streams.get(stream),
+              outputPart,
+              stream.size.totalBytes,
+              maxBytes,
+              onProgress,
+            );
+          case YoutubeDownloadKind.splitVideoAudio:
+            final video = _findStream(
+              manifest.videoOnly,
+              declaredFormat.videoFormatTag,
+              'video',
+            );
+            final estimatedAudio = _findStream(
+              manifest.audioOnly,
+              declaredFormat.audioFormatTag,
+              'audio',
+            );
+            final total =
+                video.size.totalBytes + estimatedAudio.size.totalBytes;
+            var videoReceived = 0;
+            await _writeStream(
+              control,
+              control.client.videos.streams.get(video),
+              tempVideo,
+              video.size.totalBytes,
+              maxBytes,
+              (received, _) {
+                videoReceived = received;
+                onProgress(received, total);
+              },
+            );
+            final audioManifest = await _manifest(control.client, info.videoId);
+            final audio = _findStream(
+              audioManifest.audioOnly,
+              declaredFormat.audioFormatTag,
+              'audio',
+            );
+            await _writeStream(
+              control,
+              control.client.videos.streams.get(audio),
+              tempAudio,
+              audio.size.totalBytes,
+              maxBytes - videoReceived,
+              (received, _) => onProgress(videoReceived + received, total),
+            );
+            _throwIfCancelled(control);
+            onProcessing();
+            control.muxing = true;
+            await _muxRunner.mux(
+              jobId: jobId,
+              videoPath: tempVideo.path,
+              audioPath: tempAudio.path,
+              outputPath: outputPart.path,
+              container: declaredFormat.container,
+            );
+            _throwIfCancelled(control);
+        }
+      } catch (error) {
+        _throwIfCancelled(control);
+        if (control.muxing || error.toString().contains('size limit')) rethrow;
+        // Refresh and download through yt-dlp when a client stream is blocked
+        // or stalls. Preserve exactly the format the user selected.
+        onProgress(0, declaredFormat.estimatedBytes);
+        Future<void> transfer(
+          int? tag,
+          File target,
+          int remaining,
+          YoutubeProgressCallback progress,
+        ) async {
+          if (tag == null) throw StateError('Missing YouTube format');
+          _throwIfCancelled(control);
+          await _mediaExtractor.downloadFormat(
+            jobId: jobId,
+            url: info.canonicalUrl,
+            format: '$tag',
+            outputPath: target.path,
+            maxBytes: remaining,
+            onProgress: progress,
           );
           _throwIfCancelled(control);
+        }
+
+        if (declaredFormat.kind == YoutubeDownloadKind.splitVideoAudio) {
+          await transfer(
+            declaredFormat.videoFormatTag,
+            tempVideo,
+            maxBytes,
+            onProgress,
+          );
+          final videoBytes = await tempVideo.length();
+          await transfer(
+            declaredFormat.audioFormatTag,
+            tempAudio,
+            maxBytes - videoBytes,
+            (received, total) => onProgress(
+              videoBytes + received,
+              total == null ? null : videoBytes + total,
+            ),
+          );
           onProcessing();
           control.muxing = true;
           await _muxRunner.mux(
@@ -474,12 +642,24 @@ class YoutubeDownloadService implements YoutubeMediaService {
             outputPath: outputPart.path,
             container: declaredFormat.container,
           );
-          _throwIfCancelled(control);
+        } else {
+          await transfer(
+            declaredFormat.kind == YoutubeDownloadKind.audioOnly
+                ? declaredFormat.audioFormatTag
+                : declaredFormat.videoFormatTag,
+            outputPart,
+            maxBytes,
+            onProgress,
+          );
+        }
       }
 
       _throwIfCancelled(control);
       if (!await outputPart.exists() || await outputPart.length() == 0) {
         throw StateError('The downloaded YouTube file is empty.');
+      }
+      if (await outputPart.length() > maxBytes) {
+        throw StateError('The downloaded media exceeds the size limit.');
       }
       await _deleteIfExists(output);
       await outputPart.rename(output.path);
@@ -503,6 +683,16 @@ class YoutubeDownloadService implements YoutubeMediaService {
       await _deleteIfExists(outputPart);
     }
   }
+
+  static Future<StreamManifest> _manifest(
+    YoutubeExplode client,
+    String videoId,
+  ) => client.videos.streams
+      .getManifest(
+        videoId,
+        ytClients: [YoutubeApiClient.androidVr, YoutubeApiClient.safari],
+      )
+      .timeout(const Duration(seconds: 25));
 
   static T _findStream<T extends StreamInfo>(
     Iterable<T> streams,
@@ -530,7 +720,7 @@ class YoutubeDownloadService implements YoutubeMediaService {
     final sink = file.openWrite();
     var received = 0;
     try {
-      await for (final chunk in stream) {
+      await for (final chunk in stream.timeout(const Duration(seconds: 20))) {
         _throwIfCancelled(control);
         received += chunk.length;
         if (received > maxBytes) {
@@ -574,6 +764,7 @@ class YoutubeDownloadService implements YoutubeMediaService {
     final control = _jobs[jobId];
     if (control == null) return;
     control.cancelled = true;
+    await _mediaExtractor.cancel(jobId);
     if (control.muxing) await _muxRunner.cancel(jobId);
     control.client.close();
   }

@@ -3,7 +3,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  testWidgets('fixed sheet has no resize affordance', (tester) async {
+  testWidgets('compact sheet exposes a working resize affordance', (
+    tester,
+  ) async {
     tester.view.devicePixelRatio = 1;
     tester.view.physicalSize = const Size(390, 800);
     addTearDown(() {
@@ -25,8 +27,14 @@ void main() {
       ),
     );
 
-    expect(find.byKey(const ValueKey('fixed_editor_sheet')), findsOneWidget);
-    expect(find.byKey(const ValueKey('resizable_sheet_handle')), findsNothing);
+    expect(
+      find.byKey(const ValueKey('resizable_editor_sheet')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('resizable_sheet_handle')),
+      findsOneWidget,
+    );
   });
 
   testWidgets('sheet handle resizes continuously and keeps released height', (

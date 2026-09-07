@@ -21,6 +21,7 @@ import '../providers/subtitle_provider.dart';
 import '../widgets/animated_subtitle_overlay.dart';
 import '../widgets/preview_performance_monitor.dart';
 import '../widgets/preview_playback_clock.dart';
+import '../widgets/preview_transform_controls.dart';
 
 double _previewAudioVolume({
   required TimelineClip clip,
@@ -865,12 +866,17 @@ class VideoPreviewPanel extends ConsumerStatefulWidget {
   final VoidCallback? onFullscreenToggle;
   final bool isFullscreen;
 
+  /// Enables pointer handles and the compact desktop transport presentation.
+  /// Mobile callers retain the legacy touch presentation by default.
+  final bool desktopMode;
+
   const VideoPreviewPanel({
     super.key,
     required this.videoPath,
     this.targetAspectRatio,
     this.onFullscreenToggle,
     this.isFullscreen = false,
+    this.desktopMode = false,
   });
 
   @override
@@ -921,7 +927,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   Timer? _previewAudioMixDebounce;
   int _previewAudioMixGeneration = 0;
   bool _previewAudioMixBuilding = false;
-  bool _previewAudioMixPending = false;
   bool _previewAudioMixSyncInFlight = false;
   bool _previewAudioMixSyncQueued = false;
   bool _previewAudioMixForceSeekQueued = false;
@@ -930,7 +935,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   String? _activePreviewAudioMixFingerprint;
   String? _previewAudioMixError;
   PreviewAudioMixResult? _previewAudioMixResult;
-  bool _previewAudioMixLiveEditPending = false;
   EditorTimeline? _previewAudioPlanTimeline;
   int? _previewAudioPlanEditRevision;
   String? _previewAudioPlanProjectId;
@@ -957,6 +961,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   final PreviewPerformanceMonitor _performanceMonitor =
       PreviewPerformanceMonitor(enabled: false);
   bool _showPerformanceDiagnostics = false;
+  double _desktopViewerZoom = 1.0;
   EditorTimeline? _cachedCaptionTimeline;
   List<SubtitleEntry>? _cachedCaptionEntries;
   List<SubtitleEntry> _effectiveCaptionCache = const [];
@@ -978,6 +983,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   double? _freeTransformStartRotation;
   double? _freeTransformStartFontSize;
   Duration? _freeTransformTimelinePosition;
+  SubtitleState? _styleGestureBaseline;
 
   void _ensurePreviewCaches(EditorTimeline timeline, {int? editRevision}) {
     if (identical(_cachedPreviewTimeline, timeline) &&
@@ -1057,14 +1063,8 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         _previewAudioMixResult != null &&
         _activePreviewAudioMixFingerprint ==
             _previewAudioMixResult!.fingerprint &&
-        !_previewAudioMixLiveEditPending &&
         _activePreviewAudioMixFingerprint == _plannedPreviewAudioMixFingerprint;
   }
-
-  bool get _previewAudioShouldMuteFallback =>
-      _previewAudioMixPending ||
-      _previewAudioMixBuilding ||
-      _previewAudioMixLiveEditPending;
 
   void _ensurePreviewAudioMixPlan(
     EditorTimeline timeline,
@@ -1076,30 +1076,9 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         _previewAudioPlanTimeline != null &&
         _previewAudioPlanEditRevision == editRevision &&
         _previewAudioPlanProjectId == projectId;
-    if (samePlanRevision &&
-        isTimelineGestureEditing &&
-        !identical(_previewAudioPlanTimeline, timeline)) {
-      if (!_previewAudioMixLiveEditPending) {
-        _previewAudioMixLiveEditPending = true;
-        _previewAudioMixPending = true;
-        _previewAudioMixDebounce?.cancel();
-        final generation = ++_previewAudioMixGeneration;
-        if (_previewAudioMixController != null || _previewAudioMixBuilding) {
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted) {
-              unawaited(
-                _clearPreviewAudioMix(generation, preservePending: true),
-              );
-            }
-          });
-        }
-      }
-      return;
-    }
     if (samePlanRevision && identical(_previewAudioPlanTimeline, timeline)) {
       return;
     }
-    _previewAudioMixLiveEditPending = false;
     _previewAudioPlanTimeline = timeline;
     _previewAudioPlanEditRevision = editRevision;
     _previewAudioPlanProjectId = projectId;
@@ -1109,7 +1088,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       fileExists: _cachedFileExists,
     );
     if (plan == null) {
-      _previewAudioMixPending = false;
       _plannedPreviewAudioMixFingerprint = null;
       _previewAudioMixFailureFingerprint = null;
       _previewAudioMixFailureCount = 0;
@@ -1131,7 +1109,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
         _previewAudioMixError = null;
       }
       _plannedPreviewAudioMixFingerprint = plan.fingerprint;
-      _previewAudioMixPending = false;
       return;
     }
     if (plan.fingerprint == _plannedPreviewAudioMixFingerprint) return;
@@ -1141,7 +1118,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     }
 
     _plannedPreviewAudioMixFingerprint = plan.fingerprint;
-    _previewAudioMixPending = true;
     _previewAudioMixDebounce?.cancel();
     final generation = ++_previewAudioMixGeneration;
     // Never keep an out-of-date rendered bus audible while an audio edit is
@@ -1171,7 +1147,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     _activePreviewAudioMixFingerprint = null;
     _previewAudioMixResult = null;
     _previewAudioMixBuilding = false;
-    if (!preservePending) _previewAudioMixPending = false;
     _previewAudioMixSyncInFlight = false;
     _previewAudioMixSyncQueued = false;
     _previewAudioMixForceSeekQueued = false;
@@ -1194,18 +1169,19 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     if (!mounted || generation != _previewAudioMixGeneration) return;
     setState(() {
       _previewAudioMixBuilding = true;
-      _previewAudioMixPending = true;
       _previewAudioMixError = null;
     });
     VideoPlayerController? created;
     try {
-      final result = await TimelinePreviewAudioService.ensureRendered(plan);
+      final result = await TimelinePreviewAudioService.ensureRendered(
+        plan,
+      ).timeout(const Duration(seconds: 45));
       if (!mounted || generation != _previewAudioMixGeneration) return;
       created = VideoPlayerController.file(
         File(result.outputPath),
         videoPlayerOptions: buildPreviewVideoPlayerOptions(),
       );
-      await created.initialize();
+      await created.initialize().timeout(const Duration(seconds: 12));
       await created.setLooping(false);
       await created.setVolume(0);
       final playback = ref.read(playbackProvider);
@@ -1232,7 +1208,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       _activePreviewAudioMixFingerprint = result.fingerprint;
       _previewAudioMixResult = result;
       _previewAudioMixBuilding = false;
-      _previewAudioMixPending = false;
       _previewAudioMixError = null;
       _previewAudioMixFailureFingerprint = null;
       _previewAudioMixFailureCount = 0;
@@ -1301,7 +1276,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       _activePreviewAudioMixFingerprint = null;
       _previewAudioMixResult = null;
       _previewAudioMixBuilding = false;
-      _previewAudioMixPending = false;
       _previewAudioMixSyncInFlight = false;
       _previewAudioMixSyncQueued = false;
       _previewAudioMixForceSeekQueued = false;
@@ -2889,8 +2863,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     );
     final monitoredClip = linkedAudio?.clip ?? clip;
     final monitoredTrack = linkedAudio?.track ?? track;
-    final volume =
-        _hasRenderedPreviewAudioMix || _previewAudioShouldMuteFallback
+    final volume = _hasRenderedPreviewAudioMix
         ? 0.0
         : _previewAudioVolume(
             clip: monitoredClip,
@@ -3095,6 +3068,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     _freeTransformStartFontSize = style.fontSize;
     final notifier = ref.read(subtitleProvider.notifier);
     notifier.selectEntry(activeEntry.id);
+    _styleGestureBaseline = ref.read(subtitleProvider);
     notifier.beginStyleGestureEdit();
   }
 
@@ -3102,7 +3076,29 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     _dragSourceOffsetX = null;
     _dragSourceOffsetY = null;
     _freeTransformStartFontSize = null;
+    _styleGestureBaseline = null;
     ref.read(subtitleProvider.notifier).endStyleGestureEdit();
+  }
+
+  void _cancelStyleGesture() {
+    _dragSourceOffsetX = null;
+    _dragSourceOffsetY = null;
+    _freeTransformStartFontSize = null;
+    final baseline = _styleGestureBaseline;
+    _styleGestureBaseline = null;
+    if (!mounted) return;
+    final notifier = ref.read(subtitleProvider.notifier);
+    notifier.endStyleGestureEdit();
+    if (baseline == null) return;
+    notifier.restoreFromEditorHistory(
+      entries: baseline.entries,
+      globalStyle: baseline.globalStyle,
+      selectedEntryId: baseline.selectedEntryId,
+    );
+    // beginStyleGestureEdit records the baseline so a completed gesture can
+    // become one undo step. A cancelled gesture must consume that temporary
+    // history entry after restoring the exact baseline.
+    if (notifier.canUndo) notifier.undo();
   }
 
   List<_OverlayCanvasItem> _activeOverlayItems(
@@ -3362,6 +3358,26 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     _freeTransformStartFontSize = null;
     _freeTransformTimelinePosition = null;
     ref.read(editorProvider.notifier).endTimelineGestureEdit();
+  }
+
+  void _cancelSnappedDrag() {
+    _dragSourceOffsetX = null;
+    _dragSourceOffsetY = null;
+    _freeTransformStartScale = null;
+    _freeTransformStartRotation = null;
+    _freeTransformStartFontSize = null;
+    _freeTransformTimelinePosition = null;
+    if (!mounted) return;
+    // The notifier restores the exact gesture-start snapshot. This keeps a
+    // cancelled drag from traversing unrelated editor history.
+    ref.read(editorProvider.notifier).cancelTimelineGestureEdit();
+  }
+
+  void _setDesktopViewerZoom(double zoom) {
+    if (!widget.desktopMode) return;
+    final next = zoom.clamp(0.5, 2.5).toDouble();
+    if ((next - _desktopViewerZoom).abs() < 0.001) return;
+    setState(() => _desktopViewerZoom = next);
   }
 
   bool _hasSoloMediaTrack(EditorTimeline timeline) {
@@ -3866,7 +3882,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                         // on while the visual frame is held.
                         isTrackAudible:
                             !_hasRenderedPreviewAudioMix &&
-                            !_previewAudioShouldMuteFallback &&
                             !item.clip.freezeFrame &&
                             previewVisualUsesEmbeddedAudioForTesting(
                               timeline: timeline,
@@ -4695,6 +4710,12 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                 return const SizedBox.shrink();
               }
               final isSelected = selectedClipId == clip.id;
+              final effectTrack = ref
+                  .read(editorProvider)
+                  .timeline
+                  .tracks
+                  .where((track) => track.id == item.trackId)
+                  .firstOrNull;
               final transform = clip.transform;
               return Positioned(
                 left: constraints.maxWidth * blur.safeRegionX,
@@ -4715,7 +4736,18 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                     child: Transform.scale(
                       scale: transform.scale.clamp(0.2, 4.0),
                       child: _OverlayTransformBox(
+                        key: ValueKey('gesture_${clip.id}'),
                         isSelected: isSelected,
+                        interactionEnabled:
+                            effectTrack?.isLocked != true &&
+                            (widget.desktopMode ||
+                                selectedClipId == null ||
+                                isSelected),
+                        desktopMode: widget.desktopMode,
+                        rotation: transform.rotation,
+                        flipX: transform.flipX,
+                        flipY: transform.flipY,
+                        resizeBaseValue: transform.scale,
                         onTap: () => _selectEffectClip(item),
                         onMoveStart: () {
                           _selectEffectClip(item);
@@ -4745,6 +4777,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                           });
                         },
                         onMoveEnd: _endSnappedDrag,
+                        onGestureCancel: _cancelSnappedDrag,
                         onScaleFactorUpdate: (factor) {
                           _updateOverlayTransform(
                             clip.id,
@@ -4981,7 +5014,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
       subtitleEntries: subtitleState.entries,
       globalSubtitleStyle: subtitleState.globalStyle,
     );
-    final workspaceLoop = editorState.timeline.workspaceSettings.loopPlayback;
     final activeOverlayItems = _activeOverlayItems(
       editorState.timeline,
       playbackState.position,
@@ -5229,54 +5261,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                 },
                               ),
                             ),
-                          if (_previewAudioShouldMuteFallback)
-                            Positioned(
-                              key: const ValueKey(
-                                'preview-audio-processing-state',
-                              ),
-                              right: 10,
-                              top: 10,
-                              child: IgnorePointer(
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 10,
-                                    vertical: 7,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: kBackground.withValues(alpha: 0.88),
-                                    borderRadius: BorderRadius.circular(999),
-                                    border: Border.all(
-                                      color: kAccent.withValues(alpha: 0.45),
-                                    ),
-                                  ),
-                                  child: Row(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      const SizedBox.square(
-                                        dimension: 13,
-                                        child: CircularProgressIndicator(
-                                          strokeWidth: 2,
-                                          color: kAccent,
-                                        ),
-                                      ),
-                                      const SizedBox(width: 7),
-                                      Text(
-                                        _previewAudioMixBuilding
-                                            ? 'Processing audio effects…'
-                                            : 'Preparing audio preview…',
-                                        style: const TextStyle(
-                                          color: kTextPrimary,
-                                          fontSize: 10,
-                                          fontWeight: FontWeight.w600,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ),
-                            ),
-                          if (_previewAudioMixError != null &&
-                              !_previewAudioShouldMuteFallback)
+                          if (_previewAudioMixError != null)
                             Positioned(
                               key: const ValueKey(
                                 'preview-audio-processing-error',
@@ -5431,7 +5416,24 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                                       animation.scale)
                                                   .clamp(0.2, 4.0),
                                           child: _OverlayTransformBox(
+                                            key: ValueKey(
+                                              'gesture_${activeBaseClip.id}',
+                                            ),
                                             isSelected: isSelected,
+                                            interactionEnabled:
+                                                !activeBaseTrack.isLocked &&
+                                                (widget.desktopMode ||
+                                                    editorState
+                                                            .selectedClipId ==
+                                                        null ||
+                                                    isSelected),
+                                            desktopMode: widget.desktopMode,
+                                            rotation:
+                                                transform.rotation +
+                                                animation.rotation,
+                                            flipX: transform.flipX,
+                                            flipY: transform.flipY,
+                                            resizeBaseValue: transform.scale,
                                             onTap: () {
                                               ref
                                                   .read(editorProvider.notifier)
@@ -5499,6 +5501,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                                 _endSnappedDrag();
                                               }
                                             },
+                                            onGestureCancel: _cancelSnappedDrag,
                                             onScaleFactorUpdate: (factor) {
                                               if (activeBaseTrack.isLocked) {
                                                 return;
@@ -5608,7 +5611,25 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                                           animation.scale)
                                                       .clamp(0.2, 4.0),
                                               child: _OverlayTransformBox(
+                                                key: ValueKey(
+                                                  'gesture_${item.clip.id}',
+                                                ),
                                                 isSelected: isSelected,
+                                                interactionEnabled:
+                                                    !item.track.isLocked &&
+                                                    (widget.desktopMode ||
+                                                        editorState
+                                                                .selectedClipId ==
+                                                            null ||
+                                                        isSelected),
+                                                desktopMode: widget.desktopMode,
+                                                rotation:
+                                                    transform.rotation +
+                                                    animation.rotation,
+                                                flipX: transform.flipX,
+                                                flipY: transform.flipY,
+                                                resizeBaseValue:
+                                                    transform.scale,
                                                 onTap: () =>
                                                     _selectOverlayClip(item),
                                                 onMoveStart: () {
@@ -5690,6 +5711,8 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                                     _endSnappedDrag();
                                                   }
                                                 },
+                                                onGestureCancel:
+                                                    _cancelSnappedDrag,
                                                 onScaleFactorUpdate: (factor) {
                                                   if (item.track.isLocked) {
                                                     return;
@@ -5769,6 +5792,14 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                       final isSelected =
                                           editorState.selectedClipId ==
                                           item.clip.id;
+                                      final textTrackLocked = editorState
+                                          .timeline
+                                          .tracks
+                                          .where(
+                                            (track) => track.id == item.trackId,
+                                          )
+                                          .firstOrNull
+                                          ?.isLocked;
                                       final style =
                                           item.clip.subtitleStyle ??
                                           const SubtitleStyleModel(
@@ -5819,7 +5850,23 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                                 kTimelineDesignHeight,
                                           ),
                                           child: _OverlayTransformBox(
+                                            key: ValueKey(
+                                              'gesture_${item.clip.id}',
+                                            ),
                                             isSelected: isSelected,
+                                            interactionEnabled:
+                                                textTrackLocked != true &&
+                                                (widget.desktopMode ||
+                                                    editorState
+                                                            .selectedClipId ==
+                                                        null ||
+                                                    isSelected),
+                                            desktopMode: widget.desktopMode,
+                                            rotation: transform.rotation,
+                                            flipX: transform.flipX,
+                                            flipY: transform.flipY,
+                                            resizeBaseValue: transform.scale,
+                                            minResizeValue: 0.25,
                                             onTap: () {
                                               ref
                                                   .read(editorProvider.notifier)
@@ -5882,6 +5929,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                               });
                                             },
                                             onMoveEnd: _endSnappedDrag,
+                                            onGestureCancel: _cancelSnappedDrag,
                                             onScaleFactorUpdate: (factor) {
                                               _updateOverlayTransform(
                                                 item.clip.id,
@@ -5968,12 +6016,23 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                             kTimelineDesignHeight,
                                       ),
                                       child: _OverlayTransformBox(
+                                        key: ValueKey(
+                                          'gesture_${activeEntry.id}',
+                                        ),
                                         isSelected: isSelected,
+                                        interactionEnabled:
+                                            editorState.selectedClipId ==
+                                                null ||
+                                            isSelected,
+                                        desktopMode: widget.desktopMode,
                                         onTap: () {
                                           ref
                                               .read(subtitleProvider.notifier)
                                               .selectEntry(activeEntry.id);
                                         },
+                                        resizeBaseValue: editableStyle.fontSize,
+                                        minResizeValue: 1.0,
+                                        maxResizeValue: 72.0,
                                         onMoveStart: () => _beginStyleGesture(
                                           activeEntry,
                                           editPerEntry,
@@ -6033,6 +6092,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                           );
                                         },
                                         onMoveEnd: _endStyleGesture,
+                                        onGestureCancel: _cancelStyleGesture,
                                         onScaleFactorUpdate: (factor) {
                                           final style = _readEditableStyleFor(
                                             activeEntry,
@@ -6096,8 +6156,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                 ),
                               ),
                             ),
-                          if (!_hasRenderedPreviewAudioMix &&
-                              !_previewAudioShouldMuteFallback)
+                          if (!_hasRenderedPreviewAudioMix)
                             for (final item in activeOverlayItems)
                               if (item.asset.type == EditorAssetType.video &&
                                   item.clip.freezeFrame &&
@@ -6139,8 +6198,7 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                     continueFreezeFrameAudio: true,
                                   ),
                                 ),
-                          if (!_hasRenderedPreviewAudioMix &&
-                              !_previewAudioShouldMuteFallback)
+                          if (!_hasRenderedPreviewAudioMix)
                             for (final item in activeAudioItems)
                               Positioned(
                                 left: 0,
@@ -6167,7 +6225,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                 ),
                               ),
                           if (!_hasRenderedPreviewAudioMix &&
-                              !_previewAudioShouldMuteFallback &&
                               controllerReady &&
                               activeBaseClip.freezeFrame &&
                               !activeBaseClip.isReversed &&
@@ -6289,35 +6346,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                   child: Row(
                                     mainAxisAlignment: MainAxisAlignment.center,
                                     children: [
-                                      IconButton(
-                                        tooltip: 'Go to start',
-                                        icon: const Icon(
-                                          Icons.first_page_rounded,
-                                          color: kTextSecondary,
-                                          size: 21,
-                                        ),
-                                        onPressed: () => _seekTo(Duration.zero),
-                                      ),
-                                      IconButton(
-                                        icon: const Icon(
-                                          Icons.replay_10_rounded,
-                                          color: kTextPrimary,
-                                          size: 22,
-                                        ),
-                                        onPressed: () => _seekTo(
-                                          playbackState.position -
-                                              const Duration(seconds: 10),
-                                        ),
-                                      ),
-                                      IconButton(
-                                        tooltip: 'Previous frame',
-                                        icon: const Icon(
-                                          Icons.skip_previous_rounded,
-                                          color: kTextPrimary,
-                                          size: 22,
-                                        ),
-                                        onPressed: () => _stepFrame(-1),
-                                      ),
                                       IconButton.filled(
                                         tooltip: playbackState.isPlaying
                                             ? 'Pause'
@@ -6339,52 +6367,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
                                           size: compactControls ? 24 : 27,
                                         ),
                                         onPressed: _togglePlayPause,
-                                      ),
-                                      IconButton(
-                                        tooltip: 'Next frame',
-                                        icon: const Icon(
-                                          Icons.skip_next_rounded,
-                                          color: kTextPrimary,
-                                          size: 22,
-                                        ),
-                                        onPressed: () => _stepFrame(1),
-                                      ),
-                                      IconButton(
-                                        icon: const Icon(
-                                          Icons.forward_10_rounded,
-                                          color: kTextPrimary,
-                                          size: 22,
-                                        ),
-                                        onPressed: () => _seekTo(
-                                          playbackState.position +
-                                              const Duration(seconds: 10),
-                                        ),
-                                      ),
-                                      IconButton(
-                                        tooltip: workspaceLoop
-                                            ? 'Turn looping off'
-                                            : 'Loop timeline',
-                                        icon: Icon(
-                                          Icons.repeat_rounded,
-                                          color: workspaceLoop
-                                              ? kAccent
-                                              : kTextSecondary,
-                                          size: 20,
-                                        ),
-                                        onPressed: () {
-                                          final current = ref
-                                              .read(editorProvider)
-                                              .timeline
-                                              .workspaceSettings
-                                              .loopPlayback;
-                                          ref
-                                              .read(editorProvider.notifier)
-                                              .setWorkspaceSettings(
-                                                (settings) => settings.copyWith(
-                                                  loopPlayback: !current,
-                                                ),
-                                              );
-                                        },
                                       ),
                                       IconButton(
                                         tooltip: _showPerformanceDiagnostics
@@ -8337,68 +8319,67 @@ class _CanvasGuidesPainter extends CustomPainter {
   }
 }
 
-class _OverlayTransformBox extends StatefulWidget {
+class _OverlayTransformBox extends StatelessWidget {
   final Widget child;
   final bool isSelected;
+  final bool interactionEnabled;
+  final bool desktopMode;
+  final double rotation;
+  final bool flipX;
+  final bool flipY;
+  final double resizeBaseValue;
+  final double minResizeValue;
+  final double maxResizeValue;
   final VoidCallback onTap;
   final VoidCallback onMoveStart;
   final ValueChanged<Offset> onMoveUpdate;
   final VoidCallback onMoveEnd;
+  final VoidCallback? onGestureCancel;
   final ValueChanged<double> onScaleFactorUpdate;
   final ValueChanged<double>? onRotationUpdate;
 
   const _OverlayTransformBox({
+    super.key,
     required this.child,
     required this.isSelected,
+    this.interactionEnabled = true,
+    this.desktopMode = false,
+    this.rotation = 0,
+    this.flipX = false,
+    this.flipY = false,
+    this.resizeBaseValue = 1,
+    this.minResizeValue = 0.2,
+    this.maxResizeValue = 4.0,
     required this.onTap,
     required this.onMoveStart,
     required this.onMoveUpdate,
     required this.onMoveEnd,
+    this.onGestureCancel,
     required this.onScaleFactorUpdate,
     this.onRotationUpdate,
   });
 
   @override
-  State<_OverlayTransformBox> createState() => _OverlayTransformBoxState();
-}
-
-class _OverlayTransformBoxState extends State<_OverlayTransformBox> {
-  @override
   Widget build(BuildContext context) {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: widget.onTap,
-      onScaleStart: (_) {
-        widget.onMoveStart();
-      },
-      onScaleUpdate: (details) {
-        widget.onMoveUpdate(details.focalPointDelta);
-        widget.onScaleFactorUpdate(details.scale);
-        widget.onRotationUpdate?.call(details.rotation);
-      },
-      onScaleEnd: (_) => widget.onMoveEnd(),
-      child: Stack(
-        clipBehavior: Clip.none,
-        children: [
-          widget.child,
-          Positioned.fill(
-            child: IgnorePointer(
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 100),
-                decoration: BoxDecoration(
-                  border: Border.all(
-                    color: widget.isSelected
-                        ? kAccent.withValues(alpha: 0.9)
-                        : Colors.transparent,
-                    width: widget.isSelected ? 1.5 : 0,
-                  ),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
+    return PreviewTransformControls(
+      key: key,
+      child: child,
+      isSelected: isSelected,
+      interactionEnabled: interactionEnabled,
+      desktopMode: desktopMode,
+      rotation: rotation,
+      flipX: flipX,
+      flipY: flipY,
+      resizeBaseValue: resizeBaseValue,
+      minResizeValue: minResizeValue,
+      maxResizeValue: maxResizeValue,
+      onTap: onTap,
+      onMoveStart: onMoveStart,
+      onMoveUpdate: onMoveUpdate,
+      onMoveEnd: onMoveEnd,
+      onGestureCancel: onGestureCancel,
+      onScaleFactorUpdate: onScaleFactorUpdate,
+      onRotationUpdate: onRotationUpdate,
     );
   }
 }

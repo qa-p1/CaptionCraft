@@ -1,3 +1,4 @@
+import '../widgets/resizable_editor_sheet.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter/services.dart';
@@ -1220,43 +1221,39 @@ class _CreatorLabScreenState extends ConsumerState<CreatorLabScreen> {
     required String actionLabel,
     required VoidCallback onAction,
   }) {
-    final sheetHeight = MediaQuery.sizeOf(context).height * 0.4;
     return showModalBottomSheet<Duration>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
+      enableDrag: false,
       builder: (sheetContext) {
-        return SizedBox(
-          height: sheetHeight,
-          child: AppSheetSurface(
-            key: const Key('creator_lab_result_sheet'),
-            child: SafeArea(
-              top: false,
-              child: Column(
-                children: [
-                  AppSheetHeader(
-                    title: title,
-                    subtitle: subtitle,
-                    icon: Icons.auto_awesome_rounded,
-                    onClose: () => Navigator.pop(sheetContext),
-                  ),
-                  Expanded(child: child),
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
-                    decoration: const BoxDecoration(
-                      color: Color(0xA6101316),
-                      border: Border(top: BorderSide(color: kBorder)),
-                    ),
-                    child: FilledButton.icon(
-                      onPressed: onAction,
-                      icon: const Icon(Icons.auto_awesome_rounded, size: 18),
-                      label: Text(actionLabel),
-                    ),
-                  ),
-                ],
+        return ResizableEditorSheet(
+          key: const Key('creator_lab_result_sheet'),
+          title: title,
+          subtitle: subtitle,
+          icon: Icons.auto_awesome_rounded,
+          onClose: () => Navigator.pop(sheetContext),
+          initialHeightFactor: 0.64,
+          minHeightFactor: 0.4,
+          scrollable: false,
+          contentPadding: EdgeInsets.zero,
+          child: Column(
+            children: [
+              Expanded(child: child),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+                decoration: const BoxDecoration(
+                  color: Color(0xA6101316),
+                  border: Border(top: BorderSide(color: kBorder)),
+                ),
+                child: FilledButton.icon(
+                  onPressed: onAction,
+                  icon: const Icon(Icons.auto_awesome_rounded, size: 18),
+                  label: Text(actionLabel),
+                ),
               ),
-            ),
+            ],
           ),
         );
       },

@@ -68,12 +68,12 @@ void main() {
 }
 
 Future<void> _runAttributeTool(WidgetTester tester, String toolName) async {
-  final more = find.byKey(const ValueKey('dock_primary_more'));
+  final more = find.byKey(const ValueKey('dock_primary_arrange'));
   await tester.ensureVisible(more);
   await tester.tap(more);
   await tester.pumpAndSettle();
 
-  final toolKey = ValueKey('all_tools_clip_attributes_$toolName');
+  final toolKey = ValueKey('dock_tool_$toolName');
   final tool = find.byKey(toolKey);
   expect(tool, findsOneWidget);
   await tester.ensureVisible(tool);

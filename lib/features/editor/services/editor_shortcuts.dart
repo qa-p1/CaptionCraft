@@ -22,6 +22,12 @@ enum EditorShortcutCommand {
   setWorkAreaEnd,
   clearWorkArea,
   toggleSnapping,
+  copySelection,
+  cutSelection,
+  pasteSelection,
+  duplicateSelection,
+  rippleDeleteSelected,
+  splitSelected,
   deleteSelectedClip,
   splitAtPlayhead,
   addMarker,
@@ -48,6 +54,21 @@ EditorShortcutCommand? resolveEditorShortcut({
     }
     if (key == LogicalKeyboardKey.keyA) {
       return EditorShortcutCommand.selectAll;
+    }
+    if (key == LogicalKeyboardKey.keyC) {
+      return EditorShortcutCommand.copySelection;
+    }
+    if (key == LogicalKeyboardKey.keyV) {
+      return EditorShortcutCommand.pasteSelection;
+    }
+    if (key == LogicalKeyboardKey.keyX) {
+      return EditorShortcutCommand.cutSelection;
+    }
+    if (key == LogicalKeyboardKey.keyD) {
+      return EditorShortcutCommand.duplicateSelection;
+    }
+    if (key == LogicalKeyboardKey.keyK) {
+      return EditorShortcutCommand.splitSelected;
     }
     if (key == LogicalKeyboardKey.keyB) {
       return EditorShortcutCommand.splitAtPlayhead;
@@ -98,7 +119,9 @@ EditorShortcutCommand? resolveEditorShortcut({
   }
   if (key == LogicalKeyboardKey.end) return EditorShortcutCommand.jumpToEnd;
   if (key == LogicalKeyboardKey.delete || key == LogicalKeyboardKey.backspace) {
-    return EditorShortcutCommand.deleteSelectedClip;
+    return shift
+        ? EditorShortcutCommand.rippleDeleteSelected
+        : EditorShortcutCommand.deleteSelectedClip;
   }
   if (key == LogicalKeyboardKey.keyM) {
     return EditorShortcutCommand.addMarker;

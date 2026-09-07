@@ -3,6 +3,8 @@ import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../../core/utils/api_key_vault.dart';
+import '../../../core/theme/app_theme.dart';
+import '../../../shared/widgets/app_surface.dart';
 
 class ApiSettingsScreen extends StatefulWidget {
   const ApiSettingsScreen({super.key, required this.vault});
@@ -251,7 +253,20 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
         }
       },
       child: Scaffold(
-        appBar: AppBar(title: const Text('Settings · Connected services')),
+        backgroundColor: kBackground,
+        appBar: AppBar(title: const Text('Connected services')),
+        bottomNavigationBar: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 10, 20, 12),
+            child: FilledButton.icon(
+              onPressed: editable && _dirty ? _save : null,
+              icon: Icon(
+                vault.busy ? Icons.hourglass_top_rounded : Icons.lock_outline,
+              ),
+              label: Text(vault.busy ? 'Saving…' : 'Save keys securely'),
+            ),
+          ),
+        ),
         body: vault.isRetired
             ? const Center(child: Text('Account changed. Reopen Settings.'))
             : Center(
@@ -262,24 +277,47 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
                     child: ListView(
                       padding: const EdgeInsets.all(20),
                       children: [
-                        Text(
-                          'Set up in about 2 minutes',
-                          style: Theme.of(context).textTheme.headlineSmall,
+                        AppPanel(
+                          padding: const EdgeInsets.all(20),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Icon(
+                                Icons.hub_outlined,
+                                color: kAccent,
+                                size: 28,
+                              ),
+                              const SizedBox(height: 12),
+                              Text(
+                                'Your creative toolkit',
+                                style: Theme.of(
+                                  context,
+                                ).textTheme.headlineSmall,
+                              ),
+                              const SizedBox(height: 8),
+                              const Text(
+                                'Add a key for the services you use. Each connection is optional.',
+                                style: TextStyle(color: kTextSecondary),
+                              ),
+                              const SizedBox(height: 12),
+                              Text(
+                                vault.cloud
+                                    ? 'Encrypted on device and in your backup'
+                                    : 'Protected by secure storage on this device',
+                                style: const TextStyle(
+                                  color: kTextSecondary,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
-                        const SizedBox(height: 10),
-                        const Text(
-                          'Connect only the services you want. Editing, importing, manual captions and exporting work without API keys. Provider signup or approval can take longer.',
-                        ),
-                        const SizedBox(height: 10),
-                        const Text(
-                          '1. Open a provider and create your own API key.\n2. Paste it below and save.\n3. Start creating. Your provider’s quotas and charges apply. Audio is sent to Groq only when you generate captions.',
+                        const SizedBox(height: 24),
+                        const AppSectionHeader(
+                          title: 'API connections',
+                          icon: Icons.key_outlined,
                         ),
                         const SizedBox(height: 12),
-                        Text(
-                          vault.cloud
-                              ? 'Keys are encrypted before cloud backup. This device remembers the recovery code securely; a new device needs it once.'
-                              : 'Local desktop mode: keys are protected by Windows secure storage on this PC. Cloud backup requires a supported cloud account.',
-                        ),
                         if (vault.error != null)
                           Padding(
                             padding: const EdgeInsets.symmetric(vertical: 14),
@@ -300,8 +338,9 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
                             ),
                           ),
                         for (final service in ApiService.values)
-                          Card(
-                            child: Padding(
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 12),
+                            child: AppPanel(
                               padding: const EdgeInsets.all(16),
                               child: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -310,9 +349,17 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
                                     service.label,
                                     style: Theme.of(
                                       context,
-                                    ).textTheme.titleLarge,
+                                    ).textTheme.titleMedium,
                                   ),
-                                  Text(service.description),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    service.description,
+                                    style: const TextStyle(
+                                      color: kTextSecondary,
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 8),
                                   Align(
                                     alignment: Alignment.centerLeft,
                                     child: TextButton.icon(
@@ -342,8 +389,10 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
                                       }
                                     },
                                     decoration: InputDecoration(
-                                      labelText:
-                                          '${service.label} API key (optional)',
+                                      labelText: '${service.label} API key',
+                                      hintText: 'Paste your key',
+                                      filled: true,
+                                      fillColor: kSurfaceElevated,
                                       counterText: '',
                                       suffixIcon: IconButton(
                                         tooltip: _visible.contains(service)
@@ -363,7 +412,11 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
                                     ),
                                   ),
                                   TextButton(
-                                    onPressed: editable
+                                    onPressed:
+                                        editable &&
+                                            _controllers[service]!
+                                                .text
+                                                .isNotEmpty
                                         ? () {
                                             _controllers[service]!.clear();
                                             setState(() => _dirty = true);
@@ -376,12 +429,6 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
                             ),
                           ),
                         const SizedBox(height: 12),
-                        FilledButton.icon(
-                          onPressed: editable ? _save : null,
-                          icon: const Icon(Icons.lock_outline),
-                          label: const Text('Save keys securely'),
-                        ),
-                        const SizedBox(height: 10),
                         if (vault.cloud && vault.pendingSync)
                           OutlinedButton(
                             onPressed: vault.busy ? null : vault.retrySync,
@@ -485,7 +532,7 @@ Future<void> showApiSetupPrompt(BuildContext context, ApiKeyVault vault) async {
     builder: (c) => AlertDialog(
       title: const Text('Make CaptionCraft yours in 2 minutes'),
       content: const Text(
-        'Add your own API keys for automatic captions, GIFs and stock media. We’ll show you where to get each one and remember them securely.\n\nYou can skip this and use the editor now. Find it anytime in Settings → Connected services.',
+        'Add your own API keys for automatic captions, GIFs and stock media. We’ll show you where to get each one and remember them securely.\n\nYou can skip this and use the editor now. Find it anytime in Account & usage → Connected services.',
       ),
       actions: [
         TextButton(

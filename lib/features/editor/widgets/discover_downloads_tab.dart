@@ -221,7 +221,9 @@ class _DiscoverDownloadsTabState extends State<DiscoverDownloadsTab>
               const SizedBox(height: 11),
               LinearProgressIndicator(
                 key: ValueKey('discover-download-progress-${item.id}'),
-                value: item.hasKnownProgress ? item.progress : null,
+                value: item.hasKnownProgress && item.receivedBytes > 0
+                    ? item.progress
+                    : null,
                 minHeight: 4,
                 borderRadius: BorderRadius.circular(999),
               ),
@@ -480,6 +482,10 @@ class _DiscoverDownloadsTabState extends State<DiscoverDownloadsTab>
   }
 
   String _progressLabel(DiscoverDownloadItem item) {
+    if (item.status == DiscoverDownloadStatus.downloading &&
+        item.receivedBytes == 0) {
+      return 'Connecting to media…';
+    }
     if (item.status == DiscoverDownloadStatus.processing) {
       return 'Preparing the final media file…';
     }

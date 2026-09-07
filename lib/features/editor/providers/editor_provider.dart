@@ -170,6 +170,13 @@ class EditorNotifier extends StateNotifier<EditorState> {
     });
   }
 
+  /// Read-only snapshot for service/controller collaborators.
+  ///
+  /// [StateNotifier.state] is intentionally protected outside notifier
+  /// subclasses. Timeline command routing still needs a synchronous snapshot,
+  /// so expose the same value without leaking mutation authority.
+  EditorState get currentState => state;
+
   void loadProject({
     required String videoPath,
     required String projectId,

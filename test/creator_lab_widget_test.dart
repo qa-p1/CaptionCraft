@@ -137,7 +137,7 @@ void main() {
     expect(container.read(subtitleProvider).entries, isEmpty);
   });
 
-  testWidgets('result sheet is compact and a result returns to editor seek', (
+  testWidgets('result sheet resizes and a result returns to editor seek', (
     tester,
   ) async {
     await tester.binding.setSurfaceSize(const Size(1180, 820));
@@ -172,7 +172,7 @@ void main() {
     final availableHeight = tester.getSize(labScaffold).height;
     expect(
       tester.getSize(sheet).height,
-      lessThanOrEqualTo(availableHeight * 0.42),
+      lessThanOrEqualTo(availableHeight * 0.75),
     );
     expect(
       tester.getSize(sheet).height,

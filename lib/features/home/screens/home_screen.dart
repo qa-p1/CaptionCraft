@@ -1195,21 +1195,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       children: [
         const CaptionCraftLockup(),
         const Spacer(),
-        IconButton(
-          tooltip: 'Settings · Connected services',
-          icon: const Icon(Icons.settings_outlined),
-          onPressed: () {
-            final vault = ApiKeys.active;
-            if (vault != null) {
-              Navigator.push(
-                context,
-                MaterialPageRoute<void>(
-                  builder: (_) => ApiSettingsScreen(vault: vault),
-                ),
-              );
-            }
-          },
-        ),
         if (MediaQuery.sizeOf(context).width >= 650)
           Padding(
             padding: const EdgeInsets.only(right: 14),

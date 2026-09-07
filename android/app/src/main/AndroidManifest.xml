@@ -4,6 +4,7 @@
         android:maxSdkVersion="28"/>
 
     <application
+        android:extractNativeLibs="true"
         android:label="CaptionCraft"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"

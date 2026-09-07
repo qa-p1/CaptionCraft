@@ -136,7 +136,11 @@ void main() {
       await tester.tap(find.text('Settings'));
       await tester.pumpAndSettle();
       final field = find.byKey(const ValueKey('api-key-groq'));
-      await tester.scrollUntilVisible(field, 200);
+      await tester.scrollUntilVisible(
+        field,
+        200,
+        scrollable: find.byType(Scrollable).first,
+      );
       await tester.enterText(field, 'gsk_my_key');
       await tester.pump();
       final input = tester.widget<EditableText>(

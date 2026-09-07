@@ -378,6 +378,23 @@ void main() {
       tracks: [track.copyWith(audioGain: 0.7, audioPan: 0.2)],
     );
 
+    final visualEffects = timeline.copyWith(
+      tracks: [
+        track.copyWith(
+          clips: [
+            clip.copyWith(
+              effectStack: EditorEffectStack(
+                effects: [EditorEffect(type: EditorEffectType.gaussianBlur)],
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+    expect(
+      buildPlan(visualEffects).fingerprint,
+      buildPlan(timeline).fingerprint,
+    );
     expect(buildPlan(transformed).fingerprint, buildPlan(timeline).fingerprint);
     expect(buildPlan(frozen).fingerprint, buildPlan(timeline).fingerprint);
     expect(

@@ -1,3 +1,4 @@
+import 'resizable_editor_sheet.dart';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -762,135 +763,128 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
+      enableDrag: false,
       backgroundColor: Colors.transparent,
       builder: (sheetContext) => StatefulBuilder(
-        builder: (context, setSheetState) => AppSheetSurface(
-          child: SafeArea(
-            top: false,
-            child: SizedBox(
-              height: math.min(
-                MediaQuery.sizeOf(sheetContext).height * 0.68,
-                560,
+        builder: (context, setSheetState) => ResizableEditorSheet(
+          title: 'Animation channels',
+          initialHeightFactor: 0.68,
+          showHeader: false,
+          scrollable: false,
+          contentPadding: EdgeInsets.zero,
+          child: Column(
+            children: [
+              AppSheetHeader(
+                title: 'Animation channels',
+                showHandle: false,
+                subtitle:
+                    'Visibility, solo and locking affect this graph session only',
+                icon: Icons.tune_rounded,
+                onClose: () => Navigator.pop(sheetContext),
               ),
-              child: Column(
-                children: [
-                  AppSheetHeader(
-                    title: 'Animation channels',
-                    subtitle:
-                        'Visibility, solo and locking affect this graph session only',
-                    icon: Icons.tune_rounded,
-                    onClose: () => Navigator.pop(sheetContext),
-                  ),
-                  Expanded(
-                    child: ListView.builder(
-                      padding: const EdgeInsets.fromLTRB(12, 14, 12, 20),
-                      itemCount: widget.properties.length,
-                      itemBuilder: (context, index) {
-                        final property = widget.properties[index];
-                        return Padding(
-                          padding: const EdgeInsets.only(bottom: 7),
-                          child: AppPanel(
-                            padding: EdgeInsets.zero,
-                            color: property == _property
-                                ? kAccent.withValues(alpha: 0.07)
-                                : kSurfaceElevated,
-                            selected: property == _property,
-                            child: ListTile(
-                              key: ValueKey(
-                                'keyframe_channel_${property.name}',
+              Expanded(
+                child: ListView.builder(
+                  padding: const EdgeInsets.fromLTRB(12, 14, 12, 20),
+                  itemCount: widget.properties.length,
+                  itemBuilder: (context, index) {
+                    final property = widget.properties[index];
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 7),
+                      child: AppPanel(
+                        padding: EdgeInsets.zero,
+                        color: property == _property
+                            ? kAccent.withValues(alpha: 0.07)
+                            : kSurfaceElevated,
+                        selected: property == _property,
+                        child: ListTile(
+                          key: ValueKey('keyframe_channel_${property.name}'),
+                          title: Text(_propertyLabel(property)),
+                          selected: property == _property,
+                          onTap: () {
+                            _selectProperty(property);
+                            Navigator.pop(sheetContext);
+                          },
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                key: ValueKey(
+                                  'keyframe_channel_visibility_${property.name}',
+                                ),
+                                tooltip: _hiddenProperties.contains(property)
+                                    ? 'Show channel'
+                                    : 'Hide channel',
+                                onPressed: () {
+                                  setState(() {
+                                    if (!_hiddenProperties.add(property)) {
+                                      _hiddenProperties.remove(property);
+                                    }
+                                  });
+                                  setSheetState(() {});
+                                },
+                                icon: Icon(
+                                  _hiddenProperties.contains(property)
+                                      ? Icons.visibility_off_rounded
+                                      : Icons.visibility_rounded,
+                                ),
                               ),
-                              title: Text(_propertyLabel(property)),
-                              selected: property == _property,
-                              onTap: () {
-                                _selectProperty(property);
-                                Navigator.pop(sheetContext);
-                              },
-                              trailing: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  IconButton(
-                                    key: ValueKey(
-                                      'keyframe_channel_visibility_${property.name}',
-                                    ),
-                                    tooltip:
-                                        _hiddenProperties.contains(property)
-                                        ? 'Show channel'
-                                        : 'Hide channel',
-                                    onPressed: () {
-                                      setState(() {
-                                        if (!_hiddenProperties.add(property)) {
-                                          _hiddenProperties.remove(property);
-                                        }
-                                      });
-                                      setSheetState(() {});
-                                    },
-                                    icon: Icon(
-                                      _hiddenProperties.contains(property)
-                                          ? Icons.visibility_off_rounded
-                                          : Icons.visibility_rounded,
-                                    ),
-                                  ),
-                                  IconButton(
-                                    key: ValueKey(
-                                      'keyframe_channel_solo_${property.name}',
-                                    ),
-                                    tooltip: _soloProperty == property
-                                        ? 'Clear solo'
-                                        : 'Solo channel',
-                                    onPressed: () {
-                                      setState(() {
-                                        _soloProperty =
-                                            _soloProperty == property
-                                            ? null
-                                            : property;
-                                        if (_soloProperty != null) {
-                                          _property = property;
-                                          _selectOnly(null);
-                                          _selectNearestToPlayhead();
-                                        }
-                                      });
-                                      setSheetState(() {});
-                                    },
-                                    icon: Icon(
-                                      Icons.headphones_rounded,
-                                      color: _soloProperty == property
-                                          ? kAccent
-                                          : null,
-                                    ),
-                                  ),
-                                  IconButton(
-                                    key: ValueKey(
-                                      'keyframe_channel_lock_${property.name}',
-                                    ),
-                                    tooltip:
-                                        _lockedProperties.contains(property)
-                                        ? 'Unlock channel'
-                                        : 'Lock channel',
-                                    onPressed: () {
-                                      setState(() {
-                                        if (!_lockedProperties.add(property)) {
-                                          _lockedProperties.remove(property);
-                                        }
-                                      });
-                                      setSheetState(() {});
-                                    },
-                                    icon: Icon(
-                                      _lockedProperties.contains(property)
-                                          ? Icons.lock_rounded
-                                          : Icons.lock_open_rounded,
-                                    ),
-                                  ),
-                                ],
+                              IconButton(
+                                key: ValueKey(
+                                  'keyframe_channel_solo_${property.name}',
+                                ),
+                                tooltip: _soloProperty == property
+                                    ? 'Clear solo'
+                                    : 'Solo channel',
+                                onPressed: () {
+                                  setState(() {
+                                    _soloProperty = _soloProperty == property
+                                        ? null
+                                        : property;
+                                    if (_soloProperty != null) {
+                                      _property = property;
+                                      _selectOnly(null);
+                                      _selectNearestToPlayhead();
+                                    }
+                                  });
+                                  setSheetState(() {});
+                                },
+                                icon: Icon(
+                                  Icons.headphones_rounded,
+                                  color: _soloProperty == property
+                                      ? kAccent
+                                      : null,
+                                ),
                               ),
-                            ),
+                              IconButton(
+                                key: ValueKey(
+                                  'keyframe_channel_lock_${property.name}',
+                                ),
+                                tooltip: _lockedProperties.contains(property)
+                                    ? 'Unlock channel'
+                                    : 'Lock channel',
+                                onPressed: () {
+                                  setState(() {
+                                    if (!_lockedProperties.add(property)) {
+                                      _lockedProperties.remove(property);
+                                    }
+                                  });
+                                  setSheetState(() {});
+                                },
+                                icon: Icon(
+                                  _lockedProperties.contains(property)
+                                      ? Icons.lock_rounded
+                                      : Icons.lock_open_rounded,
+                                ),
+                              ),
+                            ],
                           ),
-                        );
-                      },
-                    ),
-                  ),
-                ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
               ),
-            ),
+            ],
           ),
         ),
       ),

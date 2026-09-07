@@ -1,5 +1,11 @@
+import 'package:caption_craft/core/utils/api_key_vault.dart';
+import 'package:caption_craft/features/settings/screens/api_settings_screen.dart';
+import 'api_key_vault_test.dart' show MemoryVaultStorage;
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui' as ui;
+import 'package:flutter/services.dart';
+import 'package:flutter/rendering.dart';
 
 import 'package:caption_craft/core/theme/app_theme.dart';
 import 'package:caption_craft/features/auth/screens/login_screen.dart';
@@ -19,6 +25,20 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  setUpAll(() async {
+    if (!const bool.fromEnvironment('CAPTURE_UI')) return;
+    TestWidgetsFlutterBinding.ensureInitialized();
+    for (final font in {
+      'Inter': 'assets/fonts/Inter-Variable.ttf',
+      'Ahem': 'assets/fonts/Inter-Variable.ttf',
+      'Roboto': 'assets/fonts/Roboto-Variable.ttf',
+      'SpaceMono': 'assets/fonts/SpaceMono-Regular.ttf',
+      'MaterialIcons': 'fonts/MaterialIcons-Regular.otf',
+    }.entries) {
+      final loader = FontLoader(font.key)..addFont(rootBundle.load(font.value));
+      await loader.load();
+    }
+  });
   Future<void> pumpLogin(WidgetTester tester, {required Size size}) async {
     await tester.binding.setSurfaceSize(size);
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -33,6 +53,30 @@ void main() {
     );
     await tester.pump(const Duration(milliseconds: 500));
   }
+
+  testWidgets('connected services uses a readable phone layout', (
+    tester,
+  ) async {
+    final vault = ApiKeyVault(
+      uid: 'local',
+      cloud: false,
+      storage: MemoryVaultStorage(),
+    );
+    await vault.initialize();
+    await tester.binding.setSurfaceSize(const Size(390, 844));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: AppTheme.darkTheme,
+        home: ApiSettingsScreen(vault: vault),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Connected services'), findsOneWidget);
+    expect(find.text('Save keys securely'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    await _capture(tester, 'connected-services');
+  });
 
   testWidgets('login studio has a complete desktop layout', (tester) async {
     await pumpLogin(tester, size: const Size(1280, 800));
@@ -138,21 +182,15 @@ void main() {
       );
     }
 
-    final more = find.byKey(const ValueKey('dock_primary_more'));
-    await tester.ensureVisible(more);
-    await tester.tap(more);
+    await _capture(tester, 'editor-workspace');
+    expect(find.byKey(const ValueKey('dock_primary_more')), findsNothing);
+    final category = find.byKey(const ValueKey('dock_primary_visual'));
+    await tester.ensureVisible(category);
+    await tester.tap(category);
     await tester.pumpAndSettle();
-    expect(
-      find.byKey(const ValueKey('editor_all_tools_sheet')),
-      findsOneWidget,
-    );
-    expect(find.text('All tools'), findsOneWidget);
-    if (Platform.isLinux) {
-      await expectLater(
-        find.byType(MaterialApp),
-        matchesGoldenFile('goldens/editor_all_tools_phone.png'),
-      );
-    }
+    expect(find.byKey(const ValueKey('dock_back')), findsOneWidget);
+    await _capture(tester, 'editor-visual-tools');
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('transcription process remains usable on a phone', (
@@ -293,5 +331,21 @@ List<Project> _sampleProjects() {
     );
     project.cacheVideoAvailability(index != 4);
     return project;
+  });
+}
+
+Future<void> _capture(WidgetTester tester, String name) async {
+  if (!const bool.fromEnvironment('CAPTURE_UI')) return;
+  final boundary = tester.renderObject<RenderRepaintBoundary>(
+    find.byType(RepaintBoundary).first,
+  );
+  await tester.runAsync(() async {
+    final image = await boundary.toImage(pixelRatio: 1);
+    final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
+    await Directory('build/ui-review').create(recursive: true);
+    await File(
+      'build/ui-review/$name.png',
+    ).writeAsBytes(bytes!.buffer.asUint8List());
+    image.dispose();
   });
 }

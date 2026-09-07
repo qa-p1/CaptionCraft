@@ -10,6 +10,7 @@ import '../../../shared/widgets/captioncraft_brand.dart';
 import '../models/discover_models.dart';
 import '../providers/discover_provider.dart';
 import 'discover_browser_tab.dart';
+import 'resizable_editor_sheet.dart';
 import 'discover_downloads_tab.dart';
 import 'discover_instagram_tab.dart';
 import 'discover_youtube_tab.dart';
@@ -364,8 +365,13 @@ Future<T?> showDiscoverSheet<T>({
     sheetAnimationStyle: AnimationStyle.noAnimation,
     backgroundColor: Colors.transparent,
     barrierColor: barrierColor,
-    builder: (sheetContext) => FractionallySizedBox(
-      heightFactor: 1,
+    builder: (sheetContext) => ResizableEditorSheet(
+      title: 'Discover',
+      initialHeightFactor: 0.9,
+      maxHeightFactor: 0.96,
+      showHeader: false,
+      scrollable: false,
+      contentPadding: EdgeInsets.zero,
       child: DiscoverSheet(
         initialDestination: initialDestination,
         browserSurfaceBuilder: browserSurfaceBuilder,
