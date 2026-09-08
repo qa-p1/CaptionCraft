@@ -1859,12 +1859,20 @@ void main() {
     await tester.pump();
     await tester.tap(find.byTooltip('Clipboard'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Paste at playhead'));
-    await tester.pumpAndSettle();
+    final paste = tester.widget<ListTile>(
+      find.widgetWithText(ListTile, 'Paste at playhead'),
+    );
+    expect(paste.enabled, isFalse);
+    expect(paste.onTap, isNull);
     expect(container.read(subtitleProvider).entries, hasLength(1));
     expect(
-      find.text('Unlock the subtitle track before pasting captions.'),
-      findsOne,
+      container
+          .read(editorProvider)
+          .timeline
+          .tracks
+          .singleWhere((track) => track.id == 'locked_subtitles')
+          .clips,
+      hasLength(1),
     );
     expect(tester.takeException(), isNull);
   });

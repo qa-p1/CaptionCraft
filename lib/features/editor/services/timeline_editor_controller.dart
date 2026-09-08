@@ -476,7 +476,21 @@ class TimelineEditorController extends ChangeNotifier {
           ) !=
           null;
     }
-    return _canPasteAt(playheadPosition?.call() ?? Duration.zero);
+    return _canPasteAt(
+      _resolvePasteStart(playheadPosition?.call() ?? Duration.zero),
+    );
+  }
+
+  Duration _resolvePasteStart(Duration desiredStart) {
+    if (_clipboard.clips.length != 1) return desiredStart;
+    final item = _clipboard.clips.single;
+    final target = _resolvePasteTracks()?[item.sourceTrackId];
+    if (target == null) return desiredStart;
+    return target.closestAvailableStart(
+          desiredStart: desiredStart + item.relativeStart,
+          duration: item.clip.duration,
+        ) -
+        item.relativeStart;
   }
 
   bool _canPasteAt(Duration start) {
@@ -615,6 +629,7 @@ class TimelineEditorController extends ChangeNotifier {
   }
 
   bool _pasteAt(Duration targetStart) {
+    targetStart = _resolvePasteStart(targetStart);
     if (_clipboard.subtitles.isNotEmpty && _clipboard.clips.isEmpty) {
       final targetTrack = _editorState.timeline.insertionTrackFor(
         section: TimelineTrackSection.textSubtitle,
@@ -639,8 +654,8 @@ class TimelineEditorController extends ChangeNotifier {
               ?.map(
                 (word) => WordTiming(
                   word: word.word,
-                  startTime: word.startTime + offset,
-                  endTime: word.endTime + offset,
+                  startTime: word.startTime + nextStart - source.startTime,
+                  endTime: word.endTime + nextStart - source.startTime,
                 ),
               )
               .toList(),

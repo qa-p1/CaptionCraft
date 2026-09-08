@@ -89,6 +89,13 @@ void main() {
         startTime: const Duration(seconds: 2),
         endTime: const Duration(seconds: 3),
         text: 'Hello',
+        words: [
+          WordTiming(
+            word: 'Hello',
+            startTime: const Duration(milliseconds: 2100),
+            endTime: const Duration(milliseconds: 2800),
+          ),
+        ],
       );
       final subtitleTrack = TimelineTrack(
         id: 'subtitles',
@@ -127,6 +134,11 @@ void main() {
       expect(pasted.id, isNot(cue.id));
       expect(pasted.startTime, const Duration(seconds: 10));
       expect(pasted.endTime, const Duration(seconds: 11));
+      expect(
+        pasted.words!.single.startTime,
+        const Duration(milliseconds: 10100),
+      );
+      expect(pasted.words!.single.endTime, const Duration(milliseconds: 10800));
       final pastedClip = container
           .read(editorProvider)
           .timeline

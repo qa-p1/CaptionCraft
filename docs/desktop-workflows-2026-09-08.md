@@ -67,7 +67,15 @@ Commit `6d6f82b` passed Linux formatting/analysis and Windows analysis/regressio
 tests. The full Linux suite exposed an outdated phone-editor golden: its
 transport and selection appearance predated the latest base commit. The CI
 images were inspected against the current source before refreshing that baseline.
-The full-suite result for the updated baseline is still pending.
+The same run confirmed the rotation-handle fix and passed 599 tests, with four
+failures. Besides the golden, it exposed duplicate preview keys, lost nearest-gap
+placement for single-clip paste, and an obsolete lock-feedback assertion. Those
+are corrected; locked Paste is verified disabled, and single-clip paste reuses
+the nearest gap. Caption word timestamps now shift with pasted cues, with
+regression coverage. The final full-suite result remains pending.
+
+The signed Android app bundle/APK build and output verification passed on
+`6d6f82b` after the wrapper fix.
 
 The prior checkpoint (`6cb82a9`) built an unsigned iOS IPA successfully. Windows
 stopped at analysis, and Android failed at the wrapper launcher; both discovered

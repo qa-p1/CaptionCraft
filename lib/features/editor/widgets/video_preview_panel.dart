@@ -8354,7 +8354,6 @@ class _OverlayTransformBox extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return PreviewTransformControls(
-      key: key,
       isSelected: isSelected,
       interactionEnabled: interactionEnabled,
       desktopMode: desktopMode,
