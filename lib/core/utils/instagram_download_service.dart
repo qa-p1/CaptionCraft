@@ -35,7 +35,7 @@ abstract class InstagramMediaService {
 class InstagramDownloadService implements InstagramMediaService {
   InstagramDownloadService({
     Future<Map<String, dynamic>> Function(String)? extractor,
-    this.inspectionTimeout = const Duration(seconds: 45),
+    this.inspectionTimeout = const Duration(seconds: 125),
   }) : _extractor = extractor ?? YtDlpBridge.instance.inspect;
   final Future<Map<String, dynamic>> Function(String) _extractor;
   final Duration inspectionTimeout;
@@ -47,6 +47,13 @@ class InstagramDownloadService implements InstagramMediaService {
     'm.instagram.com',
   };
   static const browserUserAgent = 'Mozilla/5.0';
+  static const _headerNames = {
+    'user-agent': 'User-Agent',
+    'referer': 'Referer',
+    'origin': 'Origin',
+    'accept': 'Accept',
+    'accept-language': 'Accept-Language',
+  };
   static ({String shortcode, Uri canonicalUri, bool isReel})? parseUrl(
     String value,
   ) {
@@ -85,10 +92,17 @@ class InstagramDownloadService implements InstagramMediaService {
     );
   }
 
-  static Map<String, String> downloadHeaders(String canonicalUrl) => {
+  static Map<String, String> downloadHeaders(
+    String canonicalUrl, [
+    Map<String, String> extracted = const {},
+  ]) => {
     'User-Agent': browserUserAgent,
     'Referer': canonicalUrl,
     'Origin': 'https://www.instagram.com',
+    for (final entry in extracted.entries)
+      if (_headerNames.containsKey(entry.key.toLowerCase()) &&
+          !entry.value.contains(RegExp(r'[\r\n]')))
+        _headerNames[entry.key.toLowerCase()]!: entry.value,
   };
 
   @override
@@ -153,6 +167,13 @@ class InstagramDownloadService implements InstagramMediaService {
                 ? 'image/${ext == 'jpg' ? 'jpeg' : ext}'
                 : 'video/mp4',
             thumbnailUrl: _https(entry['thumbnail'] ?? info['thumbnail']),
+            httpHeaders: {
+              for (final source in [info, entry, candidate])
+                if (source['http_headers'] is Map)
+                  for (final header in (source['http_headers'] as Map).entries)
+                    if (header.key is String && header.value is String)
+                      header.key as String: header.value as String,
+            },
           ),
         );
       }

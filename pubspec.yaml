@@ -93,6 +93,8 @@
     uses-material-design: true
     assets:
       - assets/media_runtime.zip
+      - assets/media_runtime.zip.hash
+      - tools/media_runtime/main.py
       - captioncraft_logo.svg
       - assets/fonts/licenses/
     fonts:

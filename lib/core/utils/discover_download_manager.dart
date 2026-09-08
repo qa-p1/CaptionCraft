@@ -322,6 +322,7 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
       pageUrl: canonicalUri.toString(),
       headers: InstagramDownloadService.downloadHeaders(
         canonicalUri.toString(),
+        selectedMedia.httpHeaders,
       ),
       mimeType: selectedMedia.mimeType,
       metadata: <String, dynamic>{
@@ -755,6 +756,7 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
           pageUrl: refreshed.canonicalUrl,
           headers: InstagramDownloadService.downloadHeaders(
             refreshed.canonicalUrl,
+            refreshedMedia.httpHeaders,
           ),
           mimeType: refreshedMedia.mimeType,
           metadata: item.metadata,

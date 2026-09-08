@@ -46,6 +46,9 @@ jobs:
       - name: Analyze
         run: flutter analyze
 
+      - name: Test embedded media runtime
+        run: python -m unittest tools/test_media_runtime.py
+
       - name: Test
         run: flutter test
 

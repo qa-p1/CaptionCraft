@@ -223,6 +223,17 @@ class YoutubeDownloadService implements YoutubeMediaService {
     if (videoId == null) {
       throw const FormatException('Enter a valid HTTPS YouTube video URL.');
     }
+    // Use the maintained embedded extractor first. The legacy client remains
+    // a fallback, rather than delaying every request before yt-dlp can start.
+    try {
+      final data = await _mediaExtractor.inspect(
+        'https://www.youtube.com/watch?v=$videoId',
+      );
+      _ensureActive();
+      return videoInfoFromExtractor(videoId, data);
+    } catch (_) {
+      _ensureActive();
+    }
     final client = _clientFactory();
     try {
       final video = await client.videos
@@ -244,13 +255,6 @@ class YoutubeDownloadService implements YoutubeMediaService {
         duration: video.duration ?? Duration.zero,
         formats: List<YoutubeFormatOption>.unmodifiable(formats),
       );
-    } catch (_) {
-      _ensureActive();
-      final data = await _mediaExtractor.inspect(
-        'https://www.youtube.com/watch?v=$videoId',
-      );
-      _ensureActive();
-      return videoInfoFromExtractor(videoId, data);
     } finally {
       client.close();
     }
@@ -494,7 +498,7 @@ class YoutubeDownloadService implements YoutubeMediaService {
       throw StateError('The selected format exceeds the download size limit.');
     }
 
-    final control = _YoutubeJobControl(_clientFactory());
+    final control = _YoutubeJobControl(_clientFactory);
     _jobs[jobId] = control;
     final output = File(outputPath);
     final outputPart = File('$outputPath.part');
@@ -507,93 +511,104 @@ class YoutubeDownloadService implements YoutubeMediaService {
       await _deleteIfExists(tempAudio);
       _throwIfCancelled(control);
 
-      try {
-        final manifest = await _manifest(control.client, info.videoId);
-        _throwIfCancelled(control);
+      var useExtractor = declaredFormat.id.startsWith('extractor:');
+      if (!useExtractor) {
+        try {
+          final manifest = await _manifest(control.client, info.videoId);
+          _throwIfCancelled(control);
 
-        switch (declaredFormat.kind) {
-          case YoutubeDownloadKind.muxedVideo:
-            final stream = _findStream(
-              manifest.muxed,
-              declaredFormat.videoFormatTag,
-              'muxed',
-            );
-            await _writeStream(
-              control,
-              control.client.videos.streams.get(stream),
-              outputPart,
-              stream.size.totalBytes,
-              maxBytes,
-              onProgress,
-            );
-          case YoutubeDownloadKind.audioOnly:
-            final stream = _findStream(
-              manifest.audioOnly,
-              declaredFormat.audioFormatTag,
-              'audio',
-            );
-            await _writeStream(
-              control,
-              control.client.videos.streams.get(stream),
-              outputPart,
-              stream.size.totalBytes,
-              maxBytes,
-              onProgress,
-            );
-          case YoutubeDownloadKind.splitVideoAudio:
-            final video = _findStream(
-              manifest.videoOnly,
-              declaredFormat.videoFormatTag,
-              'video',
-            );
-            final estimatedAudio = _findStream(
-              manifest.audioOnly,
-              declaredFormat.audioFormatTag,
-              'audio',
-            );
-            final total =
-                video.size.totalBytes + estimatedAudio.size.totalBytes;
-            var videoReceived = 0;
-            await _writeStream(
-              control,
-              control.client.videos.streams.get(video),
-              tempVideo,
-              video.size.totalBytes,
-              maxBytes,
-              (received, _) {
-                videoReceived = received;
-                onProgress(received, total);
-              },
-            );
-            final audioManifest = await _manifest(control.client, info.videoId);
-            final audio = _findStream(
-              audioManifest.audioOnly,
-              declaredFormat.audioFormatTag,
-              'audio',
-            );
-            await _writeStream(
-              control,
-              control.client.videos.streams.get(audio),
-              tempAudio,
-              audio.size.totalBytes,
-              maxBytes - videoReceived,
-              (received, _) => onProgress(videoReceived + received, total),
-            );
-            _throwIfCancelled(control);
-            onProcessing();
-            control.muxing = true;
-            await _muxRunner.mux(
-              jobId: jobId,
-              videoPath: tempVideo.path,
-              audioPath: tempAudio.path,
-              outputPath: outputPart.path,
-              container: declaredFormat.container,
-            );
-            _throwIfCancelled(control);
+          switch (declaredFormat.kind) {
+            case YoutubeDownloadKind.muxedVideo:
+              final stream = _findStream(
+                manifest.muxed,
+                declaredFormat.videoFormatTag,
+                'muxed',
+              );
+              await _writeStream(
+                control,
+                control.client.videos.streams.get(stream),
+                outputPart,
+                stream.size.totalBytes,
+                maxBytes,
+                onProgress,
+              );
+            case YoutubeDownloadKind.audioOnly:
+              final stream = _findStream(
+                manifest.audioOnly,
+                declaredFormat.audioFormatTag,
+                'audio',
+              );
+              await _writeStream(
+                control,
+                control.client.videos.streams.get(stream),
+                outputPart,
+                stream.size.totalBytes,
+                maxBytes,
+                onProgress,
+              );
+            case YoutubeDownloadKind.splitVideoAudio:
+              final video = _findStream(
+                manifest.videoOnly,
+                declaredFormat.videoFormatTag,
+                'video',
+              );
+              final estimatedAudio = _findStream(
+                manifest.audioOnly,
+                declaredFormat.audioFormatTag,
+                'audio',
+              );
+              final total =
+                  video.size.totalBytes + estimatedAudio.size.totalBytes;
+              var videoReceived = 0;
+              await _writeStream(
+                control,
+                control.client.videos.streams.get(video),
+                tempVideo,
+                video.size.totalBytes,
+                maxBytes,
+                (received, _) {
+                  videoReceived = received;
+                  onProgress(received, total);
+                },
+              );
+              final audioManifest = await _manifest(
+                control.client,
+                info.videoId,
+              );
+              final audio = _findStream(
+                audioManifest.audioOnly,
+                declaredFormat.audioFormatTag,
+                'audio',
+              );
+              await _writeStream(
+                control,
+                control.client.videos.streams.get(audio),
+                tempAudio,
+                audio.size.totalBytes,
+                maxBytes - videoReceived,
+                (received, _) => onProgress(videoReceived + received, total),
+              );
+              _throwIfCancelled(control);
+              onProcessing();
+              control.muxing = true;
+              await _muxRunner.mux(
+                jobId: jobId,
+                videoPath: tempVideo.path,
+                audioPath: tempAudio.path,
+                outputPath: outputPart.path,
+                container: declaredFormat.container,
+              );
+              _throwIfCancelled(control);
+          }
+        } catch (error) {
+          _throwIfCancelled(control);
+          if (control.muxing || error.toString().contains('size limit')) {
+            rethrow;
+          }
+          useExtractor = true;
         }
-      } catch (error) {
-        _throwIfCancelled(control);
-        if (control.muxing || error.toString().contains('size limit')) rethrow;
+      }
+      if (useExtractor) {
         // Refresh and download through yt-dlp when a client stream is blocked
         // or stalls. Preserve exactly the format the user selected.
         onProgress(0, declaredFormat.estimatedBytes);
@@ -676,7 +691,7 @@ class YoutubeDownloadService implements YoutubeMediaService {
       }
       rethrow;
     } finally {
-      control.client.close();
+      control.close();
       _jobs.remove(jobId);
       await _deleteIfExists(tempVideo);
       await _deleteIfExists(tempAudio);
@@ -766,7 +781,7 @@ class YoutubeDownloadService implements YoutubeMediaService {
     control.cancelled = true;
     await _mediaExtractor.cancel(jobId);
     if (control.muxing) await _muxRunner.cancel(jobId);
-    control.client.close();
+    control.close();
   }
 
   void _ensureActive() {
@@ -779,18 +794,22 @@ class YoutubeDownloadService implements YoutubeMediaService {
     _disposed = true;
     for (final control in _jobs.values) {
       control.cancelled = true;
-      control.client.close();
+      control.close();
     }
     for (final jobId in _jobs.keys.toList(growable: false)) {
+      unawaited(_mediaExtractor.cancel(jobId));
       unawaited(_muxRunner.cancel(jobId));
     }
   }
 }
 
 class _YoutubeJobControl {
-  _YoutubeJobControl(this.client);
+  _YoutubeJobControl(this.clientFactory);
 
-  final YoutubeExplode client;
+  final YoutubeExplode Function() clientFactory;
+  YoutubeExplode? _client;
+  YoutubeExplode get client => _client ??= clientFactory();
+  void close() => _client?.close();
   bool cancelled = false;
   bool muxing = false;
 }

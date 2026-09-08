@@ -313,6 +313,7 @@ class InstagramMediaOption {
     this.thumbnailUrl,
     this.width,
     this.height,
+    this.httpHeaders = const {},
   });
 
   final String id;
@@ -322,6 +323,7 @@ class InstagramMediaOption {
   final String? thumbnailUrl;
   final int? width;
   final int? height;
+  final Map<String, String> httpHeaders;
 
   Map<String, dynamic> toJson() => <String, dynamic>{
     'id': id,
@@ -331,6 +333,7 @@ class InstagramMediaOption {
     if (thumbnailUrl != null) 'thumbnailUrl': thumbnailUrl,
     if (width != null) 'width': width,
     if (height != null) 'height': height,
+    if (httpHeaders.isNotEmpty) 'httpHeaders': httpHeaders,
   };
 
   factory InstagramMediaOption.fromJson(Map<String, dynamic> json) {
@@ -346,6 +349,12 @@ class InstagramMediaOption {
       thumbnailUrl: json['thumbnailUrl']?.toString(),
       width: _nullableInt(json['width']),
       height: _nullableInt(json['height']),
+      httpHeaders: {
+        if (json['httpHeaders'] is Map)
+          for (final entry in (json['httpHeaders'] as Map).entries)
+            if (entry.key is String && entry.value is String)
+              entry.key as String: entry.value as String,
+      },
     );
   }
 }

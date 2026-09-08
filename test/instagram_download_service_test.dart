@@ -39,6 +39,32 @@ void main() {
       },
     );
 
+    test('preserves extractor CDN headers through persisted media', () async {
+      final service = InstagramDownloadService(
+        extractor: (_) async => {
+          'url': 'https://media.example/reel.mp4',
+          'ext': 'mp4',
+          'http_headers': {
+            'User-Agent': 'extractor-agent',
+            'Referer': 'https://www.instagram.com/',
+          },
+        },
+      );
+      addTearDown(service.dispose);
+      final info = await service.inspect(
+        'https://www.instagram.com/reel/Caption123/',
+      );
+      final restored = InstagramMediaOption.fromJson(
+        info.media.single.toJson(),
+      );
+      final headers = InstagramDownloadService.downloadHeaders(
+        info.canonicalUrl,
+        restored.httpHeaders,
+      );
+      expect(headers['User-Agent'], 'extractor-agent');
+      expect(headers['Referer'], 'https://www.instagram.com/');
+    });
+
     test('accepts supported HTTPS Reel and post URLs only', () {
       final reel = InstagramDownloadService.parseUrl(
         'https://m.instagram.com/reels/Caption123/?utm_source=test',
