@@ -146,7 +146,10 @@ class TimelineExportService {
     onStage?.call('Checking media');
     onProgress?.call(0.02);
 
-    if (_activeExportJob != null) throw StateError('Another export is still running. Wait for it to finish.');
+    if (_activeExportJob != null)
+      throw StateError(
+        'Another export is still running. Wait for it to finish.',
+      );
     final exportJob = job ?? MediaJob();
     exportJob.checkCancelled();
     _activeExportJob = exportJob;
@@ -158,20 +161,25 @@ class TimelineExportService {
     String? captionFontDirectory;
     try {
       await exportJob.attach(-1, () async {
-        if (!downloadCancelToken.isCancelled) downloadCancelToken.cancel('Cancelled by user');
+        if (!downloadCancelToken.isCancelled)
+          downloadCancelToken.cancel('Cancelled by user');
       });
-    final workingRoot = await getTemporaryDirectory();
-    workingDirectory = Directory(
-      p.join(
-        workingRoot.path,
-        'cc_render_${DateTime.now().microsecondsSinceEpoch}',
-      ),
-    );
-    await workingDirectory.create(recursive: true);
-    exportJob.checkCancelled();
-    outputTransaction = await ExportOutputTransaction.create(outputPath, sourcePaths: [
-      project.videoPath, ...timeline.assets.map((asset) => asset.sourcePath ?? ''),
-    ]);
+      final workingRoot = await getTemporaryDirectory();
+      workingDirectory = Directory(
+        p.join(
+          workingRoot.path,
+          'cc_render_${DateTime.now().microsecondsSinceEpoch}',
+        ),
+      );
+      await workingDirectory.create(recursive: true);
+      exportJob.checkCancelled();
+      outputTransaction = await ExportOutputTransaction.create(
+        outputPath,
+        sourcePaths: [
+          project.videoPath,
+          ...timeline.assets.map((asset) => asset.sourcePath ?? ''),
+        ],
+      );
       final sourcePaths = <String, Future<String>>{};
       Future<String> resolveSourcePath(TimelineClip clip) {
         exportJob.checkCancelled();
@@ -350,7 +358,10 @@ class TimelineExportService {
         throw Exception('The renderer did not create a valid output file.');
       }
 
-      final outputInfo = await FFmpegService.getMediaInfo(outputTransaction.renderPath, job: exportJob);
+      final outputInfo = await FFmpegService.getMediaInfo(
+        outputTransaction.renderPath,
+        job: exportJob,
+      );
       final outputWidth = (outputInfo['width'] as int?) ?? 0;
       final outputHeight = (outputInfo['height'] as int?) ?? 0;
       final outputDurationMs = (outputInfo['durationMs'] as int?) ?? 0;
@@ -414,12 +425,22 @@ class TimelineExportService {
     }
   }
 
-  static ({Duration start, Duration duration}) resolveExportRange(EditorTimeline timeline, ExportSettings settings) {
-    if (settings.range == ExportRange.entireTimeline) return (start: Duration.zero, duration: timeline.duration);
+  static ({Duration start, Duration duration}) resolveExportRange(
+    EditorTimeline timeline,
+    ExportSettings settings,
+  ) {
+    if (settings.range == ExportRange.entireTimeline)
+      return (start: Duration.zero, duration: timeline.duration);
     final start = timeline.workspaceSettings.normalizedWorkAreaStart;
     final end = timeline.workspaceSettings.normalizedWorkAreaEnd;
-    if (start == null || end == null || start < Duration.zero || end <= start || end > timeline.duration) {
-      throw StateError('Set a valid work-area In and Out before exporting that range.');
+    if (start == null ||
+        end == null ||
+        start < Duration.zero ||
+        end <= start ||
+        end > timeline.duration) {
+      throw StateError(
+        'Set a valid work-area In and Out before exporting that range.',
+      );
     }
     return (start: start, duration: end - start);
   }
@@ -529,10 +550,15 @@ class TimelineExportService {
         ],
       ],
       if (settings.range == ExportRange.workArea) ...[
-        '-ss', _seconds(resolveExportRange(timeline, settings).start),
+        '-ss',
+        _seconds(resolveExportRange(timeline, settings).start),
       ],
       '-t',
-      _seconds(settings.range == ExportRange.workArea ? resolveExportRange(timeline, settings).duration : timelineDuration),
+      _seconds(
+        settings.range == ExportRange.workArea
+            ? resolveExportRange(timeline, settings).duration
+            : timelineDuration,
+      ),
       '-movflags',
       '+faststart',
       '-max_muxing_queue_size',
@@ -4400,12 +4426,18 @@ class TimelineExportService {
     bool captionsExpected = false,
     void Function(double progress)? onProgress,
   }) async {
-    final session = await FFmpegService.execute(arguments, job: job, onStatistics: (statistics) {
-      final time = statistics.getTime();
-      if (time > 0 && expectedDuration.inMilliseconds > 0) {
-        onProgress?.call((time / expectedDuration.inMilliseconds).clamp(0.0, 1.0));
-      }
-    });
+    final session = await FFmpegService.execute(
+      arguments,
+      job: job,
+      onStatistics: (statistics) {
+        final time = statistics.getTime();
+        if (time > 0 && expectedDuration.inMilliseconds > 0) {
+          onProgress?.call(
+            (time / expectedDuration.inMilliseconds).clamp(0.0, 1.0),
+          );
+        }
+      },
+    );
     final returnCode = await session.getReturnCode();
     final logs = captionsExpected || !ReturnCode.isSuccess(returnCode)
         ? await session.getAllLogsAsString() ?? ''

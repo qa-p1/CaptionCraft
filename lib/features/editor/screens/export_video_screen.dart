@@ -119,9 +119,14 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
       var outputPath = widget.destinationPath;
       if (outputPath == null) {
         final documentsDir = await getApplicationDocumentsDirectory();
-        final exportDirectory = Directory(path.join(documentsDir.path, 'CaptionCraft', 'Exports'));
+        final exportDirectory = Directory(
+          path.join(documentsDir.path, 'CaptionCraft', 'Exports'),
+        );
         await exportDirectory.create(recursive: true);
-        outputPath = path.join(exportDirectory.path, '${_safeProjectName()}_${DateTime.now().millisecondsSinceEpoch}.mp4');
+        outputPath = path.join(
+          exportDirectory.path,
+          '${_safeProjectName()}_${DateTime.now().millisecondsSinceEpoch}.mp4',
+        );
       }
       job.checkCancelled();
       final exportResult = await TimelineExportService.export(

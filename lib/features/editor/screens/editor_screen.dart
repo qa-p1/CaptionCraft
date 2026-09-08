@@ -22,6 +22,9 @@ import '../../../core/utils/ffmpeg_service.dart';
 import '../../../core/utils/firebase_service.dart';
 import '../../../core/utils/giphy_service.dart';
 import '../../../core/utils/media_import_service.dart';
+import '../../../core/utils/media_job.dart';
+import '../services/media_pool_service.dart';
+import '../widgets/source_media_dialog.dart';
 import '../../../core/utils/mask_tracking_service.dart';
 import '../../../core/utils/remote_audio_import_service.dart';
 import '../../../core/utils/remote_media_import_service.dart';
@@ -1106,7 +1109,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       case EditorShortcutCommand.export:
         _showExportDialog();
       case EditorShortcutCommand.importMedia:
-        unawaited(_pickOverlayMedia());
+        unawaited(
+          Platform.isWindows ? _importMediaPool() : _pickOverlayMedia(),
+        );
       case EditorShortcutCommand.selectAll:
         _executeTimelineCommand(TimelineEditorCommand.selectAll);
       case EditorShortcutCommand.copySelection:
@@ -3400,8 +3405,19 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     showDialog(
       context: context,
       builder: (_) => ExportDialog(
-        hasWorkArea: ref.read(editorProvider).timeline.workspaceSettings.normalizedWorkAreaStart != null &&
-            ref.read(editorProvider).timeline.workspaceSettings.normalizedWorkAreaEnd != null,
+        hasWorkArea:
+            ref
+                    .read(editorProvider)
+                    .timeline
+                    .workspaceSettings
+                    .normalizedWorkAreaStart !=
+                null &&
+            ref
+                    .read(editorProvider)
+                    .timeline
+                    .workspaceSettings
+                    .normalizedWorkAreaEnd !=
+                null,
         onExport: (settings) {
           Navigator.pop(context);
           unawaited(_openExportVideoScreen(settings));
@@ -3415,12 +3431,19 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
       try {
         destinationPath = await FilePicker.platform.saveFile(
-          dialogTitle: 'Export video', fileName: 'CaptionCraft_${DateTime.now().millisecondsSinceEpoch}.mp4',
-          type: FileType.custom, allowedExtensions: const ['mp4']);
+          dialogTitle: 'Export video',
+          fileName: 'CaptionCraft_${DateTime.now().millisecondsSinceEpoch}.mp4',
+          type: FileType.custom,
+          allowedExtensions: const ['mp4'],
+        );
         if (destinationPath == null || !mounted) return;
         if (path.extension(destinationPath).isEmpty) destinationPath += '.mp4';
       } catch (error) {
-        if (mounted) SnackBarHelper.showError(context, 'Could not choose export destination: $error');
+        if (mounted)
+          SnackBarHelper.showError(
+            context,
+            'Could not choose export destination: $error',
+          );
         return;
       }
     }
@@ -3441,7 +3464,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       context,
       MaterialPageRoute(
         builder: (_) => ExportVideoScreen(
-          destinationPath: destinationPath,          project: projectSnapshot,
+          destinationPath: destinationPath,
+          project: projectSnapshot,
           timeline: timeline,
           settings: settings,
           entries: List<SubtitleEntry>.from(subtitleState.entries),
@@ -5121,7 +5145,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         ),
       );
       if (action == _LastVisualAction.replace && mounted) {
-        await _relinkClipMedia(clip);
+        await _replaceClipMedia(clip);
       }
       return;
     }
@@ -5711,7 +5735,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                     subtitle: const Text('Replace a missing or moved source'),
                     trailing: const Icon(Icons.chevron_right_rounded),
                     onTap: () async {
-                      await _relinkClipMedia(clip);
+                      await _replaceClipMedia(clip);
                       refreshClip();
                     },
                   ),
@@ -7448,8 +7472,217 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         );
   }
 
-  Future<void> _relinkClipMedia(TimelineClip clip) async {
+  void _validateReplacementLocks(EditorTimeline timeline, TimelineClip clip) {
+    if (!timeline.tracks
+        .expand((track) => track.clips)
+        .any((item) => item.id == clip.id)) {
+      throw StateError('The selected clip was removed.');
+    }
+    if (timeline.tracks.any(
+      (track) =>
+          track.isLocked &&
+          track.clips.any(
+            (item) =>
+                item.id == clip.id ||
+                item.linkedClipId == clip.id ||
+                item.separatedAudioSourceClipId == clip.id,
+          ),
+    )) {
+      throw StateError('Unlock every linked track before replacing footage.');
+    }
+  }
+
+  bool _importingPool = false;
+  String? _mediaImportStatus;
+
+  Future<void> _importMediaPool() async {
+    if (_importingPool) return;
+    setState(() => _importingPool = true);
     try {
+      final picked = await FilePicker.platform.pickFiles(
+        allowMultiple: true,
+        type: FileType.custom,
+        allowedExtensions: MediaPoolService.extensions,
+      );
+      if (picked == null || !mounted) return;
+      final result = await MediaPoolService.importFiles(
+        picked.files.map((file) => file.path).whereType<String>().toList(),
+        existingAssets: ref.read(editorProvider).timeline.assets,
+        onProgress: (completed, total) {
+          if (mounted)
+            setState(
+              () => _mediaImportStatus = 'Importing $completed / $total',
+            );
+        },
+      );
+      if (!mounted) return;
+      final timeline = ref.read(editorProvider).timeline;
+      if (result.assets.isNotEmpty) {
+        ref
+            .read(editorProvider.notifier)
+            .setTimeline(
+              timeline.copyWith(assets: [...timeline.assets, ...result.assets]),
+            );
+      }
+      if (result.failures.isNotEmpty) {
+        await showDialog<void>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: Text(
+              '${result.assets.length} imported · ${result.failures.length} failed',
+            ),
+            content: SizedBox(
+              width: 460,
+              child: SingleChildScrollView(
+                child: Text(
+                  result.failures.entries
+                      .map(
+                        (entry) =>
+                            '${path.basename(entry.key)}: ${entry.value}',
+                      )
+                      .join('\n\n'),
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Done'),
+              ),
+            ],
+          ),
+        );
+      } else {
+        SnackBarHelper.showSuccess(
+          context,
+          result.assets.isEmpty
+              ? 'These files are already in the media pool.'
+              : '${result.assets.length} files added to the media pool',
+        );
+      }
+    } catch (error) {
+      if (mounted)
+        SnackBarHelper.showError(context, 'Could not import media: $error');
+    } finally {
+      if (mounted)
+        setState(() {
+          _importingPool = false;
+          _mediaImportStatus = null;
+        });
+    }
+  }
+
+  Future<void> _relinkPoolAsset(EditorAssetReference asset) async {
+    try {
+      final picked = await FilePicker.platform.pickFiles(
+        dialogTitle: 'Locate ${asset.label}',
+        type: FileType.custom,
+        allowedExtensions: MediaPoolService.extensions,
+      );
+      final chosen = picked?.files.firstOrNull?.path;
+      if (chosen == null) return;
+      final source = await MediaImportService.persistFile(chosen);
+      final info = await FFmpegService.getMediaInfo(source, job: MediaJob());
+      if (!mounted) return;
+      final timeline = MediaPoolService.relink(
+        timeline: ref.read(editorProvider).timeline,
+        assetId: asset.id,
+        sourcePath: source,
+        mediaInfo: info,
+      );
+      ref.read(editorProvider.notifier).setTimeline(timeline);
+      SnackBarHelper.showSuccess(
+        context,
+        'Source relinked; existing edits preserved',
+      );
+    } catch (error) {
+      if (mounted)
+        SnackBarHelper.showError(context, 'Could not relink source: $error');
+    }
+  }
+
+  void _removePoolAsset(EditorAssetReference asset) {
+    final timeline = ref.read(editorProvider).timeline;
+    if (timeline.tracks
+        .expand((track) => track.clips)
+        .any((clip) => clip.assetId == asset.id)) {
+      SnackBarHelper.showWarning(
+        context,
+        'Remove this asset’s timeline clips before removing it from the pool.',
+      );
+      return;
+    }
+    ref
+        .read(editorProvider.notifier)
+        .setTimeline(
+          timeline.copyWith(
+            assets: timeline.assets
+                .where((item) => item.id != asset.id)
+                .toList(),
+          ),
+        );
+  }
+
+  Future<void> _reviewPoolAsset(EditorAssetReference asset) async {
+    ref
+        .read(playbackProvider.notifier)
+        .requestTransport(PlaybackTransportCommand.pause);
+    final selection = await showDialog<SourceMediaSelection>(
+      context: context,
+      builder: (_) => SourceMediaDialog(asset: asset),
+    );
+    if (!mounted || selection == null) return;
+    if (!ref
+        .read(editorProvider)
+        .timeline
+        .assets
+        .any((item) => item.id == asset.id))
+      return;
+    _insertPoolAsset(
+      asset,
+      append: selection.append,
+      sourceSelection: selection,
+    );
+  }
+
+  void _insertPoolAsset(
+    EditorAssetReference asset, {
+    bool append = false,
+    SourceMediaSelection? sourceSelection,
+  }) {
+    final clipType = switch (asset.type) {
+      EditorAssetType.video => TimelineTrackType.video,
+      EditorAssetType.audio => TimelineTrackType.audio,
+      EditorAssetType.gif => TimelineTrackType.gif,
+      EditorAssetType.sticker => TimelineTrackType.sticker,
+      _ => TimelineTrackType.image,
+    };
+    final durationMs = (asset.metadata['durationMs'] as num?)?.toInt() ?? 0;
+    _insertClipIntoTimeline(
+      section: asset.type == EditorAssetType.audio
+          ? TimelineTrackSection.audio
+          : append
+          ? TimelineTrackSection.baseVideo
+          : TimelineTrackSection.overlay,
+      assetType: asset.type,
+      clipType: clipType,
+      sourcePath: asset.sourcePath,
+      label: asset.label,
+      sourceDuration: durationMs > 0
+          ? Duration(milliseconds: durationMs)
+          : null,
+      metadata: asset.metadata,
+      existingAsset: asset,
+      sourceStart: sourceSelection?.start ?? Duration.zero,
+      placementDuration: sourceSelection?.duration,
+      appendToMainTrack: append,
+      enableEmbeddedAudio: asset.metadata['hasAudio'] == true,
+    );
+  }
+
+  Future<void> _replaceClipMedia(TimelineClip clip) async {
+    try {
+      _validateReplacementLocks(ref.read(editorProvider).timeline, clip);
       final fileType = switch (clip.type) {
         TimelineTrackType.audio => FileType.audio,
         TimelineTrackType.video => FileType.video,
@@ -7476,6 +7709,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       if (!mounted) return;
       final editorState = ref.read(editorProvider);
       final timeline = editorState.timeline;
+      _validateReplacementLocks(timeline, clip);
+      clip = timeline.tracks
+          .expand((track) => track.clips)
+          .firstWhere((item) => item.id == clip.id);
       final oldAsset = timeline.assetForClip(clip);
       final assetType = switch (clip.type) {
         TimelineTrackType.video => EditorAssetType.video,
@@ -7528,7 +7765,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             );
             continue;
           }
-          if (candidate.linkedClipId == clip.id) {
+          if (candidate.linkedClipId == clip.id ||
+              candidate.separatedAudioSourceClipId == clip.id) {
             if (candidate.type == TimelineTrackType.audio) {
               if (clip.type == TimelineTrackType.video &&
                   !replacementHasAudio) {
@@ -7585,7 +7823,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       if (mounted) {
         SnackBarHelper.showError(
           context,
-          'Could not relink media: ${error.toString().replaceFirst('Exception: ', '')}',
+          'Could not replace media: ${error.toString().replaceFirst('Exception: ', '')}',
         );
       }
     }
@@ -7796,7 +8034,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         selectedClip: selectedClip,
         onSelectClip: (clip) =>
             ref.read(editorProvider.notifier).selectClip(clip.id),
-        onImport: _pickOverlayMedia,
+        onImport: _importingPool ? null : _importMediaPool,
+        importStatus: _mediaImportStatus,
+        onInsertAsset: (asset) => _insertPoolAsset(asset),
+        onAppendAsset: (asset) => _insertPoolAsset(asset, append: true),
+        onRelinkAsset: _relinkPoolAsset,
+        onRemoveAsset: _removePoolAsset,
+        onReviewAsset: _reviewPoolAsset,
         onDiscover: _openDiscoverSheet,
         onOpenEffects: () {
           final clip = _selectedClipFromState(ref.read(editorProvider));
@@ -8146,7 +8390,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       onTextAddRequested: _openTextAddSheet,
       onAudioAddRequested: _openAudioAddSheet,
       onMainVideoAddRequested: _pickBaseMedia,
-      onReplaceMediaRequested: _relinkClipMedia,
+      onReplaceMediaRequested: _replaceClipMedia,
     );
   }
 
@@ -8683,6 +8927,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
 
   bool _insertClipIntoTimeline({
     required TimelineTrackSection section,
+    EditorAssetReference? existingAsset,
+    Duration sourceStart = Duration.zero,
+    Duration? placementDuration,
     required EditorAssetType assetType,
     required TimelineTrackType clipType,
     String? sourcePath,
@@ -8705,19 +8952,22 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final editorState = ref.read(editorProvider);
     final timeline = editorState.timeline;
     final clipDuration =
-        sourceDuration == null || sourceDuration == Duration.zero
-        ? const Duration(seconds: 4)
-        : sourceDuration;
+        placementDuration ??
+        (sourceDuration == null || sourceDuration == Duration.zero
+            ? const Duration(seconds: 4)
+            : sourceDuration);
     final desiredStart = requestedStart ?? ref.read(playbackProvider).position;
 
-    final asset = EditorAssetReference(
-      type: assetType,
-      label: label,
-      sourcePath: sourcePath,
-      remoteUrl: remoteUrl,
-      isNetworkBacked: isNetworkBacked,
-      metadata: metadata,
-    );
+    final asset =
+        existingAsset ??
+        EditorAssetReference(
+          type: assetType,
+          label: label,
+          sourcePath: sourcePath,
+          remoteUrl: remoteUrl,
+          isNetworkBacked: isNetworkBacked,
+          metadata: metadata,
+        );
     final compatibleTracks = timeline.tracks
         .where(
           (track) =>
@@ -8813,8 +9063,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       assetId: asset.id,
       startTime: placementStart,
       endTime: placementStart + clipDuration,
-      sourceStartTime: Duration.zero,
-      sourceDuration: sourceDuration ?? clipDuration,
+      sourceStartTime: sourceStart,
+      sourceDuration: placementDuration ?? sourceDuration ?? clipDuration,
       fitMode:
           fitMode ??
           (section == TimelineTrackSection.overlay
@@ -8839,7 +9089,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       return track.copyWith(clips: clips);
     }).toList();
     workingTimeline = workingTimeline.copyWith(
-      assets: [...timeline.assets, asset],
+      assets: [
+        ...timeline.assets,
+        if (!timeline.assets.any((existing) => existing.id == asset.id)) asset,
+      ],
       tracks: nextTracks,
     );
 

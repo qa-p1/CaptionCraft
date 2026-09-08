@@ -42,15 +42,22 @@ class FFmpegService {
     job?.checkCancelled();
     final completion = Completer<FFmpegSession>();
     var completed = false;
-    final session = await FFmpegKit.executeWithArgumentsAsync(arguments, (result) {
-      completed = true;
-      if (!completion.isCompleted) completion.complete(result);
-    }, null, (statistics) {
-      if (!completed && job?.isCancelled != true) onStatistics?.call(statistics);
-    });
+    final session = await FFmpegKit.executeWithArgumentsAsync(
+      arguments,
+      (result) {
+        completed = true;
+        if (!completion.isCompleted) completion.complete(result);
+      },
+      null,
+      (statistics) {
+        if (!completed && job?.isCancelled != true)
+          onStatistics?.call(statistics);
+      },
+    );
     final id = session.getSessionId();
     try {
-      if (id != null && job != null) await job.attach(id, () => FFmpegKit.cancel(id));
+      if (id != null && job != null)
+        await job.attach(id, () => FFmpegKit.cancel(id));
       final result = await completion.future;
       job?.checkCancelled();
       return result;
@@ -80,26 +87,30 @@ class FFmpegService {
         await _getMediaDurationMs(videoPath);
 
     // Try FLAC first (lossless, good compression for speech)
-    final session = await execute([
-      '-y',
-      if (startTime != null) ...['-ss', _formatDurationForFfmpeg(startTime)],
-      '-i',
-      videoPath,
-      if (clipDuration != null) ...[
-        '-t',
-        _formatDurationForFfmpeg(clipDuration),
+    final session = await execute(
+      [
+        '-y',
+        if (startTime != null) ...['-ss', _formatDurationForFfmpeg(startTime)],
+        '-i',
+        videoPath,
+        if (clipDuration != null) ...[
+          '-t',
+          _formatDurationForFfmpeg(clipDuration),
+        ],
+        '-vn',
+        '-ar',
+        '${GroqConstants.targetAudioSampleRate}',
+        '-ac',
+        '${GroqConstants.targetAudioChannels}',
+        '-c:a',
+        'flac',
+        flacPath,
       ],
-      '-vn',
-      '-ar',
-      '${GroqConstants.targetAudioSampleRate}',
-      '-ac',
-      '${GroqConstants.targetAudioChannels}',
-      '-c:a',
-      'flac',
-      flacPath,
-    ], onStatistics: (statistics) {
-      if (durationMs > 0) onProgress?.call((statistics.getTime() / durationMs).clamp(0.0, 1.0));
-    });
+      onStatistics: (statistics) {
+        if (durationMs > 0)
+          onProgress?.call((statistics.getTime() / durationMs).clamp(0.0, 1.0));
+      },
+    );
     final returnCode = await session.getReturnCode();
 
     if (ReturnCode.isCancel(returnCode)) {
@@ -121,26 +132,30 @@ class FFmpegService {
       tempDir.path,
       'caption_craft_audio_$operationId.mp3',
     );
-    final mp3Session = await execute([
-      '-y',
-      if (startTime != null) ...['-ss', _formatDurationForFfmpeg(startTime)],
-      '-i',
-      videoPath,
-      if (clipDuration != null) ...[
-        '-t',
-        _formatDurationForFfmpeg(clipDuration),
+    final mp3Session = await execute(
+      [
+        '-y',
+        if (startTime != null) ...['-ss', _formatDurationForFfmpeg(startTime)],
+        '-i',
+        videoPath,
+        if (clipDuration != null) ...[
+          '-t',
+          _formatDurationForFfmpeg(clipDuration),
+        ],
+        '-vn',
+        '-ar',
+        '${GroqConstants.targetAudioSampleRate}',
+        '-ac',
+        '${GroqConstants.targetAudioChannels}',
+        '-b:a',
+        '64k',
+        mp3Path,
       ],
-      '-vn',
-      '-ar',
-      '${GroqConstants.targetAudioSampleRate}',
-      '-ac',
-      '${GroqConstants.targetAudioChannels}',
-      '-b:a',
-      '64k',
-      mp3Path,
-    ], onStatistics: (statistics) {
-      if (durationMs > 0) onProgress?.call((statistics.getTime() / durationMs).clamp(0.0, 1.0));
-    });
+      onStatistics: (statistics) {
+        if (durationMs > 0)
+          onProgress?.call((statistics.getTime() / durationMs).clamp(0.0, 1.0));
+      },
+    );
     final mp3ReturnCode = await mp3Session.getReturnCode();
 
     if (ReturnCode.isCancel(mp3ReturnCode)) {
@@ -398,24 +413,28 @@ class FFmpegService {
         ? '${scaleFilter}ass=$safeAssPath'
         : 'ass=$safeAssPath';
 
-    final session = await execute([
-      '-i',
-      videoPath,
-      '-vf',
-      vfFilter,
-      '-c:v',
-      'libx264',
-      '-crf',
-      '23',
-      '-preset',
-      'fast',
-      '-c:a',
-      'copy',
-      outputPath,
-      '-y',
-    ], onStatistics: (statistics) {
-      if (durationMs > 0) onProgress?.call((statistics.getTime() / durationMs).clamp(0.0, 1.0));
-    });
+    final session = await execute(
+      [
+        '-i',
+        videoPath,
+        '-vf',
+        vfFilter,
+        '-c:v',
+        'libx264',
+        '-crf',
+        '23',
+        '-preset',
+        'fast',
+        '-c:a',
+        'copy',
+        outputPath,
+        '-y',
+      ],
+      onStatistics: (statistics) {
+        if (durationMs > 0)
+          onProgress?.call((statistics.getTime() / durationMs).clamp(0.0, 1.0));
+      },
+    );
     final returnCode = await session.getReturnCode();
 
     if (!ReturnCode.isSuccess(returnCode)) {
@@ -448,8 +467,12 @@ class FFmpegService {
   }
 
   /// Get media information (duration, resolution, has audio).
-  static Future<Map<String, dynamic>> getMediaInfo(String videoPath, {MediaJob? job}) async {
-    final session = job == null ? await FFprobeKit.getMediaInformation(videoPath)
+  static Future<Map<String, dynamic>> getMediaInfo(
+    String videoPath, {
+    MediaJob? job,
+  }) async {
+    final session = job == null
+        ? await FFprobeKit.getMediaInformation(videoPath)
         : await _probeWithJob(videoPath, job);
     final info = session.getMediaInformation();
 
@@ -535,7 +558,10 @@ class FFmpegService {
     };
   }
 
-  static Future<MediaInformationSession> _probeWithJob(String source, MediaJob job) async {
+  static Future<MediaInformationSession> _probeWithJob(
+    String source,
+    MediaJob job,
+  ) async {
     job.checkCancelled();
     final completion = Completer<MediaInformationSession>();
     final session = await FFprobeKit.getMediaInformationAsync(source, (result) {
@@ -544,12 +570,16 @@ class FFmpegService {
     final id = session.getSessionId();
     try {
       if (id != null) await job.attach(id, () => FFmpegKit.cancel(id));
-      final result = await completion.future.timeout(const Duration(seconds: 30));
+      final result = await completion.future.timeout(
+        const Duration(seconds: 30),
+      );
       job.checkCancelled();
       return result;
     } on TimeoutException {
       if (id != null) await FFmpegKit.cancel(id);
-      throw TimeoutException('Reading this media took too long. Try a local, supported file.');
+      throw TimeoutException(
+        'Reading this media took too long. Try a local, supported file.',
+      );
     } finally {
       if (id != null) job.detach(id);
     }
