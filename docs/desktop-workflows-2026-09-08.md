@@ -63,6 +63,12 @@ cleared and package restoration was blocked by network approval. The branch's
 current GitHub Actions runs are the authoritative validation for the final code;
 do not treat an older successful build as validation of a newer commit.
 
+Commit `6d6f82b` passed Linux formatting/analysis and Windows analysis/regression
+tests. The full Linux suite exposed an outdated phone-editor golden: its
+transport and selection appearance predated the latest base commit. The CI
+images were inspected against the current source before refreshing that baseline.
+The full-suite result for the updated baseline is still pending.
+
 The prior checkpoint (`6cb82a9`) built an unsigned iOS IPA successfully. Windows
 stopped at analysis, and Android failed at the wrapper launcher; both discovered
 source problems are corrected here, pending validation of this commit.
