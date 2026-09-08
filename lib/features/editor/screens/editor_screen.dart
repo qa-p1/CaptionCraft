@@ -3400,6 +3400,8 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     showDialog(
       context: context,
       builder: (_) => ExportDialog(
+        hasWorkArea: ref.read(editorProvider).timeline.workspaceSettings.normalizedWorkAreaStart != null &&
+            ref.read(editorProvider).timeline.workspaceSettings.normalizedWorkAreaEnd != null,
         onExport: (settings) {
           Navigator.pop(context);
           unawaited(_openExportVideoScreen(settings));
@@ -3409,6 +3411,20 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   Future<void> _openExportVideoScreen(ExportSettings settings) async {
+    String? destinationPath;
+    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+      try {
+        destinationPath = await FilePicker.platform.saveFile(
+          dialogTitle: 'Export video', fileName: 'CaptionCraft_${DateTime.now().millisecondsSinceEpoch}.mp4',
+          type: FileType.custom, allowedExtensions: const ['mp4']);
+        if (destinationPath == null || !mounted) return;
+        if (path.extension(destinationPath).isEmpty) destinationPath += '.mp4';
+      } catch (error) {
+        if (mounted) SnackBarHelper.showError(context, 'Could not choose export destination: $error');
+        return;
+      }
+    }
+    if (!mounted) return;
     final subtitleState = ref.read(subtitleProvider);
     final editorState = ref.read(editorProvider);
     final timeline = editorState.timeline.mergeSubtitleEntries(
@@ -3425,7 +3441,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       context,
       MaterialPageRoute(
         builder: (_) => ExportVideoScreen(
-          project: projectSnapshot,
+          destinationPath: destinationPath,          project: projectSnapshot,
           timeline: timeline,
           settings: settings,
           entries: List<SubtitleEntry>.from(subtitleState.entries),

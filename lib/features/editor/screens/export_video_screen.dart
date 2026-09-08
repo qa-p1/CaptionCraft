@@ -9,6 +9,7 @@ import 'package:video_player/video_player.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/utils/desktop_window_close_service.dart';
 import '../../../core/utils/timeline_export_service.dart';
+import '../../../core/utils/media_job.dart';
 import '../../../shared/models/project_model.dart';
 import '../../editor/models/export_settings.dart';
 import '../../editor/models/subtitle_entry.dart';
@@ -17,6 +18,7 @@ import '../../editor/models/timeline_models.dart';
 
 class ExportVideoScreen extends StatefulWidget {
   final Project project;
+  final String? destinationPath;
   final EditorTimeline timeline;
   final ExportSettings settings;
   final List<SubtitleEntry> entries;
@@ -25,6 +27,7 @@ class ExportVideoScreen extends StatefulWidget {
   const ExportVideoScreen({
     super.key,
     required this.project,
+    this.destinationPath,
     required this.timeline,
     required this.settings,
     required this.entries,
@@ -36,6 +39,7 @@ class ExportVideoScreen extends StatefulWidget {
 }
 
 class _ExportVideoScreenState extends State<ExportVideoScreen> {
+  MediaJob? _exportJob;
   double _progress = 0;
   String _statusText = 'Preparing export...';
   String? _errorText;
@@ -73,7 +77,7 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
   void dispose() {
     DesktopWindowCloseService.unregisterHandler(this);
     if (_isExporting) {
-      unawaited(TimelineExportService.cancelActiveExport());
+      unawaited(_exportJob?.cancel());
     }
     _previewController?.dispose();
     super.dispose();
@@ -93,6 +97,8 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
   }
 
   Future<void> _runExport() async {
+    final job = MediaJob();
+    _exportJob = job;
     setState(() {
       _progress = 0.03;
       _statusText = 'Generating subtitle track...';
@@ -110,18 +116,16 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
     });
 
     try {
-      final safeProjectName = _safeProjectName();
-      final documentsDir = await getApplicationDocumentsDirectory();
-      final exportDirectory = Directory(
-        path.join(documentsDir.path, 'CaptionCraft', 'Exports'),
-      );
-      await exportDirectory.create(recursive: true);
-      final outputPath = path.join(
-        exportDirectory.path,
-        '${safeProjectName}_${DateTime.now().millisecondsSinceEpoch}.mp4',
-      );
-
+      var outputPath = widget.destinationPath;
+      if (outputPath == null) {
+        final documentsDir = await getApplicationDocumentsDirectory();
+        final exportDirectory = Directory(path.join(documentsDir.path, 'CaptionCraft', 'Exports'));
+        await exportDirectory.create(recursive: true);
+        outputPath = path.join(exportDirectory.path, '${_safeProjectName()}_${DateTime.now().millisecondsSinceEpoch}.mp4');
+      }
+      job.checkCancelled();
       final exportResult = await TimelineExportService.export(
+        job: job,
         project: widget.project,
         timeline: widget.timeline,
         subtitleEntries: widget.entries,
@@ -221,7 +225,7 @@ class _ExportVideoScreenState extends State<ExportVideoScreen> {
       _isCancelling = true;
       _statusText = 'Cancelling export...';
     });
-    await TimelineExportService.cancelActiveExport();
+    await _exportJob?.cancel();
     await _activeExportTask;
   }
 

@@ -8,8 +8,9 @@ import '../models/export_settings.dart';
 /// Professional delivery settings for the final timeline render.
 class ExportDialog extends StatefulWidget {
   final ValueChanged<ExportSettings> onExport;
+  final bool hasWorkArea;
 
-  const ExportDialog({super.key, required this.onExport});
+  const ExportDialog({super.key, required this.onExport, this.hasWorkArea = false});
 
   @override
   State<ExportDialog> createState() => _ExportDialogState();
@@ -47,6 +48,14 @@ class _ExportDialogState extends State<ExportDialog> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    if (widget.hasWorkArea) ...[
+                      _sectionLabel('RANGE'),
+                      const SizedBox(height: 8),
+                      _choiceWrap<ExportRange>(values: ExportRange.values, selected: _settings.range,
+                        label: (range) => range == ExportRange.workArea ? 'Work area' : 'Entire timeline',
+                        onSelected: (range) => setState(() => _settings = _settings.copyWith(range: range))),
+                      const SizedBox(height: 18),
+                    ],
                     _SectionHeading(
                       index: '01',
                       title: 'Frame',
