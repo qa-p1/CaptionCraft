@@ -3439,11 +3439,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         if (destinationPath == null || !mounted) return;
         if (path.extension(destinationPath).isEmpty) destinationPath += '.mp4';
       } catch (error) {
-        if (mounted)
+        if (mounted) {
           SnackBarHelper.showError(
             context,
             'Could not choose export destination: $error',
           );
+        }
         return;
       }
     }
@@ -7509,10 +7510,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         picked.files.map((file) => file.path).whereType<String>().toList(),
         existingAssets: ref.read(editorProvider).timeline.assets,
         onProgress: (completed, total) {
-          if (mounted)
+          if (mounted) {
             setState(
               () => _mediaImportStatus = 'Importing $completed / $total',
             );
+          }
         },
       );
       if (!mounted) return;
@@ -7561,14 +7563,16 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         );
       }
     } catch (error) {
-      if (mounted)
+      if (mounted) {
         SnackBarHelper.showError(context, 'Could not import media: $error');
+      }
     } finally {
-      if (mounted)
+      if (mounted) {
         setState(() {
           _importingPool = false;
           _mediaImportStatus = null;
         });
+      }
     }
   }
 
@@ -7596,8 +7600,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         'Source relinked; existing edits preserved',
       );
     } catch (error) {
-      if (mounted)
+      if (mounted) {
         SnackBarHelper.showError(context, 'Could not relink source: $error');
+      }
     }
   }
 
@@ -7636,8 +7641,9 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         .read(editorProvider)
         .timeline
         .assets
-        .any((item) => item.id == asset.id))
+        .any((item) => item.id == asset.id)) {
       return;
+    }
     _insertPoolAsset(
       asset,
       append: selection.append,

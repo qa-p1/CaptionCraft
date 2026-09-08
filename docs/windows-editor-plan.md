@@ -1,6 +1,6 @@
 # Windows editor overhaul
 
-Planning baseline: 7 September 2026. Android release snapshot: `0.10.0+2006`, captured before Windows implementation. Status: inspection and implementation plan complete; the work below is pending implementation and validation.
+Planning baseline: 7 September 2026. Android release snapshot: `0.10.0+2006`, captured before Windows implementation. Status: desktop foundations exist; media/export continuation is tracked in [Desktop workflows](desktop-workflows-2026-09-08.md). The full plan and native acceptance gates are not yet complete.
 
 ## Intended result
 

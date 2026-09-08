@@ -51,8 +51,9 @@ class _SourceMediaDialogState extends State<SourceMediaDialog> {
   Future<void> _initialize() async {
     try {
       final source = widget.asset.sourcePath;
-      if (source == null || !await File(source).exists())
+      if (source == null || !await File(source).exists()) {
         throw StateError('Source is offline. Relink it from the media pool.');
+      }
       if (!mounted) return;
       if (_still) {
         setState(() => _ready = true);
@@ -63,8 +64,9 @@ class _SourceMediaDialogState extends State<SourceMediaDialog> {
       await controller.initialize().timeout(const Duration(seconds: 20));
       if (!mounted) return;
       final duration = controller.value.duration.inMilliseconds.toDouble();
-      if (duration <= 0)
+      if (duration <= 0) {
         throw StateError('This source has no readable duration.');
+      }
       controller.addListener(_onPlaybackChanged);
       setState(() {
         _durationMs = duration;
@@ -72,11 +74,12 @@ class _SourceMediaDialogState extends State<SourceMediaDialog> {
         _ready = true;
       });
     } catch (_) {
-      if (mounted)
+      if (mounted) {
         setState(
           () => _error =
               'Source preview unavailable. Relink offline media or use a supported source format.',
         );
+      }
     }
   }
 
@@ -94,8 +97,9 @@ class _SourceMediaDialogState extends State<SourceMediaDialog> {
     try {
       await _controller?.pause();
     } catch (_) {
-      if (mounted)
+      if (mounted) {
         setState(() => _error = 'Source playback stopped. Reopen it to retry.');
+      }
     }
   }
 
@@ -113,11 +117,12 @@ class _SourceMediaDialogState extends State<SourceMediaDialog> {
         if (mounted) await controller.play();
       }
     } catch (_) {
-      if (mounted)
+      if (mounted) {
         setState(
           () => _error =
               'Could not play this source. Close and reopen it to retry.',
         );
+      }
     }
   }
 
@@ -204,8 +209,9 @@ class _SourceMediaDialogState extends State<SourceMediaDialog> {
                 ),
                 onChanged: _ready
                     ? (range) {
-                        if (range.end - range.start >= 1)
+                        if (range.end - range.start >= 1) {
                           setState(() => _range = range);
+                        }
                       }
                     : null,
                 onChangeEnd: _ready && controller != null
@@ -216,10 +222,11 @@ class _SourceMediaDialogState extends State<SourceMediaDialog> {
                             Duration(milliseconds: range.start.round()),
                           );
                         } catch (_) {
-                          if (mounted)
+                          if (mounted) {
                             setState(
                               () => _error = 'Could not seek this source.',
                             );
+                          }
                         }
                       }
                     : null,

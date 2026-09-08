@@ -283,9 +283,10 @@ class PreviewTransformGeometry {
   }
 
   static double normalizeRadians(double radians) {
-    var value = radians;
-    while (value > math.pi) value -= math.pi * 2;
-    while (value < -math.pi) value += math.pi * 2;
+    if (!radians.isFinite) return 0;
+    var value = radians.remainder(math.pi * 2);
+    if (value > math.pi) value -= math.pi * 2;
+    if (value < -math.pi) value += math.pi * 2;
     return value;
   }
 
@@ -850,10 +851,8 @@ class _PreviewTransformControlsState extends State<PreviewTransformControls>
   }
 }
 
-/// Expands pointer hit testing around a child without changing the child's
-/// layout or painted transform. Padding or an outer SizedBox would reflow
-/// fixed-size media when the viewer is tight; this proxy only accepts events
-/// in the extra region and forwards them to the state callbacks.
+/// Gives the handles space around the unchanged child layout and keeps the
+/// child's painting, coordinate conversion and hit testing at the same offset.
 class _PreviewInteractionSurface extends SingleChildRenderObjectWidget {
   final EdgeInsets hitPadding;
   final ValueChanged<PointerEvent> onPointerEvent;
@@ -884,14 +883,22 @@ class _PreviewInteractionSurface extends SingleChildRenderObjectWidget {
 }
 
 class _RenderPreviewInteractionSurface extends RenderProxyBox {
-  EdgeInsets hitPadding;
+  EdgeInsets _hitPadding;
+  EdgeInsets get hitPadding => _hitPadding;
+  set hitPadding(EdgeInsets value) {
+    if (_hitPadding == value) return;
+    _hitPadding = value;
+    markNeedsLayout();
+  }
+
   ValueChanged<PointerEvent> onPointerEvent;
 
   _RenderPreviewInteractionSurface({
-    required this.hitPadding,
+    required EdgeInsets hitPadding,
     required this.onPointerEvent,
     RenderBox? child,
-  }) : super(child);
+  }) : _hitPadding = hitPadding,
+       super(child);
 
   @override
   void setupParentData(RenderBox child) {
@@ -933,6 +940,25 @@ class _RenderPreviewInteractionSurface extends RenderProxyBox {
   );
 
   @override
+  void paint(PaintingContext context, Offset offset) {
+    final renderChild = child;
+    if (renderChild == null) return;
+    final parentData = renderChild.parentData! as BoxParentData;
+    context.paintChild(renderChild, offset + parentData.offset);
+  }
+
+  @override
+  void applyPaintTransform(RenderBox child, Matrix4 transform) {
+    final parentData = child.parentData! as BoxParentData;
+    transform.translateByDouble(
+      parentData.offset.dx,
+      parentData.offset.dy,
+      0,
+      1,
+    );
+  }
+
+  @override
   bool hitTest(BoxHitTestResult result, {required Offset position}) {
     if (!_expandedBounds.contains(position)) return false;
     final renderChild = child;
@@ -943,7 +969,12 @@ class _RenderPreviewInteractionSurface extends RenderProxyBox {
           childPosition.dy >= 0 &&
           childPosition.dx < renderChild.size.width &&
           childPosition.dy < renderChild.size.height) {
-        renderChild.hitTest(result, position: childPosition);
+        result.addWithPaintOffset(
+          offset: parentData.offset,
+          position: position,
+          hitTest: (result, position) =>
+              renderChild.hitTest(result, position: position),
+        );
       }
     }
     result.add(BoxHitTestEntry(this, position));

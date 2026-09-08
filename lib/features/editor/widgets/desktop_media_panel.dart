@@ -66,8 +66,25 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
   @override
   void didUpdateWidget(covariant DesktopMediaPanel oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.timeline.assets != widget.timeline.assets)
+    if (!_sameSources(oldWidget.timeline.assets, widget.timeline.assets)) {
       _refreshAvailability();
+    }
+  }
+
+  bool _sameSources(
+    List<EditorAssetReference> before,
+    List<EditorAssetReference> after,
+  ) {
+    if (identical(before, after)) return true;
+    if (before.length != after.length) return false;
+    for (var index = 0; index < before.length; index++) {
+      if (before[index].id != after[index].id ||
+          before[index].sourcePath != after[index].sourcePath ||
+          before[index].isNetworkBacked != after[index].isNetworkBacked) {
+        return false;
+      }
+    }
+    return true;
   }
 
   Future<void> _refreshAvailability() async {
@@ -76,15 +93,18 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
     for (final asset in widget.timeline.assets) {
       if (asset.isNetworkBacked) continue;
       try {
-        if (asset.sourcePath == null || !await File(asset.sourcePath!).exists())
+        if (asset.sourcePath == null ||
+            !await File(asset.sourcePath!).exists()) {
           offline.add(asset.id);
+        }
       } catch (_) {
         offline.add(asset.id);
       }
       if (!mounted || request != _availabilityRequest) return;
     }
-    if (mounted && request == _availabilityRequest)
+    if (mounted && request == _availabilityRequest) {
       setState(() => _offlineIds = offline);
+    }
   }
 
   @override
@@ -258,7 +278,8 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
         )
         .toList(growable: false);
     final hasFallback =
-        assets.isEmpty &&
+        widget.timeline.assets.isEmpty &&
+        _typeFilter == 'All' &&
         widget.fallbackVideoPath?.trim().isNotEmpty == true &&
         query.isEmpty;
 
@@ -324,7 +345,7 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
           ),
         Expanded(
           child: assets.isEmpty && !hasFallback
-              ? _emptyMediaState(query.isEmpty)
+              ? _emptyMediaState(query.isEmpty && _typeFilter == 'All')
               : ListView(
                   padding: const EdgeInsets.fromLTRB(8, 0, 8, 12),
                   children: [
@@ -530,7 +551,7 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
                   ],
                 ),
               ),
-              if (trailing != null) trailing,
+              ?trailing,
               if (usage > 0)
                 Text(
                   '$usage×',
@@ -765,8 +786,9 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
       asset.metadata['width'],
       asset.metadata['height'],
     ].whereType<num>().map((value) => value.toInt()).toList(growable: false);
-    if (dimensions.length == 2)
+    if (dimensions.length == 2) {
       return '$type · ${dimensions[0]}×${dimensions[1]}';
+    }
     return type;
   }
 

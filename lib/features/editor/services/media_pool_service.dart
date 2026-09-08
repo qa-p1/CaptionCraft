@@ -140,8 +140,9 @@ class MediaPoolService {
     final original = timeline.assets
         .where((asset) => asset.id == assetId)
         .firstOrNull;
-    if (original == null)
+    if (original == null) {
       throw StateError('The asset is no longer in this project.');
+    }
     final affected = timeline.assets
         .where(
           (asset) =>
@@ -156,10 +157,11 @@ class MediaPoolService {
       for (final clip in track.clips.where(
         (clip) => ids.contains(clip.assetId),
       )) {
-        if (track.isLocked)
+        if (track.isLocked) {
           throw StateError(
             'Unlock every track using this source before relinking.',
           );
+        }
         if (clip.type == TimelineTrackType.audio &&
             mediaInfo['hasAudio'] != true) {
           throw StateError(
@@ -173,10 +175,11 @@ class MediaPoolService {
           final end = clip.freezeFrame
               ? clip.effectiveFreezeFrameSourceTime.inMilliseconds + 1
               : clip.sourceStartTime.inMilliseconds + span;
-          if (durationMs < end)
+          if (durationMs < end) {
             throw StateError(
               'The selected file is shorter than an existing source trim. Use Replace footage to change the edit.',
             );
+          }
         }
       }
     }

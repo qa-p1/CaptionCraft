@@ -50,14 +50,16 @@ class FFmpegService {
       },
       null,
       (statistics) {
-        if (!completed && job?.isCancelled != true)
+        if (!completed && job?.isCancelled != true) {
           onStatistics?.call(statistics);
+        }
       },
     );
     final id = session.getSessionId();
     try {
-      if (id != null && job != null)
+      if (id != null && job != null) {
         await job.attach(id, () => FFmpegKit.cancel(id));
+      }
       final result = await completion.future;
       job?.checkCancelled();
       return result;
@@ -107,8 +109,9 @@ class FFmpegService {
         flacPath,
       ],
       onStatistics: (statistics) {
-        if (durationMs > 0)
+        if (durationMs > 0) {
           onProgress?.call((statistics.getTime() / durationMs).clamp(0.0, 1.0));
+        }
       },
     );
     final returnCode = await session.getReturnCode();
@@ -152,8 +155,9 @@ class FFmpegService {
         mp3Path,
       ],
       onStatistics: (statistics) {
-        if (durationMs > 0)
+        if (durationMs > 0) {
           onProgress?.call((statistics.getTime() / durationMs).clamp(0.0, 1.0));
+        }
       },
     );
     final mp3ReturnCode = await mp3Session.getReturnCode();
@@ -431,8 +435,9 @@ class FFmpegService {
         '-y',
       ],
       onStatistics: (statistics) {
-        if (durationMs > 0)
+        if (durationMs > 0) {
           onProgress?.call((statistics.getTime() / durationMs).clamp(0.0, 1.0));
+        }
       },
     );
     final returnCode = await session.getReturnCode();

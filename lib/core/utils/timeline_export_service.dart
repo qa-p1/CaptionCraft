@@ -146,10 +146,11 @@ class TimelineExportService {
     onStage?.call('Checking media');
     onProgress?.call(0.02);
 
-    if (_activeExportJob != null)
+    if (_activeExportJob != null) {
       throw StateError(
         'Another export is still running. Wait for it to finish.',
       );
+    }
     final exportJob = job ?? MediaJob();
     exportJob.checkCancelled();
     _activeExportJob = exportJob;
@@ -161,8 +162,9 @@ class TimelineExportService {
     String? captionFontDirectory;
     try {
       await exportJob.attach(-1, () async {
-        if (!downloadCancelToken.isCancelled)
+        if (!downloadCancelToken.isCancelled) {
           downloadCancelToken.cancel('Cancelled by user');
+        }
       });
       final workingRoot = await getTemporaryDirectory();
       workingDirectory = Directory(
@@ -429,8 +431,9 @@ class TimelineExportService {
     EditorTimeline timeline,
     ExportSettings settings,
   ) {
-    if (settings.range == ExportRange.entireTimeline)
+    if (settings.range == ExportRange.entireTimeline) {
       return (start: Duration.zero, duration: timeline.duration);
+    }
     final start = timeline.workspaceSettings.normalizedWorkAreaStart;
     final end = timeline.workspaceSettings.normalizedWorkAreaEnd;
     if (start == null ||
