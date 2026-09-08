@@ -92,11 +92,13 @@ class TimelineClipboardClip {
   final TimelineClip clip;
   final String sourceTrackId;
   final Duration relativeStart;
+  final SubtitleEntry? subtitle;
 
   const TimelineClipboardClip({
     required this.clip,
     required this.sourceTrackId,
     required this.relativeStart,
+    this.subtitle,
   });
 }
 
@@ -243,6 +245,9 @@ class TimelineEditorController extends ChangeNotifier {
             clip: entry.$2,
             sourceTrackId: entry.$1.id,
             relativeStart: entry.$2.startTime - origin,
+            subtitle: _subtitleState.entries
+                .where((cue) => cue.id == entry.$2.id)
+                .firstOrNull,
           ),
       ],
     );
@@ -717,6 +722,7 @@ class TimelineEditorController extends ChangeNotifier {
       for (final track in _editorState.timeline.tracks) track.id: track,
     };
     final newIds = <String>[];
+    final pastedSubtitles = <SubtitleEntry>[];
     for (final item in _clipboard.clips) {
       final target = targets[item.sourceTrackId];
       if (target == null) return false;
@@ -754,6 +760,28 @@ class TimelineEditorController extends ChangeNotifier {
       }
       added.putIfAbsent(target.id, () => <TimelineClip>[]).add(clone);
       newIds.add(clone.id);
+      // Timeline clips omit word timings and confidence. Carry the full cue
+      // with the clipboard so selecting its timeline mirror preserves them.
+      final cue = item.subtitle;
+      if (cue != null) {
+        final shift = clone.startTime - cue.startTime;
+        pastedSubtitles.add(
+          cue.copyWith(
+            id: clone.id,
+            startTime: clone.startTime,
+            endTime: clone.endTime,
+            words: cue.words
+                ?.map(
+                  (word) => WordTiming(
+                    word: word.word,
+                    startTime: word.startTime + shift,
+                    endTime: word.endTime + shift,
+                  ),
+                )
+                .toList(),
+          ),
+        );
+      }
     }
     final pastedClipIds = idMap.values.toSet();
     final extraGroups = sourceTimeline.groups
@@ -821,6 +849,9 @@ class TimelineEditorController extends ChangeNotifier {
           ...extraEffectContainers,
         ],
       ),
+      entries: pastedSubtitles.isEmpty
+          ? null
+          : [..._subtitleState.entries, ...pastedSubtitles],
     )) {
       return false;
     }

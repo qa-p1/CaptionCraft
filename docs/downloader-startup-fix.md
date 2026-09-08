@@ -40,7 +40,13 @@ Instagram's outer deadline accommodates cold startup plus bounded extraction.
   the server, and exchanges a loopback request without contacting a media site.
 - Added Dart regressions for the pending Android launch future, shared startup,
   retry after slow readiness, native errors, direct yt-dlp routing and persisted
-  Instagram headers. Flutter analysis/tests are being run for this change.
+  Instagram headers. All 14 bridge/YouTube/Instagram service tests passed in
+  CI on `0626c3c`, together with Linux and Windows analysis. The complete Linux
+  suite passed 607 tests and exposed one caption clipboard timing regression;
+  its follow-up carries the full caption alongside the timeline clip.
+- The downloader code in `2b3b34d` passed signed Android release builds and
+  output verification, plus the unsigned iOS build. Android debug packaging
+  and the Windows desktop regression suite also passed on `0626c3c`.
 - Live YouTube requests from this development environment were blocked by
   certificate/network timeouts; they do not establish on-device download success.
   Physical Android/iOS download checks remain necessary.
