@@ -1,6 +1,7 @@
 import 'package:caption_craft/features/auth/providers/auth_provider.dart';
 import 'package:caption_craft/features/editor/models/subtitle_entry.dart';
 import 'package:caption_craft/features/editor/models/timeline_models.dart';
+import 'package:caption_craft/features/editor/models/word_timing.dart';
 import 'package:caption_craft/features/editor/providers/editor_provider.dart';
 import 'package:caption_craft/features/editor/providers/subtitle_provider.dart';
 import 'package:caption_craft/features/editor/services/timeline_editor_controller.dart';
