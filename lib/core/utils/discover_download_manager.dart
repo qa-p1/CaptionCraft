@@ -703,7 +703,7 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
     // Terminal state can be published before a worker finishes cleaning up.
     // Deletion/retry must not race that cleanup against a new file.
     await Future.wait<void>([
-      if (persist != null) persist,
+      ?persist,
       if (activeJob != null) activeJob.catchError((Object _) {}),
     ]);
   }

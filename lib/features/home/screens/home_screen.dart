@@ -1026,7 +1026,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         ],
       ),
     );
-    if (confirmed != true) return;
+    if (confirmed != true || !mounted) return;
 
     final user = ref.read(currentUserProvider);
     await ProjectLocalStorage.deleteProject(

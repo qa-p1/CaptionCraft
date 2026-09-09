@@ -23,6 +23,28 @@ signed Android release validation, and the unsigned iOS build.
 | Teleprompter | Empty/invalid cues could enter rehearsal, and an earlier overlapping cue extending beyond the last cue was cut short. Rehearsal uses valid cues and the maximum end time. |
 | Project deletion | Local deletion did not check account ownership. It now rejects a mismatched owner, records deletion before removing snapshots, rejects saves while deletion is pending, and ignores leftover recovery copies for deleted projects. |
 
+## Full-editor and UI continuation
+
+The continuation expanded the review to timeline editing, selection, inspector
+input, audio routing, source trim, home navigation, and the agreement between
+persisted processing state and visible controls.
+
+| Area | Failure and resulting behavior |
+| --- | --- |
+| Split entry points | Toolbar/context-menu and keyboard splits had separate implementations. Both now use the shared split transaction, retaining the screen's trailing-half selection behavior. |
+| Caption splitting | Splits could discard confidence and word timings or stretch all words into the leading half. Both cue halves retain confidence and only their intersecting word intervals, clipped at the split. Undo/redo restores the complete transaction. |
+| Freeze frames | Changing each half's source window could clamp a frozen timestamp to a different frame. Frozen halves retain the original source window and frame. |
+| Split relationships | Newly split audio/captions could retain a group ID without being included in the group, and scoped effects could stop at the leading half. Split members are added to groups/compounds and scoped effect stacks are split and copied. |
+| Locked and independent companions | Existing toolbar behavior is retained: independently timed audio and locked companion tracks remain untouched. Locked split targets and fragments shorter than 100 ms are rejected. |
+| Ripple delete | Clips moved while markers and export work-area boundaries stayed behind. Downstream markers and boundaries now follow the deleted range; markers inside the removed range are removed. Undo restores them. |
+| Source trim | An open inspector could apply a stale clip snapshot or ripple into locked tracks. Trim resolves the live clip, rejects changes affecting locked tracks, and handles sources shorter than 100 ms without an invalid clamp range. |
+| Provider lifetime | Retaining an editor widget while replacing its provider scope could leave commands referencing disposed notifiers. The shared controller now rebinds to current notifiers and clears its old clipboard. |
+| Inspector fields | Blurring a field after changing selection could commit against the next clip; locking a clip could still commit pending input. Selection/lock changes cancel pending fields and submission rechecks editability. |
+| Audio bus creation | Creating and assigning a bus took two undo steps and could leave an orphan bus after the target disappeared. The combined backend operation validates the live track and records one transaction. |
+| Audio bus UI | Backend deletion was unreachable from the mixer. The mixer now exposes deletion with confirmation, returns assigned tracks to Master output, respects locked tracks, and supports undo. The routing dropdown follows undo and external routing changes. |
+| Small-screen audio | Expanding advanced audio exposed channel dropdown overflow on phone widths. Dropdowns constrain their content and bus actions wrap onto another row. A mixer widget regression covers deletion, undo and layout. |
+| Home navigation | A delete dialog returning after its screen was disposed could access a dead widget reference. It now checks mounting before continuing. |
+
 ## Verification
 
 Added regressions cover delayed native/network completion, per-job cancellation,
@@ -31,6 +53,12 @@ initialization recovery/disposal, retry during worker cleanup, late Instagram
 results/errors, missing carousel items, failed queue writes, recovery UI,
 teleprompter overlap, malformed subtitle imports, and project deletion ownership
 and recovery markers.
+
+New editor regressions cover caption split metadata and undo/redo, freeze-frame
+continuity, locked companions, group/effect membership, ripple markers/work area,
+audio bus transactions and inspector selection/lock transitions. The existing
+full suite also exercises actual editor gestures, rendered FFmpeg output,
+preview/export parity, settings/vault recovery, media libraries and persistence.
 
 The six embedded Python runtime checks pass locally. Formatting is checked with
 the pinned Dart SDK. Full Flutter analysis/tests and native builds run in GitHub
@@ -45,9 +73,11 @@ one/two-digit decimal fractions.
 ## Scope and remaining verification
 
 This is a source audit and regression pass, not proof that every possible app
-state is bug-free. It reviewed persistence/deletion, download state transitions,
-transcription/native job lifecycle, subtitle interchange and affected UI flows.
-Existing full-suite tests continue to cover editor, playback and export behavior.
+state is bug-free. It reviewed core editor commands and timing, UI lifecycle and input, audio routing,
+backend/control wiring, persistence/deletion, download state transitions,
+transcription/native job lifecycle, and subtitle interchange. Unsupported render
+features documented in the effects roadmap remain guarded; exposing dormant
+model fields alone would not provide a working feature.
 Physical-device media downloads, long-session memory/audio stress, and native
 interaction checks remain necessary. The larger desktop roadmap remains open.
 No default-branch merge or public release is part of this change.

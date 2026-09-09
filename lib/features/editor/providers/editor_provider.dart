@@ -1235,6 +1235,32 @@ class EditorNotifier extends StateNotifier<EditorState> {
     return bus.id;
   }
 
+  /// Creating a bus from a track is one user action and one undo step.
+  String? createAudioBusForTrack(String trackId, {String? name}) {
+    final track = state.timeline.tracks
+        .where((track) => track.id == trackId)
+        .firstOrNull;
+    if (track == null || track.isLocked) return null;
+    final bus = TimelineAudioBus(
+      name: name?.trim().isNotEmpty == true
+          ? name!.trim()
+          : 'Bus ${state.timeline.audioBuses.length + 1}',
+    );
+    setTimeline(
+      state.timeline.copyWith(
+        audioBuses: [...state.timeline.audioBuses, bus],
+        tracks: state.timeline.tracks
+            .map(
+              (candidate) => candidate.id == trackId
+                  ? candidate.copyWith(audioBusId: bus.id)
+                  : candidate,
+            )
+            .toList(),
+      ),
+    );
+    return bus.id;
+  }
+
   bool updateAudioBus(
     String busId,
     TimelineAudioBus Function(TimelineAudioBus bus) mapper, {
@@ -1267,6 +1293,11 @@ class EditorNotifier extends StateNotifier<EditorState> {
 
   bool deleteAudioBus(String busId) {
     if (!state.timeline.audioBuses.any((bus) => bus.id == busId)) return false;
+    if (state.timeline.tracks.any(
+      (track) => track.audioBusId == busId && track.isLocked,
+    )) {
+      return false;
+    }
     setTimeline(
       state.timeline.copyWith(
         audioBuses: state.timeline.audioBuses

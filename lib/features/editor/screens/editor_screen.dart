@@ -1415,6 +1415,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   @override
   Widget build(BuildContext context) {
     _currentUserUid = ref.watch(currentUserProvider)?.uid;
+    _timelineCommandController.bindNotifiers(
+      ref.watch(editorProvider.notifier),
+      ref.watch(subtitleProvider.notifier),
+    );
     if (!_editorInitialized) {
       return _buildEditorStartup();
     }
@@ -5222,159 +5226,21 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
   }
 
   bool _splitClipAtPlayhead(TimelineClip clip) {
-    final editorState = ref.read(editorProvider);
-    final timeline = editorState.timeline;
-    final track = _trackForClip(clip, editorState);
-    if (track == null || track.isLocked) {
-      SnackBarHelper.showInfo(context, 'Unlock the track to split clips.');
-      return false;
+    final changed = _timelineCommandController.splitClip(
+      clip.id,
+      ref.read(playbackProvider).position,
+    );
+    if (changed) {
+      final rightId = ref
+          .read(editorProvider)
+          .selectedClipIds
+          .where((id) => id != clip.id)
+          .firstOrNull;
+      if (rightId != null) {
+        ref.read(editorProvider.notifier).selectClip(rightId);
+      }
     }
-    final splitPoint = ref.read(playbackProvider).position;
-    if (splitPoint <= clip.startTime ||
-        splitPoint >= clip.endTime ||
-        (splitPoint - clip.startTime).inMilliseconds < 100 ||
-        (clip.endTime - splitPoint).inMilliseconds < 100) {
-      SnackBarHelper.showInfo(
-        context,
-        'Move the playhead inside the selected clip to split it.',
-      );
-      return false;
-    }
-
-    final rightId = const Uuid().v4();
-    final timelineOffsetMs = (splitPoint - clip.startTime).inMilliseconds;
-    final sourceOffsetMs = (timelineOffsetMs * clip.playbackRate).round();
-    final sourceDurationMs = math.max(
-      sourceOffsetMs + 1,
-      clip.sourceDuration.inMilliseconds,
-    );
-    final keyframeSplit = TimelineKeyframeEditing.split(
-      clip,
-      Duration(milliseconds: timelineOffsetMs),
-    );
-    final effectStackSplit = clip.effectStack.splitAt(
-      Duration(milliseconds: timelineOffsetMs),
-    );
-    final leftSourceStart = clip.isReversed
-        ? clip.sourceStartTime +
-              Duration(milliseconds: sourceDurationMs - sourceOffsetMs)
-        : clip.sourceStartTime;
-    final rightSourceStart = clip.isReversed
-        ? clip.sourceStartTime
-        : clip.sourceStartTime + Duration(milliseconds: sourceOffsetMs);
-    final left = clip.copyWith(
-      endTime: splitPoint,
-      sourceStartTime: leftSourceStart,
-      sourceDuration: Duration(milliseconds: sourceOffsetMs),
-      keyframes: keyframeSplit.leading,
-      effectStack: effectStackSplit.leading,
-      outroTransition: const ClipTransition(),
-      audioMix: clip.audioMix.copyWith(fadeOutMs: 0),
-    );
-    final right = clip.copyWith(
-      id: rightId,
-      startTime: splitPoint,
-      sourceStartTime: rightSourceStart,
-      sourceDuration: Duration(
-        milliseconds: math.max(1, sourceDurationMs - sourceOffsetMs),
-      ),
-      keyframes: keyframeSplit.trailing,
-      effectStack: effectStackSplit.trailing,
-      introTransition: const ClipTransition(),
-      audioMix: clip.audioMix.copyWith(fadeInMs: 0),
-    );
-
-    final nextTracks = <TimelineTrack>[];
-    for (final candidateTrack in timeline.tracks) {
-      if (candidateTrack.id == track.id) {
-        final clips = <TimelineClip>[];
-        for (final candidate in candidateTrack.clips) {
-          if (candidate.id == clip.id) {
-            clips.addAll([left, right]);
-          } else {
-            clips.add(candidate);
-          }
-        }
-        clips.sort((a, b) => a.startTime.compareTo(b.startTime));
-        nextTracks.add(candidateTrack.copyWith(clips: clips));
-        continue;
-      }
-      if (candidateTrack.isLocked) {
-        nextTracks.add(candidateTrack);
-        continue;
-      }
-      if (candidateTrack.type == TimelineTrackType.audio) {
-        final audioClips = <TimelineClip>[];
-        for (final audio in candidateTrack.clips) {
-          if (!isExactSeparatedAudioTransportMirror(
-            video: clip,
-            audio: audio,
-          )) {
-            audioClips.add(audio);
-            continue;
-          }
-          final splitAudio = splitExactSeparatedAudioMirror(
-            originalVideo: clip,
-            leftVideo: left,
-            rightVideo: right,
-            audio: audio,
-            rightAudioId: const Uuid().v4(),
-            splitAt: splitPoint,
-          );
-          audioClips.addAll([splitAudio.left, splitAudio.right]);
-        }
-        audioClips.sort((a, b) => a.startTime.compareTo(b.startTime));
-        nextTracks.add(candidateTrack.copyWith(clips: audioClips));
-        continue;
-      }
-      if (candidateTrack.type != TimelineTrackType.subtitle) {
-        nextTracks.add(candidateTrack);
-        continue;
-      }
-      final captions = <TimelineClip>[];
-      for (final caption in candidateTrack.clips) {
-        if (caption.linkedClipId != clip.id || caption.endTime <= splitPoint) {
-          captions.add(caption);
-        } else if (caption.startTime >= splitPoint) {
-          captions.add(caption.copyWith(linkedClipId: rightId));
-        } else {
-          captions.add(caption.copyWith(endTime: splitPoint));
-          captions.add(
-            caption.copyWith(
-              id: const Uuid().v4(),
-              linkedClipId: rightId,
-              startTime: splitPoint,
-            ),
-          );
-        }
-      }
-      captions.sort((a, b) => a.startTime.compareTo(b.startTime));
-      nextTracks.add(candidateTrack.copyWith(clips: captions));
-    }
-    final nextTimeline = timeline.copyWith(
-      tracks: nextTracks,
-      groups: timeline.groups
-          .map(
-            (group) => group.id == clip.groupId
-                ? group.copyWith(clipIds: [...group.clipIds, rightId])
-                : group,
-          )
-          .toList(),
-      compoundClips: timeline.compoundClips
-          .map(
-            (compound) => compound.id == clip.compoundId
-                ? compound.copyWith(clipIds: [...compound.clipIds, rightId])
-                : compound,
-          )
-          .toList(),
-    );
-    ref.read(editorProvider.notifier)
-      ..setTimeline(nextTimeline)
-      ..selectClip(rightId);
-    ref
-        .read(subtitleProvider.notifier)
-        .syncFromTimeline(nextTimeline.subtitleEntries);
-    return true;
+    return changed;
   }
 
   int _assetDurationMs(EditorTimeline timeline, TimelineClip clip) {
@@ -5402,9 +5268,19 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       SnackBarHelper.showInfo(context, 'Unlock the track to trim this clip.');
       return;
     }
+    final liveTarget = track.clips
+        .where((clip) => clip.id == target.id)
+        .firstOrNull;
+    if (liveTarget == null) return;
+    target = liveTarget;
     final assetDurationMs = _assetDurationMs(timeline, target);
-    final safeStart = sourceStartMs.clamp(0, assetDurationMs - 100).toInt();
-    final safeEnd = sourceEndMs.clamp(safeStart + 100, assetDurationMs).toInt();
+    final minimumSpanMs = math.min(100, assetDurationMs);
+    final safeStart = sourceStartMs
+        .clamp(0, assetDurationMs - minimumSpanMs)
+        .toInt();
+    final safeEnd = sourceEndMs
+        .clamp(safeStart + minimumSpanMs, assetDurationMs)
+        .toInt();
     final sourceDuration = Duration(milliseconds: safeEnd - safeStart);
     final nextDuration = Duration(
       milliseconds: math.max(
@@ -5416,6 +5292,29 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     final oldEnd = target.endTime;
     final rippleDelta = nextEnd - oldEnd;
     final isBase = track.section == TimelineTrackSection.baseVideo;
+    final affectsLockedTrack = timeline.tracks.any(
+      (candidate) =>
+          candidate.isLocked &&
+          candidate.clips.any(
+            (clip) =>
+                (clip.type == TimelineTrackType.subtitle &&
+                    clip.linkedClipId == target.id) ||
+                isExactSeparatedAudioTransportMirror(
+                  video: target,
+                  audio: clip,
+                ) ||
+                (isBase &&
+                    rippleDelta != Duration.zero &&
+                    clip.startTime >= oldEnd),
+          ),
+    );
+    if (affectsLockedTrack) {
+      SnackBarHelper.showInfo(
+        context,
+        'Unlock the affected tracks before trimming this clip.',
+      );
+      return;
+    }
     final updatedTarget = target.copyWith(
       sourceStartTime: Duration(milliseconds: safeStart),
       sourceDuration: sourceDuration,
@@ -13112,6 +13011,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         children: [
           if (streamCount > 1) ...[
             DropdownButtonFormField<int>(
+              isExpanded: true,
               key: ValueKey('audio_source_stream_${clip.id}_$selectedStream'),
               initialValue: selectedStream,
               decoration: const InputDecoration(labelText: 'Audio stream'),
@@ -13159,6 +13059,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               children: [
                 Expanded(
                   child: DropdownButtonFormField<int>(
+                    isExpanded: true,
                     key: ValueKey(
                       'audio_left_source_${clip.id}_$selectedStream',
                     ),
@@ -13186,6 +13087,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                 const SizedBox(width: 8),
                 Expanded(
                   child: DropdownButtonFormField<int>(
+                    isExpanded: true,
                     key: ValueKey(
                       'audio_right_source_${clip.id}_$selectedStream',
                     ),
@@ -13215,6 +13117,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
             const SizedBox(height: 8),
           ],
           DropdownButtonFormField<EditorAudioChannelMode>(
+            isExpanded: true,
             key: const ValueKey('audio_channel_mode'),
             initialValue: mix.channelMode,
             decoration: const InputDecoration(labelText: 'Source channels'),
@@ -13473,8 +13376,11 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
               children: [
                 Expanded(
                   child: DropdownButtonFormField<String>(
-                    key: ValueKey('audio_bus_${track.id}'),
-                    initialValue: track.audioBusId ?? '',
+                    isExpanded: true,
+                    key: ValueKey(
+                      'audio_bus_${track.id}_${bus?.id ?? 'master'}',
+                    ),
+                    initialValue: bus?.id ?? '',
                     decoration: const InputDecoration(labelText: 'Output bus'),
                     items: [
                       const DropdownMenuItem(
@@ -13541,7 +13447,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                     recordHistory: false,
                   ),
             ),
-            Row(
+            Wrap(
+              spacing: 8,
+              runSpacing: 4,
+              crossAxisAlignment: WrapCrossAlignment.center,
               children: [
                 FilterChip(
                   label: const Text('Mute'),
@@ -13553,7 +13462,6 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                         (current) => current.copyWith(muted: value),
                       ),
                 ),
-                const SizedBox(width: 8),
                 FilterChip(
                   label: const Text('Solo'),
                   selected: bus.solo,
@@ -13564,7 +13472,6 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                         (current) => current.copyWith(solo: value),
                       ),
                 ),
-                const Spacer(),
                 TextButton.icon(
                   onPressed: () => _openEffectStackSheet(
                     clip,
@@ -13574,12 +13481,52 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
                   icon: const Icon(Icons.graphic_eq_rounded, size: 17),
                   label: const Text('Bus FX'),
                 ),
+                IconButton(
+                  key: const ValueKey('delete_audio_bus'),
+                  tooltip: 'Delete bus and route its tracks to Master output',
+                  onPressed:
+                      timeline.tracks.any(
+                        (track) => track.audioBusId == bus.id && track.isLocked,
+                      )
+                      ? null
+                      : () => _deleteAudioBus(bus.id),
+                  icon: const Icon(Icons.delete_outline_rounded),
+                ),
               ],
             ),
           ],
         ],
       ),
     );
+  }
+
+  Future<void> _deleteAudioBus(String busId) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete audio bus?'),
+        content: const Text(
+          'Its tracks will return to Master output. Bus processing will be removed. You can undo this change.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Delete bus'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    if (!ref.read(editorProvider.notifier).deleteAudioBus(busId)) {
+      SnackBarHelper.showInfo(
+        context,
+        'The bus is unavailable or one of its tracks is locked.',
+      );
+    }
   }
 
   Future<void> _createAudioBusForTrack(String trackId) async {
@@ -13612,9 +13559,12 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     );
     controller.dispose();
     if (name == null || !mounted) return;
-    final notifier = ref.read(editorProvider.notifier);
-    final busId = notifier.createAudioBus(name: name);
-    notifier.assignTrackToAudioBus(trackId, busId);
+    final busId = ref
+        .read(editorProvider.notifier)
+        .createAudioBusForTrack(trackId, name: name);
+    if (busId == null) {
+      SnackBarHelper.showInfo(context, 'The track is unavailable or locked.');
+    }
   }
 
   ({TimelineTrack track, TimelineClip clip})? _separatedAudioForVideo(
