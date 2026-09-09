@@ -3,6 +3,7 @@
 class MediaJob {
   final Map<int, Future<void> Function()> _sessions = {};
   bool _cancelled = false;
+  Future<void>? _cancellation;
 
   bool get isCancelled => _cancelled;
 
@@ -17,9 +18,13 @@ class MediaJob {
 
   void detach(int id) => _sessions.remove(id);
 
-  Future<void> cancel() async {
+  Future<void> cancel() {
+    final pending = _cancellation;
+    if (pending != null) return pending;
     _cancelled = true;
-    await Future.wait(_sessions.values.toList().map((cancel) => cancel()));
+    return _cancellation = Future.wait(
+      _sessions.values.toList().map((cancel) => Future<void>.sync(cancel)),
+    ).then((_) {});
   }
 }
 

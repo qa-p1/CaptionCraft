@@ -103,6 +103,7 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
   final Map<String, DiscoverDownloadRequest> _directRequests =
       <String, DiscoverDownloadRequest>{};
   final Map<String, Future<void>> _activeJobs = <String, Future<void>>{};
+  final Map<String, int> _retryGenerations = {};
   final Map<String, int> _lastProgressEmitMicros = <String, int>{};
   final Stopwatch _progressClock = Stopwatch()..start();
 
@@ -121,9 +122,16 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
       List<DiscoverDownloadItem>.unmodifiable(_currentItems);
 
   @override
-  Future<void> initialize() {
+  Future<void> initialize() async {
     _ensureNotDisposed();
-    return _initialization ??= _initialize();
+    final initialization = _initialization ??= _initialize();
+    try {
+      await initialization;
+      _ensureNotDisposed();
+    } catch (_) {
+      if (identical(_initialization, initialization)) _initialization = null;
+      rethrow;
+    }
   }
 
   Future<void> _initialize() async {
@@ -136,12 +144,15 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
             'discover_downloads',
           ),
         );
+    _ensureNotDisposed();
     await storage.create(recursive: true);
+    _ensureNotDisposed();
     _storageDirectory = storage;
     _catalogFile = File(p.join(storage.path, 'downloads.json'));
     await _cleanupParts(storage);
     _currentItems = await _readCatalog(storage);
     final reconciled = await _reconcile(_currentItems);
+    _ensureNotDisposed();
     _currentItems = _sortItems(reconciled);
     _emit();
     await _persist();
@@ -357,7 +368,11 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
 
   Future<void> _runDirect(String id, DiscoverDownloadRequest request) async {
     final item = _itemById(id);
-    if (item == null) return;
+    if (_disposed ||
+        item == null ||
+        item.status != DiscoverDownloadStatus.queued) {
+      return;
+    }
     final storage = _requireStorage();
     final destination = File(p.join(storage.path, item.fileName));
     final part = File('${destination.path}.part');
@@ -365,6 +380,7 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
     _directJobs[id] = control;
     try {
       await _deleteIfExists(part);
+      _throwIfDirectCancelled(control, id);
       await _replaceAndPersist(
         item.copyWith(
           status: DiscoverDownloadStatus.downloading,
@@ -568,7 +584,11 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
     YoutubeFormatOption format,
   ) async {
     final item = _itemById(id);
-    if (item == null) return;
+    if (_disposed ||
+        item == null ||
+        item.status != DiscoverDownloadStatus.queued) {
+      return;
+    }
     final destination = File(p.join(_requireStorage().path, item.fileName));
     try {
       await _replaceAndPersist(
@@ -581,7 +601,8 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
         ),
       );
       final beforeStart = _itemById(id);
-      if (beforeStart == null ||
+      if (_disposed ||
+          beforeStart == null ||
           beforeStart.status == DiscoverDownloadStatus.cancelled) {
         return;
       }
@@ -655,39 +676,53 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
   Future<void> cancel(String id) async {
     await initialize();
     final item = _itemById(id);
-    if (item == null || item.isTerminal) return;
-    final direct = _directJobs[id];
-    if (direct != null) {
-      direct.userCancelled = true;
-      direct.cancelToken.cancel('Cancelled by user.');
-    }
-    final current = _itemById(id);
-    if (current != null) {
-      await _replaceAndPersist(
-        current.copyWith(
+    if (item == null) return;
+    final activeJob = _activeJobs[id];
+    Future<void>? persist;
+    if (!item.isTerminal) {
+      _retryGenerations[id] = (_retryGenerations[id] ?? 0) + 1;
+      final direct = _directJobs[id];
+      if (direct != null) {
+        direct.userCancelled = true;
+        direct.cancelToken.cancel('Cancelled by user.');
+      }
+      _replaceWithoutPersist(
+        item.copyWith(
           status: DiscoverDownloadStatus.cancelled,
           updatedAt: _clock().toUtc(),
           clearErrorMessage: true,
           clearLocalPath: true,
         ),
       );
-    }
-    if (item.source == DiscoverDownloadSource.youtube) {
-      await _youtubeService.cancel(id);
-    }
-    final activeJob = _activeJobs[id];
-    if (activeJob != null) {
-      try {
-        await activeJob;
-      } catch (_) {
-        // The worker has already translated failures into item state.
+      // Start native cancellation before waiting for disk persistence.
+      if (item.source == DiscoverDownloadSource.youtube) {
+        await _youtubeService.cancel(id);
       }
+      persist = _persist();
     }
+    // Terminal state can be published before a worker finishes cleaning up.
+    // Deletion/retry must not race that cleanup against a new file.
+    await Future.wait<void>([
+      if (persist != null) persist,
+      if (activeJob != null) activeJob.catchError((Object _) {}),
+    ]);
   }
 
   @override
   Future<void> retry(String id) async {
     await initialize();
+    if (_itemById(id)?.canRetry != true) {
+      throw StateError('Only failed or cancelled downloads can be retried.');
+    }
+    final previous = _activeJobs[id];
+    if (previous != null) {
+      try {
+        await previous;
+      } catch (_) {
+        /* The worker reports its own failure. */
+      }
+    }
+    _ensureNotDisposed();
     final item = _itemById(id);
     if (item == null) {
       throw ArgumentError.value(id, 'id', 'Download not found.');
@@ -695,7 +730,8 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
     if (!item.canRetry) {
       throw StateError('Only failed or cancelled downloads can be retried.');
     }
-    if (item.localPath != null) await _deleteManagedPath(item.localPath!);
+    final generation = (_retryGenerations[id] ?? 0) + 1;
+    _retryGenerations[id] = generation;
     final queued = item.copyWith(
       status: DiscoverDownloadStatus.queued,
       receivedBytes: 0,
@@ -704,83 +740,111 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
       clearLocalPath: true,
       clearErrorMessage: true,
     );
-    await _replaceAndPersist(queued);
-    if (item.source == DiscoverDownloadSource.direct) {
-      _validatedHttpsUri(item.sourceUrl);
-      final request =
-          _directRequests[id] ??
-          DiscoverDownloadRequest(
-            url: item.sourceUrl,
+    try {
+      await _replaceAndPersist(queued);
+      if (item.localPath != null) await _deleteManagedPath(item.localPath!);
+      if (_disposed ||
+          _retryGenerations[id] != generation ||
+          _itemById(id)?.status != DiscoverDownloadStatus.queued) {
+        return;
+      }
+      if (item.source == DiscoverDownloadSource.direct) {
+        _validatedHttpsUri(item.sourceUrl);
+        final request =
+            _directRequests[id] ??
+            DiscoverDownloadRequest(
+              url: item.sourceUrl,
+              displayName: item.displayName,
+              kind: item.kind,
+              pageUrl: item.pageUrl,
+              mimeType: item.mimeType,
+              metadata: item.metadata,
+            );
+        _directRequests[id] = request;
+        _startJob(id, () => _runDirect(id, request));
+        return;
+      }
+      if (item.source == DiscoverDownloadSource.instagram) {
+        final infoJson = item.metadata['instagramInfo'];
+        final mediaJson = item.metadata['instagramMedia'];
+        final acknowledged =
+            item.metadata['permittedContentAcknowledged'] == true;
+        if (infoJson is! Map || mediaJson is! Map || !acknowledged) {
+          await _markFailed(
+            id,
+            'This Instagram download cannot be safely retried.',
+          );
+          return;
+        }
+        try {
+          final storedMedia = InstagramMediaOption.fromJson(
+            _stringKeyedMap(mediaJson),
+          );
+          final refreshed = await _instagramService.inspect(item.sourceUrl);
+          if (_disposed ||
+              _retryGenerations[id] != generation ||
+              _itemById(id)?.status != DiscoverDownloadStatus.queued) {
+            return;
+          }
+          final mediaIndex = int.tryParse(storedMedia.id.split('-').last);
+          final refreshedMedia = refreshed.media.firstWhere(
+            (candidate) =>
+                (candidate.id == storedMedia.id &&
+                    candidate.kind == storedMedia.kind) ||
+                (mediaIndex != null &&
+                    refreshed.media.indexOf(candidate) == mediaIndex &&
+                    candidate.kind == storedMedia.kind),
+            orElse: () => throw StateError(
+              'The selected Instagram media is no longer available. Inspect the post again.',
+            ),
+          );
+          final request = DiscoverDownloadRequest(
+            url: refreshedMedia.url,
             displayName: item.displayName,
-            kind: item.kind,
-            pageUrl: item.pageUrl,
-            mimeType: item.mimeType,
+            kind: refreshedMedia.kind,
+            pageUrl: refreshed.canonicalUrl,
+            headers: InstagramDownloadService.downloadHeaders(
+              refreshed.canonicalUrl,
+              refreshedMedia.httpHeaders,
+            ),
+            mimeType: refreshedMedia.mimeType,
             metadata: item.metadata,
           );
-      _directRequests[id] = request;
-      _startJob(id, () => _runDirect(id, request));
-      return;
-    }
-    if (item.source == DiscoverDownloadSource.instagram) {
-      final infoJson = item.metadata['instagramInfo'];
-      final mediaJson = item.metadata['instagramMedia'];
+          _directRequests[id] = request;
+          _startJob(id, () => _runDirect(id, request));
+        } catch (error) {
+          if (!_disposed && _retryGenerations[id] == generation) {
+            await _markFailed(id, _friendlyError(error));
+          }
+        }
+        return;
+      }
+      final infoJson = item.metadata['youtubeInfo'];
+      final formatJson = item.metadata['youtubeFormat'];
       final acknowledged =
           item.metadata['permittedContentAcknowledged'] == true;
-      if (infoJson is! Map || mediaJson is! Map || !acknowledged) {
+      if (infoJson is! Map || formatJson is! Map || !acknowledged) {
         await _markFailed(
           id,
-          'This Instagram download cannot be safely retried.',
+          'This YouTube download cannot be safely retried.',
         );
         return;
       }
-      try {
-        final storedMedia = InstagramMediaOption.fromJson(
-          _stringKeyedMap(mediaJson),
-        );
-        final refreshed = await _instagramService.inspect(item.sourceUrl);
-        final mediaIndex = int.tryParse(storedMedia.id.split('-').last);
-        final refreshedMedia = refreshed.media.firstWhere(
-          (candidate) =>
-              candidate.id == storedMedia.id ||
-              (mediaIndex != null &&
-                  refreshed.media.indexOf(candidate) == mediaIndex &&
-                  candidate.kind == storedMedia.kind),
-          orElse: () => refreshed.media.firstWhere(
-            (candidate) => candidate.kind == storedMedia.kind,
-          ),
-        );
-        final request = DiscoverDownloadRequest(
-          url: refreshedMedia.url,
-          displayName: item.displayName,
-          kind: refreshedMedia.kind,
-          pageUrl: refreshed.canonicalUrl,
-          headers: InstagramDownloadService.downloadHeaders(
-            refreshed.canonicalUrl,
-            refreshedMedia.httpHeaders,
-          ),
-          mimeType: refreshedMedia.mimeType,
-          metadata: item.metadata,
-        );
-        _directRequests[id] = request;
-        _startJob(id, () => _runDirect(id, request));
-      } catch (error) {
+      final info = YoutubeVideoInfo.fromJson(_stringKeyedMap(infoJson));
+      final format = YoutubeFormatOption.fromJson(_stringKeyedMap(formatJson));
+      _startJob(id, () => _runYoutube(id, info, format));
+    } catch (error) {
+      if (!_disposed && _retryGenerations[id] == generation) {
         await _markFailed(id, _friendlyError(error));
       }
-      return;
+      rethrow;
     }
-    final infoJson = item.metadata['youtubeInfo'];
-    final formatJson = item.metadata['youtubeFormat'];
-    final acknowledged = item.metadata['permittedContentAcknowledged'] == true;
-    if (infoJson is! Map || formatJson is! Map || !acknowledged) {
-      await _markFailed(id, 'This YouTube download cannot be safely retried.');
-      return;
-    }
-    final info = YoutubeVideoInfo.fromJson(_stringKeyedMap(infoJson));
-    final format = YoutubeFormatOption.fromJson(_stringKeyedMap(formatJson));
-    _startJob(id, () => _runYoutube(id, info, format));
   }
 
   void _startJob(String id, Future<void> Function() run) {
+    if (_disposed || _itemById(id)?.status != DiscoverDownloadStatus.queued) {
+      return;
+    }
     late final Future<void> job;
     job = run();
     _activeJobs[id] = job;
@@ -801,7 +865,8 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
     await initialize();
     final item = _itemById(id);
     if (item == null) return;
-    if (!item.isTerminal) await cancel(id);
+    await cancel(id);
+    _retryGenerations.remove(id);
     _directRequests.remove(id);
     _currentItems = _currentItems.where((value) => value.id != id).toList();
     _emit();
@@ -824,7 +889,7 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
 
   Future<void> _markFailed(String id, String message) async {
     final item = _itemById(id);
-    if (item == null) return;
+    if (item == null || item.status == DiscoverDownloadStatus.cancelled) return;
     await _replaceAndPersist(
       item.copyWith(
         status: DiscoverDownloadStatus.failed,
@@ -868,7 +933,18 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
   Future<void> _addAndPersist(DiscoverDownloadItem item) async {
     _currentItems = _sortItems(<DiscoverDownloadItem>[item, ..._currentItems]);
     _emit();
-    await _persist();
+    try {
+      await _persist();
+    } catch (_) {
+      _replaceWithoutPersist(
+        item.copyWith(
+          status: DiscoverDownloadStatus.failed,
+          errorMessage:
+              'Could not save the download queue. Free some storage and retry.',
+        ),
+      );
+      rethrow;
+    }
   }
 
   void _replaceWithoutPersist(DiscoverDownloadItem item) {

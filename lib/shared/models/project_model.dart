@@ -566,6 +566,9 @@ class ProjectLocalStorage {
 
   static Future<void> _writeProject(Project project, String projectId) async {
     final dir = await _projectsDir;
+    if (await File(p.join(dir, '$projectId.deleted')).exists()) {
+      throw StateError('This project was deleted and cannot be saved.');
+    }
     final file = File(p.join(dir, '$projectId.json'));
     final temporaryFile = File('${file.path}.tmp');
     final backupFile = File('${file.path}.bak');
@@ -678,6 +681,24 @@ class ProjectLocalStorage {
       }
       final dir = await _projectsDir;
       final basePath = p.join(dir, '$safeProjectId.json');
+      final existing = await _readLatestProject(basePath);
+      if (ownerUid != null &&
+          existing != null &&
+          existing.ownerUid != null &&
+          existing.ownerUid != ownerUid) {
+        throw StateError('Cannot delete a project owned by another account.');
+      }
+      // Persist deletion intent before removing any recoverable snapshots.
+      // A crash or disk error must not restore a deleted project from .bak.
+      final tombstone = File(p.join(dir, '$safeProjectId.deleted'));
+      await tombstone.writeAsString(
+        jsonEncode({
+          'projectId': projectId,
+          'ownerUid': ownerUid ?? existing?.ownerUid,
+          'deletedAt': DateTime.now().toUtc().toIso8601String(),
+        }),
+        flush: true,
+      );
       for (final candidate in [
         File(basePath),
         File('$basePath.tmp'),
@@ -685,15 +706,6 @@ class ProjectLocalStorage {
       ]) {
         if (await candidate.exists()) await candidate.delete();
       }
-      final tombstone = File(p.join(dir, '$safeProjectId.deleted'));
-      await tombstone.writeAsString(
-        jsonEncode({
-          'projectId': projectId,
-          'ownerUid': ownerUid,
-          'deletedAt': DateTime.now().toUtc().toIso8601String(),
-        }),
-        flush: true,
-      );
     }();
     _saveQueues[safeProjectId] = deletion;
     try {
@@ -744,6 +756,11 @@ class ProjectLocalStorage {
   }
 
   static Future<Project?> _readLatestProject(String basePath) async {
+    if (await File(
+      '${basePath.substring(0, basePath.length - 5)}.deleted',
+    ).exists()) {
+      return null;
+    }
     Project? latest;
     for (final candidate in [
       File(basePath),

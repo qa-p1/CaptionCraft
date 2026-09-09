@@ -27,6 +27,60 @@ void main() {
       }
     });
 
+    test('deletion rejects a stale action from a different account', () async {
+      final now = DateTime.utc(2026, 9, 9);
+      final project = _project(
+        captionText: 'Owned caption',
+        lastModifiedAt: now,
+        captionsModifiedAt: now,
+      ).copyWith(ownerUid: 'alice');
+      await ProjectLocalStorage.saveProject(project);
+      await expectLater(
+        ProjectLocalStorage.deleteProject(project.id, ownerUid: 'bob'),
+        throwsStateError,
+      );
+      expect(
+        (await ProjectLocalStorage.loadProject(project.id))!.ownerUid,
+        'alice',
+      );
+      expect(await ProjectLocalStorage.loadDeletedProjectIds('bob'), isEmpty);
+    });
+
+    test(
+      'a deleted project cannot reappear from a leftover recovery file',
+      () async {
+        final now = DateTime.utc(2026, 9, 9);
+        final project = _project(
+          captionText: 'Deleted caption',
+          lastModifiedAt: now,
+          captionsModifiedAt: now,
+        ).copyWith(ownerUid: 'alice');
+        await ProjectLocalStorage.saveProject(project);
+        await ProjectLocalStorage.deleteProject(project.id, ownerUid: 'alice');
+        await expectLater(
+          ProjectLocalStorage.saveProject(project),
+          throwsStateError,
+        );
+        final backup = File(
+          p.join(
+            documentsDirectory.path,
+            'caption_craft_projects',
+            '${project.id}.json.bak',
+          ),
+        );
+        await backup.writeAsString(jsonEncode(project.toJson()));
+        expect(await ProjectLocalStorage.loadProject(project.id), isNull);
+        expect(
+          await ProjectLocalStorage.loadProjects(ownerUid: 'alice'),
+          isEmpty,
+        );
+        expect(
+          await ProjectLocalStorage.loadDeletedProjectIds('alice'),
+          contains(project.id),
+        );
+      },
+    );
+
     test(
       'saves and retrieves the latest timeline and captions locally',
       () async {

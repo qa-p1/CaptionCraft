@@ -6,6 +6,20 @@ import 'package:caption_craft/features/editor/providers/discover_provider.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('failed initialization offers a real retry', () async {
+    final facade = _FakeDiscoverFacade()..initializationFailures = 1;
+    final notifier = DiscoverNotifier(facade);
+    addTearDown(() {
+      notifier.dispose();
+      facade.dispose();
+    });
+    await notifier.initialize();
+    expect(notifier.state.isInitialized, isFalse);
+    expect(notifier.state.errorMessage, isNotNull);
+    await notifier.initialize();
+    expect(notifier.state.isInitialized, isTrue);
+    expect(notifier.state.errorMessage, isNull);
+  });
   test(
     'DiscoverNotifier exposes inspection, acknowledgement, and queue state',
     () async {
@@ -93,6 +107,7 @@ void main() {
 }
 
 class _FakeDiscoverFacade implements DiscoverDownloadFacade {
+  int initializationFailures = 0;
   final StreamController<List<DiscoverDownloadItem>> _controller =
       StreamController<List<DiscoverDownloadItem>>.broadcast(sync: true);
   List<DiscoverDownloadItem> _items = <DiscoverDownloadItem>[];
@@ -140,7 +155,9 @@ class _FakeDiscoverFacade implements DiscoverDownloadFacade {
       List<DiscoverDownloadItem>.unmodifiable(_items);
 
   @override
-  Future<void> initialize() async {}
+  Future<void> initialize() async {
+    if (initializationFailures-- > 0) throw StateError('Storage unavailable');
+  }
 
   @override
   Future<YoutubeVideoInfo> inspectYoutube(String url) async {

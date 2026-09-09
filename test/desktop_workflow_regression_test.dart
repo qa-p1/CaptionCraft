@@ -12,6 +12,28 @@ import 'package:path/path.dart' as p;
 
 void main() {
   group('job ownership', () {
+    test(
+      'a throwing cancellation still cancels every other session once',
+      () async {
+        final job = MediaJob();
+        var calls = 0;
+        await job.attach(
+          1,
+          () => throw StateError('Native cancellation failed'),
+        );
+        await job.attach(2, () async {
+          calls++;
+        });
+        await expectLater(job.cancel(), throwsStateError);
+        await expectLater(job.cancel(), throwsStateError);
+        expect(calls, 1);
+        var lateCancelled = false;
+        await job.attach(3, () async {
+          lateCancelled = true;
+        });
+        expect(lateCancelled, isTrue);
+      },
+    );
     test('cancel affects only owned sessions', () async {
       final export = MediaJob();
       final preview = MediaJob();

@@ -209,6 +209,7 @@ class _DiscoverSheetState extends ConsumerState<DiscoverSheet> {
                     },
                     onAcknowledgementChanged:
                         notifier.setPermittedContentAcknowledged,
+                    onInitialize: notifier.initialize,
                     onCancel: notifier.cancel,
                   ),
                   DiscoverInstagramTab(
