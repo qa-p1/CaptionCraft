@@ -862,6 +862,255 @@ EditorTimeline replaceGeneratedCaptionsForSource({
   return nextTimeline;
 }
 
+/// Applies a completed transcription to live editor state. A background result
+/// must not restore the timeline snapshot captured when its request started.
+({EditorTimeline timeline, List<SubtitleEntry> entries})
+buildGeneratedCaptionUpdate({
+  required TimelineClip requestedSource,
+  required String requestedMediaPath,
+  required EditorTimeline currentTimeline,
+  required List<SubtitleEntry> currentEntries,
+  required List<SubtitleEntry> generatedEntries,
+  required String legacyBaseVideoPath,
+}) {
+  final source = currentTimeline.tracks
+      .expand((track) => track.clips)
+      .where((clip) => clip.id == requestedSource.id)
+      .firstOrNull;
+  if (source == null || !currentTimeline.clipHasAudio(source)) {
+    throw StateError('The caption source is no longer available.');
+  }
+  if (source.sourceStartTime != requestedSource.sourceStartTime ||
+      source.sourceDuration != requestedSource.sourceDuration ||
+      source.playbackRate != requestedSource.playbackRate ||
+      source.isReversed != requestedSource.isReversed ||
+      source.freezeFrame != requestedSource.freezeFrame ||
+      resolveCaptionMediaPath(
+            timeline: currentTimeline,
+            sourceClip: source,
+            legacyBaseVideoPath: legacyBaseVideoPath,
+          ) !=
+          requestedMediaPath) {
+    throw StateError(
+      'The source changed during transcription. Generate captions again.',
+    );
+  }
+  final routing = resolveCaptionTrackRouting(
+    timeline: currentTimeline,
+    sourceClip: source,
+  );
+  if (routing.isBlocked || routing.destination == null) {
+    throw StateError(
+      'The caption track was locked during transcription. Unlock it and try again.',
+    );
+  }
+  if (currentTimeline.tracks
+      .where((track) => track.type == TimelineTrackType.subtitle)
+      .expand((track) => track.clips)
+      .any((clip) => clip.linkedClipId == source.id)) {
+    throw StateError(
+      'Captions were added while transcription was running. Your current captions were kept.',
+    );
+  }
+  final shifted = source.mapSourceSubtitlesToTimeline(generatedEntries);
+  return (
+    timeline: replaceGeneratedCaptionsForSource(
+      timeline: currentTimeline,
+      sourceClip: source,
+      destinationTrack: routing.destination!,
+      generatedEntries: shifted,
+    ),
+    entries: [...currentEntries, ...shifted]
+      ..sort((a, b) => a.startTime.compareTo(b.startTime)),
+  );
+}
+
+/// Builds the complete speed edit before publishing it, including linked media
+/// and ripple timing. Locked affected tracks reject the entire transaction.
+EditorTimeline buildClipPlaybackRateUpdate({
+  required EditorTimeline timeline,
+  required String clipId,
+  required double playbackRate,
+}) {
+  final track = timeline.tracks
+      .where((track) => track.clips.any((clip) => clip.id == clipId))
+      .firstOrNull;
+  if (track == null || track.isLocked) {
+    throw StateError('Unlock the track to change speed.');
+  }
+  final liveTarget = track.clips.firstWhere((clip) => clip.id == clipId);
+  if (!playbackRate.isFinite || playbackRate <= 0) {
+    throw StateError('Choose a valid playback speed.');
+  }
+  final safeRate = playbackRate.clamp(0.25, 4).toDouble();
+  final sourceDurationMs = liveTarget.sourceDuration.inMilliseconds > 0
+      ? liveTarget.sourceDuration.inMilliseconds
+      : liveTarget.duration.inMilliseconds;
+  final nextDuration = Duration(
+    milliseconds: math.max(100, (sourceDurationMs / safeRate).round()),
+  );
+  final nextEnd = liveTarget.startTime + nextDuration;
+  final rippleDelta = nextDuration - liveTarget.duration;
+  final isBase = track.section == TimelineTrackSection.baseVideo;
+  final oldEnd = liveTarget.endTime;
+  final oldDurationMs = math.max(1, liveTarget.duration.inMilliseconds);
+  final updatedTarget = liveTarget.copyWith(
+    playbackRate: safeRate,
+    endTime: nextEnd,
+    keyframes: TimelineKeyframeEditing.retime(liveTarget, nextDuration),
+    effectStack: liveTarget.effectStack.retimed(
+      liveTarget.duration,
+      nextDuration,
+    ),
+  );
+
+  final retimedTracks = timeline.tracks.map((timelineTrack) {
+    final clips = timelineTrack.clips.map((clip) {
+      if (clip.id == liveTarget.id) {
+        return updatedTarget;
+      }
+
+      if (clip.type == TimelineTrackType.audio &&
+          clip.linkedClipId == liveTarget.id) {
+        return isExactSeparatedAudioTransportMirror(
+              video: liveTarget,
+              audio: clip,
+            )
+            ? syncSeparatedAudioTransport(
+                audio: clip.copyWith(
+                  keyframes: TimelineKeyframeEditing.retime(
+                    clip,
+                    nextDuration,
+                  ),
+                  effectStack: clip.effectStack.retimed(
+                    clip.duration,
+                    nextDuration,
+                  ),
+                ),
+                updatedVideo: updatedTarget,
+              )
+            : clip;
+      }
+
+      final isSubtitleClip =
+          timelineTrack.type == TimelineTrackType.subtitle ||
+          clip.type == TimelineTrackType.subtitle;
+      final intersectsChangedClip =
+          clip.startTime < oldEnd && clip.endTime > liveTarget.startTime;
+      final belongsToChangedClip =
+          (isSubtitleClip &&
+              clip.linkedClipId == liveTarget.id &&
+              intersectsChangedClip) ||
+          (isBase &&
+              isSubtitleClip &&
+              clip.linkedClipId == null &&
+              intersectsChangedClip);
+      if (belongsToChangedClip) {
+        final relativeStartMs = (clip.startTime - liveTarget.startTime)
+            .inMilliseconds
+            .clamp(0, oldDurationMs)
+            .toInt();
+        final relativeEndMs = (clip.endTime - liveTarget.startTime)
+            .inMilliseconds
+            .clamp(relativeStartMs + 1, oldDurationMs)
+            .toInt();
+        final startRatio = relativeStartMs / oldDurationMs;
+        final endRatio = relativeEndMs / oldDurationMs;
+        final nextStart =
+            liveTarget.startTime +
+            Duration(
+              milliseconds: (nextDuration.inMilliseconds * startRatio)
+                  .round(),
+            );
+        final scaledEnd =
+            liveTarget.startTime +
+            Duration(
+              milliseconds: (nextDuration.inMilliseconds * endRatio).round(),
+            );
+        return clip.copyWith(
+          linkedClipId: liveTarget.id,
+          startTime: nextStart,
+          endTime: scaledEnd > nextStart + const Duration(milliseconds: 80)
+              ? scaledEnd
+              : nextStart + const Duration(milliseconds: 80),
+        );
+      }
+      if (isBase && clip.startTime >= oldEnd) {
+        return clip.copyWith(
+          startTime: clip.startTime + rippleDelta,
+          endTime: clip.endTime + rippleDelta,
+        );
+      }
+      return clip;
+    }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
+    return timelineTrack.copyWith(clips: clips);
+  }).toList();
+  for (var index = 0; index < timeline.tracks.length; index++) {
+    final original = timeline.tracks[index];
+    if (!original.isLocked) continue;
+    final changed = retimedTracks[index];
+    if (original.clips.any((clip) {
+      final next = changed.clips.firstWhere((item) => item.id == clip.id);
+      return !identical(clip, next);
+    })) {
+      throw StateError('Unlock affected tracks before changing speed.');
+    }
+  }
+  final nextTracks = retimedTracks
+      .map(
+        (timelineTrack) =>
+            timelineTrack.type == TimelineTrackType.subtitle &&
+                !timelineTrack.isLocked
+            ? timelineTrack.copyWith(
+                clips: _removeSubtitleTimingCollisions(timelineTrack.clips),
+              )
+            : timelineTrack,
+      )
+      .toList();
+  final markers = timeline.markers.map((marker) {
+    if (isBase && marker.position >= oldEnd) {
+      return marker.copyWith(position: marker.position + rippleDelta);
+    }
+    return marker;
+  }).toList();
+  Duration? shiftBoundary(Duration? position) {
+    if (position == null || !isBase || position < oldEnd) return position;
+    return position + rippleDelta;
+  }
+  final workspace = timeline.workspaceSettings;
+  final nextTimeline = timeline
+      .copyWith(
+        tracks: nextTracks,
+        markers: markers,
+        workspaceSettings: workspace.copyWith(
+          workAreaStart: shiftBoundary(workspace.workAreaStart),
+          workAreaEnd: shiftBoundary(workspace.workAreaEnd),
+        ),
+      )
+      .prunedRelationships();
+  if (nextTimeline.hasTrackOverlaps) {
+    throw StateError('That speed would overlap another clip on this track.');
+  }
+  return nextTimeline;
+}
+
+List<TimelineClip> _removeSubtitleTimingCollisions(List<TimelineClip> clips) {
+  final sorted = [...clips]
+    ..sort((a, b) => a.startTime.compareTo(b.startTime));
+  final result = <TimelineClip>[];
+  var nextAvailable = Duration.zero;
+  for (final clip in sorted) {
+    final start = clip.startTime < nextAvailable
+        ? nextAvailable
+        : clip.startTime;
+    final minimumEnd = start + const Duration(milliseconds: 80);
+    final end = clip.endTime < minimumEnd ? minimumEnd : clip.endTime;
+    result.add(clip.copyWith(startTime: start, endTime: end));
+    nextAvailable = end + const Duration(milliseconds: 20);
+  }
+  return result;
+}
+
 /// Main editor screen with 3-panel layout:
 /// Video Preview (top-left), Style Panel (top-right), Timeline (bottom).
 class EditorScreen extends ConsumerStatefulWidget {
@@ -3673,6 +3922,13 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     TimelineClip targetClip,
     EditorTimeline timeline,
   ) async {
+    if (!mounted) return;
+    final requestState = ref.read(editorProvider);
+    final requestOwnerUid = ref.read(currentUserProvider)?.uid;
+    timeline = requestState.timeline;
+    final liveSource = _clipById(targetClip.id, requestState);
+    if (liveSource == null) return;
+    targetClip = liveSource;
     if (_openExistingSourceCaptions(targetClip)) return;
     final captionRouting = resolveCaptionTrackRouting(
       timeline: timeline,
@@ -3743,6 +3999,10 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     );
     unawaited(
       processingNavigator.push<void>(processingRoute).whenComplete(() {
+        if (!processingClosed) {
+          cancellationRequested = true;
+          pipeline.cancel();
+        }
         processingClosed = true;
       }),
     );
@@ -3766,37 +4026,29 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
         return;
       }
 
-      final shiftedEntries = targetClip.mapSourceSubtitlesToTimeline(
-        generatedEntries,
+      if (!mounted || cancellationRequested || processingClosed) {
+        closeProcessingRoute();
+        return;
+      }
+      final currentState = ref.read(editorProvider);
+      if (currentState.projectId != requestState.projectId ||
+          ref.read(currentUserProvider)?.uid != requestOwnerUid) {
+        closeProcessingRoute();
+        return;
+      }
+      final update = buildGeneratedCaptionUpdate(
+        requestedSource: targetClip,
+        requestedMediaPath: mediaPath,
+        currentTimeline: currentState.timeline,
+        currentEntries: ref.read(subtitleProvider).entries,
+        generatedEntries: generatedEntries,
+        legacyBaseVideoPath: widget.project.videoPath,
       );
-
-      final existingLinkedSubtitleIds = timeline.tracks
-          .where((track) => track.type == TimelineTrackType.subtitle)
-          .expand((track) => track.clips)
-          .where((clip) => clip.linkedClipId == targetClip.id)
-          .map((clip) => clip.id)
-          .toSet();
-
-      final currentSubtitleState = ref.read(subtitleProvider);
-      final mergedEntries = [
-        ...currentSubtitleState.entries.where(
-          (entry) => !existingLinkedSubtitleIds.contains(entry.id),
-        ),
-        ...shiftedEntries,
-      ]..sort((a, b) => a.startTime.compareTo(b.startTime));
-
-      final nextTimeline = _timelineWithGeneratedSubtitles(
-        timeline: timeline,
-        targetClip: targetClip,
-        subtitleTrack: subtitleTrack,
-        generatedEntries: shiftedEntries,
-      );
-
       ref
           .read(editorProvider.notifier)
           .replaceTimelineAndSubtitleEntries(
-            timeline: nextTimeline,
-            entries: mergedEntries,
+            timeline: update.timeline,
+            entries: update.entries,
           );
       _scheduleProjectSave(immediate: true, changeType: 'subtitles_generated');
 
@@ -3804,7 +4056,7 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
       if (mounted) {
         SnackBarHelper.showSuccess(
           context,
-          'Generated ${shiftedEntries.length} captions for ${targetClip.label}',
+          'Generated ${generatedEntries.length} captions for ${targetClip.label}',
         );
       }
     } catch (e) {
@@ -3818,20 +4070,6 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     } finally {
       pipeline.dispose();
     }
-  }
-
-  EditorTimeline _timelineWithGeneratedSubtitles({
-    required EditorTimeline timeline,
-    required TimelineClip targetClip,
-    required TimelineTrack subtitleTrack,
-    required List<SubtitleEntry> generatedEntries,
-  }) {
-    return replaceGeneratedCaptionsForSource(
-      timeline: timeline,
-      sourceClip: targetClip,
-      destinationTrack: subtitleTrack,
-      generatedEntries: generatedEntries,
-    );
   }
 
   void _scheduleProjectSave({
@@ -4092,166 +4330,23 @@ class _EditorScreenState extends ConsumerState<EditorScreen>
     bool recordHistory = true,
   }) {
     final editorState = ref.read(editorProvider);
-    final timeline = editorState.timeline;
-    final liveTarget = _clipById(target.id, editorState) ?? target;
-    final track = _trackForClip(liveTarget, editorState);
-    if (track == null || track.isLocked) {
-      SnackBarHelper.showInfo(context, 'Unlock the track to change speed.');
-      return;
-    }
-    final safeRate = playbackRate.clamp(0.25, 4).toDouble();
-    final sourceDurationMs = liveTarget.sourceDuration.inMilliseconds > 0
-        ? liveTarget.sourceDuration.inMilliseconds
-        : liveTarget.duration.inMilliseconds;
-    final nextDuration = Duration(
-      milliseconds: math.max(100, (sourceDurationMs / safeRate).round()),
-    );
-    final nextEnd = liveTarget.startTime + nextDuration;
-    final rippleDelta = nextDuration - liveTarget.duration;
-    final isBase = track.section == TimelineTrackSection.baseVideo;
-    final oldEnd = liveTarget.endTime;
-    final oldDurationMs = math.max(1, liveTarget.duration.inMilliseconds);
-    final updatedTarget = liveTarget.copyWith(
-      playbackRate: safeRate,
-      endTime: nextEnd,
-      keyframes: TimelineKeyframeEditing.retime(liveTarget, nextDuration),
-      effectStack: liveTarget.effectStack.retimed(
-        liveTarget.duration,
-        nextDuration,
-      ),
-    );
-
-    final retimedTracks = timeline.tracks.map((timelineTrack) {
-      final clips = timelineTrack.clips.map((clip) {
-        if (clip.id == liveTarget.id) {
-          return updatedTarget;
-        }
-
-        if (clip.type == TimelineTrackType.audio &&
-            clip.linkedClipId == liveTarget.id) {
-          return isExactSeparatedAudioTransportMirror(
-                video: liveTarget,
-                audio: clip,
-              )
-              ? syncSeparatedAudioTransport(
-                  audio: clip.copyWith(
-                    keyframes: TimelineKeyframeEditing.retime(
-                      clip,
-                      nextDuration,
-                    ),
-                    effectStack: clip.effectStack.retimed(
-                      clip.duration,
-                      nextDuration,
-                    ),
-                  ),
-                  updatedVideo: updatedTarget,
-                )
-              : clip;
-        }
-
-        final isSubtitleClip =
-            timelineTrack.type == TimelineTrackType.subtitle ||
-            clip.type == TimelineTrackType.subtitle;
-        final intersectsChangedClip =
-            clip.startTime < oldEnd && clip.endTime > liveTarget.startTime;
-        final belongsToChangedClip =
-            (isSubtitleClip && clip.linkedClipId == liveTarget.id) ||
-            (isBase &&
-                isSubtitleClip &&
-                clip.linkedClipId == null &&
-                intersectsChangedClip);
-        if (belongsToChangedClip) {
-          final relativeStartMs = (clip.startTime - liveTarget.startTime)
-              .inMilliseconds
-              .clamp(0, oldDurationMs)
-              .toInt();
-          final relativeEndMs = (clip.endTime - liveTarget.startTime)
-              .inMilliseconds
-              .clamp(relativeStartMs + 1, oldDurationMs)
-              .toInt();
-          final startRatio = relativeStartMs / oldDurationMs;
-          final endRatio = relativeEndMs / oldDurationMs;
-          final nextStart =
-              liveTarget.startTime +
-              Duration(
-                milliseconds: (nextDuration.inMilliseconds * startRatio)
-                    .round(),
-              );
-          final scaledEnd =
-              liveTarget.startTime +
-              Duration(
-                milliseconds: (nextDuration.inMilliseconds * endRatio).round(),
-              );
-          return clip.copyWith(
-            linkedClipId: liveTarget.id,
-            startTime: nextStart,
-            endTime: scaledEnd > nextStart + const Duration(milliseconds: 80)
-                ? scaledEnd
-                : nextStart + const Duration(milliseconds: 80),
-          );
-        }
-        if (isBase && clip.startTime >= oldEnd) {
-          return clip.copyWith(
-            startTime: clip.startTime + rippleDelta,
-            endTime: clip.endTime + rippleDelta,
-          );
-        }
-        return clip;
-      }).toList()..sort((a, b) => a.startTime.compareTo(b.startTime));
-      return timelineTrack.copyWith(clips: clips);
-    }).toList();
-    final nextTracks = retimedTracks
-        .map(
-          (timelineTrack) =>
-              timelineTrack.type == TimelineTrackType.subtitle &&
-                  !timelineTrack.isLocked
-              ? timelineTrack.copyWith(
-                  clips: _removeSubtitleTimingCollisions(timelineTrack.clips),
-                )
-              : timelineTrack,
-        )
-        .toList();
-    final markers = timeline.markers.map((marker) {
-      if (isBase && marker.position >= oldEnd) {
-        return marker.copyWith(position: marker.position + rippleDelta);
-      }
-      return marker;
-    }).toList();
-    final nextTimeline = timeline
-        .copyWith(tracks: nextTracks, markers: markers)
-        .prunedRelationships();
-    if (nextTimeline.hasTrackOverlaps) {
+    try {
+      final nextTimeline = buildClipPlaybackRateUpdate(
+        timeline: editorState.timeline,
+        clipId: target.id,
+        playbackRate: playbackRate,
+      );
+      ref
+          .read(editorProvider.notifier)
+          .setTimeline(nextTimeline, recordHistory: recordHistory);
+      ref
+          .read(subtitleProvider.notifier)
+          .syncFromTimeline(nextTimeline.subtitleEntries);
+    } on StateError catch (error) {
       if (mounted && recordHistory) {
-        SnackBarHelper.showInfo(
-          context,
-          'That speed would overlap another clip on this track.',
-        );
+        SnackBarHelper.showInfo(context, error.message.toString());
       }
-      return;
     }
-    ref
-        .read(editorProvider.notifier)
-        .setTimeline(nextTimeline, recordHistory: recordHistory);
-    ref
-        .read(subtitleProvider.notifier)
-        .syncFromTimeline(nextTimeline.subtitleEntries);
-  }
-
-  List<TimelineClip> _removeSubtitleTimingCollisions(List<TimelineClip> clips) {
-    final sorted = [...clips]
-      ..sort((a, b) => a.startTime.compareTo(b.startTime));
-    final result = <TimelineClip>[];
-    var nextAvailable = Duration.zero;
-    for (final clip in sorted) {
-      final start = clip.startTime < nextAvailable
-          ? nextAvailable
-          : clip.startTime;
-      final minimumEnd = start + const Duration(milliseconds: 80);
-      final end = clip.endTime < minimumEnd ? minimumEnd : clip.endTime;
-      result.add(clip.copyWith(startTime: start, endTime: end));
-      nextAvailable = end + const Duration(milliseconds: 20);
-    }
-    return result;
   }
 
   bool _isVisualClip(TimelineClip? clip) {

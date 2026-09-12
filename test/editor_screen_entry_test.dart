@@ -163,8 +163,19 @@ void main() {
     expect(find.text(project.name), findsOneWidget);
     expect(tester.takeException(), isNull);
 
-    await tester.pageBack();
+    // Start the filesystem-backed exit in the real async zone, and await its
+    // disk barrier explicitly. The frame loop below measures route completion,
+    // not an accidental 800 ms deadline for fsync on a busy CI runner.
+    await tester.runAsync(() async {
+      await tester.pageBack();
+      await ProjectLocalStorage.waitForPendingSavesForTesting();
+    });
     await _waitForEditorToClose(tester);
+    final saved = await tester.runAsync(
+      () => ProjectLocalStorage.loadProject(project.id),
+    );
+    expect(saved, isNotNull);
+    expect(saved!.projectSchemaVersion, Project.currentSchemaVersion);
 
     expect(find.byType(HomeScreen), findsOneWidget);
     expect(tester.takeException(), isNull);
