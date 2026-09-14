@@ -1,5 +1,6 @@
 """Local transport for yt-dlp. All website extraction belongs to yt-dlp."""
 import hmac
+from itertools import islice
 import json
 import os
 from pathlib import Path
@@ -24,7 +25,14 @@ def media_info(info):
             'filesize', 'filesize_approx', 'fps', 'abr', 'protocol')
     result = {k: info[k] for k in keys if k in info}
     if info.get('entries') is not None:
-        result['entries'] = [media_info(e) for e in list(info['entries'])[:24] if e]
+        # Extractors may expose a lazy playlist iterator. Slicing a materialized
+        # list would retain every carousel/playlist entry before the transport
+        # applies its small response bound.
+        result['entries'] = [
+            media_info(entry)
+            for entry in islice(info['entries'], 24)
+            if isinstance(entry, dict)
+        ]
     if info.get('formats'):
         result['formats'] = [media_info(f) for f in info['formats']]
     return result

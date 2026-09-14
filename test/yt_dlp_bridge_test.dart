@@ -96,6 +96,42 @@ void main() {
   );
 
   test(
+    'an invalid readiness marker does not launch a second interpreter',
+    () async {
+      String? runtime;
+      var launches = 0;
+      final program = Completer<String?>();
+      final bridge = YtDlpBridge(
+        temporaryDirectory: () async => root,
+        prepareRuntime: () async => root.path,
+        launchRuntime: (_, environment) {
+          launches++;
+          runtime = environment['CAPTIONCRAFT_MEDIA_RUNTIME'];
+          File(
+            p.join(runtime!, 'ready.json'),
+          ).writeAsStringSync('{"port":');
+          return program.future;
+        },
+        startupTimeout: const Duration(milliseconds: 20),
+      );
+      await expectLater(
+        bridge.inspect('https://www.youtube.com/watch?v=jNQXAC9IVRw'),
+        throwsA(isA<TimeoutException>()),
+      );
+
+      await File(
+        p.join(runtime!, 'ready.json'),
+      ).writeAsString(jsonEncode({'port': server.port}));
+      expect(
+        await bridge.inspect('https://www.youtube.com/watch?v=jNQXAC9IVRw'),
+        contains('id'),
+      );
+      expect(launches, 1);
+      program.complete(null);
+    },
+  );
+
+  test(
     'native startup errors surface without waiting for the deadline',
     () async {
       final bridge = YtDlpBridge(
@@ -110,6 +146,41 @@ void main() {
             .timeout(const Duration(seconds: 2)),
         throwsA(isA<StateError>()),
       );
+    },
+  );
+
+  test(
+    'a definite startup failure does not poison later requests',
+    () async {
+      var launches = 0;
+      var failFirstLaunch = true;
+      final bridge = YtDlpBridge(
+        temporaryDirectory: () async => root,
+        prepareRuntime: () async => root.path,
+        launchRuntime: (_, environment) {
+          launches++;
+          if (failFirstLaunch) {
+            failFirstLaunch = false;
+            return Future<String?>.error(StateError('temporary startup error'));
+          }
+          File(
+            p.join(environment['CAPTIONCRAFT_MEDIA_RUNTIME']!, 'ready.json'),
+          ).writeAsStringSync(jsonEncode({'port': server.port}));
+          return Future<String?>.value(null);
+        },
+        startupTimeout: const Duration(seconds: 1),
+      );
+
+      await expectLater(
+        bridge.inspect('https://www.youtube.com/watch?v=jNQXAC9IVRw'),
+        throwsA(isA<StateError>()),
+      );
+      final result = await bridge.inspect(
+        'https://www.youtube.com/watch?v=jNQXAC9IVRw',
+      );
+
+      expect(result, contains('id'));
+      expect(launches, 2);
     },
   );
 }

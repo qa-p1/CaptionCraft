@@ -142,21 +142,30 @@ class InstagramDownloadService implements InstagramMediaService {
           (f) => f['vcodec'] != 'none' && f['url'] is String,
         );
         // Instagram's progressive variants include the post's complete media.
-        // Adaptive DASH variants can separate audio from video.
+        // Adaptive DASH variants can separate audio from video. Do not fall
+        // back to one of those manifests: the download manager intentionally
+        // accepts direct media files only and cannot turn a manifest URL into
+        // a file without a separate segment downloader.
         final video =
             videos
                 .where(
                   (f) =>
                       !'${f['format_id']}'.startsWith('dash-') &&
-                      (f['protocol'] == null || f['protocol'] == 'https'),
+                      (f['protocol'] == null ||
+                          '${f['protocol']}'.toLowerCase() == 'https') &&
+                      _https(f['url']) != null,
                 )
-                .lastOrNull ??
-            videos.lastOrNull;
+                .lastOrNull;
         final candidate = video ?? entry;
+        if (video == null && !_isDirectProtocol(entry['protocol'])) continue;
         final source = _https(candidate['url']);
         if (source == null || !seen.add(source)) continue;
-        final ext = candidate['ext'] as String? ?? '';
-        final isImage = const {'jpg', 'jpeg', 'png', 'webp'}.contains(ext);
+        final ext = '${candidate['ext'] ?? ''}'.toLowerCase();
+        final mime = '${candidate['mime_type'] ?? candidate['mimeType'] ?? ''}'
+            .toLowerCase();
+        final isImage =
+            const {'jpg', 'jpeg', 'png', 'webp'}.contains(ext) ||
+            mime.startsWith('image/');
         if (parsed.isReel && isImage) continue;
         media.add(
           InstagramMediaOption(
@@ -164,7 +173,9 @@ class InstagramDownloadService implements InstagramMediaService {
             url: source,
             kind: isImage ? DiscoverMediaKind.image : DiscoverMediaKind.video,
             mimeType: isImage
-                ? 'image/${ext == 'jpg' ? 'jpeg' : ext}'
+                ? (mime.startsWith('image/')
+                      ? mime.split(';').first.trim()
+                      : 'image/${ext == 'jpg' ? 'jpeg' : ext}')
                 : 'video/mp4',
             thumbnailUrl: _https(entry['thumbnail'] ?? info['thumbnail']),
             httpHeaders: {
@@ -218,11 +229,23 @@ class InstagramDownloadService implements InstagramMediaService {
     if (value is! String) return null;
     final uri = Uri.tryParse(value);
     return uri != null &&
-            uri.scheme == 'https' &&
+            uri.scheme.toLowerCase() == 'https' &&
             uri.host.isNotEmpty &&
-            uri.userInfo.isEmpty
-        ? uri.toString()
+            uri.userInfo.isEmpty &&
+            !_isManifestPath(uri.path)
+        ? uri.removeFragment().toString()
         : null;
+  }
+
+  static bool _isManifestPath(String path) {
+    final normalized = path.toLowerCase();
+    return normalized.endsWith('.m3u8') || normalized.endsWith('.mpd');
+  }
+
+  static bool _isDirectProtocol(Object? value) {
+    if (value == null) return true;
+    final protocol = '$value'.toLowerCase();
+    return protocol == 'https';
   }
 
   @override

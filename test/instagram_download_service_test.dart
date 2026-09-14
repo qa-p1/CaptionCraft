@@ -39,6 +39,98 @@ void main() {
       },
     );
 
+    test('image MIME without an extension remains usable', () async {
+      final service = InstagramDownloadService(
+        extractor: (_) async => {
+          'url': 'https://media.example/image',
+          'mime_type': 'image/png',
+        },
+      );
+      addTearDown(service.dispose);
+      final info = await service.inspect(
+        'https://www.instagram.com/p/Caption123/',
+      );
+      expect(info.media.single.kind, DiscoverMediaKind.image);
+      expect(info.media.single.mimeType, 'image/png');
+    });
+
+    test('does not expose adaptive manifests as downloadable media', () async {
+      final service = InstagramDownloadService(
+        extractor: (_) async => {
+          'formats': [
+            {
+              'format_id': 'dash-123v',
+              'url': 'https://media.example/video.m3u8',
+              'ext': 'mp4',
+              'protocol': 'm3u8_native',
+              'vcodec': 'h264',
+              'acodec': 'none',
+            },
+          ],
+        },
+      );
+      addTearDown(service.dispose);
+
+      await expectLater(
+        service.inspect('https://www.instagram.com/reel/Caption123/'),
+        throwsA(
+          isA<InstagramDownloadException>().having(
+            (error) => error.kind,
+            'kind',
+            InstagramFailureKind.unavailable,
+          ),
+        ),
+      );
+    });
+
+    test('does not expose protocol-only adaptive manifests', () async {
+      final service = InstagramDownloadService(
+        extractor: (_) async => {
+          'formats': [
+            {
+              'format_id': 'video-123',
+              'url': 'https://media.example/video?token=secret',
+              'ext': 'mp4',
+              'protocol': 'm3u8_native',
+              'vcodec': 'h264',
+              'acodec': 'none',
+            },
+          ],
+        },
+      );
+      addTearDown(service.dispose);
+
+      await expectLater(
+        service.inspect('https://www.instagram.com/reel/Caption123/'),
+        throwsA(
+          isA<InstagramDownloadException>().having(
+            (error) => error.kind,
+            'kind',
+            InstagramFailureKind.unavailable,
+          ),
+        ),
+      );
+    });
+
+    test('accepts uppercase HTTPS CDN URLs and removes fragments', () async {
+      final service = InstagramDownloadService(
+        extractor: (_) async => {
+          'url': 'HTTPS://media.example/reel.mp4#fragment',
+          'ext': 'mp4',
+        },
+      );
+      addTearDown(service.dispose);
+
+      final info = await service.inspect(
+        'https://www.instagram.com/reel/Caption123/',
+      );
+
+      final mediaUri = Uri.parse(info.media.single.url);
+      expect(mediaUri.scheme.toLowerCase(), 'https');
+      expect(mediaUri.path, '/reel.mp4');
+      expect(mediaUri.hasFragment, isFalse);
+    });
+
     test('preserves extractor CDN headers through persisted media', () async {
       final service = InstagramDownloadService(
         extractor: (_) async => {

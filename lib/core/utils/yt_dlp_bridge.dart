@@ -41,6 +41,7 @@ class YtDlpBridge implements MediaExtractor {
   final Duration startupTimeout;
   final Duration inspectionTimeout;
   Object? _launchError;
+  int _launchGeneration = 0;
 
   static Future<String> _prepareBundledRuntime() async {
     final app = await extractAssetZip(
@@ -89,6 +90,21 @@ class YtDlpBridge implements MediaExtractor {
   final Set<String> _cancelledJobs = {};
 
   Future<int> _start() async {
+    // A failed interpreter must not poison the singleton forever.  Keep a
+    // timed out (but potentially still starting) runtime so a slow cold start
+    // can be observed again, while discarding a runtime that reported a
+    // definite startup failure before trying again.
+    if (_directory != null && _launchError != null) {
+      await _discardRuntime();
+    }
+    if (_directory != null) {
+      final failure = File(
+        p.join(_directory!.path, 'startup-error.json'),
+      );
+      if (await failure.exists()) {
+        await _discardRuntime();
+      }
+    }
     if (_directory == null) {
       final temporary = await _temporaryDirectory();
       final root = await Directory(
@@ -97,6 +113,7 @@ class YtDlpBridge implements MediaExtractor {
       final app = await _prepareRuntime();
       final directory = await root.createTemp('session_');
       _directory = directory;
+      final launchGeneration = ++_launchGeneration;
       // Android's future completes when Python exits, not when it starts.
       // Observe failures while waiting for readiness independently. Never
       // launch a second interpreter just because a cold start was slow.
@@ -108,7 +125,7 @@ class YtDlpBridge implements MediaExtractor {
           }),
         ).then<void>(
           (error) {
-            if (error != null) {
+            if (launchGeneration == _launchGeneration && error != null) {
               _launchError = StateError(
                 error.isEmpty
                     ? 'The media runtime exited before completing the request.'
@@ -117,7 +134,9 @@ class YtDlpBridge implements MediaExtractor {
             }
           },
           onError: (Object error, StackTrace stack) {
-            _launchError = error;
+            if (launchGeneration == _launchGeneration) {
+              _launchError = error;
+            }
           },
         ),
       );
@@ -128,23 +147,60 @@ class YtDlpBridge implements MediaExtractor {
     final deadline = DateTime.now().add(startupTimeout);
     while (DateTime.now().isBefore(deadline)) {
       if (_launchError != null) {
-        throw StateError('Media runtime failed: $_launchError');
+        final error = _launchError;
+        await _discardRuntime();
+        throw StateError('Media runtime failed: $error');
       }
       if (await failure.exists()) {
-        final error =
-            (jsonDecode(await failure.readAsString()) as Map)['error'];
+        String? error;
+        try {
+          final decoded = jsonDecode(await failure.readAsString());
+          if (decoded is Map && decoded['error'] != null) {
+            error = '${decoded['error']}';
+          }
+        } catch (_) {
+          // A truncated failure marker is still a definite startup failure.
+        }
+        await _discardRuntime();
         throw StateError('Media runtime failed: $error');
       }
       if (await ready.exists()) {
-        final port = (jsonDecode(await ready.readAsString()) as Map)['port'];
-        if (port is! int || port < 1 || port > 65535) {
-          throw StateError('The media runtime returned an invalid port.');
+        Object? port;
+        try {
+          final decoded = jsonDecode(await ready.readAsString());
+          if (decoded is Map) port = decoded['port'];
+        } catch (_) {
+          // The marker is replaced atomically. Keep a broken marker and the
+          // current session just as for a slow start: the interpreter may
+          // still be starting, and launching a second one could create two
+          // transports. The request will time out if it never becomes valid.
         }
-        return port;
+        if (port is! int || port < 1 || port > 65535) {
+          // Wait for the same interpreter to publish a valid marker. A
+          // definite native/startup error above is the only safe automatic
+          // restart signal.
+        } else {
+          return port;
+        }
       }
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }
     throw TimeoutException('The media downloader could not start.');
+  }
+
+  Future<void> _discardRuntime() async {
+    final directory = _directory;
+    _directory = null;
+    _launchError = null;
+    _launchGeneration++;
+    if (directory != null) {
+      try {
+        await directory.delete(recursive: true);
+      } catch (_) {
+        // The interpreter may still be unwinding. A later attempt uses a new
+        // session directory, so cleanup failure must not block recovery.
+      }
+    }
   }
 
   @override

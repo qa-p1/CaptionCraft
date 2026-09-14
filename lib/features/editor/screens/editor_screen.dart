@@ -978,10 +978,7 @@ EditorTimeline buildClipPlaybackRateUpdate({
             )
             ? syncSeparatedAudioTransport(
                 audio: clip.copyWith(
-                  keyframes: TimelineKeyframeEditing.retime(
-                    clip,
-                    nextDuration,
-                  ),
+                  keyframes: TimelineKeyframeEditing.retime(clip, nextDuration),
                   effectStack: clip.effectStack.retimed(
                     clip.duration,
                     nextDuration,
@@ -1019,8 +1016,7 @@ EditorTimeline buildClipPlaybackRateUpdate({
         final nextStart =
             liveTarget.startTime +
             Duration(
-              milliseconds: (nextDuration.inMilliseconds * startRatio)
-                  .round(),
+              milliseconds: (nextDuration.inMilliseconds * startRatio).round(),
             );
         final scaledEnd =
             liveTarget.startTime +
@@ -1077,6 +1073,7 @@ EditorTimeline buildClipPlaybackRateUpdate({
     if (position == null || !isBase || position < oldEnd) return position;
     return position + rippleDelta;
   }
+
   final workspace = timeline.workspaceSettings;
   final nextTimeline = timeline
       .copyWith(
@@ -1095,8 +1092,7 @@ EditorTimeline buildClipPlaybackRateUpdate({
 }
 
 List<TimelineClip> _removeSubtitleTimingCollisions(List<TimelineClip> clips) {
-  final sorted = [...clips]
-    ..sort((a, b) => a.startTime.compareTo(b.startTime));
+  final sorted = [...clips]..sort((a, b) => a.startTime.compareTo(b.startTime));
   final result = <TimelineClip>[];
   var nextAvailable = Duration.zero;
   for (final clip in sorted) {

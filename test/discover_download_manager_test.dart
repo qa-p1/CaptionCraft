@@ -305,6 +305,121 @@ void main() {
       },
     );
 
+    test(
+      'cleans a direct result when completion cannot be persisted',
+      () async {
+        final storage = await _temporaryDirectory();
+        final dio = _WritingDio(
+          const <int>[
+            0x89,
+            0x50,
+            0x4e,
+            0x47,
+            0x0d,
+            0x0a,
+            0x1a,
+            0x0a,
+            1,
+          ],
+          mimeType: 'image/png',
+        );
+        var failCompletedWrite = true;
+        final manager = DiscoverDownloadManager(
+          dio: dio,
+          youtubeService: _FakeYoutubeService(),
+          storageDirectory: storage,
+          idGenerator: () => 'persistence-race',
+          catalogWriter: (catalog, snapshot) async {
+            if (failCompletedWrite &&
+                snapshot.contains('"status":"completed"')) {
+              throw const FileSystemException('Disk full');
+            }
+            await catalog.writeAsString(snapshot, flush: true);
+          },
+        );
+        addTearDown(manager.dispose);
+        await manager.initialize();
+        final failed = manager.items
+            .expand((items) => items)
+            .firstWhere(
+              (item) => item.status == DiscoverDownloadStatus.failed,
+            );
+
+        await manager.enqueueDirect(
+          const DiscoverDownloadRequest(
+            url: 'https://cdn.example.test/result.png',
+            displayName: 'Persistence race',
+            kind: DiscoverMediaKind.image,
+            mimeType: 'image/png',
+          ),
+        );
+        final item = await failed.timeout(const Duration(seconds: 2));
+
+        // Terminal state is observable before the worker finishes cleanup.
+        // Cancelling an already-terminal job waits for that worker only.
+        await manager.cancel(item.id);
+        expect(item.canRetry, isTrue);
+        expect(item.localPath, isNull);
+        expect(
+          storage
+              .listSync()
+              .whereType<File>()
+              .where((file) => !file.path.endsWith('downloads.json')),
+          isEmpty,
+        );
+
+        failCompletedWrite = false;
+        await manager.delete(item.id);
+      },
+    );
+
+    test(
+      'preserves a pre-existing destination when a direct download fails',
+      () async {
+        final storage = await _temporaryDirectory();
+        final existingBytes = const <int>[
+          0x89,
+          0x50,
+          0x4e,
+          0x47,
+          0x0d,
+          0x0a,
+          0x1a,
+          0x0a,
+          9,
+        ];
+        final existing = File(
+          p.join(storage.path, 'preserve-id-Existing.png'),
+        );
+        await existing.writeAsBytes(existingBytes, flush: true);
+        final manager = DiscoverDownloadManager(
+          dio: _FailThenWritingDio(),
+          youtubeService: _FakeYoutubeService(),
+          storageDirectory: storage,
+          idGenerator: () => 'preserve-id',
+        );
+        addTearDown(manager.dispose);
+        await manager.initialize();
+        final failed = manager.items
+            .expand((items) => items)
+            .firstWhere(
+              (item) => item.status == DiscoverDownloadStatus.failed,
+            );
+
+        await manager.enqueueDirect(
+          const DiscoverDownloadRequest(
+            url: 'https://cdn.example.test/result.png',
+            displayName: 'Existing',
+            kind: DiscoverMediaKind.image,
+            mimeType: 'image/png',
+          ),
+        );
+        await failed.timeout(const Duration(seconds: 2));
+
+        expect(await existing.readAsBytes(), existingBytes);
+      },
+    );
+
     test('strips sensitive headers on a cross-host HTTPS redirect', () async {
       final storage = await _temporaryDirectory();
       final dio = _RedirectingDio(

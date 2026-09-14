@@ -25,6 +25,7 @@ import '../../../shared/widgets/captioncraft_brand.dart';
 import '../../../shared/widgets/snack_bar_helper.dart';
 import '../../auth/providers/auth_provider.dart';
 import '../../editor/models/timeline_models.dart';
+import '../../editor/services/media_pool_service.dart';
 import '../../editor/screens/editor_screen.dart';
 import '../../profile/screens/profile_screen.dart';
 
@@ -740,7 +741,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       timeline: EditorTimeline.fromJson(project.timeline.toJson()),
       globalStyle: project.globalStyle,
       isFavorite: false,
-      lastExportPath: project.lastExportPath,
+      // An export belongs to the original project. Reusing its path would
+      // make a fresh duplicate appear to have a completed export and could
+      // open or overwrite output from the other project.
+      lastExportPath: null,
       createdAt: now,
       lastModifiedAt: now,
     );
@@ -809,7 +813,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             ]
           : null,
     );
-    final pickedFile = picked?.files.single;
+    // Some picker implementations return an empty list when the dialog is
+    // cancelled. Treat that as a normal cancellation instead of throwing from
+    // Iterable.single before the relink error boundary is entered.
+    final pickedFile = picked?.files.firstOrNull;
     final selectedPath = pickedFile?.path;
     if (selectedPath == null) return null;
 
@@ -829,7 +836,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         '.png' || '.jpg' || '.jpeg' || '.webp' => TimelineTrackType.image,
         _ => throw StateError('That visual format is not supported.'),
       };
+      // Existing assets must be validated before relinking so the media-pool
+      // checks can keep their dimensions, source windows, shared references,
+      // and lock protections intact. New legacy clips only need a probe when
+      // their duration is required to place them on the timeline.
       final shouldProbe =
+          targetAsset != null ||
           replacementClipType == TimelineTrackType.video ||
           replacementClipType == TimelineTrackType.gif;
       final info = shouldProbe
@@ -856,40 +868,48 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           if (replacementDurationMs > 0) 'durationMs': replacementDurationMs,
         },
       );
+      if (targetAsset != null && targetAsset.type != replacementAssetType) {
+        throw StateError(
+          'Choose a replacement with the same media type to preserve this edit.',
+        );
+      }
 
       var nextTimeline = project.timeline;
       if (targetClip != null) {
-        final nextTracks = nextTimeline.tracks.map((track) {
-          return track.copyWith(
-            clips: track.clips.map((clip) {
-              if (clip.id != targetClip.id) return clip;
-              return clip.copyWith(
-                type: replacementClipType,
-                label: replacementAsset.label,
-                assetId: replacementAsset.id,
-                sourceStartTime: Duration.zero,
-                sourceDuration: replacementDurationMs > 0
-                    ? Duration(milliseconds: replacementDurationMs)
-                    : clip.sourceDuration,
-              );
-            }).toList(),
+        if (targetAsset != null) {
+          // A project can use one asset in many clips, and older projects can
+          // contain separate asset records for the same source path. Relink
+          // the shared source atomically so no stale reference is left behind
+          // and let the editor service validate locks, source bounds, and
+          // companion audio before changing anything.
+          nextTimeline = MediaPoolService.relink(
+            timeline: nextTimeline,
+            assetId: targetAsset.id,
+            sourcePath: nextPath,
+            mediaInfo: info,
           );
-        }).toList();
-        final referencedAssetIds = nextTracks
-            .expand((track) => track.clips)
-            .map((clip) => clip.assetId)
-            .whereType<String>()
-            .toSet();
-        nextTimeline = nextTimeline.copyWith(
-          tracks: nextTracks,
-          assets: [
-            for (final asset in nextTimeline.assets)
-              if (asset.id != targetAsset?.id ||
-                  referencedAssetIds.contains(asset.id))
-                asset,
-            replacementAsset,
-          ],
-        );
+        } else {
+          final nextTracks = nextTimeline.tracks.map((track) {
+            return track.copyWith(
+              clips: track.clips.map((clip) {
+                if (clip.id != targetClip.id) return clip;
+                return clip.copyWith(
+                  type: replacementClipType,
+                  label: replacementAsset.label,
+                  assetId: replacementAsset.id,
+                  sourceStartTime: Duration.zero,
+                  sourceDuration: replacementDurationMs > 0
+                      ? Duration(milliseconds: replacementDurationMs)
+                      : clip.sourceDuration,
+                );
+              }).toList(),
+            );
+          }).toList();
+          nextTimeline = nextTimeline.copyWith(
+            tracks: nextTracks,
+            assets: [...nextTimeline.assets, replacementAsset],
+          );
+        }
       } else {
         final clipDuration = replacementDurationMs > 0
             ? Duration(milliseconds: replacementDurationMs)

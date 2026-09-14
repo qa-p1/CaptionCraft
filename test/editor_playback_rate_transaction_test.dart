@@ -72,27 +72,38 @@ void main() {
     expect(() => change(original), throwsStateError);
   });
 
-  test('captions outside the old source window ripple without a range error', () {
-    final updated = change(timeline([captionTrack(caption(start: 5, end: 6))]));
-    final cue = updated.tracks.last.clips.single;
-    expect(cue.startTime, const Duration(seconds: 3));
-    expect(cue.endTime, const Duration(seconds: 4));
-    expect(cue.linkedClipId, video.id);
-    expect(updated.tracks.first.clips.single.endTime, const Duration(seconds: 2));
-  });
+  test(
+    'captions outside the old source window ripple without a range error',
+    () {
+      final updated = change(
+        timeline([captionTrack(caption(start: 5, end: 6))]),
+      );
+      final cue = updated.tracks.last.clips.single;
+      expect(cue.startTime, const Duration(seconds: 3));
+      expect(cue.endTime, const Duration(seconds: 4));
+      expect(cue.linkedClipId, video.id);
+      expect(
+        updated.tracks.first.clips.single.endTime,
+        const Duration(seconds: 2),
+      );
+    },
+  );
 
-  test('speed ripple keeps downstream markers and export work area aligned', () {
-    final updated = change(timeline([]));
-    expect(updated.markers.single.position, const Duration(seconds: 4));
-    expect(updated.workspaceSettings.workAreaStart, const Duration(seconds: 2));
-    expect(updated.workspaceSettings.workAreaEnd, const Duration(seconds: 6));
-  });
+  test(
+    'speed ripple keeps downstream markers and export work area aligned',
+    () {
+      final updated = change(timeline([]));
+      expect(updated.markers.single.position, const Duration(seconds: 4));
+      expect(
+        updated.workspaceSettings.workAreaStart,
+        const Duration(seconds: 2),
+      );
+      expect(updated.workspaceSettings.workAreaEnd, const Duration(seconds: 6));
+    },
+  );
 
   test('a stale speed action cannot edit a removed clip', () {
-    expect(
-      () => change(timeline([]).copyWith(tracks: [])),
-      throwsStateError,
-    );
+    expect(() => change(timeline([]).copyWith(tracks: [])), throwsStateError);
   });
 
   test('non-finite playback rates are rejected', () {

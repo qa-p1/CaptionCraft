@@ -33,8 +33,9 @@ class PlaybackState {
   });
 
   double get progressPercent {
-    if (duration.inMilliseconds == 0) return 0;
-    return position.inMilliseconds / duration.inMilliseconds;
+    final durationUs = duration.inMicroseconds;
+    if (durationUs <= 0) return 0;
+    return (position.inMicroseconds / durationUs).clamp(0.0, 1.0).toDouble();
   }
 
   PlaybackState copyWith({
@@ -70,13 +71,40 @@ class PlaybackNotifier extends StateNotifier<PlaybackState> {
   PlaybackNotifier() : super(const PlaybackState());
 
   void updatePosition(Duration position) {
-    if (state.position == position) return;
-    state = state.copyWith(position: position);
+    final durationUs = state.duration.inMicroseconds;
+    final safePosition = durationUs <= 0
+        ? (position.isNegative ? Duration.zero : position)
+        : Duration(
+            microseconds: position.inMicroseconds
+                .clamp(0, durationUs)
+                .toInt(),
+          );
+    if (state.position == safePosition) return;
+    state = state.copyWith(position: safePosition);
   }
 
   void updateDuration(Duration duration) {
-    if (state.duration == duration) return;
-    state = state.copyWith(duration: duration);
+    final safeDuration = duration.isNegative ? Duration.zero : duration;
+    final durationUs = safeDuration.inMicroseconds;
+    final safePosition = Duration(
+      microseconds: state.position.inMicroseconds.clamp(0, durationUs).toInt(),
+    );
+    final pending = state.pendingSeekPosition;
+    final safePending = pending == null
+        ? null
+        : Duration(
+            microseconds: pending.inMicroseconds.clamp(0, durationUs).toInt(),
+          );
+    if (state.duration == safeDuration &&
+        state.position == safePosition &&
+        state.pendingSeekPosition == safePending) {
+      return;
+    }
+    state = state.copyWith(
+      duration: safeDuration,
+      position: safePosition,
+      pendingSeekPosition: safePending,
+    );
   }
 
   void setPlaying(bool isPlaying) {
@@ -90,9 +118,11 @@ class PlaybackNotifier extends StateNotifier<PlaybackState> {
   }
 
   void requestSeek(Duration position) {
-    final maxMs = state.duration.inMilliseconds;
-    final clampedMs = position.inMilliseconds.clamp(0, maxMs).toInt();
-    final target = Duration(milliseconds: clampedMs);
+    final durationUs = state.duration.inMicroseconds;
+    final maxUs = durationUs < 0 ? 0 : durationUs;
+    final target = Duration(
+      microseconds: position.inMicroseconds.clamp(0, maxUs).toInt(),
+    );
     final nextRequestId = (state.seekRequestId ?? 0) + 1;
 
     state = state.copyWith(

@@ -90,6 +90,21 @@ class TransportTests(unittest.TestCase):
         self.assertIn('Unsupported media URL', self.request(url='https://example.com')[0]['error'])
         self.assertIn('Invalid job', self.request(operation='download', job='../escape', format='140', maxBytes=100)[0]['error'])
 
+    def test_media_info_bounds_lazy_entries_before_materializing_them(self):
+        consumed = 0
+
+        def entries():
+            nonlocal consumed
+            for index in range(24):
+                consumed += 1
+                yield {'id': str(index)}
+            raise AssertionError('media_info consumed beyond its response bound')
+
+        result = self.runtime.media_info({'entries': entries()})
+
+        self.assertEqual(len(result['entries']), 24)
+        self.assertEqual(consumed, 24)
+
 class EmbeddedStartupTests(unittest.TestCase):
     def test_android_module_launch_with_bundled_dependencies(self):
         root = Path(__file__).resolve().parents[1]

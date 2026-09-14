@@ -1642,6 +1642,7 @@ class TimelineExportService {
             timeline: timeline,
             inputs: inputs,
             soloTrackIds: soloTrackIds,
+            soloBusIds: soloBusIds,
           ),
           if ((mix.pan + input.track.audioPan).abs() > 0.001)
             _panFilter(
@@ -2307,6 +2308,7 @@ class TimelineExportService {
     required EditorTimeline timeline,
     required List<TimelineRenderInput> inputs,
     required Set<String> soloTrackIds,
+    required Set<String> soloBusIds,
   }) {
     final hasVolumeKeyframes = _hasKeyframes(
       clip,
@@ -2326,6 +2328,7 @@ class TimelineExportService {
             timeline: timeline,
             inputs: inputs,
             soloTrackIds: soloTrackIds,
+            soloBusIds: soloBusIds,
           )
         : null;
     if (duckingFactor != null) {
@@ -2341,6 +2344,29 @@ class TimelineExportService {
       return 'volume=${_number(clip.audioMix.volume.clamp(0, 2))}';
     }
     return "volume='$expression':eval=frame";
+  }
+
+  @visibleForTesting
+  static String? buildDuckingVolumeExpressionForTesting({
+    required TimelineClip clip,
+    required EditorTimeline timeline,
+    required List<TimelineRenderInput> inputs,
+  }) {
+    final soloTrackIds = inputs
+        .where((input) => input.track.isSolo)
+        .map((input) => input.track.id)
+        .toSet();
+    final soloBusIds = timeline.audioBuses
+        .where((bus) => bus.solo)
+        .map((bus) => bus.id)
+        .toSet();
+    return _duckingVolumeExpression(
+      clip,
+      timeline: timeline,
+      inputs: inputs,
+      soloTrackIds: soloTrackIds,
+      soloBusIds: soloBusIds,
+    );
   }
 
   @visibleForTesting
@@ -2472,6 +2498,7 @@ class TimelineExportService {
     required EditorTimeline timeline,
     required List<TimelineRenderInput> inputs,
     required Set<String> soloTrackIds,
+    required Set<String> soloBusIds,
   }) {
     final intervals = <(int, int)>[];
     final clipStartMs = clip.startTime.inMilliseconds;
@@ -2504,13 +2531,25 @@ class TimelineExportService {
       }
     }
 
+    final separatedVideoIds = _separatedVideoAudioOwnerIds(timeline);
     for (final input in inputs) {
+      final bus = input.track.audioBusId == null
+          ? null
+          : timeline.audioBuses
+                .where((candidate) => candidate.id == input.track.audioBusId)
+                .firstOrNull;
       if (input.clip.id == clip.id ||
           (clip.duckSidechainTrackIds.isNotEmpty &&
               !clip.duckSidechainTrackIds.contains(input.track.id)) ||
           !input.hasAudio ||
           input.track.isMuted ||
+          bus?.muted == true ||
+          (soloBusIds.isNotEmpty &&
+              (bus == null || !soloBusIds.contains(bus.id))) ||
           input.clip.audioMix.muted ||
+          (input.clip.type == TimelineTrackType.video &&
+              (input.clip.embeddedAudioSeparated ||
+                  separatedVideoIds.contains(input.clip.id))) ||
           (soloTrackIds.isNotEmpty && !soloTrackIds.contains(input.track.id))) {
         continue;
       }

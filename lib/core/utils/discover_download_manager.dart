@@ -378,6 +378,8 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
     final part = File('${destination.path}.part');
     final control = _DirectJobControl(CancelToken());
     _directJobs[id] = control;
+    var destinationOwned = false;
+    var published = false;
     try {
       await _deleteIfExists(part);
       _throwIfDirectCancelled(control, id);
@@ -422,7 +424,10 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
         fallback: request.kind,
       );
       _throwIfDirectCancelled(control, id);
-      await _deleteIfExists(destination);
+      if (await destination.exists()) {
+        throw StateError('A file already exists for this download.');
+      }
+      destinationOwned = true;
       _throwIfDirectCancelled(control, id);
       await part.rename(destination.path);
       final current = _itemById(id);
@@ -447,31 +452,21 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
           clearErrorMessage: true,
         ),
       );
+      published = true;
     } catch (error) {
-      final current = _itemById(id);
-      if (current != null) {
-        final wasCancelled =
-            control.userCancelled ||
-            current.status == DiscoverDownloadStatus.cancelled;
-        await _replaceAndPersist(
-          current.copyWith(
-            status: wasCancelled
-                ? DiscoverDownloadStatus.cancelled
-                : DiscoverDownloadStatus.failed,
-            errorMessage: wasCancelled
-                ? null
-                : control.exceededLimit
-                ? 'The download exceeded the ${_sizeLabel(maxDirectBytes)} limit.'
-                : _friendlyDownloadError(item.source, error),
-            updatedAt: _clock().toUtc(),
-            clearLocalPath: true,
-          ),
-        );
-      }
+      final message = control.exceededLimit
+          ? 'The download exceeded the ${_sizeLabel(maxDirectBytes)} limit.'
+          : _friendlyDownloadError(item.source, error);
+      await _recordWorkerFailure(
+        id,
+        message,
+        cancelled: control.userCancelled,
+      );
     } finally {
       _directJobs.remove(id);
       _lastProgressEmitMicros.remove(id);
       await _deleteIfExists(part);
+      if (!published && destinationOwned) await _deleteIfExists(destination);
     }
   }
 
@@ -590,6 +585,8 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
       return;
     }
     final destination = File(p.join(_requireStorage().path, item.fileName));
+    var destinationOwned = false;
+    var published = false;
     try {
       await _replaceAndPersist(
         item.copyWith(
@@ -606,6 +603,10 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
           beforeStart.status == DiscoverDownloadStatus.cancelled) {
         return;
       }
+      if (await destination.exists()) {
+        throw StateError('A file already exists for this download.');
+      }
+      destinationOwned = true;
       final result = await _youtubeService.download(
         jobId: id,
         info: info,
@@ -647,28 +648,16 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
           clearErrorMessage: true,
         ),
       );
+      published = true;
     } catch (error) {
-      final current = _itemById(id);
-      if (current != null) {
-        final wasCancelled =
-            error is YoutubeDownloadCancelledException ||
-            current.status == DiscoverDownloadStatus.cancelled;
-        await _replaceAndPersist(
-          current.copyWith(
-            status: wasCancelled
-                ? DiscoverDownloadStatus.cancelled
-                : DiscoverDownloadStatus.failed,
-            errorMessage: wasCancelled ? null : _friendlyError(error),
-            updatedAt: _clock().toUtc(),
-            clearLocalPath: true,
-          ),
-        );
-      }
-      if (_itemById(id)?.status != DiscoverDownloadStatus.completed) {
-        await _deleteIfExists(destination);
-      }
+      await _recordWorkerFailure(
+        id,
+        _friendlyError(error),
+        cancelled: error is YoutubeDownloadCancelledException,
+      );
     } finally {
       _lastProgressEmitMicros.remove(id);
+      if (!published && destinationOwned) await _deleteIfExists(destination);
     }
   }
 
@@ -897,6 +886,36 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
         updatedAt: _clock().toUtc(),
       ),
     );
+  }
+
+  /// Workers must always translate failures into an observable terminal
+  /// state. A full disk or a transient catalog error can make the first
+  /// persistence attempt fail; that failure must not strand an item in
+  /// `downloading` or leave an unhandled asynchronous worker error. Keep the
+  /// in-memory failure even when the durable write is unavailable so a later
+  /// retry can repair the catalog.
+  Future<void> _recordWorkerFailure(
+    String id,
+    String message, {
+    required bool cancelled,
+  }) async {
+    final current = _itemById(id);
+    if (current == null) return;
+    final wasCancelled =
+        cancelled || current.status == DiscoverDownloadStatus.cancelled;
+    final failed = current.copyWith(
+      status: wasCancelled
+          ? DiscoverDownloadStatus.cancelled
+          : DiscoverDownloadStatus.failed,
+      errorMessage: wasCancelled ? null : message,
+      updatedAt: _clock().toUtc(),
+      clearLocalPath: true,
+    );
+    try {
+      await _replaceAndPersist(failed);
+    } catch (_) {
+      _replaceWithoutPersist(failed);
+    }
   }
 
   void _updateProgress(String id, int received, int? total) {

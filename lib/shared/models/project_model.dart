@@ -230,7 +230,18 @@ class Project {
     final globalStyle = _styleFromData(data['globalStyle']);
     final videoPath = data['videoPath'] as String? ?? '';
     final durationMs = (data['durationMs'] as num?)?.toInt() ?? 0;
-    final lastModifiedAt = _firestoreDate(data['lastModifiedAt']);
+    final now = DateTime.now();
+    final lastModifiedAt = _firestoreDate(
+      data['lastModifiedAt'],
+      fallback: now,
+    );
+    // A missing createdAt should never make a recovered project look newer
+    // than its last modification time. This matters when sorting a mixed
+    // legacy/current library after a partial cloud write.
+    final createdAt = _firestoreDate(
+      data['createdAt'],
+      fallback: lastModifiedAt,
+    );
 
     return Project(
       id: data['id'] as String? ?? '',
@@ -252,7 +263,7 @@ class Project {
       globalStyle: globalStyle,
       isFavorite: data['isFavorite'] as bool? ?? false,
       lastExportPath: data['lastExportPath'] as String?,
-      createdAt: _firestoreDate(data['createdAt']),
+      createdAt: createdAt,
       lastModifiedAt: lastModifiedAt,
       captionsModifiedAt: _firestoreDate(
         data['captionsModifiedAt'],
@@ -286,9 +297,12 @@ class Project {
     final globalStyle = _styleFromData(data['globalStyle']);
     final videoPath = data['videoPath'] as String? ?? '';
     final durationMs = (data['durationMs'] as num?)?.toInt() ?? 0;
+    final now = DateTime.now();
     final lastModifiedAt =
-        DateTime.tryParse(data['lastModifiedAt'] as String? ?? '') ??
-        DateTime.now();
+        DateTime.tryParse(data['lastModifiedAt'] as String? ?? '') ?? now;
+    final createdAt =
+        DateTime.tryParse(data['createdAt'] as String? ?? '') ??
+        lastModifiedAt;
 
     return Project(
       id: data['id'] as String,
@@ -310,9 +324,7 @@ class Project {
       globalStyle: globalStyle,
       isFavorite: data['isFavorite'] as bool? ?? false,
       lastExportPath: data['lastExportPath'] as String?,
-      createdAt:
-          DateTime.tryParse(data['createdAt'] as String? ?? '') ??
-          DateTime.now(),
+      createdAt: createdAt,
       lastModifiedAt: lastModifiedAt,
       captionsModifiedAt:
           DateTime.tryParse(data['captionsModifiedAt'] as String? ?? '') ??
@@ -469,7 +481,11 @@ class Project {
       return DateTime.tryParse(value) ?? fallback ?? DateTime.now();
     }
     if (value is num) {
-      return DateTime.fromMillisecondsSinceEpoch(value.toInt());
+      try {
+        return DateTime.fromMillisecondsSinceEpoch(value.toInt());
+      } catch (_) {
+        return fallback ?? DateTime.now();
+      }
     }
     return fallback ?? DateTime.now();
   }

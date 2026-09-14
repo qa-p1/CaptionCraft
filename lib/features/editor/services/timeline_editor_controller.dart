@@ -576,7 +576,7 @@ class TimelineEditorController extends ChangeNotifier {
   }
 
   bool get _canPaste {
-    if (_clipboard.subtitles.isNotEmpty) {
+    if (_clipboard.clips.isEmpty && _clipboard.subtitles.isNotEmpty) {
       return _editorState.timeline.insertionTrackFor(
             section: TimelineTrackSection.textSubtitle,
             clipType: TimelineTrackType.subtitle,
@@ -605,6 +605,9 @@ class TimelineEditorController extends ChangeNotifier {
     if (_clipboard.clips.isEmpty) return _clipboard.subtitles.isNotEmpty;
     final targets = _resolvePasteTracks();
     if (targets == null) return false;
+    final working = <String, TimelineTrack>{
+      for (final track in _editorState.timeline.tracks) track.id: track,
+    };
     for (final item in _clipboard.clips) {
       final target = targets[item.sourceTrackId];
       if (target == null) return false;
@@ -615,7 +618,13 @@ class TimelineEditorController extends ChangeNotifier {
         startTime: nextStart,
         endTime: nextStart + item.clip.duration,
       );
-      if (!target.canPlaceClip(candidate)) return false;
+      final current = working[target.id];
+      if (current == null || !current.canPlaceClip(candidate)) return false;
+      // Removed source lanes can share one fallback lane. Probe earlier
+      // candidates too, matching the sequential checks in the actual paste.
+      working[target.id] = current.copyWith(
+        clips: [...current.clips, candidate],
+      );
     }
     return true;
   }
