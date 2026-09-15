@@ -48,7 +48,9 @@ void main() {
       final ffprobeChannel = const MethodChannel(
         'flutter.arthenica.com/ffmpeg_kit',
       );
-      const eventChannel = MethodChannel('flutter.arthenica.com/ffmpeg_kit_event');
+      const eventChannel = MethodChannel(
+        'flutter.arthenica.com/ffmpeg_kit_event',
+      );
       tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
         eventChannel,
         (_) async => null,

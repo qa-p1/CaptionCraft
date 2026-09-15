@@ -635,7 +635,8 @@ void main() {
       expect(
         find.byType(EditorScreen),
         findsOneWidget,
-        reason: 'The route must remain mounted until its local write completes.',
+        reason:
+            'The route must remain mounted until its local write completes.',
       );
       await tester.sendKeyEvent(LogicalKeyboardKey.keyN);
       expect(
