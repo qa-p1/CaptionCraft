@@ -1,6 +1,9 @@
 import 'dart:io';
+import 'dart:async';
+import 'package:ffmpeg_kit_flutter_new/ffmpeg_session.dart';
+import 'package:ffmpeg_kit_flutter_new/media_information_session.dart';
+import 'media_job.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit_config.dart';
 import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:ffmpeg_kit_flutter_new/statistics.dart';
@@ -29,14 +32,52 @@ class AudioChunk {
 class FFmpegService {
   FFmpegService._();
 
+  /// Uses per-session progress and cancellation, including cancellation while
+  /// the platform is allocating the native session ID.
+  static Future<FFmpegSession> execute(
+    List<String> arguments, {
+    MediaJob? job,
+    void Function(Statistics statistics)? onStatistics,
+  }) async {
+    job?.checkCancelled();
+    final completion = Completer<FFmpegSession>();
+    var completed = false;
+    final session = await FFmpegKit.executeWithArgumentsAsync(
+      arguments,
+      (result) {
+        completed = true;
+        if (!completion.isCompleted) completion.complete(result);
+      },
+      null,
+      (statistics) {
+        if (!completed && job?.isCancelled != true) {
+          onStatistics?.call(statistics);
+        }
+      },
+    );
+    final id = session.getSessionId();
+    try {
+      if (id != null && job != null) {
+        await job.attach(id, () => FFmpegKit.cancel(id));
+      }
+      final result = await completion.future;
+      job?.checkCancelled();
+      return result;
+    } finally {
+      if (id != null) job?.detach(id);
+    }
+  }
+
   /// Extract and compress audio from video optimized for Whisper (16kHz mono).
   /// Returns the path to the extracted audio file.
   static Future<String> extractAudio(
     String videoPath, {
+    MediaJob? job,
     Duration? startTime,
     Duration? clipDuration,
     void Function(double progress)? onProgress,
   }) async {
+    job?.checkCancelled();
     final tempDir = await getTemporaryDirectory();
     final operationId = DateTime.now().microsecondsSinceEpoch;
     final flacPath = p.join(
@@ -44,93 +85,118 @@ class FFmpegService {
       'caption_craft_audio_$operationId.flac',
     );
 
-    // Get video duration for progress reporting
-    final durationMs =
-        clipDuration?.inMilliseconds.toDouble() ??
-        await _getMediaDurationMs(videoPath);
-
-    // Enable statistics callback for progress
-    if (onProgress != null && durationMs > 0) {
-      FFmpegKitConfig.enableStatisticsCallback((Statistics statistics) {
-        final time = statistics.getTime();
-        if (time > 0) {
-          onProgress((time / durationMs).clamp(0.0, 1.0));
-        }
-      });
-    }
-
-    // Try FLAC first (lossless, good compression for speech)
-    final session = await FFmpegKit.executeWithArguments([
-      '-y',
-      if (startTime != null) ...['-ss', _formatDurationForFfmpeg(startTime)],
-      '-i',
-      videoPath,
-      if (clipDuration != null) ...[
-        '-t',
-        _formatDurationForFfmpeg(clipDuration),
-      ],
-      '-vn',
-      '-ar',
-      '${GroqConstants.targetAudioSampleRate}',
-      '-ac',
-      '${GroqConstants.targetAudioChannels}',
-      '-c:a',
-      'flac',
-      flacPath,
-    ]);
-    final returnCode = await session.getReturnCode();
-
-    if (ReturnCode.isCancel(returnCode)) {
-      await _deleteFileBestEffort(flacPath);
-      throw Exception('Audio extraction cancelled.');
-    }
-
-    if (ReturnCode.isSuccess(returnCode) && await File(flacPath).exists()) {
-      // Check file size - if too large, fall back to MP3
-      final fileSize = await File(flacPath).length();
-      if (fileSize <= GroqConstants.maxChunkBytes) {
-        return flacPath;
-      }
-    }
-
-    // Fallback to MP3 (smaller but still fine for speech)
-    await _deleteFileBestEffort(flacPath);
     final mp3Path = p.join(
       tempDir.path,
       'caption_craft_audio_$operationId.mp3',
     );
-    final mp3Session = await FFmpegKit.executeWithArguments([
-      '-y',
-      if (startTime != null) ...['-ss', _formatDurationForFfmpeg(startTime)],
-      '-i',
-      videoPath,
-      if (clipDuration != null) ...[
-        '-t',
-        _formatDurationForFfmpeg(clipDuration),
-      ],
-      '-vn',
-      '-ar',
-      '${GroqConstants.targetAudioSampleRate}',
-      '-ac',
-      '${GroqConstants.targetAudioChannels}',
-      '-b:a',
-      '64k',
-      mp3Path,
-    ]);
-    final mp3ReturnCode = await mp3Session.getReturnCode();
+    try {
+      // Get video duration for progress reporting
+      final durationMs =
+          clipDuration?.inMilliseconds.toDouble() ??
+          await _getMediaDurationMs(videoPath, job: job);
 
-    if (ReturnCode.isCancel(mp3ReturnCode)) {
+      // Try FLAC first (lossless, good compression for speech)
+      final session = await execute(
+        [
+          '-y',
+          if (startTime != null) ...[
+            '-ss',
+            _formatDurationForFfmpeg(startTime),
+          ],
+          '-i',
+          videoPath,
+          if (clipDuration != null) ...[
+            '-t',
+            _formatDurationForFfmpeg(clipDuration),
+          ],
+          '-vn',
+          '-ar',
+          '${GroqConstants.targetAudioSampleRate}',
+          '-ac',
+          '${GroqConstants.targetAudioChannels}',
+          '-c:a',
+          'flac',
+          flacPath,
+        ],
+        job: job,
+        onStatistics: (statistics) {
+          if (durationMs > 0) {
+            onProgress?.call(
+              (statistics.getTime() / durationMs).clamp(0.0, 1.0),
+            );
+          }
+        },
+      );
+      final returnCode = await session.getReturnCode();
+
+      if (ReturnCode.isCancel(returnCode)) {
+        await _deleteFileBestEffort(flacPath);
+        throw Exception('Audio extraction cancelled.');
+      }
+
+      if (ReturnCode.isSuccess(returnCode) && await File(flacPath).exists()) {
+        // Check file size - if too large, fall back to MP3
+        final fileSize = await File(flacPath).length();
+        if (fileSize > 0 && fileSize <= GroqConstants.maxChunkBytes) {
+          return flacPath;
+        }
+      }
+
+      // Fallback to MP3 (smaller but still fine for speech)
+      await _deleteFileBestEffort(flacPath);
+      final mp3Session = await execute(
+        [
+          '-y',
+          if (startTime != null) ...[
+            '-ss',
+            _formatDurationForFfmpeg(startTime),
+          ],
+          '-i',
+          videoPath,
+          if (clipDuration != null) ...[
+            '-t',
+            _formatDurationForFfmpeg(clipDuration),
+          ],
+          '-vn',
+          '-ar',
+          '${GroqConstants.targetAudioSampleRate}',
+          '-ac',
+          '${GroqConstants.targetAudioChannels}',
+          '-b:a',
+          '64k',
+          mp3Path,
+        ],
+        job: job,
+        onStatistics: (statistics) {
+          if (durationMs > 0) {
+            onProgress?.call(
+              (statistics.getTime() / durationMs).clamp(0.0, 1.0),
+            );
+          }
+        },
+      );
+      final mp3ReturnCode = await mp3Session.getReturnCode();
+
+      if (ReturnCode.isCancel(mp3ReturnCode)) {
+        await _deleteFileBestEffort(mp3Path);
+        throw Exception('Audio extraction cancelled.');
+      }
+
+      if (!ReturnCode.isSuccess(mp3ReturnCode)) {
+        final logs = await mp3Session.getAllLogsAsString();
+        await _deleteFileBestEffort(mp3Path);
+        throw Exception('Audio extraction failed: $logs');
+      }
+
+      if (!await File(mp3Path).exists() || await File(mp3Path).length() == 0) {
+        throw StateError('Audio extraction produced an empty file.');
+      }
+      return mp3Path;
+    } catch (_) {
+      await _deleteFileBestEffort(flacPath);
       await _deleteFileBestEffort(mp3Path);
-      throw Exception('Audio extraction cancelled.');
+      rethrow;
     }
-
-    if (!ReturnCode.isSuccess(mp3ReturnCode)) {
-      final logs = await mp3Session.getAllLogsAsString();
-      await _deleteFileBestEffort(mp3Path);
-      throw Exception('Audio extraction failed: $logs');
-    }
-
-    return mp3Path;
   }
 
   static Future<void> _deleteFileBestEffort(String filePath) async {
@@ -142,14 +208,50 @@ class FFmpegService {
     }
   }
 
+  /// Half-open chunk ranges retain the complete final millisecond and overlap.
+  static List<({Duration start, Duration end})> audioChunkRanges(
+    Duration duration,
+  ) {
+    if (duration.inMilliseconds <= 0) {
+      throw ArgumentError.value(
+        duration,
+        'duration',
+        'Must be at least one millisecond.',
+      );
+    }
+    final totalMs = duration.inMilliseconds;
+    final chunkMs = GroqConstants.chunkDurationSeconds * 1000;
+    final overlapMs = GroqConstants.chunkOverlapSeconds * 1000;
+    final ranges = <({Duration start, Duration end})>[];
+    var startMs = 0;
+    while (startMs < totalMs) {
+      final endMs = (startMs + chunkMs).clamp(0, totalMs);
+      ranges.add((
+        start: Duration(milliseconds: startMs),
+        end: Duration(milliseconds: endMs),
+      ));
+      if (endMs == totalMs) break;
+      startMs = endMs - overlapMs > startMs ? endMs - overlapMs : endMs;
+    }
+    return ranges;
+  }
+
   /// Split audio into chunks for Groq's file size limit.
   static Future<List<AudioChunk>> chunkAudio(
     String audioPath,
-    Duration totalDuration,
-  ) async {
+    Duration totalDuration, {
+    MediaJob? job,
+  }) async {
+    job?.checkCancelled();
+    if (totalDuration <= Duration.zero) {
+      throw ArgumentError.value(
+        totalDuration,
+        'totalDuration',
+        'Must be positive.',
+      );
+    }
     final fileSize = await File(audioPath).length();
-
-    // If file is small enough, return as a single chunk
+    if (fileSize <= 0) throw StateError('The extracted audio is empty.');
     if (fileSize <= GroqConstants.maxChunkBytes) {
       return [
         AudioChunk(
@@ -160,95 +262,62 @@ class FFmpegService {
         ),
       ];
     }
-
-    // Calculate how many chunks we need
-    final totalSeconds = totalDuration.inSeconds;
-    final chunkDurationSec = GroqConstants.chunkDurationSeconds;
-    final overlapSec = GroqConstants.chunkOverlapSeconds;
-
+    final ranges = audioChunkRanges(totalDuration);
     final tempDir = await getTemporaryDirectory();
     final chunks = <AudioChunk>[];
+    final ownedPaths = <String>[];
     final operationId = DateTime.now().microsecondsSinceEpoch;
-    var startSec = 0;
-    var index = 0;
-
-    while (startSec < totalSeconds) {
-      final endSec = (startSec + chunkDurationSec).clamp(0, totalSeconds);
-      final durationSec = endSec - startSec;
-      if (durationSec <= 0) {
-        break;
-      }
-      final chunkPath = p.join(
-        tempDir.path,
-        'cc_chunk_${operationId}_$index.mp3',
-      );
-
-      final session = await FFmpegKit.executeWithArguments([
-        '-y',
-        '-ss',
-        '$startSec',
-        '-i',
-        audioPath,
-        '-t',
-        '$durationSec',
-        '-ar',
-        '${GroqConstants.targetAudioSampleRate}',
-        '-ac',
-        '${GroqConstants.targetAudioChannels}',
-        '-b:a',
-        '64k',
-        chunkPath,
-      ]);
-      final returnCode = await session.getReturnCode();
-
-      if (ReturnCode.isCancel(returnCode)) {
-        for (final createdChunk in [
-          ...chunks.map((chunk) => chunk.filePath),
+    try {
+      for (final range in ranges) {
+        job?.checkCancelled();
+        final chunkPath = p.join(
+          tempDir.path,
+          'cc_chunk_${operationId}_${chunks.length}.mp3',
+        );
+        ownedPaths.add(chunkPath);
+        final session = await execute([
+          '-y',
+          '-ss',
+          _formatDurationForFfmpeg(range.start),
+          '-i',
+          audioPath,
+          '-t',
+          _formatDurationForFfmpeg(range.end - range.start),
+          '-ar',
+          '${GroqConstants.targetAudioSampleRate}',
+          '-ac',
+          '${GroqConstants.targetAudioChannels}',
+          '-b:a',
+          '64k',
           chunkPath,
-        ]) {
-          await _deleteFileBestEffort(createdChunk);
+        ], job: job);
+        final code = await session.getReturnCode();
+        if (ReturnCode.isCancel(code)) throw const MediaJobCancelled();
+        if (!ReturnCode.isSuccess(code)) {
+          throw StateError(
+            'Audio chunking failed at chunk ${chunks.length}: ${await session.getAllLogsAsString()}',
+          );
         }
-        throw Exception('Audio chunking cancelled.');
-      }
-
-      if (!ReturnCode.isSuccess(returnCode)) {
-        final logs = await session.getAllLogsAsString();
-        for (final createdChunk in [
-          ...chunks.map((chunk) => chunk.filePath),
-          chunkPath,
-        ]) {
-          try {
-            final file = File(createdChunk);
-            if (await file.exists()) await file.delete();
-          } catch (_) {
-            // Preserve the chunking failure as the useful error.
-          }
+        if (!await File(chunkPath).exists() ||
+            await File(chunkPath).length() == 0) {
+          throw StateError('Audio chunking produced an empty file.');
         }
-        throw Exception('Audio chunking failed at chunk $index: $logs');
+        chunks.add(
+          AudioChunk(
+            index: chunks.length,
+            startTime: range.start,
+            endTime: range.end,
+            filePath: chunkPath,
+          ),
+        );
       }
-
-      chunks.add(
-        AudioChunk(
-          index: index,
-          startTime: Duration(seconds: startSec),
-          endTime: Duration(seconds: endSec.toInt()),
-          filePath: chunkPath,
-        ),
-      );
-
-      if (endSec >= totalSeconds) {
-        break;
+      return chunks;
+    } catch (_) {
+      for (final path in ownedPaths) {
+        await _deleteFileBestEffort(path);
       }
-      final nextStartSec = endSec.toInt() - overlapSec;
-      if (nextStartSec <= startSec) {
-        startSec = endSec.toInt();
-      } else {
-        startSec = nextStartSec;
-      }
-      index++;
+      rethrow;
     }
-
-    return chunks;
   }
 
   /// Generate a waveform PNG for timeline visualization.
@@ -327,15 +396,6 @@ class FFmpegService {
   }) async {
     final durationMs = await _getMediaDurationMs(videoPath);
 
-    if (onProgress != null && durationMs > 0) {
-      FFmpegKitConfig.enableStatisticsCallback((Statistics statistics) {
-        final time = statistics.getTime();
-        if (time > 0) {
-          onProgress((time / durationMs).clamp(0.0, 1.0));
-        }
-      });
-    }
-
     // Copy ASS file to a safe temp path with no spaces or special chars
     final tempDir = await getTemporaryDirectory();
     final safeAssPath = p.join(
@@ -383,22 +443,29 @@ class FFmpegService {
         ? '${scaleFilter}ass=$safeAssPath'
         : 'ass=$safeAssPath';
 
-    final session = await FFmpegKit.executeWithArguments([
-      '-i',
-      videoPath,
-      '-vf',
-      vfFilter,
-      '-c:v',
-      'libx264',
-      '-crf',
-      '23',
-      '-preset',
-      'fast',
-      '-c:a',
-      'copy',
-      outputPath,
-      '-y',
-    ]);
+    final session = await execute(
+      [
+        '-i',
+        videoPath,
+        '-vf',
+        vfFilter,
+        '-c:v',
+        'libx264',
+        '-crf',
+        '23',
+        '-preset',
+        'fast',
+        '-c:a',
+        'copy',
+        outputPath,
+        '-y',
+      ],
+      onStatistics: (statistics) {
+        if (durationMs > 0) {
+          onProgress?.call((statistics.getTime() / durationMs).clamp(0.0, 1.0));
+        }
+      },
+    );
     final returnCode = await session.getReturnCode();
 
     if (!ReturnCode.isSuccess(returnCode)) {
@@ -431,8 +498,13 @@ class FFmpegService {
   }
 
   /// Get media information (duration, resolution, has audio).
-  static Future<Map<String, dynamic>> getMediaInfo(String videoPath) async {
-    final session = await FFprobeKit.getMediaInformation(videoPath);
+  static Future<Map<String, dynamic>> getMediaInfo(
+    String videoPath, {
+    MediaJob? job,
+  }) async {
+    final session = job == null
+        ? await FFprobeKit.getMediaInformation(videoPath)
+        : await _probeWithJob(videoPath, job);
     final info = session.getMediaInformation();
 
     if (info == null) {
@@ -517,6 +589,33 @@ class FFmpegService {
     };
   }
 
+  static Future<MediaInformationSession> _probeWithJob(
+    String source,
+    MediaJob job,
+  ) async {
+    job.checkCancelled();
+    final completion = Completer<MediaInformationSession>();
+    final session = await FFprobeKit.getMediaInformationAsync(source, (result) {
+      if (!completion.isCompleted) completion.complete(result);
+    });
+    final id = session.getSessionId();
+    try {
+      if (id != null) await job.attach(id, () => FFmpegKit.cancel(id));
+      final result = await completion.future.timeout(
+        const Duration(seconds: 30),
+      );
+      job.checkCancelled();
+      return result;
+    } on TimeoutException {
+      if (id != null) await FFmpegKit.cancel(id);
+      throw TimeoutException(
+        'Reading this media took too long. Try a local, supported file.',
+      );
+    } finally {
+      if (id != null) job.detach(id);
+    }
+  }
+
   static int _pixelFormatBitDepth(String? pixelFormat) {
     final match = RegExp(
       r'p(\d{2})(?:le|be)?$',
@@ -538,48 +637,55 @@ class FFmpegService {
   }
 
   /// Generate a thumbnail from the video.
-  static Future<String> generateThumbnail(String videoPath) async {
+  static Future<String> generateThumbnail(
+    String videoPath, {
+    MediaJob? job,
+  }) async {
+    job?.checkCancelled();
     final tempDir = await getTemporaryDirectory();
     final outputPath = p.join(
       tempDir.path,
       'caption_craft_thumb_${DateTime.now().microsecondsSinceEpoch}.jpg',
     );
-
-    final session = await FFmpegKit.executeWithArguments([
-      '-y',
-      '-i',
-      videoPath,
-      '-vf',
-      'thumbnail,scale=320:180',
-      '-frames:v',
-      '1',
-      '-q:v',
-      '6',
-      outputPath,
-    ]);
-    final returnCode = await session.getReturnCode();
-
-    if (!ReturnCode.isSuccess(returnCode)) {
-      return ''; // Non-critical - return empty
+    var keepOutput = false;
+    try {
+      final session = await execute([
+        '-y',
+        '-i',
+        videoPath,
+        '-vf',
+        'thumbnail,scale=320:180',
+        '-frames:v',
+        '1',
+        '-q:v',
+        '6',
+        outputPath,
+      ], job: job);
+      if (!ReturnCode.isSuccess(await session.getReturnCode())) return '';
+      keepOutput =
+          await File(outputPath).exists() &&
+          await File(outputPath).length() > 0;
+      return keepOutput ? outputPath : '';
+    } finally {
+      if (!keepOutput) await _deleteFileBestEffort(outputPath);
     }
-
-    return outputPath;
   }
 
-  /// Cancel all running FFmpeg sessions.
+  /// Cancel all running FFmpeg sessions. Reserved for application shutdown.
   static Future<void> cancelAll() async {
     await FFmpegKit.cancel();
   }
 
-  /// Get media duration in milliseconds (helper).
-  static Future<double> _getMediaDurationMs(String videoPath) async {
+  static Future<double> _getMediaDurationMs(
+    String videoPath, {
+    MediaJob? job,
+  }) async {
     try {
-      final session = await FFprobeKit.getMediaInformation(videoPath);
-      final info = session.getMediaInformation();
-      if (info == null) return 0;
-      final durationStr = info.getDuration();
-      return (double.tryParse(durationStr ?? '0') ?? 0) * 1000;
-    } catch (e) {
+      final info = await getMediaInfo(videoPath, job: job);
+      return (info['durationMs'] as num).toDouble();
+    } on MediaJobCancelled {
+      rethrow;
+    } catch (_) {
       return 0;
     }
   }

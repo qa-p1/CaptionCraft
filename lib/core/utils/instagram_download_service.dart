@@ -35,7 +35,7 @@ abstract class InstagramMediaService {
 class InstagramDownloadService implements InstagramMediaService {
   InstagramDownloadService({
     Future<Map<String, dynamic>> Function(String)? extractor,
-    this.inspectionTimeout = const Duration(seconds: 45),
+    this.inspectionTimeout = const Duration(seconds: 125),
   }) : _extractor = extractor ?? YtDlpBridge.instance.inspect;
   final Future<Map<String, dynamic>> Function(String) _extractor;
   final Duration inspectionTimeout;
@@ -47,6 +47,13 @@ class InstagramDownloadService implements InstagramMediaService {
     'm.instagram.com',
   };
   static const browserUserAgent = 'Mozilla/5.0';
+  static const _headerNames = {
+    'user-agent': 'User-Agent',
+    'referer': 'Referer',
+    'origin': 'Origin',
+    'accept': 'Accept',
+    'accept-language': 'Accept-Language',
+  };
   static ({String shortcode, Uri canonicalUri, bool isReel})? parseUrl(
     String value,
   ) {
@@ -85,10 +92,17 @@ class InstagramDownloadService implements InstagramMediaService {
     );
   }
 
-  static Map<String, String> downloadHeaders(String canonicalUrl) => {
+  static Map<String, String> downloadHeaders(
+    String canonicalUrl, [
+    Map<String, String> extracted = const {},
+  ]) => {
     'User-Agent': browserUserAgent,
     'Referer': canonicalUrl,
     'Origin': 'https://www.instagram.com',
+    for (final entry in extracted.entries)
+      if (_headerNames.containsKey(entry.key.toLowerCase()) &&
+          !entry.value.contains(RegExp(r'[\r\n]')))
+        _headerNames[entry.key.toLowerCase()]!: entry.value,
   };
 
   @override
@@ -128,21 +142,29 @@ class InstagramDownloadService implements InstagramMediaService {
           (f) => f['vcodec'] != 'none' && f['url'] is String,
         );
         // Instagram's progressive variants include the post's complete media.
-        // Adaptive DASH variants can separate audio from video.
-        final video =
-            videos
-                .where(
-                  (f) =>
-                      !'${f['format_id']}'.startsWith('dash-') &&
-                      (f['protocol'] == null || f['protocol'] == 'https'),
-                )
-                .lastOrNull ??
-            videos.lastOrNull;
+        // Adaptive DASH variants can separate audio from video. Do not fall
+        // back to one of those manifests: the download manager intentionally
+        // accepts direct media files only and cannot turn a manifest URL into
+        // a file without a separate segment downloader.
+        final video = videos
+            .where(
+              (f) =>
+                  !'${f['format_id']}'.startsWith('dash-') &&
+                  (f['protocol'] == null ||
+                      '${f['protocol']}'.toLowerCase() == 'https') &&
+                  _https(f['url']) != null,
+            )
+            .lastOrNull;
         final candidate = video ?? entry;
+        if (video == null && !_isDirectProtocol(entry['protocol'])) continue;
         final source = _https(candidate['url']);
         if (source == null || !seen.add(source)) continue;
-        final ext = candidate['ext'] as String? ?? '';
-        final isImage = const {'jpg', 'jpeg', 'png', 'webp'}.contains(ext);
+        final ext = '${candidate['ext'] ?? ''}'.toLowerCase();
+        final mime = '${candidate['mime_type'] ?? candidate['mimeType'] ?? ''}'
+            .toLowerCase();
+        final isImage =
+            const {'jpg', 'jpeg', 'png', 'webp'}.contains(ext) ||
+            mime.startsWith('image/');
         if (parsed.isReel && isImage) continue;
         media.add(
           InstagramMediaOption(
@@ -150,9 +172,18 @@ class InstagramDownloadService implements InstagramMediaService {
             url: source,
             kind: isImage ? DiscoverMediaKind.image : DiscoverMediaKind.video,
             mimeType: isImage
-                ? 'image/${ext == 'jpg' ? 'jpeg' : ext}'
+                ? (mime.startsWith('image/')
+                      ? mime.split(';').first.trim()
+                      : 'image/${ext == 'jpg' ? 'jpeg' : ext}')
                 : 'video/mp4',
             thumbnailUrl: _https(entry['thumbnail'] ?? info['thumbnail']),
+            httpHeaders: {
+              for (final source in [info, entry, candidate])
+                if (source['http_headers'] is Map)
+                  for (final header in (source['http_headers'] as Map).entries)
+                    if (header.key is String && header.value is String)
+                      header.key as String: header.value as String,
+            },
           ),
         );
       }
@@ -197,11 +228,23 @@ class InstagramDownloadService implements InstagramMediaService {
     if (value is! String) return null;
     final uri = Uri.tryParse(value);
     return uri != null &&
-            uri.scheme == 'https' &&
+            uri.scheme.toLowerCase() == 'https' &&
             uri.host.isNotEmpty &&
-            uri.userInfo.isEmpty
-        ? uri.toString()
+            uri.userInfo.isEmpty &&
+            !_isManifestPath(uri.path)
+        ? uri.removeFragment().toString()
         : null;
+  }
+
+  static bool _isManifestPath(String path) {
+    final normalized = path.toLowerCase();
+    return normalized.endsWith('.m3u8') || normalized.endsWith('.mpd');
+  }
+
+  static bool _isDirectProtocol(Object? value) {
+    if (value == null) return true;
+    final protocol = '$value'.toLowerCase();
+    return protocol == 'https';
   }
 
   @override

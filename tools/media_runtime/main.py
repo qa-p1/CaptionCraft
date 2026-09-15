@@ -1,10 +1,12 @@
 """Local transport for yt-dlp. All website extraction belongs to yt-dlp."""
 import hmac
+from itertools import islice
 import json
 import os
 from pathlib import Path
 import socketserver
 import time
+import threading
 from urllib.parse import urlparse
 
 import certifi
@@ -14,15 +16,23 @@ os.environ['SSL_CERT_FILE'] = certifi.where()
 ROOT = Path(os.environ['CAPTIONCRAFT_MEDIA_RUNTIME'])
 TOKEN = os.environ['CAPTIONCRAFT_MEDIA_TOKEN']
 HOSTS = {'www.instagram.com', 'www.youtube.com', 'youtube.com', 'youtu.be'}
+HEARTBEAT_INTERVAL = 3.0
 
 
 def media_info(info):
     keys = ('id', 'title', 'uploader', 'thumbnail', 'url', 'ext', 'duration',
             'format_id', 'width', 'height', 'vcodec', 'acodec', 'http_headers',
-            'filesize', 'filesize_approx', 'fps', 'abr')
+            'filesize', 'filesize_approx', 'fps', 'abr', 'protocol')
     result = {k: info[k] for k in keys if k in info}
     if info.get('entries') is not None:
-        result['entries'] = [media_info(e) for e in list(info['entries'])[:24] if e]
+        # Extractors may expose a lazy playlist iterator. Slicing a materialized
+        # list would retain every carousel/playlist entry before the transport
+        # applies its small response bound.
+        result['entries'] = [
+            media_info(entry)
+            for entry in islice(info['entries'], 24)
+            if isinstance(entry, dict)
+        ]
     if info.get('formats'):
         result['formats'] = [media_info(f) for f in info['formats']]
     return result
@@ -30,11 +40,16 @@ def media_info(info):
 
 class Handler(socketserver.StreamRequestHandler):
     def send(self, value):
-        self.wfile.write((json.dumps(value) + '\n').encode())
-        self.wfile.flush()
+        with self.send_lock:
+            self.wfile.write((json.dumps(value) + '\n').encode())
+            self.wfile.flush()
 
     def handle(self):
         self.connection.settimeout(15)
+        self.send_lock = threading.Lock()
+        stopped = threading.Event()
+        heartbeat = None
+        cancel = None
         try:
             request = json.loads(self.rfile.readline(8192))
             if not hmac.compare_digest(str(request.get('token', '')), TOKEN):
@@ -43,16 +58,38 @@ class Handler(socketserver.StreamRequestHandler):
             parsed = urlparse(url)
             if parsed.scheme != 'https' or parsed.hostname not in HOSTS:
                 raise ValueError('Unsupported media URL')
+            # yt-dlp can make several requests before it has stream metadata.
+            # Keep the local transport alive during that work; the Dart side
+            # separately bounds the total operation time.
+            def keep_alive():
+                while not stopped.wait(HEARTBEAT_INTERVAL):
+                    try:
+                        self.send({'status': 'extracting'})
+                    except OSError:
+                        return
+
+            heartbeat = threading.Thread(target=keep_alive, daemon=True)
+            heartbeat.start()
             options = {
                 'quiet': True, 'no_warnings': True, 'socket_timeout': 10,
                 'retries': 1, 'extractor_retries': 1, 'fragment_retries': 1,
                 'noplaylist': True, 'playlistend': 24, 'cachedir': False,
                 'nocheckcertificate': False,
             }
+            job = request.get('job')
+            if job is not None:
+                job = str(job)
+                if not job.replace('-', '').isalnum():
+                    raise ValueError('Invalid job')
+                cancel = ROOT / (job + '.cancel')
+                if cancel.exists():
+                    raise ValueError('Download cancelled')
             operation = request.get('operation', 'inspect')
             if operation == 'inspect':
                 with yt_dlp.YoutubeDL(options) as client:
                     info = client.extract_info(url, download=False)
+                if cancel is not None and cancel.exists():
+                    raise ValueError('Inspection cancelled')
                 self.send({'result': media_info(info)})
                 return
             if operation != 'download':
@@ -106,6 +143,12 @@ class Handler(socketserver.StreamRequestHandler):
                 self.send({'error': str(error)[-700:]})
             except OSError:
                 pass
+        finally:
+            stopped.set()
+            if cancel is not None:
+                cancel.unlink(missing_ok=True)
+            if heartbeat is not None:
+                heartbeat.join(timeout=1)
 
 
 class Server(socketserver.ThreadingTCPServer):

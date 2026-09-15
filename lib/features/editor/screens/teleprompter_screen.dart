@@ -43,9 +43,20 @@ class _TeleprompterScreenState extends State<TeleprompterScreen>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _entries = List<SubtitleEntry>.from(widget.entries)
-      ..sort((a, b) => a.startTime.compareTo(b.startTime));
-    _endPosition = _entries.isEmpty ? Duration.zero : _entries.last.endTime;
+    _entries =
+        widget.entries
+            .where(
+              (entry) =>
+                  entry.text.trim().isNotEmpty &&
+                  entry.startTime >= Duration.zero &&
+                  entry.endTime > entry.startTime,
+            )
+            .toList()
+          ..sort((a, b) => a.startTime.compareTo(b.startTime));
+    _endPosition = _entries.fold(
+      Duration.zero,
+      (end, entry) => entry.endTime > end ? entry.endTime : end,
+    );
     _position = _entries.isEmpty ? Duration.zero : _entries.first.startTime;
   }
 
@@ -164,6 +175,7 @@ class _TeleprompterScreenState extends State<TeleprompterScreen>
       _position = _entries.first.startTime;
       _currentIndex = 0;
     });
+    if (!_scrollController.hasClients) return;
     _scrollController.animateTo(
       0,
       duration: const Duration(milliseconds: 300),

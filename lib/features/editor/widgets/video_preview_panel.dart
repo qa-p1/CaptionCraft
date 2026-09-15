@@ -961,7 +961,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
   final PreviewPerformanceMonitor _performanceMonitor =
       PreviewPerformanceMonitor(enabled: false);
   bool _showPerformanceDiagnostics = false;
-  double _desktopViewerZoom = 1.0;
   EditorTimeline? _cachedCaptionTimeline;
   List<SubtitleEntry>? _cachedCaptionEntries;
   List<SubtitleEntry> _effectiveCaptionCache = const [];
@@ -3371,13 +3370,6 @@ class _VideoPreviewPanelState extends ConsumerState<VideoPreviewPanel>
     // The notifier restores the exact gesture-start snapshot. This keeps a
     // cancelled drag from traversing unrelated editor history.
     ref.read(editorProvider.notifier).cancelTimelineGestureEdit();
-  }
-
-  void _setDesktopViewerZoom(double zoom) {
-    if (!widget.desktopMode) return;
-    final next = zoom.clamp(0.5, 2.5).toDouble();
-    if ((next - _desktopViewerZoom).abs() < 0.001) return;
-    setState(() => _desktopViewerZoom = next);
   }
 
   bool _hasSoloMediaTrack(EditorTimeline timeline) {
@@ -8362,8 +8354,6 @@ class _OverlayTransformBox extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return PreviewTransformControls(
-      key: key,
-      child: child,
       isSelected: isSelected,
       interactionEnabled: interactionEnabled,
       desktopMode: desktopMode,
@@ -8380,6 +8370,7 @@ class _OverlayTransformBox extends StatelessWidget {
       onGestureCancel: onGestureCancel,
       onScaleFactorUpdate: onScaleFactorUpdate,
       onRotationUpdate: onRotationUpdate,
+      child: child,
     );
   }
 }

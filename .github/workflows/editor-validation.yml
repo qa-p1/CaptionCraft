@@ -33,6 +33,7 @@ jobs:
           cache: true
 
       - name: Restore locked Dart packages
+        id: packages
         run: flutter pub get --enforce-lockfile
 
       - name: Install media validation tools
@@ -41,12 +42,20 @@ jobs:
           sudo apt-get install --yes ffmpeg
 
       - name: Verify Dart formatting
-        run: dart format --output=none --set-exit-if-changed lib test
+        run: |
+          dart format lib test
+          git diff --exit-code -- lib test
 
       - name: Analyze
+        if: ${{ !cancelled() && steps.packages.outcome == 'success' }}
         run: flutter analyze
 
+      - name: Test embedded media runtime
+        if: ${{ !cancelled() && steps.packages.outcome == 'success' }}
+        run: python -m unittest tools/test_media_runtime.py
+
       - name: Test
+        if: ${{ !cancelled() && steps.packages.outcome == 'success' }}
         run: flutter test
 
       - name: Upload golden failures

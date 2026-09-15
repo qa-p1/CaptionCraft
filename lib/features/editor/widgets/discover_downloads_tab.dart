@@ -18,6 +18,7 @@ class DiscoverDownloadsTab extends StatefulWidget {
   final List<DiscoverDownloadItem> downloads;
   final bool isInitialized;
   final String? errorMessage;
+  final Future<void> Function()? onInitialize;
   final DiscoverDownloadItemCallback onAddToTimeline;
   final DiscoverDownloadIdCallback onCancel;
   final DiscoverDownloadIdCallback onRetry;
@@ -34,6 +35,7 @@ class DiscoverDownloadsTab extends StatefulWidget {
     required this.onDelete,
     required this.onOpen,
     this.errorMessage,
+    this.onInitialize,
   });
 
   @override
@@ -108,6 +110,22 @@ class _DiscoverDownloadsTabState extends State<DiscoverDownloadsTab>
 
   Widget _buildBody() {
     if (!widget.isInitialized && widget.downloads.isEmpty) {
+      if (widget.errorMessage != null) {
+        return Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('Could not load your downloads.'),
+              const SizedBox(height: 12),
+              FilledButton.icon(
+                onPressed: widget.onInitialize,
+                icon: const Icon(Icons.refresh),
+                label: const Text('Retry'),
+              ),
+            ],
+          ),
+        );
+      }
       return const Center(
         key: ValueKey('discover-downloads-loading'),
         child: CircularProgressIndicator(strokeWidth: 2),

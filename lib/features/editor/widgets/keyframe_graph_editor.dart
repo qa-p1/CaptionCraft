@@ -77,17 +77,32 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
     super.initState();
     _property = widget.properties.contains(widget.initialProperty)
         ? widget.initialProperty
-        : widget.properties.first;
+        : widget.properties.firstOrNull ?? widget.initialProperty;
     _selectNearestToPlayhead();
   }
 
   @override
   void didUpdateWidget(covariant KeyframeGraphEditor oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (widget.properties.isEmpty) {
+      _selectedKeyframeId = null;
+      _selectedKeyframeIds = <String>{};
+      _dragKind = _GraphDragKind.none;
+      _dragStartFrames = const {};
+      _dragStartPosition = null;
+      _selectionRect = null;
+      _endEdit();
+      return;
+    }
     if (!widget.properties.contains(_property)) {
       _property = widget.properties.first;
       _selectedKeyframeId = null;
       _selectedKeyframeIds = <String>{};
+    }
+    _hiddenProperties.retainAll(widget.properties);
+    _lockedProperties.retainAll(widget.properties);
+    if (_soloProperty != null && !widget.properties.contains(_soloProperty)) {
+      _soloProperty = null;
     }
     final liveIds = _propertyFrames.map((frame) => frame.id).toSet();
     _selectedKeyframeIds = _selectedKeyframeIds.intersection(liveIds);
@@ -729,7 +744,10 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
         resolve: (timeText, valueText) {
           final timeMs = double.tryParse(timeText.trim());
           final value = double.tryParse(valueText.trim());
-          if (timeMs == null || value == null || !value.isFinite) {
+          if (timeMs == null ||
+              !timeMs.isFinite ||
+              value == null ||
+              !value.isFinite) {
             return (frame: null, error: 'Enter valid numbers.');
           }
           final time = _snapTime(
@@ -893,6 +911,15 @@ class _KeyframeGraphEditorState extends State<KeyframeGraphEditor> {
 
   @override
   Widget build(BuildContext context) {
+    if (widget.properties.isEmpty) {
+      return const Center(
+        child: Text(
+          'No animatable properties on this clip.',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: kTextSecondary),
+        ),
+      );
+    }
     final frames = _propertyFrames;
     final selected = _selectedFrame;
     return Column(

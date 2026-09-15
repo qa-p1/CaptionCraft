@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:serious_python/serious_python.dart';
@@ -23,8 +24,64 @@ abstract interface class MediaExtractor {
 }
 
 class YtDlpBridge implements MediaExtractor {
-  YtDlpBridge._();
-  static final instance = YtDlpBridge._();
+  YtDlpBridge({
+    Future<Directory> Function()? temporaryDirectory,
+    Future<String> Function()? prepareRuntime,
+    Future<String?> Function(String, Map<String, String>)? launchRuntime,
+    this.startupTimeout = const Duration(seconds: 30),
+    this.inspectionTimeout = const Duration(seconds: 90),
+  }) : _temporaryDirectory = temporaryDirectory ?? getTemporaryDirectory,
+       _prepareRuntime = prepareRuntime ?? _prepareBundledRuntime,
+       _launchRuntime = launchRuntime ?? _launchBundledRuntime;
+
+  static final instance = YtDlpBridge();
+  final Future<Directory> Function() _temporaryDirectory;
+  final Future<String> Function() _prepareRuntime;
+  final Future<String?> Function(String, Map<String, String>) _launchRuntime;
+  final Duration startupTimeout;
+  final Duration inspectionTimeout;
+  Object? _launchError;
+  int _launchGeneration = 0;
+
+  static Future<String> _prepareBundledRuntime() async {
+    final app = await extractAssetZip(
+      'assets/media_runtime.zip',
+      targetPath: 'captioncraft_media_runtime',
+      checkHash: true,
+    );
+    // Ship the small transport source directly so an app update cannot keep
+    // running the old entrypoint from the cached dependency archive.
+    await File(
+      p.join(app, 'main.py'),
+    ).writeAsString(await rootBundle.loadString('tools/media_runtime/main.py'));
+    return app;
+  }
+
+  static Future<String?> _launchBundledRuntime(
+    String app,
+    Map<String, String> environment,
+  ) async {
+    final result = await SeriousPython.runProgram(
+      p.join(app, 'main.py'),
+      // Android imports modules instead of executing __main__. Its launch
+      // future completes only when Python exits; desktop platforms return
+      // a launch acknowledgement (Windows returns the app path).
+      script:
+          'import os, json\n'
+          'os.environ.update(${jsonEncode(environment)})\n'
+          'try:\n'
+          '    import main\n'
+          '    main.serve()\n'
+          'except Exception as error:\n'
+          "    with open(os.path.join(os.environ['CAPTIONCRAFT_MEDIA_RUNTIME'], 'startup-error.json'), 'w') as failure:\n"
+          "        json.dump({'error': str(error)}, failure)\n",
+      modulePaths: [p.join(app, '__pypackages__')],
+      environmentVariables: environment,
+      sync: false,
+    );
+    return Platform.isAndroid ? (result ?? '') : null;
+  }
+
   final _token = const Uuid().v4();
   Future<int>? _startup;
   Directory? _directory;
@@ -33,31 +90,115 @@ class YtDlpBridge implements MediaExtractor {
   final Set<String> _cancelledJobs = {};
 
   Future<int> _start() async {
-    final temporary = await getTemporaryDirectory();
-    final root = await Directory(
-      p.join(temporary.path, 'media_runtime'),
-    ).create(recursive: true);
-    final directory = await root.createTemp('session_');
-    _directory = directory;
-    final app = await extractAssetZip('assets/media_runtime.zip');
-    await SeriousPython.runProgram(
-      p.join(app, 'main.py'),
-      modulePaths: [p.join(app, '__pypackages__')],
-      environmentVariables: {
-        'CAPTIONCRAFT_MEDIA_RUNTIME': directory.path,
-        'CAPTIONCRAFT_MEDIA_TOKEN': _token,
-      },
-      sync: false,
-    ).timeout(const Duration(seconds: 15));
+    // A failed interpreter must not poison the singleton forever.  Keep a
+    // timed out (but potentially still starting) runtime so a slow cold start
+    // can be observed again, while discarding a runtime that reported a
+    // definite startup failure before trying again.
+    if (_directory != null && _launchError != null) {
+      await _discardRuntime();
+    }
+    if (_directory != null) {
+      final failure = File(p.join(_directory!.path, 'startup-error.json'));
+      if (await failure.exists()) {
+        await _discardRuntime();
+      }
+    }
+    if (_directory == null) {
+      final temporary = await _temporaryDirectory();
+      final root = await Directory(
+        p.join(temporary.path, 'media_runtime'),
+      ).create(recursive: true);
+      final app = await _prepareRuntime();
+      final directory = await root.createTemp('session_');
+      _directory = directory;
+      final launchGeneration = ++_launchGeneration;
+      // Android's future completes when Python exits, not when it starts.
+      // Observe failures while waiting for readiness independently. Never
+      // launch a second interpreter just because a cold start was slow.
+      unawaited(
+        Future<String?>.sync(
+          () => _launchRuntime(app, {
+            'CAPTIONCRAFT_MEDIA_RUNTIME': directory.path,
+            'CAPTIONCRAFT_MEDIA_TOKEN': _token,
+          }),
+        ).then<void>(
+          (error) {
+            if (launchGeneration == _launchGeneration && error != null) {
+              _launchError = StateError(
+                error.isEmpty
+                    ? 'The media runtime exited before completing the request.'
+                    : error,
+              );
+            }
+          },
+          onError: (Object error, StackTrace stack) {
+            if (launchGeneration == _launchGeneration) {
+              _launchError = error;
+            }
+          },
+        ),
+      );
+    }
+    final directory = _directory!;
     final ready = File(p.join(directory.path, 'ready.json'));
-    final deadline = DateTime.now().add(const Duration(seconds: 15));
+    final failure = File(p.join(directory.path, 'startup-error.json'));
+    final deadline = DateTime.now().add(startupTimeout);
     while (DateTime.now().isBefore(deadline)) {
+      if (_launchError != null) {
+        final error = _launchError;
+        await _discardRuntime();
+        throw StateError('Media runtime failed: $error');
+      }
+      if (await failure.exists()) {
+        String? error;
+        try {
+          final decoded = jsonDecode(await failure.readAsString());
+          if (decoded is Map && decoded['error'] != null) {
+            error = '${decoded['error']}';
+          }
+        } catch (_) {
+          // A truncated failure marker is still a definite startup failure.
+        }
+        await _discardRuntime();
+        throw StateError('Media runtime failed: $error');
+      }
       if (await ready.exists()) {
-        return (jsonDecode(await ready.readAsString()) as Map)['port'] as int;
+        Object? port;
+        try {
+          final decoded = jsonDecode(await ready.readAsString());
+          if (decoded is Map) port = decoded['port'];
+        } catch (_) {
+          // The marker is replaced atomically. Keep a broken marker and the
+          // current session just as for a slow start: the interpreter may
+          // still be starting, and launching a second one could create two
+          // transports. The request will time out if it never becomes valid.
+        }
+        if (port is! int || port < 1 || port > 65535) {
+          // Wait for the same interpreter to publish a valid marker. A
+          // definite native/startup error above is the only safe automatic
+          // restart signal.
+        } else {
+          return port;
+        }
       }
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }
     throw TimeoutException('The media downloader could not start.');
+  }
+
+  Future<void> _discardRuntime() async {
+    final directory = _directory;
+    _directory = null;
+    _launchError = null;
+    _launchGeneration++;
+    if (directory != null) {
+      try {
+        await directory.delete(recursive: true);
+      } catch (_) {
+        // The interpreter may still be unwinding. A later attempt uses a new
+        // session directory, so cleanup failure must not block recovery.
+      }
+    }
   }
 
   @override
@@ -106,13 +247,15 @@ class YtDlpBridge implements MediaExtractor {
     String? jobId,
     void Function(int, int?)? onProgress,
   }) async {
-    final worker = jobId == null ? null : const Uuid().v4();
+    final worker = const Uuid().v4();
     if (jobId != null) {
       _cancelledJobs.remove(jobId);
-      _workers[jobId] = worker!;
+      _workers[jobId] = worker;
     }
     Socket? socket;
     var completed = false;
+    Timer? deadline;
+    var timedOut = false;
     try {
       int port;
       try {
@@ -136,9 +279,16 @@ class YtDlpBridge implements MediaExtractor {
       checkCancelled();
       if (jobId != null) _sockets[jobId] = socket;
       socket.write(
-        '${jsonEncode({...request, 'token': _token, 'job': ?worker})}\n',
+        '${jsonEncode({...request, 'token': _token, 'job': worker})}\n',
       );
       await socket.flush();
+      deadline = Timer(
+        jobId == null ? inspectionTimeout : const Duration(minutes: 20),
+        () {
+          timedOut = true;
+          socket?.destroy();
+        },
+      );
       await for (final line
           in socket
               .cast<List<int>>()
@@ -159,12 +309,16 @@ class YtDlpBridge implements MediaExtractor {
           );
         }
       }
+      if (timedOut) {
+        throw TimeoutException('Media extraction or download timed out.');
+      }
       throw StateError(
         'The media downloader disconnected. Retry the download.',
       );
     } finally {
+      deadline?.cancel();
+      if (!completed) await _signalCancel(worker);
       if (jobId != null) {
-        if (!completed && worker != null) await _signalCancel(worker);
         if (identical(_sockets[jobId], socket)) _sockets.remove(jobId);
         if (_workers[jobId] == worker) _workers.remove(jobId);
       }

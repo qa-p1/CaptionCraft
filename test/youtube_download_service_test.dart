@@ -32,6 +32,30 @@ void main() {
   );
 
   test(
+    'inspection and extractor formats skip the legacy client entirely',
+    () async {
+      final extractor = _Extractor();
+      final service = YoutubeDownloadService(
+        clientFactory: () => throw StateError('Legacy client must not start'),
+        mediaExtractor: extractor,
+      );
+      addTearDown(service.dispose);
+      final inspected = await service.inspect(info.canonicalUrl);
+      expect(inspected.formats.single.id, 'extractor:140');
+      final result = await service.download(
+        jobId: 'primary',
+        info: inspected,
+        format: inspected.formats.single,
+        outputPath: '${temp.path}/primary.m4a',
+        onProgress: (_, _) {},
+        onProcessing: () {},
+      );
+      expect(result.totalBytes, 4);
+      expect(extractor.formats, ['140']);
+    },
+  );
+
+  test(
     'failed client transfers fall back to package and publish byte progress',
     () async {
       final extractor = _Extractor();
@@ -120,7 +144,18 @@ class _Extractor implements MediaExtractor {
   final started = Completer<void>();
   final cancelled = Completer<void>();
   @override
-  Future<Map<String, dynamic>> inspect(String url) async => {};
+  Future<Map<String, dynamic>> inspect(String url) async => {
+    'title': 'Sample',
+    'formats': [
+      {
+        'format_id': '140',
+        'ext': 'm4a',
+        'vcodec': 'none',
+        'acodec': 'aac',
+        'url': 'https://media.example/audio',
+      },
+    ],
+  };
   @override
   Future<void> cancel(String jobId) async {
     if (!cancelled.isCompleted) cancelled.complete();

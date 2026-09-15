@@ -1,4 +1,5 @@
 """Build the platform-independent yt-dlp asset from pinned pure-Python wheels."""
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
@@ -27,4 +28,5 @@ with tempfile.TemporaryDirectory() as temporary:
             entry = zipfile.ZipInfo(name, (2026, 1, 1, 0, 0, 0))
             entry.compress_type = zipfile.ZIP_DEFLATED
             archive.writestr(entry, data)
+OUTPUT.with_suffix('.zip.hash').write_text(hashlib.sha256(OUTPUT.read_bytes()).hexdigest() + '\n')
 print(f'Created {OUTPUT} ({OUTPUT.stat().st_size:,} bytes)')

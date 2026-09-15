@@ -230,7 +230,18 @@ class Project {
     final globalStyle = _styleFromData(data['globalStyle']);
     final videoPath = data['videoPath'] as String? ?? '';
     final durationMs = (data['durationMs'] as num?)?.toInt() ?? 0;
-    final lastModifiedAt = _firestoreDate(data['lastModifiedAt']);
+    final now = DateTime.now();
+    final lastModifiedAt = _firestoreDate(
+      data['lastModifiedAt'],
+      fallback: now,
+    );
+    // A missing createdAt should never make a recovered project look newer
+    // than its last modification time. This matters when sorting a mixed
+    // legacy/current library after a partial cloud write.
+    final createdAt = _firestoreDate(
+      data['createdAt'],
+      fallback: lastModifiedAt,
+    );
 
     return Project(
       id: data['id'] as String? ?? '',
@@ -252,7 +263,7 @@ class Project {
       globalStyle: globalStyle,
       isFavorite: data['isFavorite'] as bool? ?? false,
       lastExportPath: data['lastExportPath'] as String?,
-      createdAt: _firestoreDate(data['createdAt']),
+      createdAt: createdAt,
       lastModifiedAt: lastModifiedAt,
       captionsModifiedAt: _firestoreDate(
         data['captionsModifiedAt'],
@@ -286,9 +297,11 @@ class Project {
     final globalStyle = _styleFromData(data['globalStyle']);
     final videoPath = data['videoPath'] as String? ?? '';
     final durationMs = (data['durationMs'] as num?)?.toInt() ?? 0;
+    final now = DateTime.now();
     final lastModifiedAt =
-        DateTime.tryParse(data['lastModifiedAt'] as String? ?? '') ??
-        DateTime.now();
+        DateTime.tryParse(data['lastModifiedAt'] as String? ?? '') ?? now;
+    final createdAt =
+        DateTime.tryParse(data['createdAt'] as String? ?? '') ?? lastModifiedAt;
 
     return Project(
       id: data['id'] as String,
@@ -310,9 +323,7 @@ class Project {
       globalStyle: globalStyle,
       isFavorite: data['isFavorite'] as bool? ?? false,
       lastExportPath: data['lastExportPath'] as String?,
-      createdAt:
-          DateTime.tryParse(data['createdAt'] as String? ?? '') ??
-          DateTime.now(),
+      createdAt: createdAt,
       lastModifiedAt: lastModifiedAt,
       captionsModifiedAt:
           DateTime.tryParse(data['captionsModifiedAt'] as String? ?? '') ??
@@ -469,7 +480,11 @@ class Project {
       return DateTime.tryParse(value) ?? fallback ?? DateTime.now();
     }
     if (value is num) {
-      return DateTime.fromMillisecondsSinceEpoch(value.toInt());
+      try {
+        return DateTime.fromMillisecondsSinceEpoch(value.toInt());
+      } catch (_) {
+        return fallback ?? DateTime.now();
+      }
     }
     return fallback ?? DateTime.now();
   }
@@ -566,6 +581,9 @@ class ProjectLocalStorage {
 
   static Future<void> _writeProject(Project project, String projectId) async {
     final dir = await _projectsDir;
+    if (await File(p.join(dir, '$projectId.deleted')).exists()) {
+      throw StateError('This project was deleted and cannot be saved.');
+    }
     final file = File(p.join(dir, '$projectId.json'));
     final temporaryFile = File('${file.path}.tmp');
     final backupFile = File('${file.path}.bak');
@@ -678,6 +696,24 @@ class ProjectLocalStorage {
       }
       final dir = await _projectsDir;
       final basePath = p.join(dir, '$safeProjectId.json');
+      final existing = await _readLatestProject(basePath);
+      if (ownerUid != null &&
+          existing != null &&
+          existing.ownerUid != null &&
+          existing.ownerUid != ownerUid) {
+        throw StateError('Cannot delete a project owned by another account.');
+      }
+      // Persist deletion intent before removing any recoverable snapshots.
+      // A crash or disk error must not restore a deleted project from .bak.
+      final tombstone = File(p.join(dir, '$safeProjectId.deleted'));
+      await tombstone.writeAsString(
+        jsonEncode({
+          'projectId': projectId,
+          'ownerUid': ownerUid ?? existing?.ownerUid,
+          'deletedAt': DateTime.now().toUtc().toIso8601String(),
+        }),
+        flush: true,
+      );
       for (final candidate in [
         File(basePath),
         File('$basePath.tmp'),
@@ -685,15 +721,6 @@ class ProjectLocalStorage {
       ]) {
         if (await candidate.exists()) await candidate.delete();
       }
-      final tombstone = File(p.join(dir, '$safeProjectId.deleted'));
-      await tombstone.writeAsString(
-        jsonEncode({
-          'projectId': projectId,
-          'ownerUid': ownerUid,
-          'deletedAt': DateTime.now().toUtc().toIso8601String(),
-        }),
-        flush: true,
-      );
     }();
     _saveQueues[safeProjectId] = deletion;
     try {
@@ -744,6 +771,11 @@ class ProjectLocalStorage {
   }
 
   static Future<Project?> _readLatestProject(String basePath) async {
+    if (await File(
+      '${basePath.substring(0, basePath.length - 5)}.deleted',
+    ).exists()) {
+      return null;
+    }
     Project? latest;
     for (final candidate in [
       File(basePath),

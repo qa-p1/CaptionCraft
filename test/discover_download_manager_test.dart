@@ -14,6 +14,231 @@ import 'package:path/path.dart' as p;
 void main() {
   group('DiscoverDownloadManager', () {
     test(
+      'a failed queue write leaves a retryable item without starting work',
+      () async {
+        final storage = await _temporaryDirectory();
+        final youtube = _FakeYoutubeService();
+        var failWrite = false;
+        final manager = DiscoverDownloadManager(
+          storageDirectory: storage,
+          youtubeService: youtube,
+          catalogWriter: (file, snapshot) async {
+            if (failWrite) throw const FileSystemException('Disk full');
+            await file.writeAsString(snapshot);
+          },
+        );
+        addTearDown(manager.dispose);
+        await manager.initialize();
+        failWrite = true;
+        await expectLater(
+          manager.enqueueYoutube(
+            info: youtube.info,
+            format: youtube.info.formats.single,
+            permittedContentAcknowledged: true,
+          ),
+          throwsA(isA<FileSystemException>()),
+        );
+        expect(youtube.downloadCalls, 0);
+        expect(manager.currentItems.single.canRetry, isTrue);
+        failWrite = false;
+        await manager.delete(manager.currentItems.single.id);
+      },
+    );
+
+    test(
+      'Instagram retry never substitutes a different carousel item',
+      () async {
+        final storage = await _temporaryDirectory();
+        final dio = _FailThenWritingDio();
+        final instagram = _FakeInstagramService();
+        final info = InstagramPostInfo(
+          shortcode: 'Caption123',
+          canonicalUrl: instagram.initialInfo.canonicalUrl,
+          title: 'Carousel',
+          author: 'Creator',
+          isReel: false,
+          media: const [
+            InstagramMediaOption(
+              id: 'Caption123-1',
+              url: 'https://cdn.example.test/expired.png',
+              kind: DiscoverMediaKind.image,
+              mimeType: 'image/png',
+            ),
+          ],
+        );
+        final manager = DiscoverDownloadManager(
+          dio: dio,
+          storageDirectory: storage,
+          youtubeService: _FakeYoutubeService(),
+          instagramService: instagram,
+        );
+        addTearDown(manager.dispose);
+        await manager.initialize();
+        final failed = manager.items
+            .expand((items) => items)
+            .firstWhere((item) => item.status == DiscoverDownloadStatus.failed);
+        final item = await manager.enqueueInstagram(
+          info: info,
+          media: info.media.single,
+          permittedContentAcknowledged: true,
+        );
+        await failed;
+        await manager.retry(item.id);
+        expect(
+          manager.currentItems.single.status,
+          DiscoverDownloadStatus.failed,
+        );
+        expect(
+          manager.currentItems.single.errorMessage,
+          contains('no longer available'),
+        );
+        expect(dio.requestedUrls, hasLength(1));
+        await manager.delete(item.id);
+      },
+    );
+
+    test(
+      'initialization can recover after a transient storage failure',
+      () async {
+        final storage = await _temporaryDirectory();
+        var attempts = 0;
+        final manager = DiscoverDownloadManager(
+          youtubeService: _FakeYoutubeService(),
+          documentsDirectoryProvider: () async {
+            if (++attempts == 1) {
+              throw const FileSystemException('Storage unavailable');
+            }
+            return storage;
+          },
+        );
+        addTearDown(manager.dispose);
+        await expectLater(
+          manager.initialize(),
+          throwsA(isA<FileSystemException>()),
+        );
+        await manager.initialize();
+        expect(attempts, 2);
+        expect(manager.currentItems, isEmpty);
+      },
+    );
+
+    test(
+      'disposing during initialization cannot enqueue or start work',
+      () async {
+        final storage = await _temporaryDirectory();
+        final directory = Completer<Directory>();
+        final youtube = _FakeYoutubeService();
+        final manager = DiscoverDownloadManager(
+          youtubeService: youtube,
+          documentsDirectoryProvider: () => directory.future,
+        );
+        final enqueue = manager.enqueueYoutube(
+          info: youtube.info,
+          format: youtube.info.formats.single,
+          permittedContentAcknowledged: true,
+        );
+        final rejected = expectLater(enqueue, throwsStateError);
+        manager.dispose();
+        directory.complete(storage);
+        await rejected;
+        expect(youtube.downloadCalls, 0);
+        expect(manager.currentItems, isEmpty);
+      },
+    );
+
+    for (final failLookup in [false, true]) {
+      test(
+        'cancelled Instagram retry ignores late ${failLookup ? 'errors' : 'results'}',
+        () async {
+          final storage = await _temporaryDirectory();
+          final dio = _FailThenWritingDio();
+          final instagram = _FakeInstagramService()
+            ..delayedInspection = Completer<InstagramPostInfo>();
+          final manager = DiscoverDownloadManager(
+            dio: dio,
+            storageDirectory: storage,
+            youtubeService: _FakeYoutubeService(),
+            instagramService: instagram,
+          );
+          addTearDown(manager.dispose);
+          await manager.initialize();
+          final failed = manager.items
+              .expand((items) => items)
+              .firstWhere(
+                (item) => item.status == DiscoverDownloadStatus.failed,
+              );
+          final item = await manager.enqueueInstagram(
+            info: instagram.initialInfo,
+            media: instagram.initialInfo.media.single,
+            permittedContentAcknowledged: true,
+          );
+          await failed;
+          final retry = manager.retry(item.id);
+          await instagram.inspectionStarted.future;
+          await manager.cancel(item.id);
+          if (failLookup) {
+            instagram.delayedInspection!.completeError(
+              StateError('Late lookup failure'),
+            );
+          } else {
+            instagram.delayedInspection!.complete(instagram.initialInfo);
+          }
+          await retry;
+          expect(
+            manager.currentItems.single.status,
+            DiscoverDownloadStatus.cancelled,
+          );
+          expect(dio.requestedUrls, hasLength(1));
+          await manager.delete(item.id);
+        },
+      );
+    }
+
+    test('retry waits for the failed worker to finish cleanup', () async {
+      final storage = await _temporaryDirectory();
+      final cleanupGate = Completer<void>();
+      final youtube = _FirstFailureYoutube();
+      var blocked = false;
+      final manager = DiscoverDownloadManager(
+        storageDirectory: storage,
+        youtubeService: youtube,
+        catalogWriter: (catalog, snapshot) async {
+          if (!blocked && snapshot.contains('"status":"failed"')) {
+            blocked = true;
+            await cleanupGate.future;
+          }
+          await catalog.writeAsString(snapshot, flush: true);
+        },
+      );
+      addTearDown(manager.dispose);
+      await manager.initialize();
+      final failed = manager.items
+          .expand((items) => items)
+          .firstWhere((item) => item.status == DiscoverDownloadStatus.failed);
+      final item = await manager.enqueueYoutube(
+        info: youtube.info,
+        format: youtube.info.formats.single,
+        permittedContentAcknowledged: true,
+      );
+      await failed;
+      final completed = manager.items
+          .expand((items) => items)
+          .firstWhere(
+            (item) => item.status == DiscoverDownloadStatus.completed,
+          );
+      final retry = manager.retry(item.id);
+      await Future<void>.delayed(Duration.zero);
+      expect(youtube.attempts, 1);
+      cleanupGate.complete();
+      await retry;
+      final result = await completed;
+      await manager.cancel(item.id); // Waits for terminal worker cleanup.
+      expect(youtube.attempts, 2);
+      expect(await File(result.localPath!).exists(), isTrue);
+      await manager.delete(item.id);
+    });
+
+    test(
       'downloads direct media atomically without persisting headers',
       () async {
         final storage = await _temporaryDirectory();
@@ -77,6 +302,111 @@ void main() {
         await manager.delete(item.id);
         expect(await File(item.localPath!).exists(), isFalse);
         expect(manager.currentItems, isEmpty);
+      },
+    );
+
+    test(
+      'cleans a direct result when completion cannot be persisted',
+      () async {
+        final storage = await _temporaryDirectory();
+        final dio = _WritingDio(const <int>[
+          0x89,
+          0x50,
+          0x4e,
+          0x47,
+          0x0d,
+          0x0a,
+          0x1a,
+          0x0a,
+          1,
+        ], mimeType: 'image/png');
+        var failCompletedWrite = true;
+        final manager = DiscoverDownloadManager(
+          dio: dio,
+          youtubeService: _FakeYoutubeService(),
+          storageDirectory: storage,
+          idGenerator: () => 'persistence-race',
+          catalogWriter: (catalog, snapshot) async {
+            if (failCompletedWrite &&
+                snapshot.contains('"status":"completed"')) {
+              throw const FileSystemException('Disk full');
+            }
+            await catalog.writeAsString(snapshot, flush: true);
+          },
+        );
+        addTearDown(manager.dispose);
+        await manager.initialize();
+        final failed = manager.items
+            .expand((items) => items)
+            .firstWhere((item) => item.status == DiscoverDownloadStatus.failed);
+
+        await manager.enqueueDirect(
+          const DiscoverDownloadRequest(
+            url: 'https://cdn.example.test/result.png',
+            displayName: 'Persistence race',
+            kind: DiscoverMediaKind.image,
+            mimeType: 'image/png',
+          ),
+        );
+        final item = await failed.timeout(const Duration(seconds: 2));
+
+        // Terminal state is observable before the worker finishes cleanup.
+        // Cancelling an already-terminal job waits for that worker only.
+        await manager.cancel(item.id);
+        expect(item.canRetry, isTrue);
+        expect(item.localPath, isNull);
+        expect(
+          storage.listSync().whereType<File>().where(
+            (file) => !file.path.endsWith('downloads.json'),
+          ),
+          isEmpty,
+        );
+
+        failCompletedWrite = false;
+        await manager.delete(item.id);
+      },
+    );
+
+    test(
+      'preserves a pre-existing destination when a direct download fails',
+      () async {
+        final storage = await _temporaryDirectory();
+        final existingBytes = const <int>[
+          0x89,
+          0x50,
+          0x4e,
+          0x47,
+          0x0d,
+          0x0a,
+          0x1a,
+          0x0a,
+          9,
+        ];
+        final existing = File(p.join(storage.path, 'preserve-id-Existing.png'));
+        await existing.writeAsBytes(existingBytes, flush: true);
+        final manager = DiscoverDownloadManager(
+          dio: _FailThenWritingDio(),
+          youtubeService: _FakeYoutubeService(),
+          storageDirectory: storage,
+          idGenerator: () => 'preserve-id',
+        );
+        addTearDown(manager.dispose);
+        await manager.initialize();
+        final failed = manager.items
+            .expand((items) => items)
+            .firstWhere((item) => item.status == DiscoverDownloadStatus.failed);
+
+        await manager.enqueueDirect(
+          const DiscoverDownloadRequest(
+            url: 'https://cdn.example.test/result.png',
+            displayName: 'Existing',
+            kind: DiscoverMediaKind.image,
+            mimeType: 'image/png',
+          ),
+        );
+        await failed.timeout(const Duration(seconds: 2));
+
+        expect(await existing.readAsBytes(), existingBytes);
       },
     );
 
@@ -656,7 +986,37 @@ class _FakeYoutubeService implements YoutubeMediaService {
   void dispose() {}
 }
 
+class _FirstFailureYoutube extends _FakeYoutubeService {
+  int attempts = 0;
+  @override
+  Future<YoutubeDownloadResult> download({
+    required String jobId,
+    required YoutubeVideoInfo info,
+    required YoutubeFormatOption format,
+    required String outputPath,
+    required YoutubeProgressCallback onProgress,
+    required void Function() onProcessing,
+    int maxBytes = YoutubeDownloadService.defaultMaxBytes,
+  }) async {
+    if (++attempts == 1) {
+      await File(outputPath).writeAsBytes([1, 2]);
+      throw StateError('Interrupted transfer');
+    }
+    return super.download(
+      jobId: jobId,
+      info: info,
+      format: format,
+      outputPath: outputPath,
+      onProgress: onProgress,
+      onProcessing: onProcessing,
+      maxBytes: maxBytes,
+    );
+  }
+}
+
 class _FakeInstagramService implements InstagramMediaService {
+  Completer<InstagramPostInfo>? delayedInspection;
+  final inspectionStarted = Completer<void>();
   final InstagramPostInfo initialInfo = const InstagramPostInfo(
     shortcode: 'Caption123',
     canonicalUrl: 'https://www.instagram.com/p/Caption123/',
@@ -678,6 +1038,8 @@ class _FakeInstagramService implements InstagramMediaService {
   @override
   Future<InstagramPostInfo> inspect(String url) async {
     inspectCalls++;
+    if (!inspectionStarted.isCompleted) inspectionStarted.complete();
+    if (delayedInspection != null) return delayedInspection!.future;
     return const InstagramPostInfo(
       shortcode: 'Caption123',
       canonicalUrl: 'https://www.instagram.com/p/Caption123/',

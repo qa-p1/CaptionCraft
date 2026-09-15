@@ -27,6 +27,60 @@ void main() {
       }
     });
 
+    test('deletion rejects a stale action from a different account', () async {
+      final now = DateTime.utc(2026, 9, 9);
+      final project = _project(
+        captionText: 'Owned caption',
+        lastModifiedAt: now,
+        captionsModifiedAt: now,
+      ).copyWith(ownerUid: 'alice');
+      await ProjectLocalStorage.saveProject(project);
+      await expectLater(
+        ProjectLocalStorage.deleteProject(project.id, ownerUid: 'bob'),
+        throwsStateError,
+      );
+      expect(
+        (await ProjectLocalStorage.loadProject(project.id))!.ownerUid,
+        'alice',
+      );
+      expect(await ProjectLocalStorage.loadDeletedProjectIds('bob'), isEmpty);
+    });
+
+    test(
+      'a deleted project cannot reappear from a leftover recovery file',
+      () async {
+        final now = DateTime.utc(2026, 9, 9);
+        final project = _project(
+          captionText: 'Deleted caption',
+          lastModifiedAt: now,
+          captionsModifiedAt: now,
+        ).copyWith(ownerUid: 'alice');
+        await ProjectLocalStorage.saveProject(project);
+        await ProjectLocalStorage.deleteProject(project.id, ownerUid: 'alice');
+        await expectLater(
+          ProjectLocalStorage.saveProject(project),
+          throwsStateError,
+        );
+        final backup = File(
+          p.join(
+            documentsDirectory.path,
+            'caption_craft_projects',
+            '${project.id}.json.bak',
+          ),
+        );
+        await backup.writeAsString(jsonEncode(project.toJson()));
+        expect(await ProjectLocalStorage.loadProject(project.id), isNull);
+        expect(
+          await ProjectLocalStorage.loadProjects(ownerUid: 'alice'),
+          isEmpty,
+        );
+        expect(
+          await ProjectLocalStorage.loadDeletedProjectIds('alice'),
+          contains(project.id),
+        );
+      },
+    );
+
     test(
       'saves and retrieves the latest timeline and captions locally',
       () async {
@@ -172,6 +226,30 @@ void main() {
       );
       expect(merged.lastModifiedAt, local.lastModifiedAt);
       expect(merged.captionsModifiedAt, remote.captionsModifiedAt);
+    });
+
+    test('missing creation times follow the modification time', () {
+      final modifiedAt = DateTime.utc(2026, 7, 29, 15);
+      final project = Project.fromFirestore({
+        'id': 'partial-cloud-project',
+        'name': 'Partial cloud project',
+        'lastModifiedAt': modifiedAt,
+        'durationMs': 5000,
+      });
+
+      expect(project.createdAt.isAtSameMomentAs(modifiedAt), isTrue);
+      expect(project.lastModifiedAt.isAtSameMomentAs(modifiedAt), isTrue);
+      expect(project.durationMs, 5000);
+
+      final local = Project.fromJson({
+        'id': 'partial-local-project',
+        'name': 'Partial local project',
+        'videoPath': '',
+        'durationMs': 0,
+        'lastModifiedAt': modifiedAt.toIso8601String(),
+      });
+      expect(local.createdAt.isAtSameMomentAs(modifiedAt), isTrue);
+      expect(local.captionsModifiedAt.isAtSameMomentAs(modifiedAt), isTrue);
     });
   });
 }

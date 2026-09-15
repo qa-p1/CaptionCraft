@@ -3,7 +3,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_colorpicker/flutter_colorpicker.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/utils/caption_font_service.dart';
+import '../models/timeline_models.dart';
 import '../models/subtitle_style_model.dart';
+import '../providers/editor_provider.dart';
 import '../providers/subtitle_provider.dart';
 import 'animated_subtitle_overlay.dart';
 
@@ -13,12 +15,40 @@ class SubtitleStylePanel extends ConsumerWidget {
   final Set<String>? entryIds;
 
   void _updateStyle(WidgetRef ref, SubtitleStyleModel style) {
+    if (_targetTrackIsLocked(ref.read(editorProvider).timeline)) return;
     final notifier = ref.read(subtitleProvider.notifier);
     if (entryIds == null) {
       notifier.updateGlobalStyle(style);
     } else {
       notifier.updateEntriesStyle(entryIds!, style);
     }
+  }
+
+  void _updateStyleLive(WidgetRef ref, SubtitleStyleModel style) {
+    if (_targetTrackIsLocked(ref.read(editorProvider).timeline)) return;
+    final notifier = ref.read(subtitleProvider.notifier);
+    if (entryIds == null) {
+      notifier.updateGlobalStyleLive(style);
+    } else {
+      for (final id in entryIds!) {
+        notifier.setEntryStyleOverrideLive(id, style);
+      }
+    }
+  }
+
+  bool _targetTrackIsLocked(EditorTimeline timeline) {
+    if (entryIds == null) {
+      return timeline.tracks.any(
+        (track) => track.type == TimelineTrackType.subtitle && track.isLocked,
+      );
+    }
+    if (entryIds!.isEmpty) return false;
+    return timeline.tracks.any(
+      (track) =>
+          track.type == TimelineTrackType.subtitle &&
+          track.isLocked &&
+          track.clips.any((clip) => entryIds!.contains(clip.id)),
+    );
   }
 
   // Available fonts
@@ -83,6 +113,8 @@ class SubtitleStylePanel extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final subtitleState = ref.watch(subtitleProvider);
+    final editorState = ref.watch(editorProvider);
+    final targetTrackIsLocked = _targetTrackIsLocked(editorState.timeline);
     final style =
         (entryIds == null
             ? null
@@ -92,373 +124,382 @@ class SubtitleStylePanel extends ConsumerWidget {
                   ?.styleOverride) ??
         subtitleState.globalStyle;
 
-    return Container(
-      color: kSurface,
-      child: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          // Section: Animation Presets
-          _sectionHeader('Animation Presets'),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              // None option
-              GestureDetector(
-                onTap: () {
-                  _updateStyle(ref, style.copyWith(clearAnimationPreset: true));
-                },
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 150),
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: style.animationPreset == null
-                        ? kAccent.withValues(alpha: 0.15)
-                        : kSurfaceElevated,
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(
-                      color: style.animationPreset == null ? kAccent : kBorder,
-                      width: style.animationPreset == null ? 1.5 : 1,
-                    ),
-                  ),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        Icons.text_fields_rounded,
-                        color: style.animationPreset == null
-                            ? kAccent
-                            : kTextSecondary,
-                        size: 24,
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        'Static',
-                        style: TextStyle(
-                          color: style.animationPreset == null
-                              ? kAccent
-                              : kTextPrimary,
-                          fontSize: 11,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        'No animation',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(color: kTextSecondary, fontSize: 9),
-                      ),
-                    ],
+    final controls = ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        // Section: Animation Presets
+        _sectionHeader('Animation Presets'),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            // None option
+            GestureDetector(
+              onTap: () {
+                _updateStyle(ref, style.copyWith(clearAnimationPreset: true));
+              },
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 150),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: style.animationPreset == null
+                      ? kAccent.withValues(alpha: 0.15)
+                      : kSurfaceElevated,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: style.animationPreset == null ? kAccent : kBorder,
+                    width: style.animationPreset == null ? 1.5 : 1,
                   ),
                 ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.text_fields_rounded,
+                      color: style.animationPreset == null
+                          ? kAccent
+                          : kTextSecondary,
+                      size: 24,
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'Static',
+                      style: TextStyle(
+                        color: style.animationPreset == null
+                            ? kAccent
+                            : kTextPrimary,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      'No animation',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: kTextSecondary, fontSize: 9),
+                    ),
+                  ],
+                ),
               ),
-              ...SubtitleAnimationPreset.values.map((preset) {
-                return AnimationPresetCard(
-                  preset: preset,
-                  isSelected: style.animationPreset == preset,
-                  onTap: () {
-                    _updateStyle(ref, style.copyWith(animationPreset: preset));
-                  },
-                );
-              }),
-            ],
-          ),
-          const SizedBox(height: 20),
-          const Divider(color: kBorder),
-          const SizedBox(height: 12),
-
-          // Section: Style Presets
-          _sectionHeader('Style Presets'),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: _presets.entries.map((preset) {
-              return _PresetChip(
-                name: preset.key,
-                style: preset.value,
+            ),
+            ...SubtitleAnimationPreset.values.map((preset) {
+              return AnimationPresetCard(
+                preset: preset,
+                isSelected: style.animationPreset == preset,
                 onTap: () {
-                  ref.read(subtitleProvider.notifier).applyPreset(preset.value);
+                  _updateStyle(ref, style.copyWith(animationPreset: preset));
                 },
               );
-            }).toList(),
-          ),
-          const SizedBox(height: 20),
-          const Divider(color: kBorder),
-          const SizedBox(height: 12),
+            }),
+          ],
+        ),
+        const SizedBox(height: 20),
+        const Divider(color: kBorder),
+        const SizedBox(height: 12),
 
-          // Section: Font
-          _sectionHeader('Font'),
-          const SizedBox(height: 8),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            decoration: BoxDecoration(
-              color: kSurfaceElevated,
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: kBorder),
-            ),
-            child: DropdownButtonHideUnderline(
-              child: DropdownButton<String>(
-                value: _fonts.contains(style.fontFamily)
-                    ? style.fontFamily
-                    : 'Inter',
-                dropdownColor: kSurfaceElevated,
-                isExpanded: true,
-                items: _fonts
-                    .map(
-                      (f) => DropdownMenuItem(
-                        value: f,
-                        child: Text(
-                          f,
-                          style: TextStyle(
-                            fontFamily: f,
-                            color: kTextPrimary,
-                            fontSize: 14,
-                          ),
+        // Section: Style Presets
+        _sectionHeader('Style Presets'),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: _presets.entries.map((preset) {
+            return _PresetChip(
+              name: preset.key,
+              style: preset.value,
+              onTap: () => _updateStyle(ref, preset.value),
+            );
+          }).toList(),
+        ),
+        const SizedBox(height: 20),
+        const Divider(color: kBorder),
+        const SizedBox(height: 12),
+
+        // Section: Font
+        _sectionHeader('Font'),
+        const SizedBox(height: 8),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          decoration: BoxDecoration(
+            color: kSurfaceElevated,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: kBorder),
+          ),
+          child: DropdownButtonHideUnderline(
+            child: DropdownButton<String>(
+              value: _fonts.contains(style.fontFamily)
+                  ? style.fontFamily
+                  : 'Inter',
+              dropdownColor: kSurfaceElevated,
+              isExpanded: true,
+              items: _fonts
+                  .map(
+                    (f) => DropdownMenuItem(
+                      value: f,
+                      child: Text(
+                        f,
+                        style: TextStyle(
+                          fontFamily: f,
+                          color: kTextPrimary,
+                          fontSize: 14,
                         ),
                       ),
-                    )
-                    .toList(),
-                onChanged: (value) {
-                  if (value != null) {
-                    _updateStyle(ref, style.copyWith(fontFamily: value));
-                  }
-                },
-              ),
+                    ),
+                  )
+                  .toList(),
+              onChanged: (value) {
+                if (value != null) {
+                  _updateStyle(ref, style.copyWith(fontFamily: value));
+                }
+              },
             ),
           ),
-          const SizedBox(height: 16),
+        ),
+        const SizedBox(height: 16),
 
-          // Font size slider
-          _sectionHeader('Size'),
-          const SizedBox(height: 4),
-          Row(
-            children: [
-              Text(
-                '${style.fontSize.round()}px',
+        // Font size slider
+        _sectionHeader('Size'),
+        const SizedBox(height: 4),
+        Row(
+          children: [
+            Text(
+              '${style.fontSize.round()}px',
+              style: TextStyle(
+                fontFamily: 'monospace',
+                color: kTextSecondary,
+                fontSize: 12,
+              ),
+            ),
+            Expanded(
+              child: Slider(
+                value: style.fontSize,
+                min: 1,
+                max: 48,
+                activeColor: kAccent,
+                inactiveColor: kBorder,
+                onChangeStart: (_) =>
+                    ref.read(subtitleProvider.notifier).beginStyleGestureEdit(),
+                onChanged: (value) =>
+                    _updateStyleLive(ref, style.copyWith(fontSize: value)),
+                onChangeEnd: (_) =>
+                    ref.read(subtitleProvider.notifier).endStyleGestureEdit(),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        _sectionHeader('Max Width'),
+        Row(
+          children: [
+            SizedBox(
+              width: 48,
+              child: Text(
+                '${(style.maxWidthFactor * 100).round()}%',
                 style: TextStyle(
                   fontFamily: 'monospace',
                   color: kTextSecondary,
                   fontSize: 12,
                 ),
               ),
-              Expanded(
-                child: Slider(
-                  value: style.fontSize,
-                  min: 1,
-                  max: 48,
-                  activeColor: kAccent,
-                  inactiveColor: kBorder,
-                  onChangeStart: (_) => ref
-                      .read(subtitleProvider.notifier)
-                      .beginStyleGestureEdit(),
-                  onChanged: (value) {
-                    ref
-                        .read(subtitleProvider.notifier)
-                        .updateGlobalStyleLive(style.copyWith(fontSize: value));
-                  },
-                  onChangeEnd: (_) =>
-                      ref.read(subtitleProvider.notifier).endStyleGestureEdit(),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          _sectionHeader('Max Width'),
-          Row(
-            children: [
-              SizedBox(
-                width: 48,
-                child: Text(
-                  '${(style.maxWidthFactor * 100).round()}%',
-                  style: TextStyle(
-                    fontFamily: 'monospace',
-                    color: kTextSecondary,
-                    fontSize: 12,
-                  ),
-                ),
-              ),
-              Expanded(
-                child: Slider(
-                  value: style.maxWidthFactor.clamp(0.25, 1.0),
-                  min: 0.25,
-                  max: 1.0,
-                  activeColor: kAccent,
-                  inactiveColor: kBorder,
-                  onChangeStart: (_) => ref
-                      .read(subtitleProvider.notifier)
-                      .beginStyleGestureEdit(),
-                  onChanged: (value) {
-                    ref
-                        .read(subtitleProvider.notifier)
-                        .updateGlobalStyleLive(
-                          style.copyWith(maxWidthFactor: value),
-                        );
-                  },
-                  onChangeEnd: (_) =>
-                      ref.read(subtitleProvider.notifier).endStyleGestureEdit(),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              Expanded(
-                child: Text(
-                  'Drag subtitle in preview to reposition/resize',
-                  style: TextStyle(color: kTextSecondary, fontSize: 11),
-                ),
-              ),
-              TextButton(
-                onPressed: () {
-                  _updateStyle(
-                    ref,
-                    style.copyWith(
-                      offsetX: 0,
-                      offsetY: 0,
-                      verticalOffset: 0,
-                      maxWidthFactor: 0.85,
-                    ),
-                  );
-                },
-                child: const Text('Reset'),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-
-          // Text Color
-          _sectionHeader('Text Color'),
-          const SizedBox(height: 8),
-          GestureDetector(
-            onTap: () => _showColorPicker(context, ref, style.textColor, true),
-            child: _colorPreview(style.textColor),
-          ),
-          const SizedBox(height: 16),
-
-          // Background
-          _sectionHeader('Background'),
-          const SizedBox(height: 8),
-          _backgroundSelector(ref, style),
-          if (style.backgroundType != SubtitleBackground.none) ...[
-            const SizedBox(height: 12),
-            _sectionHeader('Background Color'),
-            const SizedBox(height: 8),
-            GestureDetector(
-              onTap: () =>
-                  _showColorPicker(context, ref, style.backgroundColor, false),
-              child: _colorPreview(style.backgroundColor),
             ),
-            const SizedBox(height: 12),
-            _sectionHeader('Opacity'),
-            Slider(
-              value: style.backgroundOpacity,
-              min: 0,
-              max: 1,
-              activeColor: kAccent,
-              inactiveColor: kBorder,
-              onChangeStart: (_) =>
-                  ref.read(subtitleProvider.notifier).beginStyleGestureEdit(),
-              onChanged: (value) {
-                ref
-                    .read(subtitleProvider.notifier)
-                    .updateGlobalStyleLive(
-                      style.copyWith(backgroundOpacity: value),
-                    );
-              },
-              onChangeEnd: (_) =>
-                  ref.read(subtitleProvider.notifier).endStyleGestureEdit(),
+            Expanded(
+              child: Slider(
+                value: style.maxWidthFactor.clamp(0.25, 1.0),
+                min: 0.25,
+                max: 1.0,
+                activeColor: kAccent,
+                inactiveColor: kBorder,
+                onChangeStart: (_) =>
+                    ref.read(subtitleProvider.notifier).beginStyleGestureEdit(),
+                onChanged: (value) => _updateStyleLive(
+                  ref,
+                  style.copyWith(maxWidthFactor: value),
+                ),
+                onChangeEnd: (_) =>
+                    ref.read(subtitleProvider.notifier).endStyleGestureEdit(),
+              ),
             ),
           ],
-          const SizedBox(height: 16),
-
-          // Position
-          _sectionHeader('Position'),
-          const SizedBox(height: 8),
-          _positionSelector(ref, style),
-          const SizedBox(height: 10),
-          _sectionHeader('Vertical Nudge'),
-          Row(
-            children: [
-              SizedBox(
-                width: 48,
-                child: Text(
-                  style.verticalOffset.toStringAsFixed(0),
-                  style: TextStyle(
-                    fontFamily: 'monospace',
-                    color: kTextSecondary,
-                    fontSize: 12,
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                'Drag subtitle in preview to reposition/resize',
+                style: TextStyle(color: kTextSecondary, fontSize: 11),
+              ),
+            ),
+            TextButton(
+              onPressed: () {
+                _updateStyle(
+                  ref,
+                  style.copyWith(
+                    offsetX: 0,
+                    offsetY: 0,
+                    verticalOffset: 0,
+                    maxWidthFactor: 0.85,
                   ),
+                );
+              },
+              child: const Text('Reset'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+
+        // Text Color
+        _sectionHeader('Text Color'),
+        const SizedBox(height: 8),
+        GestureDetector(
+          onTap: () => _showColorPicker(context, ref, style.textColor, true),
+          child: _colorPreview(style.textColor),
+        ),
+        const SizedBox(height: 16),
+
+        // Background
+        _sectionHeader('Background'),
+        const SizedBox(height: 8),
+        _backgroundSelector(ref, style),
+        if (style.backgroundType != SubtitleBackground.none) ...[
+          const SizedBox(height: 12),
+          _sectionHeader('Background Color'),
+          const SizedBox(height: 8),
+          GestureDetector(
+            onTap: () =>
+                _showColorPicker(context, ref, style.backgroundColor, false),
+            child: _colorPreview(style.backgroundColor),
+          ),
+          const SizedBox(height: 12),
+          _sectionHeader('Opacity'),
+          Slider(
+            value: style.backgroundOpacity,
+            min: 0,
+            max: 1,
+            activeColor: kAccent,
+            inactiveColor: kBorder,
+            onChangeStart: (_) =>
+                ref.read(subtitleProvider.notifier).beginStyleGestureEdit(),
+            onChanged: (value) =>
+                _updateStyleLive(ref, style.copyWith(backgroundOpacity: value)),
+            onChangeEnd: (_) =>
+                ref.read(subtitleProvider.notifier).endStyleGestureEdit(),
+          ),
+        ],
+        const SizedBox(height: 16),
+
+        // Position
+        _sectionHeader('Position'),
+        const SizedBox(height: 8),
+        _positionSelector(ref, style),
+        const SizedBox(height: 10),
+        _sectionHeader('Vertical Nudge'),
+        Row(
+          children: [
+            SizedBox(
+              width: 48,
+              child: Text(
+                style.verticalOffset.toStringAsFixed(0),
+                style: TextStyle(
+                  fontFamily: 'monospace',
+                  color: kTextSecondary,
+                  fontSize: 12,
                 ),
               ),
-              Expanded(
-                child: Slider(
-                  value: style.verticalOffset.clamp(-60.0, 60.0).toDouble(),
-                  min: -60,
-                  max: 60,
-                  activeColor: kAccent,
-                  inactiveColor: kBorder,
-                  onChangeStart: (_) => ref
-                      .read(subtitleProvider.notifier)
-                      .beginStyleGestureEdit(),
-                  onChanged: (value) {
-                    ref
-                        .read(subtitleProvider.notifier)
-                        .updateGlobalStyleLive(
-                          style.copyWith(verticalOffset: value),
-                        );
-                  },
-                  onChangeEnd: (_) =>
-                      ref.read(subtitleProvider.notifier).endStyleGestureEdit(),
+            ),
+            Expanded(
+              child: Slider(
+                value: style.verticalOffset.clamp(-60.0, 60.0).toDouble(),
+                min: -60,
+                max: 60,
+                activeColor: kAccent,
+                inactiveColor: kBorder,
+                onChangeStart: (_) =>
+                    ref.read(subtitleProvider.notifier).beginStyleGestureEdit(),
+                onChanged: (value) => _updateStyleLive(
+                  ref,
+                  style.copyWith(verticalOffset: value),
+                ),
+                onChangeEnd: (_) =>
+                    ref.read(subtitleProvider.notifier).endStyleGestureEdit(),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+
+        // Text Alignment
+        _sectionHeader('Alignment'),
+        const SizedBox(height: 8),
+        _alignmentSelector(ref, style),
+        const SizedBox(height: 16),
+
+        // Text Style toggles
+        _sectionHeader('Text Style'),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            _ToggleChip(
+              label: 'B',
+              isActive: style.isBold,
+              fontWeight: FontWeight.bold,
+              onTap: () {
+                _updateStyle(ref, style.copyWith(isBold: !style.isBold));
+              },
+            ),
+            const SizedBox(width: 8),
+            _ToggleChip(
+              label: 'I',
+              isActive: style.isItalic,
+              isItalic: true,
+              onTap: () {
+                _updateStyle(ref, style.copyWith(isItalic: !style.isItalic));
+              },
+            ),
+            const SizedBox(width: 8),
+            _ToggleChip(
+              label: 'AA',
+              isActive: style.isAllCaps,
+              onTap: () {
+                _updateStyle(ref, style.copyWith(isAllCaps: !style.isAllCaps));
+              },
+            ),
+          ],
+        ),
+      ],
+    );
+
+    return Container(
+      color: kSurface,
+      child: Stack(
+        children: [
+          IgnorePointer(ignoring: targetTrackIsLocked, child: controls),
+          if (targetTrackIsLocked)
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: Container(
+                color: kSurfaceElevated,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 10,
+                ),
+                child: const Row(
+                  children: [
+                    Icon(Icons.lock_outline, color: kTextSecondary, size: 18),
+                    SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'This caption track is locked. Unlock it to edit style.',
+                        style: TextStyle(color: kTextSecondary, fontSize: 12),
+                      ),
+                    ),
+                  ],
                 ),
               ),
-            ],
-          ),
-          const SizedBox(height: 16),
-
-          // Text Alignment
-          _sectionHeader('Alignment'),
-          const SizedBox(height: 8),
-          _alignmentSelector(ref, style),
-          const SizedBox(height: 16),
-
-          // Text Style toggles
-          _sectionHeader('Text Style'),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              _ToggleChip(
-                label: 'B',
-                isActive: style.isBold,
-                fontWeight: FontWeight.bold,
-                onTap: () {
-                  _updateStyle(ref, style.copyWith(isBold: !style.isBold));
-                },
-              ),
-              const SizedBox(width: 8),
-              _ToggleChip(
-                label: 'I',
-                isActive: style.isItalic,
-                isItalic: true,
-                onTap: () {
-                  _updateStyle(ref, style.copyWith(isItalic: !style.isItalic));
-                },
-              ),
-              const SizedBox(width: 8),
-              _ToggleChip(
-                label: 'AA',
-                isActive: style.isAllCaps,
-                onTap: () {
-                  _updateStyle(
-                    ref,
-                    style.copyWith(isAllCaps: !style.isAllCaps),
-                  );
-                },
-              ),
-            ],
-          ),
+            ),
         ],
       ),
     );
@@ -604,7 +645,22 @@ class SubtitleStylePanel extends ConsumerWidget {
             ),
             TextButton(
               onPressed: () {
-                final style = ref.read(subtitleProvider).globalStyle;
+                if (_targetTrackIsLocked(ref.read(editorProvider).timeline)) {
+                  Navigator.pop(ctx);
+                  return;
+                }
+                // Re-read the target style when applying. The panel can stay
+                // open while another editor update arrives, and using the
+                // global style here would erase a selected cue's formatting.
+                final state = ref.read(subtitleProvider);
+                final liveStyle = entryIds == null
+                    ? state.globalStyle
+                    : state.entries
+                              .where((entry) => entryIds!.contains(entry.id))
+                              .firstOrNull
+                              ?.styleOverride ??
+                          state.globalStyle;
+                final style = liveStyle;
                 if (isTextColor) {
                   _updateStyle(ref, style.copyWith(textColor: pickedColor));
                 } else {

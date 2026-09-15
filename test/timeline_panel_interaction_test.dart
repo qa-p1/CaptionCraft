@@ -1780,6 +1780,147 @@ void main() {
     expect(replaceRequested?.id, 'overlay_clip');
   });
 
+  testWidgets(
+    'track deletion is blocked when it would remove a locked linked clip',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(844, 360));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final container = ProviderContainer(
+        overrides: [currentUserProvider.overrideWithValue(null)],
+      );
+      addTearDown(container.dispose);
+      container
+          .read(editorProvider.notifier)
+          .loadProject(
+            videoPath: 'missing.mp4',
+            projectId: 'locked-linked-track-test',
+            projectName: 'Locked linked track test',
+            timeline: _linkedOverlayAudioTimeline(audioLocked: true),
+          );
+
+      await tester.pumpWidget(_timelineHarness(container));
+      await tester.pumpAndSettle();
+      final trackLabel = find.byKey(
+        const ValueKey('timeline_track_overlay_video_track'),
+      );
+      tester.widget<GestureDetector>(trackLabel).onTap?.call();
+      await tester.pump();
+      tester.widget<GestureDetector>(trackLabel).onTap?.call();
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Delete'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(FilledButton, 'Delete'));
+      await tester.pumpAndSettle();
+
+      final timeline = container.read(editorProvider).timeline;
+      expect(
+        timeline.tracks.any((track) => track.id == 'overlay_video_track'),
+        isTrue,
+      );
+      expect(
+        timeline.tracks
+            .singleWhere((track) => track.id == 'overlay_audio_track')
+            .clips,
+        hasLength(1),
+      );
+      expect(
+        find.text('Unlock Separated overlay audio before deleting this track.'),
+        findsOneWidget,
+      );
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'deleting a linked clip track removes captions and repairs selection',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(844, 360));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final entry = SubtitleEntry(
+        id: 'linked_caption',
+        startTime: const Duration(seconds: 2),
+        endTime: const Duration(seconds: 4),
+        text: 'Linked caption',
+      );
+      final container = ProviderContainer(
+        overrides: [currentUserProvider.overrideWithValue(null)],
+      );
+      addTearDown(container.dispose);
+      container
+          .read(subtitleProvider.notifier)
+          .initializeFromProject(
+            entries: [entry],
+            globalStyle: const SubtitleStyleModel(),
+          );
+      container
+          .read(editorProvider.notifier)
+          .loadProject(
+            videoPath: 'missing.mp4',
+            projectId: 'linked-caption-track-test',
+            projectName: 'Linked caption track test',
+            timeline: _linkedOverlayCaptionTimeline(entry),
+          );
+
+      await tester.pumpWidget(_timelineHarness(container));
+      await tester.pumpAndSettle();
+      final trackLabel = find.byKey(
+        const ValueKey('timeline_track_overlay_video_track'),
+      );
+      tester.widget<GestureDetector>(trackLabel).onTap?.call();
+      await tester.pump();
+      tester.widget<GestureDetector>(trackLabel).onTap?.call();
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Delete'));
+      await tester.pumpAndSettle();
+      // Track-label taps clear clip selection. Reapply a mixed selection while
+      // the confirmation is open so deletion must repair the retained clip.
+      container.read(editorProvider.notifier)
+        ..selectTrack('overlay_captions')
+        ..selectClipIds(['base_clip', 'linked_caption']);
+      container.read(subtitleProvider.notifier).selectEntry('linked_caption');
+      await tester.pump();
+      await tester.tap(find.widgetWithText(FilledButton, 'Delete'));
+      await tester.pumpAndSettle();
+
+      expect(container.read(subtitleProvider).entries, isEmpty);
+      expect(container.read(subtitleProvider).selectedEntryId, isNull);
+      final editorState = container.read(editorProvider);
+      expect(editorState.selectedClipId, 'base_clip');
+      expect(editorState.selectedClipIds, {'base_clip'});
+      expect(editorState.timeline.subtitleEntries, isEmpty);
+      expect(find.text('Linked caption'), findsNothing);
+      expect(editorState.canUndo, isTrue);
+      expect(container.read(subtitleProvider.notifier).canUndo, isFalse);
+
+      container.read(editorProvider.notifier).undo();
+      await tester.pump();
+      final restoredState = container.read(editorProvider);
+      expect(
+        restoredState.timeline.tracks.any(
+          (track) => track.id == 'overlay_video_track',
+        ),
+        isTrue,
+      );
+      expect(restoredState.selectedClipId, 'linked_caption');
+      expect(restoredState.selectedClipIds, {'base_clip', 'linked_caption'});
+      expect(
+        container.read(subtitleProvider).entries.single.id,
+        'linked_caption',
+      );
+      expect(
+        container.read(subtitleProvider).selectedEntryId,
+        'linked_caption',
+      );
+      expect(container.read(subtitleProvider.notifier).canUndo, isFalse);
+
+      container.read(editorProvider.notifier).redo();
+      await tester.pump();
+      expect(container.read(subtitleProvider).entries, isEmpty);
+      expect(container.read(subtitleProvider).selectedEntryId, isNull);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
   testWidgets('locked subtitle lanes reject toolbar mutations', (tester) async {
     await tester.binding.setSurfaceSize(const Size(390, 300));
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -1859,12 +2000,20 @@ void main() {
     await tester.pump();
     await tester.tap(find.byTooltip('Clipboard'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Paste at playhead'));
-    await tester.pumpAndSettle();
+    final paste = tester.widget<ListTile>(
+      find.widgetWithText(ListTile, 'Paste at playhead'),
+    );
+    expect(paste.enabled, isFalse);
+    expect(paste.onTap, isNull);
     expect(container.read(subtitleProvider).entries, hasLength(1));
     expect(
-      find.text('Unlock the subtitle track before pasting captions.'),
-      findsOne,
+      container
+          .read(editorProvider)
+          .timeline
+          .tracks
+          .singleWhere((track) => track.id == 'locked_subtitles')
+          .clips,
+      hasLength(1),
     );
     expect(tester.takeException(), isNull);
   });
@@ -2284,6 +2433,28 @@ EditorTimeline _linkedOverlayAudioTimeline({
             sourceDuration: sourceDuration,
             playbackRate: video.playbackRate,
             isReversed: video.isReversed,
+          ),
+        ],
+      ),
+    ],
+  );
+}
+
+EditorTimeline _linkedOverlayCaptionTimeline(SubtitleEntry entry) {
+  final timeline = _linkedOverlayAudioTimeline();
+  return timeline.copyWith(
+    tracks: [
+      ...timeline.tracks,
+      TimelineTrack(
+        id: 'overlay_captions',
+        name: 'Overlay captions',
+        type: TimelineTrackType.subtitle,
+        section: TimelineTrackSection.textSubtitle,
+        clips: [
+          TimelineClip.fromSubtitleEntry(
+            entry,
+            trackId: 'overlay_captions',
+            linkedClipId: 'overlay_video',
           ),
         ],
       ),

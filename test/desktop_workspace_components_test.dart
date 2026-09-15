@@ -154,6 +154,32 @@ void main() {
     );
   });
 
+  testWidgets(
+    'inspector discards pending edits when selection changes or locks',
+    (tester) async {
+      final key = GlobalKey<_InspectorHarnessState>();
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: AppTheme.darkTheme,
+          home: Scaffold(body: _InspectorHarness(key: key)),
+        ),
+      );
+      final field = find.byType(TextField).first;
+      await tester.enterText(field, '900');
+      key.currentState!.switchClip('second');
+      await tester.pump();
+      await tester.tap(find.byType(TextField).at(1));
+      await tester.pump();
+      expect(key.currentState!.commits, 0);
+      expect(key.currentState!.transform.offsetX, 10);
+      await tester.enterText(field, '800');
+      key.currentState!.lock();
+      await tester.pump();
+      expect(key.currentState!.commits, 0);
+      expect(key.currentState!.transform.offsetX, 10);
+    },
+  );
+
   testWidgets('inspector refreshes unfocused values and commits blur/cancel', (
     tester,
   ) async {
@@ -222,6 +248,11 @@ class _MemoryPreferencesStore extends DesktopWorkspacePreferencesStore {
 }
 
 class _InspectorHarnessState extends State<_InspectorHarness> {
+  String clipId = 'inspector-clip';
+  bool canEdit = true;
+  int commits = 0;
+  void switchClip(String id) => setState(() => clipId = id);
+  void lock() => setState(() => canEdit = false);
   TimelineTransform transform = const TimelineTransform(
     offsetX: 10,
     offsetY: 20,
@@ -231,7 +262,7 @@ class _InspectorHarnessState extends State<_InspectorHarness> {
   );
 
   TimelineClip get clip => TimelineClip(
-    id: 'inspector-clip',
+    id: clipId,
     trackId: 'video-track',
     type: TimelineTrackType.video,
     label: 'Inspector clip',
@@ -258,13 +289,16 @@ class _InspectorHarnessState extends State<_InspectorHarness> {
           clips: [clip],
         ),
         playheadPosition: const Duration(seconds: 1),
-        canEdit: true,
+        canEdit: canEdit,
         canAdjustAudio: true,
         canOpenEffects: false,
         canAnimate: false,
         canOpenTiming: false,
         canEditCaptions: false,
-        onTransformChanged: (mapper, _) => replaceTransform(mapper(transform)),
+        onTransformChanged: (mapper, _) {
+          commits++;
+          replaceTransform(mapper(transform));
+        },
       ),
     );
   }
