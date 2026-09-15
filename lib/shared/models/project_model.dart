@@ -301,8 +301,7 @@ class Project {
     final lastModifiedAt =
         DateTime.tryParse(data['lastModifiedAt'] as String? ?? '') ?? now;
     final createdAt =
-        DateTime.tryParse(data['createdAt'] as String? ?? '') ??
-        lastModifiedAt;
+        DateTime.tryParse(data['createdAt'] as String? ?? '') ?? lastModifiedAt;
 
     return Project(
       id: data['id'] as String,

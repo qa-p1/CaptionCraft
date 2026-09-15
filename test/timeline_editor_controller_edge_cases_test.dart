@@ -71,15 +71,9 @@ void main() {
       expect(controller.canExecute(TimelineEditorCommand.paste), isFalse);
       expect(controller.pasteAtPlayhead(), isFalse);
       expect(
-        container
-            .read(editorProvider)
-            .timeline
-            .tracks
-            .single
-            .clips,
+        container.read(editorProvider).timeline.tracks.single.clips,
         isEmpty,
       );
     },
   );
-
 }

@@ -169,6 +169,18 @@ void main() {
       await tester.pumpAndSettle();
       await tester.enterText(
         find.byKey(const ValueKey('keyframe_numeric_time')),
+        'NaN',
+      );
+      await tester.tap(find.byKey(const ValueKey('keyframe_numeric_apply')));
+      await tester.pump();
+      expect(find.text('Enter valid numbers.'), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('keyframe_numeric_apply')),
+        findsOneWidget,
+      );
+
+      await tester.enterText(
+        find.byKey(const ValueKey('keyframe_numeric_time')),
         '300',
       );
       await tester.enterText(
@@ -208,4 +220,95 @@ void main() {
       expect(addButton.onPressed, isNull);
     },
   );
+
+  testWidgets('graph renders an empty state when no properties are available', (
+    tester,
+  ) async {
+    final clip = TimelineClip(
+      id: 'static',
+      trackId: 'video',
+      type: TimelineTrackType.video,
+      label: 'Static clip',
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 1),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 720,
+            child: KeyframeGraphEditor(
+              clip: clip,
+              properties: const [],
+              initialProperty: TimelineKeyframeProperty.opacity,
+              playhead: Duration.zero,
+              frameRate: 30,
+              onChanged: (_, __) {},
+              onSeek: (_) {},
+              onEditStart: () {},
+              onEditEnd: () {},
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(
+      find.text('No animatable properties on this clip.'),
+      findsOneWidget,
+    );
+    expect(find.byKey(const ValueKey('keyframe_graph_canvas')), findsNothing);
+  });
+
+  testWidgets('graph survives properties being removed during an update', (
+    tester,
+  ) async {
+    final clip = TimelineClip(
+      id: 'updated',
+      trackId: 'video',
+      type: TimelineTrackType.video,
+      label: 'Updated clip',
+      startTime: Duration.zero,
+      endTime: const Duration(seconds: 1),
+    );
+    var properties = const [TimelineKeyframeProperty.opacity];
+    late void Function(VoidCallback) rebuild;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 720,
+            child: StatefulBuilder(
+              builder: (context, setState) {
+                rebuild = setState;
+                return KeyframeGraphEditor(
+                  clip: clip,
+                  properties: properties,
+                  initialProperty: TimelineKeyframeProperty.opacity,
+                  playhead: Duration.zero,
+                  frameRate: 30,
+                  onChanged: (_, __) {},
+                  onSeek: (_) {},
+                  onEditStart: () {},
+                  onEditEnd: () {},
+                );
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+    expect(find.byKey(const ValueKey('keyframe_graph_canvas')), findsOneWidget);
+
+    rebuild(() => properties = const []);
+    await tester.pump();
+
+    expect(
+      find.text('No animatable properties on this clip.'),
+      findsOneWidget,
+    );
+    expect(find.byKey(const ValueKey('keyframe_graph_canvas')), findsNothing);
+  });
 }

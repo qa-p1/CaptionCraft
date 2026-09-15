@@ -98,9 +98,7 @@ class YtDlpBridge implements MediaExtractor {
       await _discardRuntime();
     }
     if (_directory != null) {
-      final failure = File(
-        p.join(_directory!.path, 'startup-error.json'),
-      );
+      final failure = File(p.join(_directory!.path, 'startup-error.json'));
       if (await failure.exists()) {
         await _discardRuntime();
       }

@@ -48,10 +48,7 @@ void main() {
     notifier.updateDuration(const Duration(seconds: 4));
 
     expect(notifier.state.position, const Duration(seconds: 4));
-    expect(
-      notifier.state.pendingSeekPosition,
-      const Duration(seconds: 4),
-    );
+    expect(notifier.state.pendingSeekPosition, const Duration(seconds: 4));
     expect(notifier.state.progressPercent, 1);
   });
 

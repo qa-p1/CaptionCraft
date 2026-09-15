@@ -309,20 +309,17 @@ void main() {
       'cleans a direct result when completion cannot be persisted',
       () async {
         final storage = await _temporaryDirectory();
-        final dio = _WritingDio(
-          const <int>[
-            0x89,
-            0x50,
-            0x4e,
-            0x47,
-            0x0d,
-            0x0a,
-            0x1a,
-            0x0a,
-            1,
-          ],
-          mimeType: 'image/png',
-        );
+        final dio = _WritingDio(const <int>[
+          0x89,
+          0x50,
+          0x4e,
+          0x47,
+          0x0d,
+          0x0a,
+          0x1a,
+          0x0a,
+          1,
+        ], mimeType: 'image/png');
         var failCompletedWrite = true;
         final manager = DiscoverDownloadManager(
           dio: dio,
@@ -341,9 +338,7 @@ void main() {
         await manager.initialize();
         final failed = manager.items
             .expand((items) => items)
-            .firstWhere(
-              (item) => item.status == DiscoverDownloadStatus.failed,
-            );
+            .firstWhere((item) => item.status == DiscoverDownloadStatus.failed);
 
         await manager.enqueueDirect(
           const DiscoverDownloadRequest(
@@ -361,10 +356,9 @@ void main() {
         expect(item.canRetry, isTrue);
         expect(item.localPath, isNull);
         expect(
-          storage
-              .listSync()
-              .whereType<File>()
-              .where((file) => !file.path.endsWith('downloads.json')),
+          storage.listSync().whereType<File>().where(
+            (file) => !file.path.endsWith('downloads.json'),
+          ),
           isEmpty,
         );
 
@@ -388,9 +382,7 @@ void main() {
           0x0a,
           9,
         ];
-        final existing = File(
-          p.join(storage.path, 'preserve-id-Existing.png'),
-        );
+        final existing = File(p.join(storage.path, 'preserve-id-Existing.png'));
         await existing.writeAsBytes(existingBytes, flush: true);
         final manager = DiscoverDownloadManager(
           dio: _FailThenWritingDio(),
@@ -402,9 +394,7 @@ void main() {
         await manager.initialize();
         final failed = manager.items
             .expand((items) => items)
-            .firstWhere(
-              (item) => item.status == DiscoverDownloadStatus.failed,
-            );
+            .firstWhere((item) => item.status == DiscoverDownloadStatus.failed);
 
         await manager.enqueueDirect(
           const DiscoverDownloadRequest(

@@ -130,6 +130,7 @@ deploy its owner-scoped Firestore rules. Never commit signing material or API ke
 - [Editor architecture](docs/editor_architecture.md) and [roadmap](docs/editor_core_roadmap.md)
 - [Windows media/export continuation](docs/desktop-workflows-2026-09-08.md)
 - [Editor, UI and recovery edge-case audit](docs/edge-case-audit-2026-09-09.md)
+- [Full-app audit continuation and capability map](docs/full-app-audit-2026-09-13.md)
 - [Effects, color and audio](docs/editor_effects_audio_status.md)
 - [Asset-pack publishing](docs/asset-pack-deployment.md), [LUTs](docs/lut-pack.md), [sound effects](docs/sfx-library.md)
 - [Historical release-readiness audit](docs/release-readiness-2026-08-31.md)

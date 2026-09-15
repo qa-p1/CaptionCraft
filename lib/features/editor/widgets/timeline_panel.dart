@@ -959,6 +959,26 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       return;
     }
     final removedClipIds = track.clips.map((clip) => clip.id).toSet();
+    final lockedCompanionTracks = timeline.tracks
+        .where(
+          (candidate) =>
+              candidate.id != track.id &&
+              candidate.isLocked &&
+              candidate.clips.any(
+                (clip) => removedClipIds.contains(clip.linkedClipId),
+              ),
+        )
+        .toList(growable: false);
+    if (lockedCompanionTracks.isNotEmpty) {
+      final names = lockedCompanionTracks
+          .map((candidate) => candidate.displayName)
+          .join(', ');
+      SnackBarHelper.showInfo(
+        context,
+        'Unlock $names before deleting this track.',
+      );
+      return;
+    }
     final nextTracks = timeline.tracks
         .where((candidate) => candidate.id != track.id)
         .map(
@@ -989,21 +1009,69 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
               remainingAssetIds.contains(asset.id),
         )
         .toList();
+    final nextTimeline = timeline
+        .copyWith(tracks: nextTracks, assets: nextAssets)
+        .prunedRelationships();
+    final retainedClipIds = nextTimeline.tracks
+        .expand((candidate) => candidate.clips)
+        .map((clip) => clip.id)
+        .toSet();
+    final selectedClipIds = editorState.selectedClipIds;
+    final retainedSelectedClipIds = selectedClipIds
+        .where(retainedClipIds.contains)
+        .toList(growable: true);
+    final selectedClipId = editorState.selectedClipId;
+    if (selectedClipId != null &&
+        retainedClipIds.contains(selectedClipId) &&
+        !retainedSelectedClipIds.contains(selectedClipId)) {
+      retainedSelectedClipIds.add(selectedClipId);
+    }
+    final nextSelectedClipIds = [
+      ...retainedSelectedClipIds.where((clipId) => clipId != selectedClipId),
+      if (selectedClipId != null &&
+          retainedSelectedClipIds.contains(selectedClipId))
+        selectedClipId,
+    ];
+    final selectionSetUnchanged =
+        nextSelectedClipIds.length == selectedClipIds.length &&
+        nextSelectedClipIds.toSet().containsAll(selectedClipIds);
+    final selectionNeedsRepair =
+        !selectionSetUnchanged ||
+        nextSelectedClipIds.lastOrNull != editorState.selectedClipId;
+    final selectedSubtitleId = ref.read(subtitleProvider).selectedEntryId;
+    final subtitleSelectionWasRemoved =
+        selectedSubtitleId != null &&
+        !retainedClipIds.contains(selectedSubtitleId);
 
-    ref
-        .read(editorProvider.notifier)
-        .setTimeline(
-          timeline
-              .copyWith(tracks: nextTracks, assets: nextAssets)
-              .prunedRelationships(),
-        );
+    if (!_applyTimeline(nextTimeline)) return;
 
     if (editorState.selectedTrackId == track.id) {
       ref.read(editorProvider.notifier).selectTrack(null);
+      if (selectedSubtitleId != null && !subtitleSelectionWasRemoved) {
+        ref.read(subtitleProvider.notifier).selectEntry(selectedSubtitleId);
+      }
     }
-    if (editorState.selectedClipId != null &&
-        track.clips.any((clip) => clip.id == editorState.selectedClipId)) {
-      ref.read(editorProvider.notifier).selectClip(null);
+    if (selectionNeedsRepair) {
+      if (nextSelectedClipIds.isEmpty) {
+        ref.read(editorProvider.notifier).selectClip(null);
+      } else {
+        ref
+            .read(editorProvider.notifier)
+            .selectClipIds(nextSelectedClipIds);
+        final nextPrimaryId = nextSelectedClipIds.lastOrNull;
+        final nextPrimary = nextPrimaryId == null
+            ? null
+            : nextTimeline.tracks
+                .expand((candidate) => candidate.clips)
+                .where((clip) => clip.id == nextPrimaryId)
+                .firstOrNull;
+        if (nextPrimary?.type == TimelineTrackType.subtitle) {
+          ref.read(subtitleProvider.notifier).selectEntry(nextPrimaryId);
+        } else if (subtitleSelectionWasRemoved) {
+          ref.read(subtitleProvider.notifier).selectEntry(null);
+        }
+      }
+    } else if (subtitleSelectionWasRemoved) {
       ref.read(subtitleProvider.notifier).selectEntry(null);
     }
   }

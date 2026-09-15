@@ -107,9 +107,7 @@ void main() {
         launchRuntime: (_, environment) {
           launches++;
           runtime = environment['CAPTIONCRAFT_MEDIA_RUNTIME'];
-          File(
-            p.join(runtime!, 'ready.json'),
-          ).writeAsStringSync('{"port":');
+          File(p.join(runtime!, 'ready.json')).writeAsStringSync('{"port":');
           return program.future;
         },
         startupTimeout: const Duration(milliseconds: 20),
@@ -149,38 +147,35 @@ void main() {
     },
   );
 
-  test(
-    'a definite startup failure does not poison later requests',
-    () async {
-      var launches = 0;
-      var failFirstLaunch = true;
-      final bridge = YtDlpBridge(
-        temporaryDirectory: () async => root,
-        prepareRuntime: () async => root.path,
-        launchRuntime: (_, environment) {
-          launches++;
-          if (failFirstLaunch) {
-            failFirstLaunch = false;
-            return Future<String?>.error(StateError('temporary startup error'));
-          }
-          File(
-            p.join(environment['CAPTIONCRAFT_MEDIA_RUNTIME']!, 'ready.json'),
-          ).writeAsStringSync(jsonEncode({'port': server.port}));
-          return Future<String?>.value(null);
-        },
-        startupTimeout: const Duration(seconds: 1),
-      );
+  test('a definite startup failure does not poison later requests', () async {
+    var launches = 0;
+    var failFirstLaunch = true;
+    final bridge = YtDlpBridge(
+      temporaryDirectory: () async => root,
+      prepareRuntime: () async => root.path,
+      launchRuntime: (_, environment) {
+        launches++;
+        if (failFirstLaunch) {
+          failFirstLaunch = false;
+          return Future<String?>.error(StateError('temporary startup error'));
+        }
+        File(
+          p.join(environment['CAPTIONCRAFT_MEDIA_RUNTIME']!, 'ready.json'),
+        ).writeAsStringSync(jsonEncode({'port': server.port}));
+        return Future<String?>.value(null);
+      },
+      startupTimeout: const Duration(seconds: 1),
+    );
 
-      await expectLater(
-        bridge.inspect('https://www.youtube.com/watch?v=jNQXAC9IVRw'),
-        throwsA(isA<StateError>()),
-      );
-      final result = await bridge.inspect(
-        'https://www.youtube.com/watch?v=jNQXAC9IVRw',
-      );
+    await expectLater(
+      bridge.inspect('https://www.youtube.com/watch?v=jNQXAC9IVRw'),
+      throwsA(isA<StateError>()),
+    );
+    final result = await bridge.inspect(
+      'https://www.youtube.com/watch?v=jNQXAC9IVRw',
+    );
 
-      expect(result, contains('id'));
-      expect(launches, 2);
-    },
-  );
+    expect(result, contains('id'));
+    expect(launches, 2);
+  });
 }

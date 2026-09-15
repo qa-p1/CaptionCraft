@@ -146,16 +146,15 @@ class InstagramDownloadService implements InstagramMediaService {
         // back to one of those manifests: the download manager intentionally
         // accepts direct media files only and cannot turn a manifest URL into
         // a file without a separate segment downloader.
-        final video =
-            videos
-                .where(
-                  (f) =>
-                      !'${f['format_id']}'.startsWith('dash-') &&
-                      (f['protocol'] == null ||
-                          '${f['protocol']}'.toLowerCase() == 'https') &&
-                      _https(f['url']) != null,
-                )
-                .lastOrNull;
+        final video = videos
+            .where(
+              (f) =>
+                  !'${f['format_id']}'.startsWith('dash-') &&
+                  (f['protocol'] == null ||
+                      '${f['protocol']}'.toLowerCase() == 'https') &&
+                  _https(f['url']) != null,
+            )
+            .lastOrNull;
         final candidate = video ?? entry;
         if (video == null && !_isDirectProtocol(entry['protocol'])) continue;
         final source = _https(candidate['url']);

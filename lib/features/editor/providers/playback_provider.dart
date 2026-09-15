@@ -75,9 +75,7 @@ class PlaybackNotifier extends StateNotifier<PlaybackState> {
     final safePosition = durationUs <= 0
         ? (position.isNegative ? Duration.zero : position)
         : Duration(
-            microseconds: position.inMicroseconds
-                .clamp(0, durationUs)
-                .toInt(),
+            microseconds: position.inMicroseconds.clamp(0, durationUs).toInt(),
           );
     if (state.position == safePosition) return;
     state = state.copyWith(position: safePosition);

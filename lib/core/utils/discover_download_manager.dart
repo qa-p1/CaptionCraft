@@ -457,11 +457,7 @@ class DiscoverDownloadManager implements DiscoverDownloadFacade {
       final message = control.exceededLimit
           ? 'The download exceeded the ${_sizeLabel(maxDirectBytes)} limit.'
           : _friendlyDownloadError(item.source, error);
-      await _recordWorkerFailure(
-        id,
-        message,
-        cancelled: control.userCancelled,
-      );
+      await _recordWorkerFailure(id, message, cancelled: control.userCancelled);
     } finally {
       _directJobs.remove(id);
       _lastProgressEmitMicros.remove(id);

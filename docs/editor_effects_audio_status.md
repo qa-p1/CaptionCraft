@@ -1,8 +1,10 @@
 # Effects, color, and audio implementation status
 
-This status is audited against implementation and tests on
-`editor-heavy-project-foundation`. Persisted fields are not counted as complete
-unless preview/export or an explicit delivery guard consumes them.
+Updated September 13 against `release-readiness-desktop-workflows-20260907`.
+The earlier document described an older foundation and incorrectly listed
+several subsequently connected features as unsupported. The implementation
+boundaries below come from current consumers and regression fixtures; they
+do not establish physical-device validation.
 
 ## Working now
 
@@ -14,8 +16,8 @@ unless preview/export or an explicit delivery guard consumes them.
   glow, geometry, shadow/stroke, and distortion catalog produces valid FFmpeg
   filters; compatibility tests parse every type and verify every visible
   numeric parameter changes delivery output.
-- Rectangle and ellipse effect masks, feathering, inversion, and tracking
-  metadata persist. Adjustment layers can be created, trimmed, split, and
+- Rectangle, ellipse, and freeform effect masks, feathering, inversion, and
+  tracking keyframes persist. Adjustment layers can be created, trimmed, split, and
   duplicated and process lower visual layers during their active range.
 - Standard scalar color controls, RGB channels, RGB curve, tone/global wheels,
   and LUT intensity are shared by preview/export paths. Whites and the other
@@ -28,8 +30,21 @@ unless preview/export or an explicit delivery guard consumes them.
   EQ, dynamics, restoration, reverb/delay/distortion, pitch/time-stretch,
   normalization/limiting, and deterministic lane ducking feed the shared
   preview/export audio graph.
-- Unsupported selective-color and HDR/Log delivery states fail clearly instead
-  of silently exporting a different SDR result.
+- Hue curves, HSL/skin-tone qualifiers, spatial masks, and neutral-reference
+  sampling are connected through `advanced_color_controls.dart` and the shared
+  color graph. `color_scope_and_tracking_test.dart` exercises freeform mask UI,
+  persisted tracking, actual moving-target tracking, and scope graphs.
+- Waveform, RGB parade, vectorscope, and histogram have FFmpeg scope consumers.
+  Object tracking uses FFmpeg template matching (`find_rect`). These are real
+  processing paths, with limitations described below.
+- Color management supports SDR, HLG, PQ, and wide-gamut output paths. Automatic
+  and Log remain input interpretations and are rejected as project output
+  spaces; preserving HDR with SDR output is also rejected.
+- Audio analysis measures peak, RMS, and loudness. A saved loudness pass is reused
+  only when its source/render fingerprint matches; otherwise normalization uses
+  the fallback pass. Bus creation, assignment, and deletion have mixer controls
+  and undo. See `audio_workflow_foundation_test.dart` and
+  `editor_screen_capability_test.dart`.
 
 Many named stylized effects are deterministic FFmpeg approximations rather than
 GPU shader simulations. During active playback the bounded live fallback also
@@ -40,23 +55,21 @@ edit/playback settles and final export always uses the full graph.
 
 - Group and compound records are shared processing sets over member clips, not
   true flattened nested timelines with independent internal timebases.
-- Freeform mask drawing and actual object/planar tracking are not implemented;
-  the current tracking fields are metadata only.
-- Hue-vs-hue/saturation/luminance curves, HSL qualifiers, tracked selective
-  corrections, skin-tone tools, and neutral-reference white-balance sampling
-  have persistence foundations but no supported render/UI workflow. Export is
-  intentionally blocked if that dormant state is present.
-- SDR Rec.709 is the supported delivery path. Camera-log transforms, HLG/PQ,
-  wide-gamut processing, metadata override, and HDR export are not implemented
-  and are intentionally blocked rather than silently converted.
-- Waveform monitor, RGB parade, vectorscope, histogram, and playing video scopes
-  are not implemented.
-- Audio meters are not real-time peak/RMS/LUFS meters, loudness normalization is
-  one-pass, and signal-threshold sidechain ducking is not implemented.
+- Template matching is not general object recognition or planar tracking.
+  Occlusion, scale/rotation changes, long clips, and native-device performance
+  still need physical-media verification.
+- HDR processing code and deterministic fixtures do not verify display
+  calibration, every camera Log profile, or encoded HDR playback on devices.
+- Scopes are sampled/cached processing, not proof of continuous real-time scope
+  performance on all devices. Audio measurements are analysis results, not
+  continuously sampled live mixer meters.
+- Signal-threshold sidechain ducking is not implemented; existing ducking follows
+  timeline activity.
 - Generic audio-effect parameter keyframes are not exposed because several
   filters cannot be safely timeline-enabled; volume automation is supported.
-- Intelligent music remix/stretch-to-duration and persisted advanced bus/submix
-  routing UI remain outstanding.
+- Intelligent music remix/stretch-to-duration remains outstanding. Bus routing
+  is persisted and exposed; true nested submix/compound timelines remain outside
+  the current processing-set model.
 
 These boundaries must stay visible in product copy and tests; a roadmap checkbox
 or serialized model field alone must not be used to claim completion.

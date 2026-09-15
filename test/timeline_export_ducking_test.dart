@@ -159,11 +159,7 @@ void main() {
             _audioInput(targetTrack, target, 0),
             _audioInput(separatedVideoTrack, separatedOwner, 1),
             _audioInput(separatedAudioTrack, separatedAudio, 2),
-            _audioInput(
-              explicitlySeparatedTrack,
-              explicitlySeparatedVideo,
-              3,
-            ),
+            _audioInput(explicitlySeparatedTrack, explicitlySeparatedVideo, 3),
             _audioInput(ordinaryTrack, ordinaryVoice, 4),
           ],
         );
