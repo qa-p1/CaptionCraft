@@ -48,6 +48,17 @@ void main() {
       final ffprobeChannel = const MethodChannel(
         'flutter.arthenica.com/ffmpeg_kit',
       );
+      const eventChannel = MethodChannel('flutter.arthenica.com/ffmpeg_kit_event');
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        eventChannel,
+        (_) async => null,
+      );
+      addTearDown(
+        () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+          eventChannel,
+          null,
+        ),
+      );
       final ffprobeCalls = <MethodCall>[];
       tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
         ffprobeChannel,
@@ -215,7 +226,9 @@ void main() {
           final savedAssets = saved?.timeline.assets;
           if (savedAssets != null &&
               savedAssets.length == 2 &&
-              savedAssets.every((asset) => asset.sourcePath == replacementPath)) {
+              savedAssets.every(
+                (asset) => asset.sourcePath == replacementPath,
+              )) {
             break;
           }
         }
@@ -233,21 +246,21 @@ void main() {
       expect(find.text('Media relinked successfully'), findsOneWidget);
       expect(saved, isNotNull);
       expect(saved!.videoPath, replacementPath);
-      expect(saved!.timeline.assets, hasLength(2));
+      expect(saved.timeline.assets, hasLength(2));
       expect(
-        saved!.timeline.assets.map((asset) => asset.sourcePath),
+        saved.timeline.assets.map((asset) => asset.sourcePath),
         everyElement(replacementPath),
       );
       expect(
-        saved!.timeline.assets.map((asset) => asset.remoteUrl),
+        saved.timeline.assets.map((asset) => asset.remoteUrl),
         everyElement(isNull),
       );
 
-      final restoredBase = saved!.timeline.tracks
+      final restoredBase = saved.timeline.tracks
           .singleWhere((track) => track.id == baseClip.trackId)
           .clips
           .single;
-      final restoredOverlay = saved!.timeline.tracks
+      final restoredOverlay = saved.timeline.tracks
           .singleWhere((track) => track.id == overlayClip.trackId)
           .clips
           .single;

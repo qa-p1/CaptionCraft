@@ -64,12 +64,7 @@ void main() {
       final words = GroqService.parseWordsResponse({
         'words': const [],
         'segments': [
-          {
-            'words': const [],
-            'text': 'fallback',
-            'start': 0.0,
-            'end': 0.5,
-          },
+          {'words': const [], 'text': 'fallback', 'start': 0.0, 'end': 0.5},
           {
             'words': [
               {'word': 'timed', 'start': 0.5, 'end': 1.0},

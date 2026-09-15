@@ -238,17 +238,20 @@ class GroqService {
   /// - Each SubtitleEntry: startTime=first word's start, endTime=latest word's end,
   ///   text=all words joined with spaces, words=per-word timing sub-list.
   static List<SubtitleEntry> groupWordsIntoLines(List<WordTiming> allWords) {
-    final indexedWords = allWords.asMap().entries
-        .where(
-          (entry) =>
-              entry.value.word.trim().isNotEmpty &&
-              entry.value.endTime > entry.value.startTime,
-        )
-        .toList()
-      ..sort((a, b) {
-        final start = a.value.startTime.compareTo(b.value.startTime);
-        return start != 0 ? start : a.key.compareTo(b.key);
-      });
+    final indexedWords =
+        allWords
+            .asMap()
+            .entries
+            .where(
+              (entry) =>
+                  entry.value.word.trim().isNotEmpty &&
+                  entry.value.endTime > entry.value.startTime,
+            )
+            .toList()
+          ..sort((a, b) {
+            final start = a.value.startTime.compareTo(b.value.startTime);
+            return start != 0 ? start : a.key.compareTo(b.key);
+          });
     final words = indexedWords.map((entry) => entry.value).toList();
     if (words.isEmpty) return [];
 

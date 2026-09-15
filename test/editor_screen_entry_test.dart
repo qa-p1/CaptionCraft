@@ -629,27 +629,27 @@ void main() {
     );
     Focus.of(tester.element(editorScaffold)).requestFocus();
     await tester.pump();
-    await tester.pageBack();
-    await tester.pump();
-    expect(
-      find.byType(EditorScreen),
-      findsOneWidget,
-      reason: 'The route must remain mounted until its local write completes.',
-    );
-    await tester.sendKeyEvent(LogicalKeyboardKey.keyN);
-    expect(
-      container
-          .read(editorProvider)
-          .timeline
-          .workspaceSettings
-          .snapping
-          .enabled,
-      isFalse,
-      reason: 'Keyboard edits must be blocked after the exit save begins.',
-    );
-    await tester.runAsync(
-      () => Future<void>.delayed(const Duration(milliseconds: 100)),
-    );
+    // Start exit I/O in the real async zone and await the write itself.
+    await tester.runAsync(() async {
+      await tester.pageBack();
+      expect(
+        find.byType(EditorScreen),
+        findsOneWidget,
+        reason: 'The route must remain mounted until its local write completes.',
+      );
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyN);
+      expect(
+        container
+            .read(editorProvider)
+            .timeline
+            .workspaceSettings
+            .snapping
+            .enabled,
+        isFalse,
+        reason: 'Keyboard edits must be blocked after the exit save begins.',
+      );
+      await ProjectLocalStorage.waitForPendingSavesForTesting();
+    });
     await _waitForEditorToClose(tester);
 
     expect(find.byType(EditorScreen), findsNothing);

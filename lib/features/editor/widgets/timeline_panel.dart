@@ -1055,16 +1055,14 @@ class _TimelinePanelState extends ConsumerState<TimelinePanel> {
       if (nextSelectedClipIds.isEmpty) {
         ref.read(editorProvider.notifier).selectClip(null);
       } else {
-        ref
-            .read(editorProvider.notifier)
-            .selectClipIds(nextSelectedClipIds);
+        ref.read(editorProvider.notifier).selectClipIds(nextSelectedClipIds);
         final nextPrimaryId = nextSelectedClipIds.lastOrNull;
         final nextPrimary = nextPrimaryId == null
             ? null
             : nextTimeline.tracks
-                .expand((candidate) => candidate.clips)
-                .where((clip) => clip.id == nextPrimaryId)
-                .firstOrNull;
+                  .expand((candidate) => candidate.clips)
+                  .where((clip) => clip.id == nextPrimaryId)
+                  .firstOrNull;
         if (nextPrimary?.type == TimelineTrackType.subtitle) {
           ref.read(subtitleProvider.notifier).selectEntry(nextPrimaryId);
         } else if (subtitleSelectionWasRemoved) {

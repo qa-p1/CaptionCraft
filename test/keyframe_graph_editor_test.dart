@@ -244,7 +244,7 @@ void main() {
               initialProperty: TimelineKeyframeProperty.opacity,
               playhead: Duration.zero,
               frameRate: 30,
-              onChanged: (_, __) {},
+              onChanged: (_, _) {},
               onSeek: (_) {},
               onEditStart: () {},
               onEditEnd: () {},
@@ -254,10 +254,7 @@ void main() {
       ),
     );
 
-    expect(
-      find.text('No animatable properties on this clip.'),
-      findsOneWidget,
-    );
+    expect(find.text('No animatable properties on this clip.'), findsOneWidget);
     expect(find.byKey(const ValueKey('keyframe_graph_canvas')), findsNothing);
   });
 
@@ -289,7 +286,7 @@ void main() {
                   initialProperty: TimelineKeyframeProperty.opacity,
                   playhead: Duration.zero,
                   frameRate: 30,
-                  onChanged: (_, __) {},
+                  onChanged: (_, _) {},
                   onSeek: (_) {},
                   onEditStart: () {},
                   onEditEnd: () {},
@@ -305,10 +302,7 @@ void main() {
     rebuild(() => properties = const []);
     await tester.pump();
 
-    expect(
-      find.text('No animatable properties on this clip.'),
-      findsOneWidget,
-    );
+    expect(find.text('No animatable properties on this clip.'), findsOneWidget);
     expect(find.byKey(const ValueKey('keyframe_graph_canvas')), findsNothing);
   });
 }

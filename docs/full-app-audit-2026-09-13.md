@@ -113,7 +113,15 @@ and bus workflows. Serialized fields alone were not treated as usable features.
   **7 Python tests**, and Android debug packaging. Push validation also passed
   its test and analysis steps. Android, Windows, and iOS build workflows
   succeeded. Formatting was the validation failure; its exact diff was applied.
-- Final integrated validation is recorded below when the completed patch runs.
+- Caption/UI checkpoint `98c8f24`: PR validation passed 677 tests with three
+  test-setup failures; push validation passed 676 with the same failures plus
+  the existing save-on-exit timing failure. The logs identified lazily built
+  controls queried before scrolling, a missing FFmpeg event-channel mock, and
+  a wall-clock save wait. Corrections retain the assertions and await actual
+  persistence. Seven test-code analysis warnings and the pinned formatter's
+  remaining differences were also corrected. Android succeeded; iOS was still
+  running at this checkpoint. Windows stopped at those analysis warnings.
+- Final validation after these corrections is linked from draft PR #9.
 
 ## Remaining limits
 

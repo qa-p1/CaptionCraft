@@ -32,17 +32,19 @@ void main() {
     final editedFontSize = _entry(state, 'caption').styleOverride!.fontSize;
     container.read(subtitleProvider.notifier).undo();
     expect(
-      _entry(container.read(subtitleProvider), 'caption')
-          .styleOverride
-          ?.fontSize,
+      _entry(
+        container.read(subtitleProvider),
+        'caption',
+      ).styleOverride?.fontSize,
       20,
     );
     expect(container.read(subtitleProvider).globalStyle.fontSize, 10);
     container.read(subtitleProvider.notifier).redo();
     expect(
-      _entry(container.read(subtitleProvider), 'caption')
-          .styleOverride
-          ?.fontSize,
+      _entry(
+        container.read(subtitleProvider),
+        'caption',
+      ).styleOverride?.fontSize,
       editedFontSize,
     );
 
@@ -67,11 +69,9 @@ void main() {
     await _pumpPanel(tester, container, entryIds: const {'caption'});
 
     final header = find.text('Text Color');
-    await tester.ensureVisible(header);
+    await tester.scrollUntilVisible(header, 200);
     final headerRect = tester.getRect(header);
-    await tester.tapAt(
-      Offset(headerRect.center.dx, headerRect.bottom + 20),
-    );
+    await tester.tapAt(Offset(headerRect.center.dx, headerRect.bottom + 20));
     await tester.pumpAndSettle();
 
     expect(find.byType(ColorPicker), findsOneWidget);
@@ -95,7 +95,7 @@ void main() {
       'caption',
     ).styleOverride;
     final colorHeader = find.text('Text Color');
-    await tester.ensureVisible(colorHeader);
+    await tester.scrollUntilVisible(colorHeader, 200);
     final colorHeaderRect = tester.getRect(colorHeader);
     await tester.tapAt(
       Offset(colorHeaderRect.center.dx, colorHeaderRect.bottom + 20),
@@ -116,19 +116,27 @@ void main() {
     await tester.tap(find.widgetWithText(TextButton, 'Apply'));
     await tester.pumpAndSettle();
     expect(
-      _entry(container.read(subtitleProvider), 'caption')
-          .styleOverride
-          ?.toJson(),
+      _entry(
+        container.read(subtitleProvider),
+        'caption',
+      ).styleOverride?.toJson(),
       originalStyle?.toJson(),
     );
 
+    // Reveal the preset without a gesture: the locked panel ignores scrolling.
+    tester
+        .state<ScrollableState>(find.byType(Scrollable).first)
+        .position
+        .jumpTo(0);
+    await tester.pumpAndSettle();
     final cleanWhite = find.text('Clean White');
     await tester.tap(cleanWhite, warnIfMissed: false);
     await tester.pumpAndSettle();
     expect(
-      _entry(container.read(subtitleProvider), 'caption')
-          .styleOverride
-          ?.toJson(),
+      _entry(
+        container.read(subtitleProvider),
+        'caption',
+      ).styleOverride?.toJson(),
       originalStyle?.toJson(),
     );
 
@@ -145,9 +153,10 @@ void main() {
     await tester.tap(cleanWhite);
     await tester.pumpAndSettle();
     expect(
-      _entry(container.read(subtitleProvider), 'caption')
-          .styleOverride
-          ?.fontFamily,
+      _entry(
+        container.read(subtitleProvider),
+        'caption',
+      ).styleOverride?.fontFamily,
       'Inter',
     );
   });
@@ -320,24 +329,26 @@ ProviderContainer _projectContainer() {
     entries: [entry],
     globalStyle: const SubtitleStyleModel(fontSize: 10),
   );
-  container.read(editorProvider.notifier).loadProject(
-    videoPath: 'missing.mp4',
-    projectId: 'style-panel',
-    projectName: 'Style panel',
-    timeline: EditorTimeline(
-      tracks: [
-        TimelineTrack(
-          id: 'captions',
-          name: 'Captions',
-          type: TimelineTrackType.subtitle,
-          section: TimelineTrackSection.textSubtitle,
-          clips: [
-            TimelineClip.fromSubtitleEntry(entry, trackId: 'captions'),
+  container
+      .read(editorProvider.notifier)
+      .loadProject(
+        videoPath: 'missing.mp4',
+        projectId: 'style-panel',
+        projectName: 'Style panel',
+        timeline: EditorTimeline(
+          tracks: [
+            TimelineTrack(
+              id: 'captions',
+              name: 'Captions',
+              type: TimelineTrackType.subtitle,
+              section: TimelineTrackSection.textSubtitle,
+              clips: [
+                TimelineClip.fromSubtitleEntry(entry, trackId: 'captions'),
+              ],
+            ),
           ],
         ),
-      ],
-    ),
-  );
+      );
   return container;
 }
 
@@ -357,9 +368,7 @@ Future<void> _pumpPanel(
       container: container,
       child: MaterialApp(
         theme: AppTheme.darkTheme,
-        home: Scaffold(
-          body: SubtitleStylePanel(entryIds: entryIds),
-        ),
+        home: Scaffold(body: SubtitleStylePanel(entryIds: entryIds)),
       ),
     ),
   );

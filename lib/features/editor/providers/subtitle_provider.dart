@@ -676,13 +676,9 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
       final start = firstHalf
           ? wordStart
           : (wordStart < splitAt ? splitAt : wordStart);
-      final end = firstHalf
-          ? (wordEnd > splitAt ? splitAt : wordEnd)
-          : wordEnd;
+      final end = firstHalf ? (wordEnd > splitAt ? splitAt : wordEnd) : wordEnd;
       if (end <= start) continue;
-      result.add(
-        WordTiming(word: word.word, startTime: start, endTime: end),
-      );
+      result.add(WordTiming(word: word.word, startTime: start, endTime: end));
     }
     return result;
   }

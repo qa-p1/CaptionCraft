@@ -39,8 +39,7 @@ class SubtitleStylePanel extends ConsumerWidget {
   bool _targetTrackIsLocked(EditorTimeline timeline) {
     if (entryIds == null) {
       return timeline.tracks.any(
-        (track) =>
-            track.type == TimelineTrackType.subtitle && track.isLocked,
+        (track) => track.type == TimelineTrackType.subtitle && track.isLocked,
       );
     }
     if (entryIds!.isEmpty) return false;
@@ -279,9 +278,8 @@ class SubtitleStylePanel extends ConsumerWidget {
                 max: 48,
                 activeColor: kAccent,
                 inactiveColor: kBorder,
-                onChangeStart: (_) => ref
-                    .read(subtitleProvider.notifier)
-                    .beginStyleGestureEdit(),
+                onChangeStart: (_) =>
+                    ref.read(subtitleProvider.notifier).beginStyleGestureEdit(),
                 onChanged: (value) =>
                     _updateStyleLive(ref, style.copyWith(fontSize: value)),
                 onChangeEnd: (_) =>
@@ -312,9 +310,8 @@ class SubtitleStylePanel extends ConsumerWidget {
                 max: 1.0,
                 activeColor: kAccent,
                 inactiveColor: kBorder,
-                onChangeStart: (_) => ref
-                    .read(subtitleProvider.notifier)
-                    .beginStyleGestureEdit(),
+                onChangeStart: (_) =>
+                    ref.read(subtitleProvider.notifier).beginStyleGestureEdit(),
                 onChanged: (value) => _updateStyleLive(
                   ref,
                   style.copyWith(maxWidthFactor: value),
@@ -370,12 +367,8 @@ class SubtitleStylePanel extends ConsumerWidget {
           _sectionHeader('Background Color'),
           const SizedBox(height: 8),
           GestureDetector(
-            onTap: () => _showColorPicker(
-              context,
-              ref,
-              style.backgroundColor,
-              false,
-            ),
+            onTap: () =>
+                _showColorPicker(context, ref, style.backgroundColor, false),
             child: _colorPreview(style.backgroundColor),
           ),
           const SizedBox(height: 12),
@@ -388,10 +381,8 @@ class SubtitleStylePanel extends ConsumerWidget {
             inactiveColor: kBorder,
             onChangeStart: (_) =>
                 ref.read(subtitleProvider.notifier).beginStyleGestureEdit(),
-            onChanged: (value) => _updateStyleLive(
-              ref,
-              style.copyWith(backgroundOpacity: value),
-            ),
+            onChanged: (value) =>
+                _updateStyleLive(ref, style.copyWith(backgroundOpacity: value)),
             onChangeEnd: (_) =>
                 ref.read(subtitleProvider.notifier).endStyleGestureEdit(),
           ),
@@ -424,9 +415,8 @@ class SubtitleStylePanel extends ConsumerWidget {
                 max: 60,
                 activeColor: kAccent,
                 inactiveColor: kBorder,
-                onChangeStart: (_) => ref
-                    .read(subtitleProvider.notifier)
-                    .beginStyleGestureEdit(),
+                onChangeStart: (_) =>
+                    ref.read(subtitleProvider.notifier).beginStyleGestureEdit(),
                 onChanged: (value) => _updateStyleLive(
                   ref,
                   style.copyWith(verticalOffset: value),
@@ -472,10 +462,7 @@ class SubtitleStylePanel extends ConsumerWidget {
               label: 'AA',
               isActive: style.isAllCaps,
               onTap: () {
-                _updateStyle(
-                  ref,
-                  style.copyWith(isAllCaps: !style.isAllCaps),
-                );
+                _updateStyle(ref, style.copyWith(isAllCaps: !style.isAllCaps));
               },
             ),
           ],
@@ -487,10 +474,7 @@ class SubtitleStylePanel extends ConsumerWidget {
       color: kSurface,
       child: Stack(
         children: [
-          IgnorePointer(
-            ignoring: targetTrackIsLocked,
-            child: controls,
-          ),
+          IgnorePointer(ignoring: targetTrackIsLocked, child: controls),
           if (targetTrackIsLocked)
             Positioned(
               top: 0,
