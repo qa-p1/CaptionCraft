@@ -10,6 +10,22 @@ void main() {
   group('PreviewTransformGeometry', () {
     const size = Size(100, 80);
 
+    test(
+      'rotation normalization handles extreme and nonfinite values without looping',
+      () {
+        for (final value in [1e300, -1e300, math.pi * 1000, -math.pi * 1000]) {
+          expect(
+            PreviewTransformGeometry.normalizeRadians(value),
+            inInclusiveRange(-math.pi, math.pi),
+          );
+        }
+        expect(PreviewTransformGeometry.normalizeRadians(double.infinity), 0);
+        expect(PreviewTransformGeometry.normalizeRadians(double.nan), 0);
+        expect(PreviewTransformGeometry.normalizeRadians(-math.pi), -math.pi);
+        expect(PreviewTransformGeometry.normalizeRadians(math.pi), math.pi);
+      },
+    );
+
     test('classifies every edge and corner as a resize handle', () {
       final points = <PreviewTransformHandle, Offset>{
         PreviewTransformHandle.topLeft: Offset.zero,

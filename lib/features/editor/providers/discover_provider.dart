@@ -97,6 +97,8 @@ class DiscoverNotifier extends StateNotifier<DiscoverState> {
   }
 
   Future<void> _initialize() async {
+    if (!mounted) return;
+    state = state.copyWith(clearErrorMessage: true);
     try {
       await _facade.initialize();
       if (!mounted) return;
@@ -106,9 +108,10 @@ class DiscoverNotifier extends StateNotifier<DiscoverState> {
         clearErrorMessage: true,
       );
     } catch (error) {
+      _initialization = null;
       if (!mounted) return;
       state = state.copyWith(
-        isInitialized: true,
+        isInitialized: false,
         errorMessage: _errorText(error),
       );
     }

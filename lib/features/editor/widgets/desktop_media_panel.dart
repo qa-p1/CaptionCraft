@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import '../../../core/theme/app_theme.dart';
@@ -16,6 +18,12 @@ class DesktopMediaPanel extends StatefulWidget {
   final TimelineClip? selectedClip;
   final ValueChanged<TimelineClip>? onSelectClip;
   final VoidCallback? onImport;
+  final String? importStatus;
+  final ValueChanged<EditorAssetReference>? onInsertAsset;
+  final ValueChanged<EditorAssetReference>? onAppendAsset;
+  final ValueChanged<EditorAssetReference>? onRelinkAsset;
+  final ValueChanged<EditorAssetReference>? onRemoveAsset;
+  final ValueChanged<EditorAssetReference>? onReviewAsset;
   final VoidCallback? onDiscover;
   final VoidCallback? onOpenEffects;
   final VoidCallback? onOpenCaptions;
@@ -27,6 +35,12 @@ class DesktopMediaPanel extends StatefulWidget {
     this.selectedClip,
     this.onSelectClip,
     this.onImport,
+    this.importStatus,
+    this.onInsertAsset,
+    this.onAppendAsset,
+    this.onRelinkAsset,
+    this.onRemoveAsset,
+    this.onReviewAsset,
     this.onDiscover,
     this.onOpenEffects,
     this.onOpenCaptions,
@@ -39,6 +53,59 @@ class DesktopMediaPanel extends StatefulWidget {
 class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
   final TextEditingController _searchController = TextEditingController();
   DesktopLibrarySection _section = DesktopLibrarySection.media;
+  String _typeFilter = 'All';
+  Set<String> _offlineIds = {};
+  int _availabilityRequest = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshAvailability();
+  }
+
+  @override
+  void didUpdateWidget(covariant DesktopMediaPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!_sameSources(oldWidget.timeline.assets, widget.timeline.assets)) {
+      _refreshAvailability();
+    }
+  }
+
+  bool _sameSources(
+    List<EditorAssetReference> before,
+    List<EditorAssetReference> after,
+  ) {
+    if (identical(before, after)) return true;
+    if (before.length != after.length) return false;
+    for (var index = 0; index < before.length; index++) {
+      if (before[index].id != after[index].id ||
+          before[index].sourcePath != after[index].sourcePath ||
+          before[index].isNetworkBacked != after[index].isNetworkBacked) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  Future<void> _refreshAvailability() async {
+    final request = ++_availabilityRequest;
+    final offline = <String>{};
+    for (final asset in widget.timeline.assets) {
+      if (asset.isNetworkBacked) continue;
+      try {
+        if (asset.sourcePath == null ||
+            !await File(asset.sourcePath!).exists()) {
+          offline.add(asset.id);
+        }
+      } catch (_) {
+        offline.add(asset.id);
+      }
+      if (!mounted || request != _availabilityRequest) return;
+    }
+    if (mounted && request == _availabilityRequest) {
+      setState(() => _offlineIds = offline);
+    }
+  }
 
   @override
   void dispose() {
@@ -82,7 +149,8 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
               ),
             ),
           ),
-          if (_section == DesktopLibrarySection.media && widget.onImport != null)
+          if (_section == DesktopLibrarySection.media &&
+              widget.onImport != null)
             Tooltip(
               message: 'Import media',
               child: IconButton(
@@ -143,7 +211,9 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
             duration: const Duration(milliseconds: 120),
             padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 3),
             decoration: BoxDecoration(
-              color: selected ? kAccent.withValues(alpha: 0.14) : Colors.transparent,
+              color: selected
+                  ? kAccent.withValues(alpha: 0.14)
+                  : Colors.transparent,
               borderRadius: BorderRadius.circular(7),
               border: Border.all(color: selected ? kAccent : kBorder),
             ),
@@ -190,12 +260,26 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
     final assets = widget.timeline.assets
         .where(
           (asset) =>
-              query.isEmpty ||
-              asset.label.toLowerCase().contains(query) ||
-              (asset.sourcePath ?? '').toLowerCase().contains(query),
+              (query.isEmpty ||
+                  asset.label.toLowerCase().contains(query) ||
+                  (asset.sourcePath ?? '').toLowerCase().contains(query)) &&
+              (_typeFilter == 'All' ||
+                  _typeFilter == 'Offline' && _offlineIds.contains(asset.id) ||
+                  _typeFilter == 'Video' &&
+                      asset.type == EditorAssetType.video ||
+                  _typeFilter == 'Audio' &&
+                      asset.type == EditorAssetType.audio ||
+                  _typeFilter == 'Images' &&
+                      [
+                        EditorAssetType.image,
+                        EditorAssetType.gif,
+                        EditorAssetType.sticker,
+                      ].contains(asset.type)),
         )
         .toList(growable: false);
-    final hasFallback = assets.isEmpty &&
+    final hasFallback =
+        widget.timeline.assets.isEmpty &&
+        _typeFilter == 'All' &&
         widget.fallbackVideoPath?.trim().isNotEmpty == true &&
         query.isEmpty;
 
@@ -228,9 +312,40 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
             ),
           ),
         ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          child: DropdownButton<String>(
+            isExpanded: true,
+            value: _typeFilter,
+            items: ['All', 'Video', 'Audio', 'Images', 'Offline']
+                .map(
+                  (filter) => DropdownMenuItem(
+                    value: filter,
+                    child: Text(
+                      filter == 'Offline'
+                          ? 'Offline (${_offlineIds.length})'
+                          : filter,
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                  ),
+                )
+                .toList(),
+            onChanged: (filter) {
+              if (filter != null) setState(() => _typeFilter = filter);
+            },
+          ),
+        ),
+        if (widget.importStatus != null)
+          Padding(
+            padding: const EdgeInsets.all(8),
+            child: Text(
+              widget.importStatus!,
+              style: const TextStyle(fontSize: 12),
+            ),
+          ),
         Expanded(
           child: assets.isEmpty && !hasFallback
-              ? _emptyMediaState(query.isEmpty)
+              ? _emptyMediaState(query.isEmpty && _typeFilter == 'All')
               : ListView(
                   padding: const EdgeInsets.fromLTRB(8, 0, 8, 12),
                   children: [
@@ -252,7 +367,9 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(
-              emptyProject ? Icons.video_library_outlined : Icons.search_off_rounded,
+              emptyProject
+                  ? Icons.video_library_outlined
+                  : Icons.search_off_rounded,
               size: 28,
               color: kTextTertiary,
             ),
@@ -291,7 +408,8 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
       title: label.isEmpty ? 'Project source' : label,
       subtitle: 'Project source · base video',
       usage: widget.timeline.videoClips.length,
-      selected: widget.selectedClip?.type == TimelineTrackType.video &&
+      selected:
+          widget.selectedClip?.type == TimelineTrackType.video &&
           widget.selectedClip?.assetId == null,
       onTap: () {
         final clip = widget.timeline.videoClips.firstOrNull;
@@ -309,7 +427,51 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
     return _assetCard(
       icon: _iconForAsset(asset.type),
       title: asset.label,
-      subtitle: _assetSubtitle(asset),
+      subtitle: _offlineIds.contains(asset.id)
+          ? 'Offline · relink source'
+          : _assetSubtitle(asset),
+      trailing: PopupMenuButton<String>(
+        tooltip: 'Asset actions',
+        onSelected: (action) {
+          switch (action) {
+            case 'review':
+              widget.onReviewAsset?.call(asset);
+            case 'insert':
+              widget.onInsertAsset?.call(asset);
+            case 'append':
+              widget.onAppendAsset?.call(asset);
+            case 'relink':
+              widget.onRelinkAsset?.call(asset);
+            case 'remove':
+              widget.onRemoveAsset?.call(asset);
+          }
+        },
+        itemBuilder: (_) => [
+          if (widget.onReviewAsset != null)
+            const PopupMenuItem(
+              value: 'review',
+              child: Text('Open source / choose range…'),
+            ),
+          if (widget.onInsertAsset != null)
+            const PopupMenuItem(
+              value: 'insert',
+              child: Text('Insert at playhead'),
+            ),
+          if (widget.onAppendAsset != null)
+            const PopupMenuItem(
+              value: 'append',
+              child: Text('Append to timeline'),
+            ),
+          if (widget.onRelinkAsset != null)
+            const PopupMenuItem(value: 'relink', child: Text('Relink source…')),
+          if (widget.onRemoveAsset != null)
+            PopupMenuItem(
+              value: 'remove',
+              enabled: usage == 0,
+              child: const Text('Remove from pool'),
+            ),
+        ],
+      ),
       usage: usage,
       selected: selected,
       onTap: () {
@@ -329,6 +491,7 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
     required int usage,
     required bool selected,
     required VoidCallback onTap,
+    Widget? trailing,
   }) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 6),
@@ -339,7 +502,9 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
           duration: const Duration(milliseconds: 120),
           padding: const EdgeInsets.all(8),
           decoration: BoxDecoration(
-            color: selected ? kAccent.withValues(alpha: 0.12) : kSurfaceElevated,
+            color: selected
+                ? kAccent.withValues(alpha: 0.12)
+                : kSurfaceElevated,
             borderRadius: BorderRadius.circular(8),
             border: Border.all(color: selected ? kAccent : kBorder),
           ),
@@ -352,7 +517,11 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
                   color: kBackground,
                   borderRadius: BorderRadius.circular(6),
                 ),
-                child: Icon(icon, size: 18, color: selected ? kAccent : kTextSecondary),
+                child: Icon(
+                  icon,
+                  size: 18,
+                  color: selected ? kAccent : kTextSecondary,
+                ),
               ),
               const SizedBox(width: 8),
               Expanded(
@@ -374,11 +543,15 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
                       subtitle,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: kTextSecondary, fontSize: 10.5),
+                      style: const TextStyle(
+                        color: kTextSecondary,
+                        fontSize: 10.5,
+                      ),
                     ),
                   ],
                 ),
               ),
+              ?trailing,
               if (usage > 0)
                 Text(
                   '$usage×',
@@ -397,7 +570,8 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
 
   Widget _buildEffectsBody() {
     final selected = widget.selectedClip;
-    final effectCount = selected?.effectStack.effects
+    final effectCount =
+        selected?.effectStack.effects
             .where((effect) => effect.domain.name == 'visual')
             .length ??
         0;
@@ -443,7 +617,9 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
       children: [
         _contextCard(
           icon: Icons.closed_caption_outlined,
-          title: tracks.isEmpty ? 'No caption track' : '${tracks.length} caption track${tracks.length == 1 ? '' : 's'}',
+          title: tracks.isEmpty
+              ? 'No caption track'
+              : '${tracks.length} caption track${tracks.length == 1 ? '' : 's'}',
           subtitle: 'Select a cue in the timeline to edit its text and style.',
         ),
         const SizedBox(height: 8),
@@ -469,8 +645,7 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
               ),
             ),
           ),
-          for (final clip in track.clips.take(20))
-            _captionCueTile(clip),
+          for (final clip in track.clips.take(20)) _captionCueTile(clip),
         ],
       ],
     );
@@ -484,19 +659,28 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
         dense: true,
         visualDensity: const VisualDensity(vertical: -3),
         contentPadding: const EdgeInsets.symmetric(horizontal: 8),
-        tileColor: selected ? kAccent.withValues(alpha: 0.12) : kSurfaceElevated,
+        tileColor: selected
+            ? kAccent.withValues(alpha: 0.12)
+            : kSurfaceElevated,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(7),
           side: BorderSide(color: selected ? kAccent : kBorder),
         ),
-        leading: const Icon(Icons.subtitles_outlined, size: 16, color: kTextSecondary),
+        leading: const Icon(
+          Icons.subtitles_outlined,
+          size: 16,
+          color: kTextSecondary,
+        ),
         title: Text(
           clip.text ?? clip.label,
           maxLines: 2,
           overflow: TextOverflow.ellipsis,
           style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w700),
         ),
-        subtitle: Text(_formatCueTime(clip.startTime), style: const TextStyle(fontSize: 10)),
+        subtitle: Text(
+          _formatCueTime(clip.startTime),
+          style: const TextStyle(fontSize: 10),
+        ),
         onTap: () => widget.onSelectClip?.call(clip),
       ),
     );
@@ -523,9 +707,22 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(title, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w800)),
+                Text(
+                  title,
+                  style: const TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
                 const SizedBox(height: 3),
-                Text(subtitle, style: const TextStyle(color: kTextSecondary, fontSize: 10.5, height: 1.25)),
+                Text(
+                  subtitle,
+                  style: const TextStyle(
+                    color: kTextSecondary,
+                    fontSize: 10.5,
+                    height: 1.25,
+                  ),
+                ),
               ],
             ),
           ),
@@ -552,8 +749,19 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
           borderRadius: BorderRadius.circular(8),
           side: const BorderSide(color: kBorder),
         ),
-        leading: Icon(icon, size: 18, color: enabled ? kTextPrimary : kTextTertiary),
-        title: Text(title, style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: enabled ? kTextPrimary : kTextTertiary)),
+        leading: Icon(
+          icon,
+          size: 18,
+          color: enabled ? kTextPrimary : kTextTertiary,
+        ),
+        title: Text(
+          title,
+          style: TextStyle(
+            fontSize: 11,
+            fontWeight: FontWeight.w700,
+            color: enabled ? kTextPrimary : kTextTertiary,
+          ),
+        ),
         subtitle: Text(subtitle, style: const TextStyle(fontSize: 10.5)),
         trailing: const Icon(Icons.chevron_right_rounded, size: 17),
         onTap: onTap,
@@ -574,11 +782,13 @@ class _DesktopMediaPanelState extends State<DesktopMediaPanel> {
     if (duration is num && duration > 0) {
       return '$type · ${_formatCueTime(Duration(milliseconds: duration.toInt()))}';
     }
-    final dimensions = [asset.metadata['width'], asset.metadata['height']]
-        .whereType<num>()
-        .map((value) => value.toInt())
-        .toList(growable: false);
-    if (dimensions.length == 2) return '$type · ${dimensions[0]}×${dimensions[1]}';
+    final dimensions = [
+      asset.metadata['width'],
+      asset.metadata['height'],
+    ].whereType<num>().map((value) => value.toInt()).toList(growable: false);
+    if (dimensions.length == 2) {
+      return '$type · ${dimensions[0]}×${dimensions[1]}';
+    }
     return type;
   }
 

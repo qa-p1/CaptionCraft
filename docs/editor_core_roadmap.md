@@ -115,7 +115,7 @@ preview/export semantics, caching, and known limitations.
 - [x] Validate every exposed effect filter and parameter with focused FFmpeg tests.
 - [x] Add adjustment layers plus clip, track, group, compound-set, and project scopes.
 - [x] Add a durable previewable LUT pack and dedicated bottom-control section.
-- [x] Reject dormant selective-color and unsupported HDR/Log delivery instead of silently ignoring it.
+- [x] Connect selective-color processing and validate project color-space combinations; Automatic/Log output and HDR preservation into SDR remain rejected.
 - [ ] Complete the unsupported boundaries listed in [Effects, color, and audio status](editor_effects_audio_status.md).
 
 ## Verification snapshot

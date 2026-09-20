@@ -92,11 +92,13 @@ class TimelineClipboardClip {
   final TimelineClip clip;
   final String sourceTrackId;
   final Duration relativeStart;
+  final SubtitleEntry? subtitle;
 
   const TimelineClipboardClip({
     required this.clip,
     required this.sourceTrackId,
     required this.relativeStart,
+    this.subtitle,
   });
 }
 
@@ -126,17 +128,15 @@ class TimelineClipboard {
 /// remains in the editor history rather than creating a second subtitle-only
 /// undo action.
 class TimelineEditorController extends ChangeNotifier {
-  final EditorNotifier editor;
-  final SubtitleNotifier subtitles;
+  EditorNotifier editor;
+  SubtitleNotifier subtitles;
   final Duration Function()? playheadPosition;
   final void Function(String message)? onFeedback;
 
   /// Optional owner callback for the editor's canonical split operation.
   ///
-  /// The screen already owns the complete split semantics (keyframe curve
-  /// subdivision, reverse/freeze timing, separated audio and caption links).
-  /// A desktop workspace can inject that operation here so keyboard/menu split
-  /// commands use exactly the same path as the existing editor action.
+  /// A workspace can inject selection/feedback behavior around [splitClip].
+  /// The shared transaction owns keyframes, source timing and caption links.
   final bool Function(TimelineClip clip, Duration splitAt)? splitClipAtPlayhead;
 
   TimelineClipboard _clipboard = const TimelineClipboard();
@@ -155,6 +155,19 @@ class TimelineEditorController extends ChangeNotifier {
 
   TimelineClipboard get clipboard => _clipboard;
   bool get hasClipboard => _clipboard.isNotEmpty;
+
+  /// Provider scopes may change while Flutter retains the editor widget state.
+  void bindNotifiers(
+    EditorNotifier nextEditor,
+    SubtitleNotifier nextSubtitles,
+  ) {
+    if (identical(editor, nextEditor) && identical(subtitles, nextSubtitles)) {
+      return;
+    }
+    editor = nextEditor;
+    subtitles = nextSubtitles;
+    _clipboard = const TimelineClipboard();
+  }
 
   /// The timeline panel binds its active pointer gesture here.  The callback
   /// is intentionally optional so a workspace can create the controller
@@ -243,6 +256,9 @@ class TimelineEditorController extends ChangeNotifier {
             clip: entry.$2,
             sourceTrackId: entry.$1.id,
             relativeStart: entry.$2.startTime - origin,
+            subtitle: _subtitleState.entries
+                .where((cue) => cue.id == entry.$2.id)
+                .firstOrNull,
           ),
       ],
     );
@@ -296,21 +312,43 @@ class TimelineEditorController extends ChangeNotifier {
         ? selected.first
         : selected.where((entry) => entry.$2.id == primaryId).firstOrNull ??
               selected.first;
-    final track = selectedEntry.$1;
     final clip = selectedEntry.$2;
     final splitAt = playheadPosition?.call() ?? Duration.zero;
     if (splitAt <= clip.startTime || splitAt >= clip.endTime) return false;
 
     final canonicalSplit = splitClipAtPlayhead;
     if (canonicalSplit != null) {
-      // The screen owns the full split semantics. Route keyboard, menu and
-      // context-menu commands through that operation whenever the workspace
-      // provides it, so there is one implementation and one undo step.
+      // Preserve the workspace's selection and feedback behavior. Its callback
+      // uses splitClip for the shared transaction.
       final changed = canonicalSplit(clip, splitAt);
       if (changed) notifyListeners();
       return changed;
     }
 
+    return splitClip(clip.id, splitAt);
+  }
+
+  /// Shared split transaction for toolbar, context menu and keyboard commands.
+  /// Resolve the current clip so an open menu cannot edit a stale snapshot.
+  bool splitClip(String clipId, Duration splitAt) {
+    final entry = _allClipsWithTracks
+        .where((entry) => entry.$2.id == clipId)
+        .firstOrNull;
+    if (entry == null) return false;
+    final track = entry.$1;
+    final clip = entry.$2;
+    if (track.isLocked) {
+      _feedback('Unlock the track to split this clip');
+      return false;
+    }
+    if ((splitAt - clip.startTime).inMilliseconds < 100 ||
+        (clip.endTime - splitAt).inMilliseconds < 100) {
+      _feedback(
+        'Move the playhead at least 100 ms inside the clip to split it',
+      );
+      return false;
+    }
+    final splitIds = <String, String>{};
     final firstDuration = splitAt - clip.startTime;
     final sourceOffsetMs = (firstDuration.inMilliseconds * clip.playbackRate)
         .round();
@@ -322,13 +360,16 @@ class TimelineEditorController extends ChangeNotifier {
     final keyframeSplit = TimelineKeyframeEditing.split(clip, firstDuration);
     final effectStackSplit = clip.effectStack.splitAt(firstDuration);
     final secondId = const Uuid().v4();
+    splitIds[clip.id] = secondId;
     final first = clip.copyWith(
       endTime: splitAt,
-      sourceStartTime: clip.isReversed
+      sourceStartTime: clip.freezeFrame
+          ? clip.sourceStartTime
+          : clip.isReversed
           ? clip.sourceStartTime +
                 Duration(milliseconds: sourceTotalMs - sourceOffsetMs)
           : clip.sourceStartTime,
-      sourceDuration: sourceFirst,
+      sourceDuration: clip.freezeFrame ? clip.sourceDuration : sourceFirst,
       keyframes: keyframeSplit.leading,
       effectStack: effectStackSplit.leading,
       outroTransition: const ClipTransition(),
@@ -338,10 +379,14 @@ class TimelineEditorController extends ChangeNotifier {
       id: secondId,
       startTime: splitAt,
       endTime: clip.endTime,
-      sourceStartTime: clip.isReversed
+      sourceStartTime: clip.freezeFrame
+          ? clip.sourceStartTime
+          : clip.isReversed
           ? clip.sourceStartTime
           : clip.sourceStartTime + sourceFirst,
-      sourceDuration: Duration(milliseconds: sourceTotalMs - sourceOffsetMs),
+      sourceDuration: clip.freezeFrame
+          ? clip.sourceDuration
+          : Duration(milliseconds: sourceTotalMs - sourceOffsetMs),
       keyframes: keyframeSplit.trailing,
       effectStack: effectStackSplit.trailing,
       introTransition: const ClipTransition(),
@@ -365,6 +410,8 @@ class TimelineEditorController extends ChangeNotifier {
       final clips = <TimelineClip>[];
       for (final candidateClip in candidate.clips) {
         if (_isExactSeparatedAudioMirror(video: clip, audio: candidateClip)) {
+          final audioId = const Uuid().v4();
+          splitIds[candidateClip.id] = audioId;
           final audioKeyframes = TimelineKeyframeEditing.split(
             candidateClip,
             firstDuration,
@@ -384,7 +431,7 @@ class TimelineEditorController extends ChangeNotifier {
             )
             ..add(
               candidateClip.copyWith(
-                id: const Uuid().v4(),
+                id: audioId,
                 linkedClipId: second.id,
                 separatedFromClipId: second.id,
                 startTime: splitAt,
@@ -406,11 +453,13 @@ class TimelineEditorController extends ChangeNotifier {
           } else if (candidateClip.startTime >= splitAt) {
             clips.add(candidateClip.copyWith(linkedClipId: second.id));
           } else {
+            final captionId = const Uuid().v4();
+            splitIds[candidateClip.id] = captionId;
             clips
               ..add(candidateClip.copyWith(endTime: splitAt))
               ..add(
                 candidateClip.copyWith(
-                  id: const Uuid().v4(),
+                  id: captionId,
                   linkedClipId: second.id,
                   startTime: splitAt,
                 ),
@@ -427,20 +476,79 @@ class TimelineEditorController extends ChangeNotifier {
       tracks: nextTracks,
       groups: sourceTimeline.groups
           .map(
-            (group) => group.id == clip.groupId
-                ? group.copyWith(clipIds: [...group.clipIds, secondId])
-                : group,
+            (group) => group.copyWith(
+              clipIds: [
+                ...group.clipIds,
+                ...group.clipIds
+                    .where(splitIds.containsKey)
+                    .map((id) => splitIds[id]!),
+              ],
+            ),
           )
           .toList(),
       compoundClips: sourceTimeline.compoundClips
           .map(
-            (compound) => compound.id == clip.compoundId
-                ? compound.copyWith(clipIds: [...compound.clipIds, secondId])
-                : compound,
+            (compound) => compound.copyWith(
+              clipIds: [
+                ...compound.clipIds,
+                ...compound.clipIds
+                    .where(splitIds.containsKey)
+                    .map((id) => splitIds[id]!),
+              ],
+            ),
           )
           .toList(),
+      effectContainers: sourceTimeline.effectContainers.expand((container) {
+        final secondTarget = splitIds[container.targetId];
+        if (secondTarget == null ||
+            (container.scope != EditorEffectScope.clip &&
+                container.scope != EditorEffectScope.adjustmentLayer)) {
+          return [container];
+        }
+        final original = _allClipsWithTracks
+            .firstWhere((entry) => entry.$2.id == container.targetId)
+            .$2;
+        final stacks = container.stack.splitAt(splitAt - original.startTime);
+        return [
+          container.copyWith(stack: stacks.leading),
+          EditorEffectContainer(
+            scope: container.scope,
+            targetId: secondTarget,
+            label: container.label,
+            enabled: container.enabled,
+            stack: stacks.trailing.cloneWithNewIds(),
+          ),
+        ];
+      }).toList(),
     );
-    final nextEntries = nextTimeline.subtitleEntries;
+    final originals = {for (final cue in _subtitleState.entries) cue.id: cue};
+    final sourceIds = {
+      for (final entry in splitIds.entries) entry.value: entry.key,
+    };
+    final nextEntries = nextTimeline.subtitleEntries.map((cue) {
+      final original = originals[sourceIds[cue.id] ?? cue.id];
+      if (original == null) return cue;
+      return cue.copyWith(
+        confidenceScore: original.confidenceScore,
+        words: original.words
+            ?.where(
+              (word) =>
+                  word.endTime > cue.startTime && word.startTime < cue.endTime,
+            )
+            .map(
+              (word) => WordTiming(
+                word: word.word,
+                startTime: word.startTime < cue.startTime
+                    ? cue.startTime
+                    : word.startTime,
+                endTime: word.endTime > cue.endTime
+                    ? cue.endTime
+                    : word.endTime,
+              ),
+            )
+            .toList(),
+      );
+    }).toList();
     if (!_commit(nextTimeline, entries: nextEntries)) return false;
     editor.selectClipIds({first.id, second.id});
     notifyListeners();
@@ -468,7 +576,7 @@ class TimelineEditorController extends ChangeNotifier {
   }
 
   bool get _canPaste {
-    if (_clipboard.subtitles.isNotEmpty) {
+    if (_clipboard.clips.isEmpty && _clipboard.subtitles.isNotEmpty) {
       return _editorState.timeline.insertionTrackFor(
             section: TimelineTrackSection.textSubtitle,
             clipType: TimelineTrackType.subtitle,
@@ -476,13 +584,30 @@ class TimelineEditorController extends ChangeNotifier {
           ) !=
           null;
     }
-    return _canPasteAt(playheadPosition?.call() ?? Duration.zero);
+    return _canPasteAt(
+      _resolvePasteStart(playheadPosition?.call() ?? Duration.zero),
+    );
+  }
+
+  Duration _resolvePasteStart(Duration desiredStart) {
+    if (_clipboard.clips.length != 1) return desiredStart;
+    final item = _clipboard.clips.single;
+    final target = _resolvePasteTracks()?[item.sourceTrackId];
+    if (target == null) return desiredStart;
+    return target.closestAvailableStart(
+          desiredStart: desiredStart + item.relativeStart,
+          duration: item.clip.duration,
+        ) -
+        item.relativeStart;
   }
 
   bool _canPasteAt(Duration start) {
     if (_clipboard.clips.isEmpty) return _clipboard.subtitles.isNotEmpty;
     final targets = _resolvePasteTracks();
     if (targets == null) return false;
+    final working = <String, TimelineTrack>{
+      for (final track in _editorState.timeline.tracks) track.id: track,
+    };
     for (final item in _clipboard.clips) {
       final target = targets[item.sourceTrackId];
       if (target == null) return false;
@@ -493,7 +618,13 @@ class TimelineEditorController extends ChangeNotifier {
         startTime: nextStart,
         endTime: nextStart + item.clip.duration,
       );
-      if (!target.canPlaceClip(candidate)) return false;
+      final current = working[target.id];
+      if (current == null || !current.canPlaceClip(candidate)) return false;
+      // Removed source lanes can share one fallback lane. Probe earlier
+      // candidates too, matching the sequential checks in the actual paste.
+      working[target.id] = current.copyWith(
+        clips: [...current.clips, candidate],
+      );
     }
     return true;
   }
@@ -507,8 +638,8 @@ class TimelineEditorController extends ChangeNotifier {
       return false;
     }
     final position = playheadPosition?.call() ?? Duration.zero;
-    return position > selected.first.$2.startTime &&
-        position < selected.first.$2.endTime;
+    return (position - selected.first.$2.startTime).inMilliseconds >= 100 &&
+        (selected.first.$2.endTime - position).inMilliseconds >= 100;
   }
 
   bool get _canRippleDelete {
@@ -604,8 +735,43 @@ class TimelineEditorController extends ChangeNotifier {
       nextClips.sort((a, b) => a.startTime.compareTo(b.startTime));
       return track.copyWith(clips: nextClips);
     }).toList();
+    Duration? ripplePosition(Duration? position) {
+      if (position == null || position <= rangeStart) return position;
+      if (position < rangeEnd) return rangeStart;
+      return position - rippleDuration;
+    }
+
+    final workspace = timeline.workspaceSettings;
+    final nextIn = ripplePosition(workspace.workAreaStart);
+    final nextOut = ripplePosition(workspace.workAreaEnd);
+    final collapsedArea =
+        nextIn != null && nextOut != null && nextOut <= nextIn;
     final nextTimeline = timeline
-        .copyWith(tracks: nextTracks)
+        .copyWith(
+          tracks: nextTracks,
+          markers: ripple
+              ? timeline.markers
+                    .where(
+                      (marker) =>
+                          marker.position < rangeStart ||
+                          marker.position >= rangeEnd,
+                    )
+                    .map(
+                      (marker) => marker.copyWith(
+                        position: ripplePosition(marker.position),
+                      ),
+                    )
+                    .toList()
+              : timeline.markers,
+          workspaceSettings: ripple
+              ? workspace.copyWith(
+                  workAreaStart: nextIn,
+                  workAreaEnd: nextOut,
+                  clearWorkAreaStart: collapsedArea,
+                  clearWorkAreaEnd: collapsedArea,
+                )
+              : workspace,
+        )
         .prunedRelationships();
     if (!_commit(nextTimeline)) return false;
     editor.clearClipSelection();
@@ -615,6 +781,7 @@ class TimelineEditorController extends ChangeNotifier {
   }
 
   bool _pasteAt(Duration targetStart) {
+    targetStart = _resolvePasteStart(targetStart);
     if (_clipboard.subtitles.isNotEmpty && _clipboard.clips.isEmpty) {
       final targetTrack = _editorState.timeline.insertionTrackFor(
         section: TimelineTrackSection.textSubtitle,
@@ -639,8 +806,8 @@ class TimelineEditorController extends ChangeNotifier {
               ?.map(
                 (word) => WordTiming(
                   word: word.word,
-                  startTime: word.startTime + offset,
-                  endTime: word.endTime + offset,
+                  startTime: word.startTime + nextStart - source.startTime,
+                  endTime: word.endTime + nextStart - source.startTime,
                 ),
               )
               .toList(),
@@ -702,6 +869,7 @@ class TimelineEditorController extends ChangeNotifier {
       for (final track in _editorState.timeline.tracks) track.id: track,
     };
     final newIds = <String>[];
+    final pastedSubtitles = <SubtitleEntry>[];
     for (final item in _clipboard.clips) {
       final target = targets[item.sourceTrackId];
       if (target == null) return false;
@@ -739,6 +907,28 @@ class TimelineEditorController extends ChangeNotifier {
       }
       added.putIfAbsent(target.id, () => <TimelineClip>[]).add(clone);
       newIds.add(clone.id);
+      // Timeline clips omit word timings and confidence. Carry the full cue
+      // with the clipboard so selecting its timeline mirror preserves them.
+      final cue = item.subtitle;
+      if (cue != null) {
+        final shift = clone.startTime - cue.startTime;
+        pastedSubtitles.add(
+          cue.copyWith(
+            id: clone.id,
+            startTime: clone.startTime,
+            endTime: clone.endTime,
+            words: cue.words
+                ?.map(
+                  (word) => WordTiming(
+                    word: word.word,
+                    startTime: word.startTime + shift,
+                    endTime: word.endTime + shift,
+                  ),
+                )
+                .toList(),
+          ),
+        );
+      }
     }
     final pastedClipIds = idMap.values.toSet();
     final extraGroups = sourceTimeline.groups
@@ -806,6 +996,9 @@ class TimelineEditorController extends ChangeNotifier {
           ...extraEffectContainers,
         ],
       ),
+      entries: pastedSubtitles.isEmpty
+          ? null
+          : [..._subtitleState.entries, ...pastedSubtitles],
     )) {
       return false;
     }

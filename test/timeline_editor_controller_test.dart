@@ -1,6 +1,7 @@
 import 'package:caption_craft/features/auth/providers/auth_provider.dart';
 import 'package:caption_craft/features/editor/models/subtitle_entry.dart';
 import 'package:caption_craft/features/editor/models/timeline_models.dart';
+import 'package:caption_craft/features/editor/models/word_timing.dart';
 import 'package:caption_craft/features/editor/providers/editor_provider.dart';
 import 'package:caption_craft/features/editor/providers/subtitle_provider.dart';
 import 'package:caption_craft/features/editor/services/timeline_editor_controller.dart';
@@ -68,10 +69,7 @@ void main() {
     );
     addTearDown(controller.dispose);
 
-    expect(
-      controller.canExecute(TimelineEditorCommand.delete),
-      isFalse,
-    );
+    expect(controller.canExecute(TimelineEditorCommand.delete), isFalse);
     expect(controller.deleteSelection(), isFalse);
     expect(
       container
@@ -84,78 +82,93 @@ void main() {
     );
   });
 
-  test('subtitle paste allocates fresh ids and delete removes both mirrors', () {
-    final cue = SubtitleEntry(
-      id: 'cue-original',
-      startTime: const Duration(seconds: 2),
-      endTime: const Duration(seconds: 3),
-      text: 'Hello',
-    );
-    final subtitleTrack = TimelineTrack(
-      id: 'subtitles',
-      name: 'Subtitles',
-      type: TimelineTrackType.subtitle,
-      section: TimelineTrackSection.textSubtitle,
-    );
-    final container = ProviderContainer(
-      overrides: [currentUserProvider.overrideWithValue(null)],
-    );
-    addTearDown(container.dispose);
-    final editor = container.read(editorProvider.notifier);
-    final subtitles = container.read(subtitleProvider.notifier);
-    subtitles.loadSubtitles([cue]);
-    editor.loadProject(
-      videoPath: 'missing.mp4',
-      projectId: 'subtitle-paste',
-      projectName: 'Subtitle paste',
-      timeline: EditorTimeline(tracks: [subtitleTrack]),
-    );
-    var playhead = const Duration(seconds: 10);
-    final controller = TimelineEditorController(
-      editor: editor,
-      subtitles: subtitles,
-      playheadPosition: () => playhead,
-    );
-    addTearDown(controller.dispose);
+  test(
+    'subtitle paste allocates fresh ids and delete removes both mirrors',
+    () {
+      final cue = SubtitleEntry(
+        id: 'cue-original',
+        startTime: const Duration(seconds: 2),
+        endTime: const Duration(seconds: 3),
+        text: 'Hello',
+        words: [
+          WordTiming(
+            word: 'Hello',
+            startTime: const Duration(milliseconds: 2100),
+            endTime: const Duration(milliseconds: 2800),
+          ),
+        ],
+      );
+      final subtitleTrack = TimelineTrack(
+        id: 'subtitles',
+        name: 'Subtitles',
+        type: TimelineTrackType.subtitle,
+        section: TimelineTrackSection.textSubtitle,
+      );
+      final container = ProviderContainer(
+        overrides: [currentUserProvider.overrideWithValue(null)],
+      );
+      addTearDown(container.dispose);
+      final editor = container.read(editorProvider.notifier);
+      final subtitles = container.read(subtitleProvider.notifier);
+      subtitles.loadSubtitles([cue]);
+      editor.loadProject(
+        videoPath: 'missing.mp4',
+        projectId: 'subtitle-paste',
+        projectName: 'Subtitle paste',
+        timeline: EditorTimeline(tracks: [subtitleTrack]),
+      );
+      var playhead = const Duration(seconds: 10);
+      final controller = TimelineEditorController(
+        editor: editor,
+        subtitles: subtitles,
+        playheadPosition: () => playhead,
+      );
+      addTearDown(controller.dispose);
 
-    subtitles.selectEntry(cue.id);
-    expect(controller.copySelection(), isTrue);
-    expect(controller.pasteAtPlayhead(), isTrue);
+      subtitles.selectEntry(cue.id);
+      expect(controller.copySelection(), isTrue);
+      expect(controller.pasteAtPlayhead(), isTrue);
 
-    final entries = container.read(subtitleProvider).entries;
-    expect(entries, hasLength(2));
-    final pasted = entries.singleWhere((entry) => entry.id != cue.id);
-    expect(pasted.id, isNot(cue.id));
-    expect(pasted.startTime, const Duration(seconds: 10));
-    expect(pasted.endTime, const Duration(seconds: 11));
-    final pastedClip = container
-        .read(editorProvider)
-        .timeline
-        .tracks
-        .single
-        .clips
-        .singleWhere((clip) => clip.id == pasted.id);
-    expect(pastedClip.id, pasted.id);
-
-    editor.clearClipSelection();
-    subtitles.selectEntry(pasted.id);
-    expect(controller.deleteSelection(), isTrue);
-    expect(
-      container.read(subtitleProvider).entries.map((entry) => entry.id),
-      [cue.id],
-    );
-    expect(
-      container
+      final entries = container.read(subtitleProvider).entries;
+      expect(entries, hasLength(2));
+      final pasted = entries.singleWhere((entry) => entry.id != cue.id);
+      expect(pasted.id, isNot(cue.id));
+      expect(pasted.startTime, const Duration(seconds: 10));
+      expect(pasted.endTime, const Duration(seconds: 11));
+      expect(
+        pasted.words!.single.startTime,
+        const Duration(milliseconds: 10100),
+      );
+      expect(pasted.words!.single.endTime, const Duration(milliseconds: 10800));
+      final pastedClip = container
           .read(editorProvider)
           .timeline
           .tracks
           .single
           .clips
-          .map((clip) => clip.id),
-      [cue.id],
-    );
-    playhead = Duration.zero;
-  });
+          .singleWhere((clip) => clip.id == pasted.id);
+      expect(pastedClip.id, pasted.id);
+
+      editor.clearClipSelection();
+      subtitles.selectEntry(pasted.id);
+      expect(controller.deleteSelection(), isTrue);
+      expect(
+        container.read(subtitleProvider).entries.map((entry) => entry.id),
+        [cue.id],
+      );
+      expect(
+        container
+            .read(editorProvider)
+            .timeline
+            .tracks
+            .single
+            .clips
+            .map((clip) => clip.id),
+        [cue.id],
+      );
+      playhead = Duration.zero;
+    },
+  );
 
   test('pasted linked companions point at cloned relationship ids', () {
     final video = TimelineClip(

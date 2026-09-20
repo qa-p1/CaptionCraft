@@ -185,19 +185,24 @@ class GroqService {
       );
     }
 
-    timings.sort((a, b) => a.startTime.compareTo(b.startTime));
-    return timings;
+    final indexedTimings = timings.asMap().entries.toList()
+      ..sort((a, b) {
+        final byStart = a.value.startTime.compareTo(b.value.startTime);
+        return byStart != 0 ? byStart : a.key.compareTo(b.key);
+      });
+    return indexedTimings.map((entry) => entry.value).toList();
   }
 
   static List<Map<String, dynamic>> _extractWordItems(
     Map<String, dynamic> data,
   ) {
     final topLevelWords = data['words'];
-    if (topLevelWords is List) {
-      return topLevelWords
+    if (topLevelWords is List && topLevelWords.isNotEmpty) {
+      final words = topLevelWords
           .whereType<Map>()
           .map((word) => Map<String, dynamic>.from(word))
           .toList();
+      if (words.isNotEmpty) return words;
     }
 
     final segments = data['segments'];
@@ -207,12 +212,14 @@ class GroqService {
     for (final segment in segments.whereType<Map>()) {
       final segmentWords = segment['words'];
       if (segmentWords is List) {
-        words.addAll(
-          segmentWords.whereType<Map>().map(
-            (word) => Map<String, dynamic>.from(word),
-          ),
-        );
-        continue;
+        final extracted = segmentWords
+            .whereType<Map>()
+            .map((word) => Map<String, dynamic>.from(word))
+            .toList();
+        if (extracted.isNotEmpty) {
+          words.addAll(extracted);
+          continue;
+        }
       }
 
       final text = segment['text'];
@@ -228,18 +235,33 @@ class GroqService {
   /// Group consecutive words into line-level SubtitleEntry blocks.
   /// Rules:
   /// - Group until 4–6 words OR gap > 400ms between words, whichever first.
-  /// - Each SubtitleEntry: startTime=first word's start, endTime=last word's end,
+  /// - Each SubtitleEntry: startTime=first word's start, endTime=latest word's end,
   ///   text=all words joined with spaces, words=per-word timing sub-list.
   static List<SubtitleEntry> groupWordsIntoLines(List<WordTiming> allWords) {
-    if (allWords.isEmpty) return [];
+    final indexedWords =
+        allWords
+            .asMap()
+            .entries
+            .where(
+              (entry) =>
+                  entry.value.word.trim().isNotEmpty &&
+                  entry.value.endTime > entry.value.startTime,
+            )
+            .toList()
+          ..sort((a, b) {
+            final start = a.value.startTime.compareTo(b.value.startTime);
+            return start != 0 ? start : a.key.compareTo(b.key);
+          });
+    final words = indexedWords.map((entry) => entry.value).toList();
+    if (words.isEmpty) return [];
 
     final entries = <SubtitleEntry>[];
     var currentGroupWords = <WordTiming>[];
 
-    for (var i = 0; i < allWords.length; i++) {
-      currentGroupWords.add(allWords[i]);
+    for (var i = 0; i < words.length; i++) {
+      currentGroupWords.add(words[i]);
 
-      final isLastWord = i == allWords.length - 1;
+      final isLastWord = i == words.length - 1;
       final hasEnoughWords = currentGroupWords.length >= 4;
       final hasMaxWords = currentGroupWords.length >= 6;
 
@@ -247,17 +269,20 @@ class GroqService {
       bool hasGap = false;
       if (!isLastWord) {
         final gapMs =
-            allWords[i + 1].startTime.inMilliseconds -
-            allWords[i].endTime.inMilliseconds;
+            words[i + 1].startTime.inMilliseconds -
+            words[i].endTime.inMilliseconds;
         hasGap = gapMs > 400;
       }
 
       // Decide whether to flush the current group
       if (isLastWord || hasMaxWords || (hasEnoughWords && hasGap)) {
+        final endTime = currentGroupWords
+            .map((word) => word.endTime)
+            .reduce((a, b) => a > b ? a : b);
         entries.add(
           SubtitleEntry(
             startTime: currentGroupWords.first.startTime,
-            endTime: currentGroupWords.last.endTime,
+            endTime: endTime,
             text: currentGroupWords.map((w) => w.word).join(' '),
             words: List<WordTiming>.from(currentGroupWords),
           ),
@@ -275,13 +300,17 @@ class GroqService {
   ) {
     if (allEntries.length <= 1) return allEntries;
 
-    // Sort by start time
-    allEntries.sort((a, b) => a.startTime.compareTo(b.startTime));
+    // Work on a copy: callers may retain the input as an undo/source list.
+    final sorted = allEntries.asMap().entries.toList()
+      ..sort((a, b) {
+        final byStart = a.value.startTime.compareTo(b.value.startTime);
+        return byStart != 0 ? byStart : a.key.compareTo(b.key);
+      });
 
-    final deduplicated = <SubtitleEntry>[allEntries.first];
-    for (var i = 1; i < allEntries.length; i++) {
+    final deduplicated = <SubtitleEntry>[sorted.first.value];
+    for (var i = 1; i < sorted.length; i++) {
       final prev = deduplicated.last;
-      final current = allEntries[i];
+      final current = sorted[i].value;
 
       // If entries overlap significantly (>50% of shorter duration), skip the later one
       final overlapStart = current.startTime;
@@ -312,11 +341,15 @@ class GroqService {
   static List<WordTiming> deduplicateWordOverlaps(List<WordTiming> allWords) {
     if (allWords.length <= 1) return allWords;
 
-    final sorted = List<WordTiming>.from(allWords)
-      ..sort((a, b) => a.startTime.compareTo(b.startTime));
+    final sorted = allWords.asMap().entries.toList()
+      ..sort((a, b) {
+        final byStart = a.value.startTime.compareTo(b.value.startTime);
+        return byStart != 0 ? byStart : a.key.compareTo(b.key);
+      });
     final deduplicated = <WordTiming>[];
 
-    for (final current in sorted) {
+    for (final indexedCurrent in sorted) {
+      final current = indexedCurrent.value;
       if (current.endTime <= current.startTime || current.word.trim().isEmpty) {
         continue;
       }

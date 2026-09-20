@@ -1,0 +1,36 @@
+/// Cancellation belongs to one operation, including native sessions allocated
+/// after cancellation was requested.
+class MediaJob {
+  final Map<int, Future<void> Function()> _sessions = {};
+  bool _cancelled = false;
+  Future<void>? _cancellation;
+
+  bool get isCancelled => _cancelled;
+
+  void checkCancelled() {
+    if (_cancelled) throw const MediaJobCancelled();
+  }
+
+  Future<void> attach(int id, Future<void> Function() cancel) async {
+    _sessions[id] = cancel;
+    if (_cancelled) await cancel();
+  }
+
+  void detach(int id) => _sessions.remove(id);
+
+  Future<void> cancel() {
+    final pending = _cancellation;
+    if (pending != null) return pending;
+    _cancelled = true;
+    return _cancellation = Future.wait(
+      _sessions.values.toList().map((cancel) => Future<void>.sync(cancel)),
+    ).then((_) {});
+  }
+}
+
+class MediaJobCancelled implements Exception {
+  const MediaJobCancelled();
+
+  @override
+  String toString() => 'Operation cancelled.';
+}

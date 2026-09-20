@@ -576,6 +576,76 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets(
+    'mixer deletes a bus and routing follows undo without a stale dropdown',
+    (tester) async {
+      tester.view.devicePixelRatio = 1;
+      tester.view.physicalSize = const Size(390, 844);
+      addTearDown(() {
+        tester.view.resetDevicePixelRatio();
+        tester.view.resetPhysicalSize();
+      });
+      final container = ProviderContainer(
+        overrides: [currentUserProvider.overrideWithValue(null)],
+      );
+      addTearDown(container.dispose);
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: MaterialApp(
+            theme: AppTheme.darkTheme,
+            home: EditorScreen(project: _audibleVideoProject()),
+          ),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 650));
+      final editor = container.read(editorProvider.notifier);
+      editor
+        ..selectTrack('base-track')
+        ..selectClip('base-video');
+      final busId = editor.createAudioBusForTrack(
+        'base-track',
+        name: 'Dialogue',
+      )!;
+      await tester.pump();
+      await tester.ensureVisible(
+        find.byKey(const ValueKey('dock_primary_audio')),
+      );
+      await tester.tap(find.byKey(const ValueKey('dock_primary_audio')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('dock_tool_mixer')));
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(
+        find.byKey(const ValueKey('advanced_audio_controls')),
+      );
+      await tester.tap(find.text('Advanced routing & processing'));
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(
+        find.byKey(const ValueKey('delete_audio_bus')),
+      );
+      await tester.tap(find.byKey(const ValueKey('delete_audio_bus')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(FilledButton, 'Delete bus'));
+      await tester.pumpAndSettle();
+      expect(container.read(editorProvider).timeline.audioBuses, isEmpty);
+      expect(
+        container.read(editorProvider).timeline.tracks.first.audioBusId,
+        isNull,
+      );
+      editor.undo();
+      await tester.pumpAndSettle();
+      expect(
+        container.read(editorProvider).timeline.audioBuses.single.id,
+        busId,
+      );
+      expect(
+        find.byKey(ValueKey('audio_bus_base-track_$busId')),
+        findsOneWidget,
+      );
+      expect(tester.takeException(), isNull);
+    },
+  );
+
   testWidgets('video audio stays attached until the user separates it', (
     tester,
   ) async {

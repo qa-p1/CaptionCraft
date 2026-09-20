@@ -163,8 +163,19 @@ void main() {
     expect(find.text(project.name), findsOneWidget);
     expect(tester.takeException(), isNull);
 
-    await tester.pageBack();
+    // Start the filesystem-backed exit in the real async zone, and await its
+    // disk barrier explicitly. The frame loop below measures route completion,
+    // not an accidental 800 ms deadline for fsync on a busy CI runner.
+    await tester.runAsync(() async {
+      await tester.pageBack();
+      await ProjectLocalStorage.waitForPendingSavesForTesting();
+    });
     await _waitForEditorToClose(tester);
+    final saved = await tester.runAsync(
+      () => ProjectLocalStorage.loadProject(project.id),
+    );
+    expect(saved, isNotNull);
+    expect(saved!.projectSchemaVersion, Project.currentSchemaVersion);
 
     expect(find.byType(HomeScreen), findsOneWidget);
     expect(tester.takeException(), isNull);
@@ -618,27 +629,28 @@ void main() {
     );
     Focus.of(tester.element(editorScaffold)).requestFocus();
     await tester.pump();
-    await tester.pageBack();
-    await tester.pump();
-    expect(
-      find.byType(EditorScreen),
-      findsOneWidget,
-      reason: 'The route must remain mounted until its local write completes.',
-    );
-    await tester.sendKeyEvent(LogicalKeyboardKey.keyN);
-    expect(
-      container
-          .read(editorProvider)
-          .timeline
-          .workspaceSettings
-          .snapping
-          .enabled,
-      isFalse,
-      reason: 'Keyboard edits must be blocked after the exit save begins.',
-    );
-    await tester.runAsync(
-      () => Future<void>.delayed(const Duration(milliseconds: 100)),
-    );
+    // Start exit I/O in the real async zone and await the write itself.
+    await tester.runAsync(() async {
+      await tester.pageBack();
+      expect(
+        find.byType(EditorScreen),
+        findsOneWidget,
+        reason:
+            'The route must remain mounted until its local write completes.',
+      );
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyN);
+      expect(
+        container
+            .read(editorProvider)
+            .timeline
+            .workspaceSettings
+            .snapping
+            .enabled,
+        isFalse,
+        reason: 'Keyboard edits must be blocked after the exit save begins.',
+      );
+      await ProjectLocalStorage.waitForPendingSavesForTesting();
+    });
     await _waitForEditorToClose(tester);
 
     expect(find.byType(EditorScreen), findsNothing);

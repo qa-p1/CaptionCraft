@@ -119,6 +119,14 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel> {
   void didUpdateWidget(covariant DesktopInspectorPanel oldWidget) {
     super.didUpdateWidget(oldWidget);
     final clipChanged = oldWidget.clip?.id != widget.clip?.id;
+    if (clipChanged || (oldWidget.canEdit && !widget.canEdit)) {
+      // A pending field edit belongs to the old selection. Blurring after a
+      // rebuild must not create an edit or undo entry on the new clip.
+      _editingOriginals.clear();
+      for (final node in _focusNodes) {
+        node.unfocus();
+      }
+    }
     _syncControllers(force: clipChanged);
   }
 
@@ -905,6 +913,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel> {
     String value,
     TimelineTransform Function(TimelineTransform current, double parsed) mapper,
   ) {
+    if (!widget.canEdit || widget.clip == null) return;
     final parsed = double.tryParse(value.trim());
     if (parsed == null || !parsed.isFinite) {
       _syncControllers();

@@ -877,38 +877,25 @@ class SubtitleExportService {
     return entries;
   }
 
-  static Duration? _parseSrtTime(String timeStr) {
-    // Format: HH:MM:SS,mmm
-    final match = RegExp(
-      r'(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})',
-    ).firstMatch(timeStr);
-    if (match == null) return null;
-    final fraction = match.group(4)!.padRight(3, '0').substring(0, 3);
+  static Duration? _parseSrtTime(String value) =>
+      _parseTimestamp(value, requireHours: true);
 
+  static Duration? _parseVttTime(String value) =>
+      _parseTimestamp(value, requireHours: false);
+
+  static Duration? _parseTimestamp(String value, {required bool requireHours}) {
+    // Keep the existing comma/short-fraction compatibility, but never parse
+    // a substring, normalize invalid minutes/seconds, or turn text into zero.
+    final pattern = requireHours
+        ? r'^(\d{1,6}):([0-5]\d):([0-5]\d)[,.](\d{1,3})$'
+        : r'^(?:(\d{1,6}):)?([0-5]\d):([0-5]\d)[,.](\d{1,3})$';
+    final match = RegExp(pattern).firstMatch(value);
+    if (match == null) return null;
     return Duration(
-      hours: int.parse(match.group(1)!),
+      hours: int.parse(match.group(1) ?? '0'),
       minutes: int.parse(match.group(2)!),
       seconds: int.parse(match.group(3)!),
-      milliseconds: int.parse(fraction),
-    );
-  }
-
-  static Duration? _parseVttTime(String timeStr) {
-    // Formats: HH:MM:SS.mmm or MM:SS.mmm
-    final parts = timeStr.replaceAll(',', '.').split(':');
-    if (parts.length != 2 && parts.length != 3) return null;
-    final secondParts = parts.last.split('.');
-    if (secondParts.length != 2) return null;
-    final fraction = secondParts[1].padRight(3, '0').substring(0, 3);
-    final seconds = int.tryParse(secondParts[0]);
-    final minutes = int.tryParse(parts[parts.length - 2]);
-    final hours = parts.length == 3 ? int.tryParse(parts[0]) : 0;
-    if (seconds == null || minutes == null || hours == null) return null;
-    return Duration(
-      hours: hours,
-      minutes: minutes,
-      seconds: seconds,
-      milliseconds: int.tryParse(fraction) ?? 0,
+      milliseconds: int.parse(match.group(4)!.padRight(3, '0')),
     );
   }
 }

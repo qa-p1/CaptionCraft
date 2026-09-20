@@ -5,10 +5,7 @@ import 'dart:math' as math;
 
 import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
-import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit_config.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
-import 'package:ffmpeg_kit_flutter_new/statistics.dart';
 import 'package:flutter/foundation.dart' show listEquals, visibleForTesting;
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
@@ -22,6 +19,8 @@ import '../../features/editor/models/timeline_models.dart';
 import '../../shared/models/project_model.dart';
 import 'caption_font_service.dart';
 import 'ffmpeg_service.dart';
+import 'media_job.dart';
+import 'export_output_transaction.dart';
 import 'subtitle_export_service.dart';
 import 'storage_capacity_service.dart';
 
@@ -76,6 +75,7 @@ class TimelineExportService {
   static const _maxNetworkAssetBytes = 64 * 1024 * 1024;
   static const _maxNetworkRedirects = 5;
   static CancelToken? _activeDownloadCancelToken;
+  static MediaJob? _activeExportJob;
 
   @visibleForTesting
   static ExportStorageEstimate estimateStorageRequirements({
@@ -117,7 +117,7 @@ class TimelineExportService {
     if (downloadToken != null && !downloadToken.isCancelled) {
       downloadToken.cancel('Cancelled by user');
     }
-    await FFmpegService.cancelAll();
+    await _activeExportJob?.cancel();
   }
 
   static Future<TimelineExportResult> export({
@@ -127,6 +127,7 @@ class TimelineExportService {
     required SubtitleStyleModel globalSubtitleStyle,
     required ExportSettings settings,
     required String outputPath,
+    MediaJob? job,
     void Function(double progress)? onProgress,
     void Function(String stage)? onStage,
   }) async {
@@ -137,6 +138,7 @@ class TimelineExportService {
     }
 
     final timelineDuration = timeline.duration;
+    final range = resolveExportRange(timeline, settings);
     if (timelineDuration <= Duration.zero) {
       throw Exception('The timeline duration is invalid.');
     }
@@ -144,23 +146,45 @@ class TimelineExportService {
     onStage?.call('Checking media');
     onProgress?.call(0.02);
 
-    final workingRoot = await getTemporaryDirectory();
-    final workingDirectory = Directory(
-      p.join(
-        workingRoot.path,
-        'cc_render_${DateTime.now().microsecondsSinceEpoch}',
-      ),
-    );
-    await workingDirectory.create(recursive: true);
+    if (_activeExportJob != null) {
+      throw StateError(
+        'Another export is still running. Wait for it to finish.',
+      );
+    }
+    final exportJob = job ?? MediaJob();
+    exportJob.checkCancelled();
+    _activeExportJob = exportJob;
+    Directory? workingDirectory;
+    ExportOutputTransaction? outputTransaction;
     final downloadCancelToken = CancelToken();
     _activeDownloadCancelToken = downloadCancelToken;
     String? assPath;
     String? captionFontDirectory;
-    var exportCompleted = false;
-
     try {
+      await exportJob.attach(-1, () async {
+        if (!downloadCancelToken.isCancelled) {
+          downloadCancelToken.cancel('Cancelled by user');
+        }
+      });
+      final workingRoot = await getTemporaryDirectory();
+      workingDirectory = Directory(
+        p.join(
+          workingRoot.path,
+          'cc_render_${DateTime.now().microsecondsSinceEpoch}',
+        ),
+      );
+      await workingDirectory.create(recursive: true);
+      exportJob.checkCancelled();
+      outputTransaction = await ExportOutputTransaction.create(
+        outputPath,
+        sourcePaths: [
+          project.videoPath,
+          ...timeline.assets.map((asset) => asset.sourcePath ?? ''),
+        ],
+      );
       final sourcePaths = <String, Future<String>>{};
       Future<String> resolveSourcePath(TimelineClip clip) {
+        exportJob.checkCancelled();
         final sourceKey = _sourceCacheKey(clip);
         return sourcePaths.putIfAbsent(
           sourceKey,
@@ -168,7 +192,7 @@ class TimelineExportService {
             project: project,
             timeline: timeline,
             clip: clip,
-            workingDirectory: workingDirectory,
+            workingDirectory: workingDirectory!,
             downloadCancelToken: downloadCancelToken,
           ),
         );
@@ -176,9 +200,10 @@ class TimelineExportService {
 
       final mediaInfoByPath = <String, Future<Map<String, dynamic>>>{};
       Future<Map<String, dynamic>> probeMedia(String sourcePath) {
+        exportJob.checkCancelled();
         return mediaInfoByPath.putIfAbsent(
           sourcePath,
-          () => FFmpegService.getMediaInfo(sourcePath),
+          () => FFmpegService.getMediaInfo(sourcePath, job: exportJob),
         );
       }
 
@@ -312,19 +337,17 @@ class TimelineExportService {
         timelineDuration: timelineDuration,
         assPath: assPath,
         captionFontDirectory: captionFontDirectory,
-        outputPath: outputPath,
+        outputPath: outputTransaction.renderPath,
       );
 
-      final outputFile = File(outputPath);
-      if (await outputFile.exists()) {
-        await outputFile.delete();
-      }
-      await outputFile.parent.create(recursive: true);
+      exportJob.checkCancelled();
+      final outputFile = File(outputTransaction.renderPath);
 
       onStage?.call('Rendering timeline');
       await _execute(
         args,
-        expectedDuration: timelineDuration,
+        job: exportJob,
+        expectedDuration: range.duration,
         captionsExpected: assPath != null,
         onProgress: (value) {
           onProgress?.call(0.1 + value * 0.84);
@@ -337,7 +360,10 @@ class TimelineExportService {
         throw Exception('The renderer did not create a valid output file.');
       }
 
-      final outputInfo = await FFmpegService.getMediaInfo(outputPath);
+      final outputInfo = await FFmpegService.getMediaInfo(
+        outputTransaction.renderPath,
+        job: exportJob,
+      );
       final outputWidth = (outputInfo['width'] as int?) ?? 0;
       final outputHeight = (outputInfo['height'] as int?) ?? 0;
       final outputDurationMs = (outputInfo['durationMs'] as int?) ?? 0;
@@ -346,25 +372,27 @@ class TimelineExportService {
       }
       final allowedDurationDifference = math.max(
         1000,
-        (timelineDuration.inMilliseconds * 0.06).round(),
+        (range.duration.inMilliseconds * 0.06).round(),
       );
-      if ((outputDurationMs - timelineDuration.inMilliseconds).abs() >
+      if ((outputDurationMs - range.duration.inMilliseconds).abs() >
           allowedDurationDifference) {
         throw Exception(
           'Export duration mismatch: expected '
-          '${timelineDuration.inSeconds}s, got '
+          '${range.duration.inSeconds}s, got '
           '${Duration(milliseconds: outputDurationMs).inSeconds}s.',
         );
       }
 
+      final fileSize = await outputFile.length();
+      exportJob.checkCancelled();
+      await outputTransaction.commit();
       onProgress?.call(1);
-      exportCompleted = true;
       return TimelineExportResult(
         outputPath: outputPath,
         width: outputWidth,
         height: outputHeight,
         durationMs: outputDurationMs,
-        fileSize: await outputFile.length(),
+        fileSize: fileSize,
         hasAudio: outputInfo['hasAudio'] as bool? ?? false,
       );
     } on FileSystemException catch (error) {
@@ -378,14 +406,9 @@ class TimelineExportService {
       if (identical(_activeDownloadCancelToken, downloadCancelToken)) {
         _activeDownloadCancelToken = null;
       }
-      if (!exportCompleted) {
-        try {
-          final partialOutput = File(outputPath);
-          if (await partialOutput.exists()) await partialOutput.delete();
-        } catch (_) {
-          // A cancelled render may still have a file handle briefly open.
-        }
-      }
+      if (identical(_activeExportJob, exportJob)) _activeExportJob = null;
+      exportJob.detach(-1);
+      await outputTransaction?.dispose();
       if (assPath != null) {
         try {
           final assFile = File(assPath);
@@ -395,13 +418,34 @@ class TimelineExportService {
         }
       }
       try {
-        if (await workingDirectory.exists()) {
+        if (workingDirectory != null && await workingDirectory.exists()) {
           await workingDirectory.delete(recursive: true);
         }
       } catch (_) {
         // Network-backed working media is temporary and can be retried later.
       }
     }
+  }
+
+  static ({Duration start, Duration duration}) resolveExportRange(
+    EditorTimeline timeline,
+    ExportSettings settings,
+  ) {
+    if (settings.range == ExportRange.entireTimeline) {
+      return (start: Duration.zero, duration: timeline.duration);
+    }
+    final start = timeline.workspaceSettings.normalizedWorkAreaStart;
+    final end = timeline.workspaceSettings.normalizedWorkAreaEnd;
+    if (start == null ||
+        end == null ||
+        start < Duration.zero ||
+        end <= start ||
+        end > timeline.duration) {
+      throw StateError(
+        'Set a valid work-area In and Out before exporting that range.',
+      );
+    }
+    return (start: start, duration: end - start);
   }
 
   static String _volumeRoot(String path) {
@@ -508,8 +552,16 @@ class TimelineExportService {
           _hdr10X265Parameters(timeline.colorManagement),
         ],
       ],
+      if (settings.range == ExportRange.workArea) ...[
+        '-ss',
+        _seconds(resolveExportRange(timeline, settings).start),
+      ],
       '-t',
-      _seconds(timelineDuration),
+      _seconds(
+        settings.range == ExportRange.workArea
+            ? resolveExportRange(timeline, settings).duration
+            : timelineDuration,
+      ),
       '-movflags',
       '+faststart',
       '-max_muxing_queue_size',
@@ -1590,6 +1642,7 @@ class TimelineExportService {
             timeline: timeline,
             inputs: inputs,
             soloTrackIds: soloTrackIds,
+            soloBusIds: soloBusIds,
           ),
           if ((mix.pan + input.track.audioPan).abs() > 0.001)
             _panFilter(
@@ -2255,6 +2308,7 @@ class TimelineExportService {
     required EditorTimeline timeline,
     required List<TimelineRenderInput> inputs,
     required Set<String> soloTrackIds,
+    required Set<String> soloBusIds,
   }) {
     final hasVolumeKeyframes = _hasKeyframes(
       clip,
@@ -2274,6 +2328,7 @@ class TimelineExportService {
             timeline: timeline,
             inputs: inputs,
             soloTrackIds: soloTrackIds,
+            soloBusIds: soloBusIds,
           )
         : null;
     if (duckingFactor != null) {
@@ -2289,6 +2344,29 @@ class TimelineExportService {
       return 'volume=${_number(clip.audioMix.volume.clamp(0, 2))}';
     }
     return "volume='$expression':eval=frame";
+  }
+
+  @visibleForTesting
+  static String? buildDuckingVolumeExpressionForTesting({
+    required TimelineClip clip,
+    required EditorTimeline timeline,
+    required List<TimelineRenderInput> inputs,
+  }) {
+    final soloTrackIds = inputs
+        .where((input) => input.track.isSolo)
+        .map((input) => input.track.id)
+        .toSet();
+    final soloBusIds = timeline.audioBuses
+        .where((bus) => bus.solo)
+        .map((bus) => bus.id)
+        .toSet();
+    return _duckingVolumeExpression(
+      clip,
+      timeline: timeline,
+      inputs: inputs,
+      soloTrackIds: soloTrackIds,
+      soloBusIds: soloBusIds,
+    );
   }
 
   @visibleForTesting
@@ -2420,6 +2498,7 @@ class TimelineExportService {
     required EditorTimeline timeline,
     required List<TimelineRenderInput> inputs,
     required Set<String> soloTrackIds,
+    required Set<String> soloBusIds,
   }) {
     final intervals = <(int, int)>[];
     final clipStartMs = clip.startTime.inMilliseconds;
@@ -2452,13 +2531,25 @@ class TimelineExportService {
       }
     }
 
+    final separatedVideoIds = _separatedVideoAudioOwnerIds(timeline);
     for (final input in inputs) {
+      final bus = input.track.audioBusId == null
+          ? null
+          : timeline.audioBuses
+                .where((candidate) => candidate.id == input.track.audioBusId)
+                .firstOrNull;
       if (input.clip.id == clip.id ||
           (clip.duckSidechainTrackIds.isNotEmpty &&
               !clip.duckSidechainTrackIds.contains(input.track.id)) ||
           !input.hasAudio ||
           input.track.isMuted ||
+          bus?.muted == true ||
+          (soloBusIds.isNotEmpty &&
+              (bus == null || !soloBusIds.contains(bus.id))) ||
           input.clip.audioMix.muted ||
+          (input.clip.type == TimelineTrackType.video &&
+              (input.clip.embeddedAudioSeparated ||
+                  separatedVideoIds.contains(input.clip.id))) ||
           (soloTrackIds.isNotEmpty && !soloTrackIds.contains(input.track.id))) {
         continue;
       }
@@ -4373,17 +4464,22 @@ class TimelineExportService {
   static Future<void> _execute(
     List<String> arguments, {
     required Duration expectedDuration,
+    required MediaJob job,
     bool captionsExpected = false,
     void Function(double progress)? onProgress,
   }) async {
-    if (onProgress != null && expectedDuration.inMilliseconds > 0) {
-      FFmpegKitConfig.enableStatisticsCallback((Statistics statistics) {
+    final session = await FFmpegService.execute(
+      arguments,
+      job: job,
+      onStatistics: (statistics) {
         final time = statistics.getTime();
-        if (time <= 0) return;
-        onProgress((time / expectedDuration.inMilliseconds).clamp(0.0, 1.0));
-      });
-    }
-    final session = await FFmpegKit.executeWithArguments(arguments);
+        if (time > 0 && expectedDuration.inMilliseconds > 0) {
+          onProgress?.call(
+            (time / expectedDuration.inMilliseconds).clamp(0.0, 1.0),
+          );
+        }
+      },
+    );
     final returnCode = await session.getReturnCode();
     final logs = captionsExpected || !ReturnCode.isSuccess(returnCode)
         ? await session.getAllLogsAsString() ?? ''

@@ -1,3 +1,5 @@
+enum ExportRange { entireTimeline, workArea }
+
 enum ExportResolution { original, p1080, p720, p480 }
 
 enum ExportFrameRate { source, fps24, fps30, fps60 }
@@ -11,6 +13,7 @@ class ExportSettings {
   final bool includeAudio;
   final bool burnSubtitles;
   final bool saveToGallery;
+  final ExportRange range;
 
   const ExportSettings({
     this.resolution = ExportResolution.original,
@@ -19,6 +22,7 @@ class ExportSettings {
     this.includeAudio = true,
     this.burnSubtitles = true,
     this.saveToGallery = true,
+    this.range = ExportRange.entireTimeline,
   });
 
   int? get targetHeight {
@@ -119,6 +123,7 @@ class ExportSettings {
     bool? includeAudio,
     bool? burnSubtitles,
     bool? saveToGallery,
+    ExportRange? range,
   }) {
     return ExportSettings(
       resolution: resolution ?? this.resolution,
@@ -127,6 +132,7 @@ class ExportSettings {
       includeAudio: includeAudio ?? this.includeAudio,
       burnSubtitles: burnSubtitles ?? this.burnSubtitles,
       saveToGallery: saveToGallery ?? this.saveToGallery,
+      range: range ?? this.range,
     );
   }
 }

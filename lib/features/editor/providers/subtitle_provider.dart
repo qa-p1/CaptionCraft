@@ -209,12 +209,15 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
 
   /// Select a subtitle entry.
   void selectEntry(String? id) {
+    if (id != null && !state.entries.any((entry) => entry.id == id)) return;
     if (state.selectedEntryId == id) return;
     state = state.copyWith(selectedEntryId: id, clearSelection: id == null);
   }
 
   /// Update a subtitle's text.
   void updateText(String id, String text) {
+    final existing = state.entries.where((entry) => entry.id == id).firstOrNull;
+    if (existing == null || existing.text == text) return;
     _pushUndo();
     final entries = state.entries.map((e) {
       if (e.id == id) {
@@ -236,6 +239,11 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
     final safeEnd = endTime <= safeStart
         ? safeStart + const Duration(milliseconds: 100)
         : endTime;
+    final existing = state.entries.where((entry) => entry.id == id).firstOrNull;
+    if (existing == null ||
+        (existing.startTime == safeStart && existing.endTime == safeEnd)) {
+      return;
+    }
     if (pushUndo && !_isTimelineGestureEditing) {
       _pushUndo();
     }
@@ -286,6 +294,7 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
 
   /// Delete a subtitle entry.
   void deleteEntry(String id) {
+    if (!state.entries.any((entry) => entry.id == id)) return;
     _pushUndo();
     final entries = state.entries.where((e) => e.id != id).toList();
     state = state.copyWith(
@@ -296,8 +305,9 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
 
   /// Duplicate a subtitle entry.
   void duplicateEntry(String id) {
+    final original = state.entries.where((e) => e.id == id).firstOrNull;
+    if (original == null) return;
     _pushUndo();
-    final original = state.entries.firstWhere((e) => e.id == id);
     final copyStart = original.endTime;
     final copyEnd = original.endTime + original.duration;
     final copy = SubtitleEntry(
@@ -337,7 +347,8 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
 
   /// Split a subtitle at a given time.
   void splitEntry(String id, Duration splitAt) {
-    final original = state.entries.firstWhere((e) => e.id == id);
+    final original = state.entries.where((e) => e.id == id).firstOrNull;
+    if (original == null) return;
     if (splitAt <= original.startTime || splitAt >= original.endTime) return;
     _pushUndo();
 
@@ -345,12 +356,20 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
     final elapsedMs = (splitAt - original.startTime).inMilliseconds;
     final splitRatio = durationMs <= 0 ? 0.5 : elapsedMs / durationMs;
     final textParts = _splitTextNearRatio(original.text, splitRatio);
-    final firstWords = original.words
-        ?.where((word) => word.startTime < splitAt)
-        .toList();
-    final secondWords = original.words
-        ?.where((word) => word.endTime > splitAt)
-        .toList();
+    final firstWords = _wordsForSplit(
+      original.words,
+      cueStart: original.startTime,
+      cueEnd: original.endTime,
+      splitAt: splitAt,
+      firstHalf: true,
+    );
+    final secondWords = _wordsForSplit(
+      original.words,
+      cueStart: original.startTime,
+      cueEnd: original.endTime,
+      splitAt: splitAt,
+      firstHalf: false,
+    );
 
     final first = original.copyWith(
       endTime: splitAt,
@@ -528,6 +547,7 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
 
   /// Set a per-entry style override.
   void setEntryStyleOverride(String id, SubtitleStyleModel? style) {
+    if (!state.entries.any((entry) => entry.id == id)) return;
     if (!_isStyleGestureEditing) {
       _pushUndo();
     }
@@ -544,6 +564,7 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
   }
 
   void setEntryStyleOverrideLive(String id, SubtitleStyleModel? style) {
+    if (!state.entries.any((entry) => entry.id == id)) return;
     final entries = state.entries.map((e) {
       if (e.id == id) {
         return e.copyWith(
@@ -635,6 +656,31 @@ class SubtitleNotifier extends StateNotifier<SubtitleState> {
           );
         })
         .toList(growable: false);
+  }
+
+  /// Returns only the part of each word that intersects the requested half.
+  /// A word crossing the split belongs to both halves, but each copy is
+  /// clipped so neither cue retains timing outside its own range.
+  List<WordTiming>? _wordsForSplit(
+    List<WordTiming>? words, {
+    required Duration cueStart,
+    required Duration cueEnd,
+    required Duration splitAt,
+    required bool firstHalf,
+  }) {
+    if (words == null) return null;
+    final result = <WordTiming>[];
+    for (final word in words) {
+      final wordStart = word.startTime < cueStart ? cueStart : word.startTime;
+      final wordEnd = word.endTime > cueEnd ? cueEnd : word.endTime;
+      final start = firstHalf
+          ? wordStart
+          : (wordStart < splitAt ? splitAt : wordStart);
+      final end = firstHalf ? (wordEnd > splitAt ? splitAt : wordEnd) : wordEnd;
+      if (end <= start) continue;
+      result.add(WordTiming(word: word.word, startTime: start, endTime: end));
+    }
+    return result;
   }
 
   (String, String) _splitTextNearRatio(String text, double ratio) {

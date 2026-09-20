@@ -1,5 +1,12 @@
 # Windows implementation handoff
 
+## September 8 continuation
+
+The original worker assignments below describe the September 7 session. Current
+media/export continuation, branch/base commit, verification and remaining scope
+are recorded in [Desktop workflows](desktop-workflows-2026-09-08.md).
+
+
 The user requested implementation by `gpt-5.6-luna` agents at `max` reasoning effort. The root agent orchestrates, reviews and routes corrections; it does not implement application changes. Read `windows-editor-plan.md` for the full scope and acceptance checks.
 
 ## Release baseline
